@@ -22,7 +22,7 @@ pub fn start(pool: &SqlitePool, book_id: &str) -> Result<ViewSession, sqlx::Erro
     crate::db::block_on(async {
         sqlx::query_as::<_, ViewSession>(
             "INSERT INTO view_history (id, book_id, started_at, ended_at) \
-             SELECT hex(randomblob(16)), ?1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP \
+             SELECT hex(randomblob(16)), ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP \
              RETURNING id, book_id, started_at, ended_at",
         )
         .bind(book_id)
@@ -34,7 +34,7 @@ pub fn start(pool: &SqlitePool, book_id: &str) -> Result<ViewSession, sqlx::Erro
 /// 閲覧セッションを終了する（ended_at = 現在時刻）。
 pub fn end(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query("UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?1")
+        sqlx::query("UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(session_id)
             .execute(pool)
             .await
@@ -45,7 +45,7 @@ pub fn end(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
 /// 閲覧セッションの ended_at を現在時刻に更新する（強制終了対策の heartbeat）。
 pub fn touch(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query("UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?1")
+        sqlx::query("UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(session_id)
             .execute(pool)
             .await
@@ -56,7 +56,7 @@ pub fn touch(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
 /// 閲覧回数（セッション数）。
 pub fn view_count(pool: &SqlitePool, book_id: &str) -> Result<i64, sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query_scalar("SELECT COUNT(*) FROM view_history WHERE book_id = ?1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM view_history WHERE book_id = ?")
             .bind(book_id)
             .fetch_one(pool)
             .await
@@ -67,9 +67,9 @@ pub fn view_count(pool: &SqlitePool, book_id: &str) -> Result<i64, sqlx::Error> 
 pub fn total_duration_secs(pool: &SqlitePool, book_id: &str) -> Result<i64, sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query_scalar(
-            "SELECT COALESCE(SUM(CAST(julianday(COALESCE(ended_at, started_at)) - \
-             julianday(started_at) AS REAL) * 86400), 0)::INTEGER \
-             FROM view_history WHERE book_id = ?1",
+            "SELECT CAST(COALESCE(SUM(CAST(julianday(COALESCE(ended_at, started_at)) - \
+             julianday(started_at) AS REAL) * 86400), 0) AS INTEGER) \
+             FROM view_history WHERE book_id = ?",
         )
         .bind(book_id)
         .fetch_one(pool)

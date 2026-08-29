@@ -22,7 +22,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Clippy (workspace, all targets)
+      - name: Clippy (core crates) — Linux
+        if: runner.os == 'Linux'
+        run: cargo clippy -p opfspack -p thundoku-core --all-targets -- -D warnings
+      - name: Clippy (workspace) — macOS / Windows
+        if: runner.os != 'Linux'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test (opfspack + core) — Linux

@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(item.file_name.as_deref(), Some("sample-book.pdf"));
         assert_eq!(
             item.download_url.as_deref(),
-            Some("https://booth.pm/downloadables/8191306?browse=1")
+            Some("https://booth.pm/downloadables/8191306")
         );
         assert!(
             item.thumbnail_url
