@@ -1,0 +1,38 @@
+[package]
+name = "thundoku-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# xwin クロスビルドで SSE4.1 ソースがフラグなしでコンパイルされて失敗するため、
+# sse41 feature を有効にする（-msse4.1 が付与される）
+libwebp-sys = { version = "0.9", features = ["sse41"] }
+thiserror.workspace = true
+log.workspace = true
+ureq = { version = "2", features = ["rustls", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+base64 = "0.22"
+percent-encoding = "2"
+md5 = "0.7"
+rand = "0.8"
+sha2.workspace = true
+opfspack = { path = "../opfspack" }
+image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
+webp = "0.3"
+lindera = { version = "0.44", features = ["ipadic"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# mupdf は MSVC（msbuild）でソースビルドされるため、xwin クロスビルドでは使えない
+[target.'cfg(not(windows))'.dependencies]
+mupdf = "0.8"
+
+[dev-dependencies]
+parking_lot = "0.12"

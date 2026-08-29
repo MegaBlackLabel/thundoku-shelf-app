@@ -1,0 +1,17 @@
+[tools]
+rust = "1.97"
+
+[tasks.run]
+run = "cargo run -p thundoku-shelf"
+
+[tasks.test]
+run = "cargo test --workspace"
+
+[tasks.build]
+run = "cargo build --release"
+
+[tasks.fmt]
+run = "cargo fmt --all"
+
+[tasks.lint]
+run = "cargo clippy --workspace --all-targets -- -D warnings"

@@ -1,0 +1,18 @@
+[package]
+name = "opfspack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+pbkdf2 = "0.12"
+hkdf = "0.12"
+sha2.workspace = true
+aes-gcm = "0.10"
+flate2 = "1"
+crc32fast = "1"
+rand = "0.8"
+[dev-dependencies]
+crc32fast = "1"
+hex = "0.4"
