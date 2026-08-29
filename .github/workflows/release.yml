@@ -33,7 +33,7 @@ jobs:
       - name: Package (macOS)
         if: runner.os == 'macOS'
         working-directory: target/${{ matrix.target }}/release
-        run: zip -r ../../${{ matrix.artifact }} thundoku-shelf
+        run: zip -r "$GITHUB_WORKSPACE/${{ matrix.artifact }}" thundoku-shelf
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
