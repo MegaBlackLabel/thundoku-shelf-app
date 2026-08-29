@@ -13,8 +13,9 @@ fn main() {
     {
         std::panic::set_hook(Box::new(|info| {
             use std::io::Write;
-            if let Ok(mut f) =
-                std::fs::OpenOptions::new().append(true).open("C:\\thundoku.log")
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .append(true)
+                .open("C:\\thundoku.log")
             {
                 let _ = writeln!(f, "PANIC: {info}");
             }

@@ -94,10 +94,8 @@ pub fn fetch_zenn_tags() -> Result<Vec<String>, ZennError> {
     // 起動時に 1 回だけ取得し、プロセス内でキャッシュする
     // （取り込みのたびにネットワーク待ちで止まらないようにする）
     static CACHE: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
-    if let Ok(guard) = CACHE.lock() {
-        if let Some(tags) = guard.as_ref() {
-            return Ok(tags.clone());
-        }
+    if let Ok(Some(tags)) = CACHE.lock().map(|guard| guard.clone()) {
+        return Ok(tags);
     }
     // タイムアウト付きで取得（ハングすると取り込みが止まるため）
     let agent = ureq::AgentBuilder::new()

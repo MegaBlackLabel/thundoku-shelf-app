@@ -201,6 +201,8 @@ impl BoothClient {
         let mut items = Vec::new();
         let mut page = 1;
         let mut max_page = 1;
+        let page_regex =
+            regex::Regex::new(r#"/library\?page=(\d+)"#).expect("booth library page regex");
         loop {
             let html = self.get(
                 &format!("https://accounts.booth.pm/library?page={page}"),
@@ -208,10 +210,7 @@ impl BoothClient {
             )?;
             // ページネーションリンク（/library?page=N）から最大ページ数を検出
             let mut new_max = max_page;
-            for cap in regex::Regex::new(r#"/library\?page=(\d+)"#)
-                .unwrap()
-                .captures_iter(&html)
-            {
+            for cap in page_regex.captures_iter(&html) {
                 if let Ok(p) = cap[1].parse::<usize>() {
                     new_max = new_max.max(p);
                 }
@@ -436,7 +435,9 @@ fn parse_library(html: &str) -> Vec<BoothLibraryItem> {
         // data-href が消えている本）を特定する。ダウンロード可能な場合は
         // ブロック内の別の手がかり（JSON・data 属性）から URL を復元するため、
         // ブロックの実物をログに残す。
-        if item.download_url.is_none() && item.file_name.is_some() || (item.download_url.is_none() && item.thumbnail_url.is_some()) {
+        if item.download_url.is_none() && item.file_name.is_some()
+            || (item.download_url.is_none() && item.thumbnail_url.is_some())
+        {
             log::warn!(
                 "booth library: download_url なし item_id={} title={:?} file_name={:?} block_head={:?}",
                 item.item_id,

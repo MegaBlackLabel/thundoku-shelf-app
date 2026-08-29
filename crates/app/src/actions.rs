@@ -95,4 +95,3 @@ pub struct HideBook {
 pub struct OpenAuthProvider {
     pub provider: crate::views::auth::AuthProvider,
 }
-

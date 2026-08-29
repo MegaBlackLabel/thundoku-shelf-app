@@ -52,7 +52,7 @@ pub fn render_pdf_pages(
         std::sync::Mutex::new((0..total).map(|_| None).collect());
     let done = std::sync::atomic::AtomicUsize::new(0);
     let progress = std::sync::Arc::new(std::sync::Mutex::new(progress));
-    let chunk_size = (total + 7) / 8;
+    let chunk_size = total.div_ceil(8);
     std::thread::scope(|s| {
         for chunk in 0..8 {
             let start = chunk * chunk_size;
@@ -65,14 +65,11 @@ pub fn render_pdf_pages(
             let done = &done;
             let progress = progress.clone();
             s.spawn(move || {
-                let Ok(document) =
-                    Document::from_bytes(&bytes, "application/pdf")
-                else {
+                let Ok(document) = Document::from_bytes(&bytes, "application/pdf") else {
                     return;
                 };
                 for index in start..end {
-                    let result =
-                        render_page(&document, index as i32).map_err(|e| e.to_string());
+                    let result = render_page(&document, index as i32).map_err(|e| e.to_string());
                     results.lock().unwrap()[index] = Some(result);
                     let finished = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     if let Ok(mut callback) = progress.lock() {
@@ -85,9 +82,7 @@ pub fn render_pdf_pages(
     let mut first_error: Option<ImportError> = None;
     let mut rendered = Vec::with_capacity(total);
     for (index, result) in results.into_inner().unwrap().into_iter().enumerate() {
-        match result.unwrap_or_else(|| {
-            Err("page renderer did not produce a result".to_string())
-        }) {
+        match result.unwrap_or_else(|| Err("page renderer did not produce a result".to_string())) {
             Ok(page_image) => rendered.push(page_image),
             Err(message) => {
                 if first_error.is_none() {
@@ -150,4 +145,3 @@ fn render_page(document: &Document, index: i32) -> Result<PageImage, ImportError
         text,
     })
 }
-

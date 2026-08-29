@@ -8,20 +8,16 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AppContext as _, InteractiveElement as _,
-    ReadGlobal as _, StatefulInteractiveElement as _, Styled as _, img,
-    prelude::FluentBuilder as _,
+    Animation, AnimationExt as _, AppContext as _, InteractiveElement as _, ReadGlobal as _,
+    StatefulInteractiveElement as _, Styled as _, prelude::FluentBuilder as _,
 };
 use gpui::{
     AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
-    SharedString, Window, div, px, relative,
+    SharedString, Window, div, px,
 };
-use gpui::StyledImage as _;
-use gpui_component::{Icon, IconName, Theme, ThemeMode, ActiveTheme as _};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode};
 
 use crate::app_state::AppState;
-use thundoku_core::db;
-use thundoku_core::db::{books, bookshelf, progress};
 use crate::icons::AppIcon;
 use crate::views::about::AboutView;
 use crate::views::auth::{AuthDialog, AuthProvider};
@@ -29,6 +25,8 @@ use crate::views::bookshelf::BookshelfView;
 use crate::views::checklist::ChecklistView;
 use crate::views::reader::ReaderView;
 use crate::views::settings::SettingsView;
+use thundoku_core::db;
+use thundoku_core::db::{books, bookshelf, progress};
 
 /// アクティブなナビゲーション先。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +159,6 @@ impl Workspace {
     fn schedule_sidebar_auto_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_close_generation += 1;
         let generation = self.sidebar_close_generation;
-        let handle = cx.entity();
         cx.spawn_in(window, async move |handle, cx| {
             loop {
                 cx.background_executor()
@@ -173,7 +170,7 @@ impl Workspace {
                         let m = window.mouse_position();
                         let h = window.bounds().size.height.as_f32();
                         let (mx, my) = (m.x.as_f32(), m.y.as_f32());
-                        mx >= 0.0 && mx <= 256.0 && my >= 0.0 && my <= h
+                        (0.0..=256.0).contains(&mx) && my >= 0.0 && my <= h
                     })
                     .unwrap_or(false);
                 if in_sidebar {
@@ -181,7 +178,7 @@ impl Workspace {
                     continue;
                 }
                 let _ = cx.update(|_window, app| {
-                    handle.update(app, |this, cx| {
+                    let _ = handle.update(app, |this, cx| {
                         if this.sidebar_open && this.sidebar_close_generation == generation {
                             log::info!("sidebar: auto close (mouse outside)");
                             this.sidebar_open = false;
@@ -211,13 +208,6 @@ impl Workspace {
         db::settings::get(&AppState::global(cx).db_pool, "theme.mode")
             .ok()
             .flatten()
-    }
-
-    /// テーマモード名（テスト用の軽量アクセサ）。
-    fn theme_mode_name(&self) -> Option<String> {
-        // read_with(&Context) からは使えないため、テストは DB 直接参照に委ねる。
-        // ここでは現在適用済みモードの名前を返す。
-        None
     }
 
     /// テーマモードを設定して保存する。
@@ -268,9 +258,9 @@ impl Workspace {
                             .is_none_or(|site| item.site_id == *site)
                     })
                     .filter(|item| {
-                        let book = local
-                            .iter()
-                            .find(|b| b.tbf_product_id.as_deref() == Some(item.database_id.as_str()));
+                        let book = local.iter().find(|b| {
+                            b.tbf_product_id.as_deref() == Some(item.database_id.as_str())
+                        });
                         match book {
                             Some(book) => {
                                 let progress = progress::get(&db, &book.id).ok().flatten();
@@ -344,7 +334,12 @@ impl Workspace {
         let site_row = |name: &str,
                         logged_in: bool,
                         login_provider: Option<AuthProvider>,
-                        logout: Option<fn(&mut crate::views::settings::SettingsView, &mut Context<crate::views::settings::SettingsView>)>| {
+                        logout: Option<
+            fn(
+                &mut crate::views::settings::SettingsView,
+                &mut Context<crate::views::settings::SettingsView>,
+            ),
+        >| {
             let handle = handle.clone();
             let name = name.to_string();
             let name_for_id = name.clone();
@@ -362,7 +357,11 @@ impl Workspace {
                         .flex_col()
                         .gap_0p5()
                         .text_sm()
-                        .child(div().font_weight(FontWeight::MEDIUM).child(name_for_id.clone()))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name_for_id.clone()),
+                        )
                         // Google はログイン中、メールアドレスを 2 段目に表示
                         .when(google_email.is_some() && name_for_id == "Google", |this| {
                             this.child(
@@ -393,7 +392,7 @@ impl Workspace {
                                         if let Some(logout) = logout {
                                             handle.update(cx, |this, cx| {
                                                 let settings = this.settings.clone();
-                                                settings.update(cx, |s, cx| logout(s, cx));
+                                                settings.update(cx, logout);
                                                 this.auth_panel_open = false;
                                                 cx.notify();
                                             });
@@ -416,10 +415,10 @@ impl Workspace {
                         div()
                             .id(format!("account-login-{name}"))
                             .on_click({
-                                let provider = login_provider.clone();
+                                let provider = login_provider;
                                 let handle = handle.clone();
                                 move |_, _window, cx| {
-                                    if let Some(provider) = provider.clone() {
+                                    if let Some(provider) = provider {
                                         cx.defer(move |cx| {
                                             cx.dispatch_action(&crate::actions::OpenAuthProvider {
                                                 provider,
@@ -451,19 +450,31 @@ impl Workspace {
             .flex_col()
             .gap_1p5()
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("アカウント"),
-                    ),
+                div().flex().items_center().child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .child("アカウント"),
+                ),
             )
-            .child(site_row("Google", google_logged_in, Some(AuthProvider::Google), Some(crate::views::settings::SettingsView::logout_google)))
-            .child(site_row("技術書典", tbf_logged_in, Some(AuthProvider::TechBookFest), Some(crate::views::settings::SettingsView::logout_tbf)))
-            .child(site_row("BOOTH", booth_logged_in, Some(AuthProvider::Booth), Some(crate::views::settings::SettingsView::logout_booth)))
+            .child(site_row(
+                "Google",
+                google_logged_in,
+                Some(AuthProvider::Google),
+                Some(crate::views::settings::SettingsView::logout_google),
+            ))
+            .child(site_row(
+                "技術書典",
+                tbf_logged_in,
+                Some(AuthProvider::TechBookFest),
+                Some(crate::views::settings::SettingsView::logout_tbf),
+            ))
+            .child(site_row(
+                "BOOTH",
+                booth_logged_in,
+                Some(AuthProvider::Booth),
+                Some(crate::views::settings::SettingsView::logout_booth),
+            ))
     }
 
     /// アクションの登録（メニュー・ショートカット・外部ディスパッチ）。
@@ -488,7 +499,8 @@ impl Workspace {
             }};
         }
         let _ = std::marker::PhantomData::<H>;
-        reg!(crate::actions::ToggleSidebar, |this, cx| this.toggle_sidebar(cx));
+        reg!(crate::actions::ToggleSidebar, |this, cx| this
+            .toggle_sidebar(cx));
         reg!(crate::actions::ToggleTheme, |this, cx| this.cycle_theme(cx));
         reg!(crate::actions::ShowBookshelf, |this, cx| {
             this.switch_to(NavTarget::Bookshelf, cx);
@@ -527,26 +539,27 @@ impl Workspace {
             this.auth_dialog = None;
             cx.notify();
         });
-        reg_with!(crate::actions::OpenAuthProvider, |action: &crate::actions::OpenAuthProvider, this: &mut Workspace, cx: &mut Context<Workspace>| {
-            let provider = action.provider.clone();
-            this.show_auth = true;
-            let dialog = this
-                .auth_dialog
-                .get_or_insert_with(|| cx.new(AuthDialog::new))
-                .clone();
-            dialog.update(cx, |d, cx| {
-                d.open_with_provider(Some(provider.clone()));
-            });
-            cx.notify();
-        });
-        reg!(crate::actions::CloseReader, |this, cx| this.close_reader(cx));
+        reg_with!(
+            crate::actions::OpenAuthProvider,
+            |action: &crate::actions::OpenAuthProvider,
+             this: &mut Workspace,
+             cx: &mut Context<Workspace>| {
+                let provider = action.provider;
+                this.show_auth = true;
+                let dialog = this
+                    .auth_dialog
+                    .get_or_insert_with(|| cx.new(AuthDialog::new))
+                    .clone();
+                dialog.update(cx, |d, _| {
+                    d.open_with_provider(Some(provider));
+                });
+                cx.notify();
+            }
+        );
+        reg!(crate::actions::CloseReader, |this, cx| this
+            .close_reader(cx));
         reg!(crate::actions::SyncDrive, |this, cx| this.sync_drive(cx));
     }
-
-    fn sidebar_auto_close_window(&mut self, _cx: &mut Context<Self>) {
-        // ホバー外で閉じる処理は render 側の on_mouse_exit で行う。
-    }
-
 }
 
 impl Render for Workspace {
@@ -564,13 +577,11 @@ impl Render for Workspace {
                     cx.background_executor()
                         .timer(Duration::from_millis(3000))
                         .await;
-                    let _ = cx
-                        .update(|cx| {
-                            if *AppState::global(cx).toast_generation.lock() == generation {
-                                crate::app_state::clear_toast(cx);
-                            }
-                        });
-                    let _ = handle;
+                    cx.update(|cx| {
+                        if *AppState::global(cx).toast_generation.lock() == generation {
+                            crate::app_state::clear_toast(cx);
+                        }
+                    });
                 })
                 .detach();
             }
@@ -694,12 +705,16 @@ impl Render for Workspace {
                         .on_mouse_down(gpui::MouseButton::Left, {
                             let handle = cx.entity();
                             move |_, _window, cx| {
-                                handle.update(cx, |this, cx| {
+                                handle.update(cx, |_, cx| {
                                     cx.dispatch_action(&crate::actions::CloseAuth);
                                 });
                             }
                         })
-                        .child(dialog.map(|d| d.into_any_element()).unwrap_or_else(|| div().into_any_element())),
+                        .child(
+                            dialog
+                                .map(|d| d.into_any_element())
+                                .unwrap_or_else(|| div().into_any_element()),
+                        ),
                 )
                 .into_any_element()
             } else {
@@ -716,8 +731,7 @@ impl Workspace {
         let handle = cx.entity();
         let active = self.active;
         let unread_count = self.unread_count;
-        let theme_mode_name =
-            self.theme_mode(cx).unwrap_or_else(|| "system".to_string());
+        let theme_mode_name = self.theme_mode(cx).unwrap_or_else(|| "system".to_string());
         // バッジ色分け: 100 件以上=赤 / 10〜99 件=黄 / 1〜9 件=緑
         let badge_color = if unread_count >= 100 {
             gpui::rgb(0xef4444)
@@ -974,6 +988,7 @@ impl Workspace {
     }
 
     /// メインのナビ行（アイコン + ラベル）。サブメニュートグルは本棚のときのみ。
+    #[allow(clippy::too_many_arguments)]
     fn nav_row(
         &mut self,
         target: NavTarget,
@@ -1113,8 +1128,6 @@ impl Workspace {
             .into_any_element()
     }
 
-
-
     fn bookshelf_submenu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.bookshelf_submenu_open;
         let theme = cx.theme().clone();
@@ -1158,7 +1171,7 @@ impl Workspace {
                                 move |_, _window, cx| {
                                     cx.stop_propagation();
                                     handle.update(cx, |this, cx| {
-                                        let _ = this.bookshelf.update(cx, |b, cx| {
+                                        this.bookshelf.update(cx, |b, cx| {
                                             b.set_site_filter(cx, None);
                                         });
                                         this.switch_to(NavTarget::Bookshelf, cx);
@@ -1179,10 +1192,9 @@ impl Workspace {
                                 .px_2()
                                 .py_1p5()
                                 .text_xs()
-                                .when(
-                                    site_filter.as_deref() == Some("techbookfest"),
-                                    |this| this.bg(theme.secondary),
-                                )
+                                .when(site_filter.as_deref() == Some("techbookfest"), |this| {
+                                    this.bg(theme.secondary)
+                                })
                                 .hover(|style| style.bg(theme.secondary))
                                 .cursor_pointer()
                                 .on_click({
@@ -1190,7 +1202,7 @@ impl Workspace {
                                     move |_, _window, cx| {
                                         cx.stop_propagation();
                                         handle.update(cx, |this, cx| {
-                                            let _ = this.bookshelf.update(cx, |b, cx| {
+                                            this.bookshelf.update(cx, |b, cx| {
                                                 b.set_site_filter(cx, Some("techbookfest"));
                                             });
                                             this.switch_to(NavTarget::Bookshelf, cx);
@@ -1212,10 +1224,9 @@ impl Workspace {
                                 .px_2()
                                 .py_1p5()
                                 .text_xs()
-                                .when(
-                                    site_filter.as_deref() == Some("booth"),
-                                    |this| this.bg(theme.secondary),
-                                )
+                                .when(site_filter.as_deref() == Some("booth"), |this| {
+                                    this.bg(theme.secondary)
+                                })
                                 .hover(|style| style.bg(theme.secondary))
                                 .cursor_pointer()
                                 .on_click({
@@ -1223,7 +1234,7 @@ impl Workspace {
                                     move |_, _window, cx| {
                                         cx.stop_propagation();
                                         handle.update(cx, |this, cx| {
-                                            let _ = this.bookshelf.update(cx, |b, cx| {
+                                            this.bookshelf.update(cx, |b, cx| {
                                                 b.set_site_filter(cx, Some("booth"));
                                             });
                                             this.switch_to(NavTarget::Bookshelf, cx);
@@ -1239,8 +1250,7 @@ impl Workspace {
                             "bookshelf-submenu-anim-{}",
                             if open { "open" } else { "closed" }
                         )),
-                        Animation::new(Duration::from_millis(200))
-                            .with_easing(gpui::ease_in_out),
+                        Animation::new(Duration::from_millis(200)).with_easing(gpui::ease_in_out),
                         move |this, t| {
                             let t = t.clamp(0.0, 1.0);
                             let height = if open { 120.0 * t } else { 120.0 * (1.0 - t) };
@@ -1261,7 +1271,7 @@ mod tests {
     fn setup(cx: &mut TestAppContext) -> gpui::Entity<Workspace> {
         cx.update(gpui_component::init);
         cx.update(AppState::init_test);
-        cx.new(|cx| Workspace::new(cx))
+        cx.new(Workspace::new)
     }
 
     #[gpui::test]
@@ -1368,7 +1378,7 @@ mod tests {
         });
         // ロゴは常に 40x40（閉状態でも潰れない）
         let logo_size = ws.read_with(cx, |w, _| (w.sidebar_open,));
-        assert_eq!(logo_size.0, false);
+        assert!(!logo_size.0);
     }
 
     #[gpui::test]
@@ -1388,7 +1398,7 @@ mod tests {
             });
         });
         let logo_size = ws.read_with(cx, |w, _| (w.sidebar_open,));
-        assert_eq!(logo_size.0, true);
+        assert!(logo_size.0);
     }
 
     #[gpui::test]

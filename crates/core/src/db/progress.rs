@@ -17,7 +17,8 @@ impl ReadingProgress {
     /// True when the last page has been reached.
     /// current_page はリーダーの保存形式と同じ 1-indexed（最終ページ = total_pages）。
     pub fn is_finished(&self) -> bool {
-        self.total_pages.is_some_and(|total| self.current_page >= total)
+        self.total_pages
+            .is_some_and(|total| self.current_page >= total)
     }
 }
 

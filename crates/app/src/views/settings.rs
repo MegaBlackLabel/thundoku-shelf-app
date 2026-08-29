@@ -1,14 +1,12 @@
 //! 設定ビュー: アカウント・Google Drive・外観・データ管理。
 
+use gpui::StyledImage as _;
 use gpui::{
-    AppContext as _,
-    App, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement as _, Window, div, img, px,
+    App, AppContext as _, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement as _, Window, div, img, px,
 };
 use gpui::{ReadGlobal as _, Styled as _};
 use gpui_component::Sizable as _;
-use gpui::StyledImage as _;
-use gpui::prelude::FluentBuilder as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::Dialog;
 
@@ -35,9 +33,6 @@ use crate::views::auth::AuthProvider;
 pub struct SettingsView {
     busy: bool,
     error: Option<String>,
-    toast: Option<String>,
-    /// トースト自動消滅の世代カウンタ
-    toast_generation: u64,
     /// 非表示にした本の一覧（設定画面で表示解除できる）
     hidden_items: Vec<thundoku_core::db::bookshelf::BookshelfItem>,
     /// 非表示リストの表紙取得の進行中フラグ（二重実行防止）
@@ -70,8 +65,6 @@ impl SettingsView {
         Self {
             busy: false,
             error: None,
-            toast: None,
-            toast_generation: 0,
             hidden_items: Vec::new(),
             fetch_covers_in_progress: false,
             confirm_delete: false,
@@ -199,7 +192,7 @@ impl SettingsView {
                 } else {
                     format!("https://techbookfest.org/{url}")
                 };
-                let Ok(mut response) = agent
+                let Ok(response) = agent
                     .get(&url)
                     .set(
                         "User-Agent",
@@ -228,7 +221,7 @@ impl SettingsView {
                     let _ = resized.save(data_dir.join("thumbnails").join(format!("{site_id}_{database_id}.png")));
                 }
             }
-            handle.update(cx, |this, cx| {
+            let _ = handle.update(cx, |this, cx| {
                 this.fetch_covers_in_progress = false;
                 let state = AppState::global(cx);
                 this.hidden_items = db::bookshelf::list_hidden(&state.db_pool).unwrap_or_default();
@@ -245,7 +238,9 @@ impl SettingsView {
         database_id: &str,
     ) -> Option<std::sync::Arc<gpui::RenderImage>> {
         // png 優先（縮小キャッシュ）、なければ元の拡張子を試す
-        let base = data_dir.join("thumbnails").join(format!("{site_id}_{database_id}"));
+        let base = data_dir
+            .join("thumbnails")
+            .join(format!("{site_id}_{database_id}"));
         let bytes = ["png", "jpg", "jpeg", "webp"]
             .iter()
             .find_map(|ext| std::fs::read(format!("{}.{ext}", base.display())).ok())?;
@@ -255,7 +250,9 @@ impl SettingsView {
         for pixel in rgba.chunks_exact_mut(4) {
             pixel.swap(0, 2);
         }
-        Some(std::sync::Arc::new(gpui::RenderImage::new([image::Frame::new(rgba)])))
+        Some(std::sync::Arc::new(gpui::RenderImage::new([
+            image::Frame::new(rgba),
+        ])))
     }
 
     /// Web の SettingsGroupCard 相当: 丸角・ボーダー・ヘッダー
@@ -406,9 +403,15 @@ impl SettingsView {
             .detach();
         }
         if server_ok.is_ok() {
-            self.show_toast("技術書典からログアウトしました（サイト側のセッションも破棄しました）", cx);
+            self.show_toast(
+                "技術書典からログアウトしました（サイト側のセッションも破棄しました）",
+                cx,
+            );
         } else {
-            self.show_toast("技術書典からログアウトしました（サイト側のセッションは残っています）", cx);
+            self.show_toast(
+                "技術書典からログアウトしました（サイト側のセッションは残っています）",
+                cx,
+            );
         }
         log::info!("logout_tbf: done ({:?})", t.elapsed());
         cx.notify();
@@ -464,9 +467,15 @@ impl SettingsView {
         }
         log::info!("logout_booth: cleared ({:?})", t.elapsed());
         if server_ok.is_ok() {
-            self.show_toast("BOOTH からログアウトしました（サイト側のセッションも破棄しました）", cx);
+            self.show_toast(
+                "BOOTH からログアウトしました（サイト側のセッションも破棄しました）",
+                cx,
+            );
         } else {
-            self.show_toast("BOOTH からログアウトしました（サイト側のセッションは残っています）", cx);
+            self.show_toast(
+                "BOOTH からログアウトしました（サイト側のセッションは残っています）",
+                cx,
+            );
         }
         cx.notify();
     }
@@ -854,8 +863,7 @@ impl Render for SettingsView {
             self.refresh_status_counts(cx);
             // 非表示リスト（設定画面から表示解除できるようにする）
             let state = AppState::global(cx);
-            self.hidden_items =
-                db::bookshelf::list_hidden(&state.db_pool).unwrap_or_default();
+            self.hidden_items = db::bookshelf::list_hidden(&state.db_pool).unwrap_or_default();
             // 表紙キャッシュが無いものはバックグラウンドで取得する
             self.fetch_missing_covers(cx);
         }
@@ -864,7 +872,6 @@ impl Render for SettingsView {
         self.refresh_google_profile(cx);
         let busy = self.busy;
         let error = self.error.clone();
-        let toast = self.toast.clone();
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let google_profile = AppState::global(cx).google_profile.lock().clone();

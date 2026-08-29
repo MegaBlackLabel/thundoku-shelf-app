@@ -8,7 +8,6 @@ use gpui::StyledImage as _;
 use gpui::{
     Context, FontWeight, IntoElement, ParentElement, Render, SharedString, Window, div, px,
     relative,
-img,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::Icon;

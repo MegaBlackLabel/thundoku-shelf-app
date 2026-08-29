@@ -27,11 +27,6 @@ pub struct ReaderView {
 }
 
 impl ReaderView {
-    /// 開いている本の ID（試し読みは None）。
-    pub(crate) fn book_id(&self) -> Option<SharedString> {
-        self.book_id.clone()
-    }
-
     /// 閲覧履歴セッションを終了する（ビューアーを閉じる際に呼ぶ）。
     pub(crate) fn end_session(&mut self, cx: &App) {
         if let Some(session_id) = self.view_session_id.take() {

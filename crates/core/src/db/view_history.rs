@@ -34,26 +34,22 @@ pub fn start(pool: &SqlitePool, book_id: &str) -> Result<ViewSession, sqlx::Erro
 /// 閲覧セッションを終了する（ended_at = 現在時刻）。
 pub fn end(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query(
-            "UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?1",
-        )
-        .bind(session_id)
-        .execute(pool)
-        .await
-        .map(|_| ())
+        sqlx::query("UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?1")
+            .bind(session_id)
+            .execute(pool)
+            .await
+            .map(|_| ())
     })
 }
 
 /// 閲覧セッションの ended_at を現在時刻に更新する（強制終了対策の heartbeat）。
 pub fn touch(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query(
-            "UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?1",
-        )
-        .bind(session_id)
-        .execute(pool)
-        .await
-        .map(|_| ())
+        sqlx::query("UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?1")
+            .bind(session_id)
+            .execute(pool)
+            .await
+            .map(|_| ())
     })
 }
 

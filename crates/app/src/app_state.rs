@@ -213,7 +213,7 @@ pub fn set_toast(cx: &mut App, message: impl Into<String>) {
     if let Some(ws) = ws {
         // レンダリング中の再入パニックを避けるため defer で次フレームに回す
         cx.defer(move |cx| {
-            ws.update(cx, |_, cx| cx.notify());
+            let _ = ws.update(cx, |_, cx| cx.notify());
         });
     }
 }

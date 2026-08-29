@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use gpui::StyledImage as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Anchor, AppContext as _, InteractiveElement as _, ReadGlobal as _,
@@ -13,14 +14,12 @@ use gpui::{
     App, Context, Entity, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
     SharedString, Window, div, img, px,
 };
-use gpui::StyledImage as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::popover::Popover;
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{ActiveTheme as _, Icon, IconName};
 use gpui_component::theme::Colorize as _;
+use gpui_component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::booth::BoothClient;
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, documents, progress};
@@ -61,7 +60,7 @@ struct BookEntry {
 /// A single bookshelf card: a `bookshelf_items` row plus its resolved cover
 /// and optional local book (downloaded pack).
 #[derive(Clone)]
-struct ShelfCard {
+pub(crate) struct ShelfCard {
     shelf: bookshelf::BookshelfItem,
     local: Option<Box<BookEntry>>,
     /// Tags shown on the card: local book tags when downloaded, otherwise
@@ -164,23 +163,28 @@ impl BookshelfView {
                 .ok();
         });
         let redownload_handle = handle.clone();
-        App::on_action(cx, move |action: &crate::actions::RedownloadBook, cx: &mut App| {
-            let database_id = action.database_id.to_string();
-            let site_id = action.site_id.to_string();
-            redownload_handle
-                .update(cx, |this, cx| {
-                    let Some(card) = this
-                        .shelf_cards
-                        .iter()
-                        .find(|c| c.shelf.database_id == database_id && c.shelf.site_id == site_id)
-                        .cloned()
-                    else {
-                        return;
-                    };
-                    this.redownload_item(cx, &card);
-                })
-                .ok();
-        });
+        App::on_action(
+            cx,
+            move |action: &crate::actions::RedownloadBook, cx: &mut App| {
+                let database_id = action.database_id.to_string();
+                let site_id = action.site_id.to_string();
+                redownload_handle
+                    .update(cx, |this, cx| {
+                        let Some(card) = this
+                            .shelf_cards
+                            .iter()
+                            .find(|c| {
+                                c.shelf.database_id == database_id && c.shelf.site_id == site_id
+                            })
+                            .cloned()
+                        else {
+                            return;
+                        };
+                        this.redownload_item(cx, &card);
+                    })
+                    .ok();
+            },
+        );
         let handle = handle.clone();
         App::on_action(cx, move |action: &HideBook, cx: &mut App| {
             let database_id = action.database_id.to_string();
@@ -304,8 +308,12 @@ impl BookshelfView {
     /// 選択中のカードを開く（カードクリックと同じ動作: ローカル本はビューアー、
     /// リモート本はダウンロード）
     fn activate_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(idx) = self.selected_index else { return };
-        let Some(&card_idx) = self.filtered.get(idx) else { return };
+        let Some(idx) = self.selected_index else {
+            return;
+        };
+        let Some(&card_idx) = self.filtered.get(idx) else {
+            return;
+        };
         let card = self.shelf_cards[card_idx].clone();
         if self.download_states.contains_key(&card.shelf.database_id) {
             return;
@@ -318,13 +326,7 @@ impl BookshelfView {
     }
 
     /// 選択位置を移動（dx: 左右、dy: 上下 — 上下は列数分移動）
-    fn shift_selection(
-        &mut self,
-        dx: i64,
-        dy: i64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn shift_selection(&mut self, dx: i64, dy: i64, window: &mut Window, cx: &mut Context<Self>) {
         if self.filtered.is_empty() {
             return;
         }
@@ -349,7 +351,12 @@ impl BookshelfView {
         let items = db::bookshelf::list_all(&state.db_pool).unwrap_or_default();
         let hidden: std::collections::HashMap<(String, String), i64> = items
             .iter()
-            .map(|item| ((item.site_id.clone(), item.database_id.clone()), item.is_hidden))
+            .map(|item| {
+                (
+                    (item.site_id.clone(), item.database_id.clone()),
+                    item.is_hidden,
+                )
+            })
             .collect();
         for card in &mut self.shelf_cards {
             if let Some(&is_hidden) =
@@ -359,26 +366,6 @@ impl BookshelfView {
             }
         }
         self.filtered_dirty = true;
-    }
-
-    /// ビューアーで更新された読書進捗を該当カードにだけ反映する
-    /// （reload は 315 件のカード再生成で数秒かかるため使わない）。
-    pub(crate) fn refresh_progress(&mut self, cx: &mut Context<Self>, book_id: &str) {
-        let state = Self::app_state(cx);
-        let db = &state.db_pool;
-        if let Some(progress) = db::progress::get(db, book_id).ok().flatten() {
-            if let Some(card) = self.shelf_cards.iter_mut().find(|c| {
-                c.local.as_ref().is_some_and(|e| e.book.id == book_id)
-            }) {
-                if let Some(local) = card.local.as_mut() {
-                    local.progress = Some((progress.current_page, progress.total_pages));
-                    // 読了判定は finished_at 優先（reload と同じ）。旧データで
-                    // finished_at が無い場合は is_finished（1-indexed）で判定する
-                    local.is_read = progress.finished_at.is_some() || progress.is_finished();
-                }
-            }
-        }
-        cx.notify();
     }
 
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
@@ -399,9 +386,7 @@ impl BookshelfView {
                 let progress = progress::get(db, &book.id).ok().flatten();
                 // 一度でも最終ページまで表示したら読了（finished_at が立つと戻っても維持）。
                 // upsert 時に最終ページ到達で finished_at がセットされる。
-                let is_read = progress
-                    .as_ref()
-                    .is_some_and(|p| p.finished_at.is_some());
+                let is_read = progress.as_ref().is_some_and(|p| p.finished_at.is_some());
                 // ダウンロード直後は reading_progress が無いため、インポート時の
                 // total_pages（imported_documents）から表示用の進捗を作る。
                 // ページ数は 1-indexed（未読 = 1 ページ目）
@@ -637,7 +622,10 @@ impl BookshelfView {
                 .flatten()
                 .is_some_and(|v| v == "true")
         };
-        log::info!("reload: fetch_remote_covers 呼び出し（{:?}）", reload_start.elapsed());
+        log::info!(
+            "reload: fetch_remote_covers 呼び出し（{:?}）",
+            reload_start.elapsed()
+        );
         // Kick off remote cover fetching for cards that only have a placeholder.
         self.fetch_remote_covers(cx);
         log::info!("reload: 完了（{:?}）", reload_start.elapsed());
@@ -722,86 +710,92 @@ impl BookshelfView {
                     s.spawn(move || {
                         log::info!("cover worker: スレッド起動");
                         loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if i < 8 || i % 100 == 0 {
-                            log::info!("cover worker: i={i} / {}", pending.len());
-                        }
-                        let Some((site_id, database_id, url)) = pending.get(i) else {
-                            log::info!("cover worker: 終了 (i={i}, len={})", pending.len());
-                            break;
-                        };
-                        let resolved = if url.starts_with('/') {
-                            format!("https://techbookfest.org{url}")
-                        } else {
-                            url.clone()
-                        };
-                        let bytes = if site_id == "booth" {
-                            // BOOTH の表紙は公開画像（booth.pximg.net — Cookie 不要）。
-                            // 商品ページの共有画像（オリジナル・高解像度）を優先し、
-                            // ライブラリのサムネイル（thumbnail_url）はフォールバック。
-                            let primary = booth_session.as_ref().and_then(|session| {
-                                let item_id: u64 = database_id.parse().ok()?;
-                                let detail = BoothClient::new(session)
-                                    .item_detail(item_id)
-                                    .ok()?;
-                                detail.images.into_iter().next()
-                            });
-                            match primary {
-                                Some(image_url) => {
-                                    fetch_bytes(&agent, &image_url)
-                                        .or_else(|| fetch_bytes(&agent, &resolved))
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if i < 8 || i.is_multiple_of(100) {
+                                log::info!("cover worker: i={i} / {}", pending.len());
+                            }
+                            let Some((site_id, database_id, url)) = pending.get(i) else {
+                                log::info!("cover worker: 終了 (i={i}, len={})", pending.len());
+                                break;
+                            };
+                            let resolved = if url.starts_with('/') {
+                                format!("https://techbookfest.org{url}")
+                            } else {
+                                url.clone()
+                            };
+                            let bytes = if site_id == "booth" {
+                                // BOOTH の表紙は公開画像（booth.pximg.net — Cookie 不要）。
+                                // 商品ページの共有画像（オリジナル・高解像度）を優先し、
+                                // ライブラリのサムネイル（thumbnail_url）はフォールバック。
+                                let primary = booth_session.as_ref().and_then(|session| {
+                                    let item_id: u64 = database_id.parse().ok()?;
+                                    let detail =
+                                        BoothClient::new(session).item_detail(item_id).ok()?;
+                                    detail.images.into_iter().next()
+                                });
+                                match primary {
+                                    Some(image_url) => fetch_bytes(agent, &image_url)
+                                        .or_else(|| fetch_bytes(agent, &resolved)),
+                                    None => fetch_bytes(agent, &resolved),
                                 }
-                                None => fetch_bytes(&agent, &resolved),
-                            }
-                        } else {
-                            // TBF の表紙も公開 URL なら直接取得する（4 並列が機能する）。
-                            // 失敗した場合のみセッション付きクライアントにフォールバック
-                            // （クライアントは Mutex のため直列になるが、まれなケース）。
-                            match fetch_bytes(&agent, &resolved) {
-                                Some(bytes) => Some(bytes),
-                                None => {
-                                    log::warn!(
-                                        "TBF 表紙を直接取得できずフォールバック: {resolved}"
-                                    );
-                                    tbf_client.lock().download(&resolved).ok()
+                            } else {
+                                // TBF の表紙も公開 URL なら直接取得する（4 並列が機能する）。
+                                // 失敗した場合のみセッション付きクライアントにフォールバック
+                                // （クライアントは Mutex のため直列になるが、まれなケース）。
+                                match fetch_bytes(agent, &resolved) {
+                                    Some(bytes) => Some(bytes),
+                                    None => {
+                                        log::warn!(
+                                            "TBF 表紙を直接取得できずフォールバック: {resolved}"
+                                        );
+                                        tbf_client.lock().download(&resolved).ok()
+                                    }
                                 }
+                            };
+                            let Some(bytes) = bytes else {
+                                fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                log::warn!(
+                                    "表紙の取得失敗: {} / {} ({resolved})",
+                                    site_id,
+                                    database_id
+                                );
+                                let _ = fail_tx.send((site_id.clone(), database_id.clone()));
+                                continue;
+                            };
+                            let _ext = match &bytes[..] {
+                                _ if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8 => {
+                                    "jpg"
+                                }
+                                _ if bytes.len() >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" => {
+                                    "png"
+                                }
+                                _ if bytes.len() >= 12
+                                    && &bytes[0..4] == b"RIFF"
+                                    && &bytes[8..12] == b"WEBP" =>
+                                {
+                                    "webp"
+                                }
+                                _ => "jpg",
+                            };
+                            // 縮小済みサムネイルを PNG で保存する（reload 時のキャッシュ
+                            // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）
+                            let cache_path =
+                                thumbnails_dir.join(format!("{site_id}_{database_id}.png"));
+                            if let Some(cached) = resize_for_cache(&bytes, 288) {
+                                let _ = std::fs::write(&cache_path, &cached);
                             }
-                        };
-                        let Some(bytes) = bytes else {
-                            fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            log::warn!("表紙の取得失敗: {} / {} ({resolved})", site_id, database_id);
-                            let _ = fail_tx.send((site_id.clone(), database_id.clone()));
-                            continue;
-                        };
-                        let ext = match &bytes[..] {
-                            _ if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8 => "jpg",
-                            _ if bytes.len() >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" => "png",
-                            _ if bytes.len() >= 12
-                                && &bytes[0..4] == b"RIFF"
-                                && &bytes[8..12] == b"WEBP" =>
-                            {
-                                "webp"
-                            }
-                            _ => "jpg",
-                        };
-                        // 縮小済みサムネイルを PNG で保存する（reload 時のキャッシュ
-                        // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）
-                        let cache_path = thumbnails_dir.join(format!("{site_id}_{database_id}.png"));
-                        if let Some(cached) = resize_for_cache(&bytes, 288) {
-                            let _ = std::fs::write(&cache_path, &cached);
-                        }
-                        // デコード + 縮小はこのスレッド（4 並列）で行い、UI には
-                        // デコード済みサムネイルだけ送る（UI スレッドで 307 枚
-                        // デコードすると固まるため）
-                        let Some(image) = decode_and_resize(&bytes, 288) else {
-                            fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            log::warn!("表紙のデコード失敗: {site_id} / {database_id}");
-                            let _ = fail_tx.send((site_id.clone(), database_id.clone()));
-                            continue;
-                        };
-                        ok_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // 1 枚取得完了 → UI に通知
-                        let _ = tx.send((site_id.clone(), database_id.clone(), image));
+                            // デコード + 縮小はこのスレッド（4 並列）で行い、UI には
+                            // デコード済みサムネイルだけ送る（UI スレッドで 307 枚
+                            // デコードすると固まるため）
+                            let Some(image) = decode_and_resize(&bytes, 288) else {
+                                fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                log::warn!("表紙のデコード失敗: {site_id} / {database_id}");
+                                let _ = fail_tx.send((site_id.clone(), database_id.clone()));
+                                continue;
+                            };
+                            ok_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // 1 枚取得完了 → UI に通知
+                            let _ = tx.send((site_id.clone(), database_id.clone(), image));
                         }
                     });
                 }
@@ -865,11 +859,11 @@ impl BookshelfView {
             for (site_id, database_id) in fail_rx.try_iter() {
                 handle.update(cx, |this, cx| {
                     if let Some(card) = this.shelf_cards.iter_mut().find(|c| {
-                        c.shelf.site_id == site_id && c.shelf.database_id == database_id
+                        c.shelf.site_id == site_id
+                            && c.shelf.database_id == database_id
+                            && c.cover.is_none()
                     }) {
-                        if card.cover.is_none() {
-                            card.cover_fetch_failed = true;
-                        }
+                        card.cover_fetch_failed = true;
                     }
                     this.filtered_dirty = true;
                     cx.notify();
@@ -1035,141 +1029,145 @@ impl BookshelfView {
         std::thread::spawn(move || {
             let result = (|| -> Result<usize, String> {
                 let session = session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
-            let client = BoothClient::new(&session);
-            // ライブラリ（購入品一覧）と購入履歴（購入日）を取得
-            let library = client.library().map_err(|e| e.to_string())?;
-            let orders = client.orders().map_err(|e| e.to_string())?;
-            // 商品名 → 購入日時の照合マップ（先勝ち = 最新）
-            let mut bought_at = std::collections::HashMap::new();
-            for order in &orders {
-                bought_at
-                    .entry(order.item_title.clone())
-                    .or_insert_with(|| order.ordered_at.clone());
-            }
-            // 各商品の表紙（オリジナルサイズ）URL を取得。
-            // 商品ページが消えている（「お探しの本は見つかりませんでした」= 404）場合は
-            // 削除対象として記録する（一時的なネットワークエラーでは削除しない）。
-            // 初回同期で商品数が多いと 1 件ずつの HTTP 待ちで数十秒かかるため、
-            // 4 並列で取得する（BOOTH API への負荷を抑えるため並列度は固定）。
-            let covers = std::sync::Mutex::new(HashMap::new());
-            let vanished = std::sync::Mutex::new(Vec::new());
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let client = BoothClient::new(&session);
-            std::thread::scope(|s| {
-                for _ in 0..4 {
-                    let client = &client;
-                    let covers = &covers;
-                    let vanished = &vanished;
-                    let next = &next;
-                    let library = &library;
-                    s.spawn(move || loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let Some(item) = library.get(i) else { break };
-                        match client.item_detail(item.item_id) {
-                            Ok(detail) => {
-                                if let Some(first) = detail.images.first() {
-                                    covers
-                                        .lock()
-                                        .unwrap()
-                                        .insert(item.item_id, first.clone());
+                let client = BoothClient::new(&session);
+                // ライブラリ（購入品一覧）と購入履歴（購入日）を取得
+                let library = client.library().map_err(|e| e.to_string())?;
+                let orders = client.orders().map_err(|e| e.to_string())?;
+                // 商品名 → 購入日時の照合マップ（先勝ち = 最新）
+                let mut bought_at = std::collections::HashMap::new();
+                for order in &orders {
+                    bought_at
+                        .entry(order.item_title.clone())
+                        .or_insert_with(|| order.ordered_at.clone());
+                }
+                // 各商品の表紙（オリジナルサイズ）URL を取得。
+                // 商品ページが消えている（「お探しの本は見つかりませんでした」= 404）場合は
+                // 削除対象として記録する（一時的なネットワークエラーでは削除しない）。
+                // 初回同期で商品数が多いと 1 件ずつの HTTP 待ちで数十秒かかるため、
+                // 4 並列で取得する（BOOTH API への負荷を抑えるため並列度は固定）。
+                let covers = std::sync::Mutex::new(HashMap::new());
+                let vanished = std::sync::Mutex::new(Vec::new());
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let client = BoothClient::new(&session);
+                std::thread::scope(|s| {
+                    for _ in 0..4 {
+                        let client = &client;
+                        let covers = &covers;
+                        let vanished = &vanished;
+                        let next = &next;
+                        let library = &library;
+                        s.spawn(move || {
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let Some(item) = library.get(i) else { break };
+                                match client.item_detail(item.item_id) {
+                                    Ok(detail) => {
+                                        if let Some(first) = detail.images.first() {
+                                            covers
+                                                .lock()
+                                                .unwrap()
+                                                .insert(item.item_id, first.clone());
+                                        }
+                                    }
+                                    Err(thundoku_core::booth::BoothError::NotFound) => {
+                                        vanished.lock().unwrap().push(item.item_id);
+                                    }
+                                    Err(_) => {}
                                 }
                             }
-                            Err(thundoku_core::booth::BoothError::NotFound) => {
-                                vanished.lock().unwrap().push(item.item_id);
-                            }
-                            Err(_) => {}
-                        }
-                    });
-                }
-            });
-            let covers = covers.into_inner().unwrap();
-            let vanished = vanished.into_inner().unwrap();
-            // bookshelf_items へ upsert（site_id = booth）
+                        });
+                    }
+                });
+                let covers = covers.into_inner().unwrap();
+                let vanished = vanished.into_inner().unwrap();
+                // bookshelf_items へ upsert（site_id = booth）
 
-            // ダウンロードリンクのない商品（物理本のみ等）は本棚に表示しない
-            for item in &library {
-                if item.download_url.is_none() {
-                    continue;
+                // ダウンロードリンクのない商品（物理本のみ等）は本棚に表示しない
+                for item in &library {
+                    if item.download_url.is_none() {
+                        continue;
+                    }
+                    bookshelf::upsert(
+                        &db,
+                        &bookshelf::BookshelfItem {
+                            site_id: "booth".into(),
+                            database_id: item.item_id.to_string(),
+                            title: item.title.clone(),
+                            circle_name: item.shop_name.clone(),
+                            thumbnail_url: covers.get(&item.item_id).cloned(),
+                            format: "PDF".into(),
+                            caused_at: bought_at.get(&item.title).cloned(),
+                            event_name: None,
+                            event_slug: None,
+                            event_id: None,
+                            file_name: item.file_name.clone(),
+                            download_url: item.download_url.clone(),
+                            is_downloadable: 1,
+                            is_checked: 0,
+                            is_purchased: 1,
+                            is_new: 0,
+                            is_active: 1,
+                            is_favorite: 0,
+                            is_hidden: 0,
+                            hidden_at: None,
+                            tags_json: None,
+                            synced_at: "2026-08-25 00:00:00".into(),
+                            created_at: "2026-08-25 00:00:00".into(),
+                            updated_at: "2026-08-25 00:00:00".into(),
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
-                bookshelf::upsert(
-                    &db,
-                    &bookshelf::BookshelfItem {
-                        site_id: "booth".into(),
-                        database_id: item.item_id.to_string(),
-                        title: item.title.clone(),
-                        circle_name: item.shop_name.clone(),
-                        thumbnail_url: covers.get(&item.item_id).cloned(),
-                        format: "PDF".into(),
-                        caused_at: bought_at.get(&item.title).cloned(),
-                        event_name: None,
-                        event_slug: None,
-                        event_id: None,
-                        file_name: item.file_name.clone(),
-                        download_url: item.download_url.clone(),
-                        is_downloadable: 1,
-                        is_checked: 0,
-                        is_purchased: 1,
-                        is_new: 0,
-                        is_active: 1,
-                        is_favorite: 0,
-                        is_hidden: 0,
-                        hidden_at: None,
-                        tags_json: None,
-                        synced_at: "2026-08-25 00:00:00".into(),
-                        created_at: "2026-08-25 00:00:00".into(),
-                        updated_at: "2026-08-25 00:00:00".into(),
-                    },
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            // ライブラリに DL URL が無くなった商品は本棚から取り除く
-            let _ = thundoku_core::db::block_on(async {
-                sqlx::query(
+                // ライブラリに DL URL が無くなった商品は本棚から取り除く
+                let _ = thundoku_core::db::block_on(async {
+                    sqlx::query(
                     "DELETE FROM bookshelf_items WHERE site_id = 'booth'                      AND (download_url IS NULL OR download_url = '')",
                 )
                 .execute(&db)
                 .await
-            });
-            // ライブラリに存在しない商品（購入キャンセル・返品等）も削除する。
-            // ダウンロード済み（books に tbf_product_id で紐づく）は残す。
-            let current_ids: Vec<String> = library.iter().map(|i| i.item_id.to_string()).collect();
-            let delete_not_in_library = |pool: &thundoku_core::db::SqlitePool,
-                                         ids: &[String]| {
-                thundoku_core::db::block_on(async {
-                    if ids.is_empty() {
-                        sqlx::query(
+                });
+                // ライブラリに存在しない商品（購入キャンセル・返品等）も削除する。
+                // ダウンロード済み（books に tbf_product_id で紐づく）は残す。
+                let current_ids: Vec<String> =
+                    library.iter().map(|i| i.item_id.to_string()).collect();
+                let delete_not_in_library =
+                    |pool: &thundoku_core::db::SqlitePool, ids: &[String]| {
+                        thundoku_core::db::block_on(async {
+                            if ids.is_empty() {
+                                sqlx::query(
                             "DELETE FROM bookshelf_items WHERE site_id = 'booth'                              AND database_id NOT IN                              (SELECT tbf_product_id FROM books WHERE site_id = 'booth')",
                         )
                         .execute(pool)
                         .await
-                    } else {
-                        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                        let sql = format!(
-                            "DELETE FROM bookshelf_items WHERE site_id = 'booth'                              AND database_id NOT IN ({placeholders})                              AND database_id NOT IN                              (SELECT tbf_product_id FROM books WHERE site_id = 'booth')"
-                        );
-                        let mut query = sqlx::query(&sql);
-                        for id in ids {
-                            query = query.bind(id);
-                        }
-                        query.execute(pool).await
+                            } else {
+                                let placeholders =
+                                    ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                                let sql = format!(
+                                    "DELETE FROM bookshelf_items WHERE site_id = 'booth'                              AND database_id NOT IN ({placeholders})                              AND database_id NOT IN                              (SELECT tbf_product_id FROM books WHERE site_id = 'booth')"
+                                );
+                                let mut query = sqlx::query(&sql);
+                                for id in ids {
+                                    query = query.bind(id);
+                                }
+                                query.execute(pool).await
+                            }
+                        })
+                    };
+                let _ = delete_not_in_library(&db, &current_ids);
+                // 商品ページが消えた本（お探しの本は見つかりませんでした）も削除する。
+                // ダウンロード済み（books に紐づく）は残す。
+                if !vanished.is_empty() {
+                    let placeholders = vanished.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let sql = format!(
+                        "DELETE FROM bookshelf_items WHERE site_id = 'booth'                      AND database_id IN ({placeholders})                      AND database_id NOT IN                      (SELECT tbf_product_id FROM books WHERE site_id = 'booth')"
+                    );
+                    let mut query = sqlx::query(&sql);
+                    for id in &vanished {
+                        query = query.bind(id.to_string());
                     }
-                })
-            };
-            let _ = delete_not_in_library(&db, &current_ids);
-            // 商品ページが消えた本（お探しの本は見つかりませんでした）も削除する。
-            // ダウンロード済み（books に紐づく）は残す。
-            if !vanished.is_empty() {
-                let placeholders = vanished.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let sql = format!(
-                    "DELETE FROM bookshelf_items WHERE site_id = 'booth'                      AND database_id IN ({placeholders})                      AND database_id NOT IN                      (SELECT tbf_product_id FROM books WHERE site_id = 'booth')"
-                );
-                let mut query = sqlx::query(&sql);
-                for id in &vanished {
-                    query = query.bind(id.to_string());
+                    let _ = thundoku_core::db::block_on(async { query.execute(&db).await });
                 }
-                let _ = thundoku_core::db::block_on(async { query.execute(&db).await });
-            }
-            Ok::<_, String>(library.len())
+                Ok::<_, String>(library.len())
             })();
             let _ = tx.send(result);
         });
@@ -1302,164 +1300,115 @@ impl BookshelfView {
         // NOTE: sync_channel(64) はバッファが満杯になると send がブロックする。
         // UI がカードの再描画（表紙 307 件の反映など）で忙しいと取り込みが
         // 数分ストールする原因になるため、unbounded の channel を使う。
-        let (progress_tx, progress_rx) =
-            std::sync::mpsc::channel::<(String, DownloadState)>();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(String, DownloadState)>();
         // ダウンロード + インポート（レンダリング含む）は GPUI のワーカーを
         // 数分ブロックすると他の処理（表紙取得など）が止まってビジーになるため、
         // 専用スレッドで実行して結果をチャネルで受け取る。
-        let (result_tx, result_rx) =
-            std::sync::mpsc::channel::<Result<String, String>>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<String, String>>();
         std::thread::spawn(move || {
             let result = (|| -> Result<String, String> {
-            // ダウンロード（サイトで分岐）:
-            // - BOOTH: セッション Cookie で downloadables/{id} を GET → 302 の
-            //   Location（署名付き S3 URL）を自動追跡してファイル本体を取得
-            // - 技術書典: GraphQL の downloadURL を resolve して取得
-            let bytes = if site_id == "booth" {
-                let session =
-                    booth_session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
-                let client = BoothClient::new(&session);
-                let url = item.download_url.as_deref().unwrap_or_default().to_string();
-                let download_tx = progress_tx.clone();
-                let download_progress_id = product_id.clone();
-                let mut on_download = move |downloaded: u64, total: u64| {
-                    let fraction = if total > 0 {
-                        downloaded as f32 / total as f32
-                    } else {
-                        0.0
+                // ダウンロード（サイトで分岐）:
+                // - BOOTH: セッション Cookie で downloadables/{id} を GET → 302 の
+                //   Location（署名付き S3 URL）を自動追跡してファイル本体を取得
+                // - 技術書典: GraphQL の downloadURL を resolve して取得
+                let bytes = if site_id == "booth" {
+                    let session =
+                        booth_session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
+                    let client = BoothClient::new(&session);
+                    let url = item.download_url.as_deref().unwrap_or_default().to_string();
+                    let download_tx = progress_tx.clone();
+                    let download_progress_id = product_id.clone();
+                    let mut on_download = move |downloaded: u64, total: u64| {
+                        let fraction = if total > 0 {
+                            downloaded as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let _ = download_tx.send((
+                            download_progress_id.clone(),
+                            DownloadState::Downloading(fraction),
+                        ));
                     };
-                    let _ = download_tx.send((
-                        download_progress_id.clone(),
-                        DownloadState::Downloading(fraction),
-                    ));
-                };
-                client
-                    .download_with_progress(&url, &mut on_download)
-                    .map_err(|e| e.to_string())?
-            } else {
-                let mut client = tbf_client.lock();
-                // The bookshelf item's `downloadURL` (GraphQL
-                // `downloadContent.downloadURL`) carries the DLC id, which may
-                // differ from `database_id`; fall back to the database-id URL
-                // only when the item has no download URL (mirrors the Web
-                // `urlToResolve` selection).
-                let fallback = format!("{TBF_DOWNLOAD_BASE}/{product_id}/download");
-                let url = item
-                    .download_url
-                    .as_deref()
-                    .unwrap_or(&fallback)
-                    .to_string();
-                let resolved = client
-                    .resolve_download_url(&url)
-                    .map_err(|e| e.to_string())?;
-                let download_tx = progress_tx.clone();
-                let download_progress_id = product_id.clone();
-                let mut on_download = move |downloaded: u64, total: u64| {
-                    let fraction = if total > 0 {
-                        downloaded as f32 / total as f32
-                    } else {
-                        0.0
+                    client
+                        .download_with_progress(&url, &mut on_download)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    let mut client = tbf_client.lock();
+                    // The bookshelf item's `downloadURL` (GraphQL
+                    // `downloadContent.downloadURL`) carries the DLC id, which may
+                    // differ from `database_id`; fall back to the database-id URL
+                    // only when the item has no download URL (mirrors the Web
+                    // `urlToResolve` selection).
+                    let fallback = format!("{TBF_DOWNLOAD_BASE}/{product_id}/download");
+                    let url = item
+                        .download_url
+                        .as_deref()
+                        .unwrap_or(&fallback)
+                        .to_string();
+                    let resolved = client
+                        .resolve_download_url(&url)
+                        .map_err(|e| e.to_string())?;
+                    let download_tx = progress_tx.clone();
+                    let download_progress_id = product_id.clone();
+                    let mut on_download = move |downloaded: u64, total: u64| {
+                        let fraction = if total > 0 {
+                            downloaded as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let _ = download_tx.send((
+                            download_progress_id.clone(),
+                            DownloadState::Downloading(fraction),
+                        ));
                     };
-                    let _ = download_tx.send((
-                        download_progress_id.clone(),
-                        DownloadState::Downloading(fraction),
-                    ));
+                    let bytes = client
+                        .download_with_progress(&resolved, &mut on_download)
+                        .map_err(|e| e.to_string())?;
+                    // TBF クライアントのロックを解放してから重い処理（PDF レンダリング）
+                    // に入る。保持したままだと同期等の他操作がブロックされる。
+                    drop(client);
+                    bytes
                 };
-                let bytes = client
-                    .download_with_progress(&resolved, &mut on_download)
-                    .map_err(|e| e.to_string())?;
-                // TBF クライアントのロックを解放してから重い処理（PDF レンダリング）
-                // に入る。保持したままだと同期等の他操作がブロックされる。
-                drop(client);
-                bytes
-            };
-            let file_name = item_file_name(&title, &item);
-            let extension = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
-            let import_tx = progress_tx.clone();
-            let import_progress_id = product_id.clone();
-            let mut last_import_pct = u32::MAX;
-            let mut on_import = move |fraction: f32| {
-                let pct = (fraction * 100.0).round() as u32;
-                if pct != last_import_pct {
-                    last_import_pct = pct;
-                    let _ = import_tx.send((
-                        import_progress_id.clone(),
-                        DownloadState::Processing(fraction),
-                    ));
-                }
-            };
-            let imported = if extension == "pdf" {
-                // PDF レンダリング（重い）は DB ロック外で行い、UI スレッドの
-                // DB 操作をブロックしないようにする。
-                let pages = thundoku_core::import::pdf::render_pdf_pages(&bytes, &mut on_import)
-                    .map_err(|e| e.to_string())?;
+                let file_name = item_file_name(&title, &item);
+                let extension = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
+                let import_tx = progress_tx.clone();
+                let import_progress_id = product_id.clone();
+                let mut last_import_pct = u32::MAX;
+                let mut on_import = move |fraction: f32| {
+                    let pct = (fraction * 100.0).round() as u32;
+                    if pct != last_import_pct {
+                        last_import_pct = pct;
+                        let _ = import_tx.send((
+                            import_progress_id.clone(),
+                            DownloadState::Processing(fraction),
+                        ));
+                    }
+                };
+                let imported = if extension == "pdf" {
+                    // PDF レンダリング（重い）は DB ロック外で行い、UI スレッドの
+                    // DB 操作をブロックしないようにする。
+                    let pages =
+                        thundoku_core::import::pdf::render_pdf_pages(&bytes, &mut on_import)
+                            .map_err(|e| e.to_string())?;
 
-                let imported = thundoku_core::import::import_rendered_pdf_pages(
-                    &db,
-                    &file_name,
-                    bytes.len() as i64,
-                    pages,
-                    &packs_dir,
-                    None,
-                )
-                .map_err(|e| e.to_string())?;
-                // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
-                if !site_id.is_empty() {
-                    let _ = books::set_site_id(&db, &imported.book.id, &site_id);
-                }
-                // 本棚の bookshelf_items.database_id と対応付け、カードを
-                // 「ダウンロード済み」として表示・ビューアーで開けるようにする。
-                let _ = books::set_tbf_product_id(&db, &imported.book.id, &product_id);
-                // ダウンロード直後からページ数を表示できるように
-                // reading_progress（未読・総ページ数）を作成する。
-                if imported.document.total_pages > 0 {
-                    let _ = progress::upsert(
-                        &db,
-                        &progress::ReadingProgress {
-                            book_id: imported.book.id.clone(),
-                            current_page: 0,
-                            total_pages: Some(imported.document.total_pages),
-                            finished_at: None,
-                            last_read_at: "2026-01-01 00:00:00".to_string(),
-                            scroll_position: 0.0,
-                        },
-                    );
-                }
-                // タグ取得が OFF なら自動生成タグを取り除く（Web 版の
-                // disableTagGeneration 相当）。
-                if !tag_fetch_enabled {
-                    let _ = db::tags::delete_generated(&db, &imported.book.id);
-                }
-                Ok::<_, String>(imported)
-            } else {
-                let imported = match extension.as_str() {
-                    "epub" => thundoku_core::import::import_epub_bytes(
-                        &db, &file_name, &bytes, &packs_dir, None,
-                    ),
-                    "zip" => thundoku_core::import::import_zip_bytes(
+                    let imported = thundoku_core::import::import_rendered_pdf_pages(
                         &db,
                         &file_name,
-                        &bytes,
+                        bytes.len() as i64,
+                        pages,
                         &packs_dir,
                         None,
-                        &mut on_import,
-                    ),
-                    // BOOTH は PDF だけでなく画像ファイル（イラスト等）もある
-                    "jpg" | "jpeg" | "png" | "webp" | "gif" => {
-                        thundoku_core::import::import_image_bytes(
-                            &db, &file_name, &bytes, &packs_dir, None,
-                        )
-                    }
-                    other => Err(thundoku_core::import::ImportError::UnsupportedType(
-                        other.to_string(),
-                    )),
-                };
-                if let Ok(imported) = &imported {
+                    )
+                    .map_err(|e| e.to_string())?;
                     // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
                     if !site_id.is_empty() {
                         let _ = books::set_site_id(&db, &imported.book.id, &site_id);
                     }
+                    // 本棚の bookshelf_items.database_id と対応付け、カードを
+                    // 「ダウンロード済み」として表示・ビューアーで開けるようにする。
                     let _ = books::set_tbf_product_id(&db, &imported.book.id, &product_id);
+                    // ダウンロード直後からページ数を表示できるように
+                    // reading_progress（未読・総ページ数）を作成する。
                     if imported.document.total_pages > 0 {
                         let _ = progress::upsert(
                             &db,
@@ -1473,15 +1422,63 @@ impl BookshelfView {
                             },
                         );
                     }
+                    // タグ取得が OFF なら自動生成タグを取り除く（Web 版の
+                    // disableTagGeneration 相当）。
                     if !tag_fetch_enabled {
                         let _ = db::tags::delete_generated(&db, &imported.book.id);
                     }
-                }
-                imported.map_err(|e| e.to_string())
-            };
-            imported
-                .map(|imported| imported.book.title)
-                .map_err(|e| e.to_string())
+                    Ok::<_, String>(imported)
+                } else {
+                    let imported = match extension.as_str() {
+                        "epub" => thundoku_core::import::import_epub_bytes(
+                            &db, &file_name, &bytes, &packs_dir, None,
+                        ),
+                        "zip" => thundoku_core::import::import_zip_bytes(
+                            &db,
+                            &file_name,
+                            &bytes,
+                            &packs_dir,
+                            None,
+                            &mut on_import,
+                        ),
+                        // BOOTH は PDF だけでなく画像ファイル（イラスト等）もある
+                        "jpg" | "jpeg" | "png" | "webp" | "gif" => {
+                            thundoku_core::import::import_image_bytes(
+                                &db, &file_name, &bytes, &packs_dir, None,
+                            )
+                        }
+                        other => Err(thundoku_core::import::ImportError::UnsupportedType(
+                            other.to_string(),
+                        )),
+                    };
+                    if let Ok(imported) = &imported {
+                        // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
+                        if !site_id.is_empty() {
+                            let _ = books::set_site_id(&db, &imported.book.id, &site_id);
+                        }
+                        let _ = books::set_tbf_product_id(&db, &imported.book.id, &product_id);
+                        if imported.document.total_pages > 0 {
+                            let _ = progress::upsert(
+                                &db,
+                                &progress::ReadingProgress {
+                                    book_id: imported.book.id.clone(),
+                                    current_page: 0,
+                                    total_pages: Some(imported.document.total_pages),
+                                    finished_at: None,
+                                    last_read_at: "2026-01-01 00:00:00".to_string(),
+                                    scroll_position: 0.0,
+                                },
+                            );
+                        }
+                        if !tag_fetch_enabled {
+                            let _ = db::tags::delete_generated(&db, &imported.book.id);
+                        }
+                    }
+                    imported.map_err(|e| e.to_string())
+                };
+                imported
+                    .map(|imported| imported.book.title)
+                    .map_err(|e| e.to_string())
             })();
             let _ = result_tx.send(result);
         });
@@ -1625,12 +1622,8 @@ impl BookshelfView {
         {
             let state = Self::app_state(cx);
             let db = &state.db_pool;
-            let _ = bookshelf::set_hidden(
-                db,
-                &card.shelf.site_id,
-                &card.shelf.database_id,
-                new_state,
-            );
+            let _ =
+                bookshelf::set_hidden(db, &card.shelf.site_id, &card.shelf.database_id, new_state);
             if let Some(local) = &card.local {
                 let _ = books::set_hidden(db, &local.book.id, new_state);
             }
@@ -1647,7 +1640,8 @@ impl BookshelfView {
     }
 
     /// ローカル削除（Drive には触れない）。
-    pub fn delete_book(&mut self, cx: &mut Context<Self>, book_id: &str) {        {
+    pub fn delete_book(&mut self, cx: &mut Context<Self>, book_id: &str) {
+        {
             let state = Self::app_state(cx);
             let db = &state.db_pool;
             let _ = progress::delete(db, book_id);
@@ -1664,7 +1658,7 @@ impl BookshelfView {
 
     /// 本を再ダウンロードする（コンテキストメニューの「再取得」）。
     /// 既にローカルに持っている場合は pack ごと削除してから再取得する。
-    pub fn redownload_item(&mut self, cx: &mut Context<Self>, card: &ShelfCard) {
+    pub(crate) fn redownload_item(&mut self, cx: &mut Context<Self>, card: &ShelfCard) {
         let state = Self::app_state(cx);
         if let Some(local) = &card.local {
             let db = &state.db_pool;
@@ -1676,10 +1670,10 @@ impl BookshelfView {
         // 表紙キャッシュも破棄して再取得させる（reload の fetch_remote_covers が
         // thumbnail_url から取り直す）。キャッシュファイル + カードの cover をクリア。
         if !card.shelf.site_id.is_empty() {
-            let cache_path = state
-                .data_dir
-                .join("thumbnails")
-                .join(format!("{}_{}.png", card.shelf.site_id, card.shelf.database_id));
+            let cache_path = state.data_dir.join("thumbnails").join(format!(
+                "{}_{}.png",
+                card.shelf.site_id, card.shelf.database_id
+            ));
             let _ = std::fs::remove_file(&cache_path);
             if let Some(slot) = self.shelf_cards.iter_mut().find(|c| {
                 c.shelf.site_id == card.shelf.site_id
@@ -1869,6 +1863,7 @@ impl BookshelfView {
         cx.defer(move |cx| cx.dispatch_action(&action));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_card(
         window: &mut Window,
         theme: &gpui_component::Theme,
@@ -1908,7 +1903,6 @@ impl BookshelfView {
         let is_read = local.map(|e| e.is_read).unwrap_or(false);
         let is_downloaded = local.is_some();
         let is_favorite = shelf.is_favorite == 1;
-        let download_state = download_state;
         let progress_text = local.and_then(|e| {
             e.progress.map(|(current, total)| match total {
                 Some(total) => format!("{} / {total}ページ", current.max(1)),
@@ -2188,34 +2182,42 @@ impl BookshelfView {
             });
 
         // タグ行: 編集中なら Web の TagsInput 風エディタを表示
-        card_el = card_el.child(
-            if editing {
-                BookshelfView::render_tag_editor(
+        card_el = card_el.child(if editing {
+            BookshelfView::render_tag_editor(
+                window,
+                theme,
+                &handle,
+                editing_tags,
+                editing_suggestions,
+                editing_input.expect("editing input"),
+            )
+            .into_any_element()
+        } else {
+            // タグ行のどこをクリックしてもカードのクリック（開く/ダウンロード）
+            // が発火しないようにする（Web 版のタグ行と同じ挙動）
+            div()
+                .id(SharedString::from(format!("tag-row-{database_id}")))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_1()
+                .items_center()
+                .cursor_pointer()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .children(BookshelfView::render_tag_chips(
+                    theme,
+                    &handle,
+                    favorite_tags,
+                    card,
+                ))
+                .child(BookshelfView::render_tag_edit_button(
                     window,
                     theme,
                     &handle,
-                    editing_tags,
-                    editing_suggestions,
-                    editing_input.expect("editing input"),
-                )
+                    &database_id,
+                ))
                 .into_any_element()
-            } else {
-                // タグ行のどこをクリックしてもカードのクリック（開く/ダウンロード）
-                // が発火しないようにする（Web 版のタグ行と同じ挙動）
-                div()
-                    .id(SharedString::from(format!("tag-row-{database_id}")))
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_1()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .children(BookshelfView::render_tag_chips(theme, &handle, favorite_tags, card))
-                    .child(BookshelfView::render_tag_edit_button(window, theme, &handle, &database_id))
-                    .into_any_element()
-            },
-        );
+        });
 
         card_el.context_menu({
             let has_local = delete_id.is_some();
@@ -2335,7 +2337,7 @@ impl BookshelfView {
     /// インラインタグエディタ（Web の TagsInput 相当: 枠付きチップ + 入力 +
     /// サジェスチョン + 保存/キャンセル）。
     fn render_tag_editor(
-        window: &mut Window,
+        _window: &mut Window,
         theme: &gpui_component::Theme,
         handle: &gpui::Entity<BookshelfView>,
         editing_tags: &[String],
@@ -3450,7 +3452,7 @@ impl Render for BookshelfView {
                                 .max(160.0);
                             // 仮想化: 行単位の List（可視行のみ描画）でスクロールを軽くする。
                             // 各行は同じカード幅・gap の横並び（行内左寄せは justify_start）。
-                            let rows = (self.filtered.len() + columns - 1) / columns;
+                            let rows = self.filtered.len().div_ceil(columns);
                             if self.list_state.item_count() != rows {
                                 self.list_state.reset(rows);
                             }
@@ -3603,7 +3605,6 @@ fn fetch_bytes(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
 
 /// 画像を縮小して PNG バイト列として保存用に変換する（キャッシュ用）。
 fn resize_for_cache(data: &[u8], max_width: u32) -> Option<Vec<u8>> {
-    use std::io::Write;
     let img = image::load_from_memory(data).ok()?;
     let (w, h) = (img.width(), img.height());
     let resized = if w > max_width {
@@ -3877,9 +3878,9 @@ mod tests {
                     is_purchased: 1,
                     is_new: 0,
                     is_active: 1,
-is_favorite: 0,
-is_hidden: 0,
-                        hidden_at: None,
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    hidden_at: None,
                     tags_json: None,
                     synced_at: "2026-08-21 00:00:00".into(),
                     created_at: "2026-08-21 00:00:00".into(),
@@ -3920,9 +3921,9 @@ is_hidden: 0,
                     is_purchased: 1,
                     is_new: 0,
                     is_active: 1,
-is_favorite: 0,
-is_hidden: 0,
-                        hidden_at: None,
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    hidden_at: None,
                     tags_json: None,
                     synced_at: "2026-08-21 00:00:00".into(),
                     created_at: "2026-08-21 00:00:00".into(),
@@ -4579,9 +4580,9 @@ is_hidden: 0,
                     is_purchased: 1,
                     is_new: 0,
                     is_active: 1,
-is_favorite: 0,
-is_hidden: 0,
-                        hidden_at: None,
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    hidden_at: None,
                     tags_json: None,
                     synced_at: "2026-08-21 00:00:00".into(),
                     created_at: "2026-08-21 00:00:00".into(),
@@ -4698,9 +4699,9 @@ is_hidden: 0,
                     is_purchased: 1,
                     is_new: 0,
                     is_active: 1,
-is_favorite: 0,
-is_hidden: 0,
-                        hidden_at: None,
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    hidden_at: None,
                     tags_json: None,
                     synced_at: "2026-08-21 00:00:00".into(),
                     created_at: "2026-08-21 00:00:00".into(),
@@ -5112,7 +5113,11 @@ is_hidden: 0,
             thundoku_core::db::bookshelf::set_favorite(db, "techbookfest", "db-1", true).unwrap();
         });
         let view = cx.new(BookshelfView::new);
-        cx.update(|cx| view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Favorite)));
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_read_filter(cx, ReadFilter::Favorite)
+            })
+        });
         let visible = view.read_with(cx, |this, cx| {
             this.visible_shelf_cards(cx)
                 .iter()

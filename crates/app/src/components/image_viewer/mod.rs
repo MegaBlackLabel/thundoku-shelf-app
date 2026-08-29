@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AppContext as _, InteractiveElement as _, ReadGlobal as _, ScrollHandle, Subscription,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, prelude::FluentBuilder as _,
+    AppContext as _, InteractiveElement as _, ReadGlobal as _, ScrollHandle,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
+    prelude::FluentBuilder as _,
 };
 use gpui::{
     Context, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
@@ -83,11 +84,9 @@ impl PageLoader for PackPageLoader {
         let (_, bytes) = cached.as_ref().ok_or("pack load failed")?;
         let reader = opfspack::PackReader::open(bytes).map_err(|e| e.to_string())?;
         // pack キーは一度だけ導出（PBKDF2 100k 回はページごとに実行しない）
-        let key = self.pack_key.get_or_init(|| {
-            self.identity
-                .as_ref()
-                .map(opfspack::derived_pack_key)
-        });
+        let key = self
+            .pack_key
+            .get_or_init(|| self.identity.as_ref().map(opfspack::derived_pack_key));
         let data = reader
             .read_entry_with_key(pack_entry, key.as_ref())
             .map_err(|e| e.to_string())?;
@@ -181,12 +180,8 @@ fn decode_render_image(data: &[u8]) -> Result<Arc<RenderImage>, String> {
             {
                 return Err("webp info failed".into());
             }
-            let ptr = libwebp_sys::WebPDecodeRGBA(
-                data.as_ptr(),
-                data.len(),
-                &mut width,
-                &mut height,
-            );
+            let ptr =
+                libwebp_sys::WebPDecodeRGBA(data.as_ptr(), data.len(), &mut width, &mut height);
             if ptr.is_null() {
                 return Err("webp decode failed".into());
             }
@@ -356,7 +351,11 @@ impl ImageViewer {
             db::settings::get(db, &viewer_key("viewer.autoplay_interval"))
                 .ok()
                 .flatten()
-                .or_else(|| db::settings::get(db, "viewer.autoplay_interval").ok().flatten())
+                .or_else(|| {
+                    db::settings::get(db, "viewer.autoplay_interval")
+                        .ok()
+                        .flatten()
+                })
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(AUTOPLAY_DEFAULT_MS)
         };
@@ -753,7 +752,11 @@ impl ImageViewer {
     pub fn adjust_zoom(&mut self, cx: &mut Context<Self>, delta: f32) {
         self.zoomed = true;
         self.zoom_scale = (self.zoom_scale + delta).clamp(1.0, 8.0);
-        log::info!("adjust_zoom: delta={delta} scale={} zoomed={}", self.zoom_scale, self.zoomed);
+        log::info!(
+            "adjust_zoom: delta={delta} scale={} zoomed={}",
+            self.zoom_scale,
+            self.zoomed
+        );
         if self.zoom_scale <= 1.0 {
             self.zoomed = false;
             self.pan_offset = gpui::Point::new(0.0, 0.0);
@@ -766,11 +769,12 @@ impl ImageViewer {
     /// （1 回目: 拡大開始 / 2 回目以降: さらに拡大 / 上限で: 終了）
     /// 250ms 以内の再呼び出しは 1 回のダブルクリックとみなして無視する
     pub fn toggle_zoom(&mut self, cx: &mut Context<Self>) {
-        if let Some(t) = self.last_zoom_toggle {
-            if t.elapsed().as_millis() < 250 {
-                log::info!("toggle_zoom: debounced");
-                return;
-            }
+        if self
+            .last_zoom_toggle
+            .is_some_and(|t| t.elapsed().as_millis() < 250)
+        {
+            log::info!("toggle_zoom: debounced");
+            return;
         }
         self.last_zoom_toggle = Some(std::time::Instant::now());
         if !self.zoomed {
@@ -787,7 +791,11 @@ impl ImageViewer {
             self.pan_offset = gpui::Point::new(0.0, 0.0);
             self.pan_velocity = gpui::Point::new(0.0, 0.0);
         }
-        log::info!("toggle_zoom: zoomed={} scale={}", self.zoomed, self.zoom_scale);
+        log::info!(
+            "toggle_zoom: zoomed={} scale={}",
+            self.zoomed,
+            self.zoom_scale
+        );
         cx.notify();
     }
 
@@ -801,11 +809,7 @@ impl ImageViewer {
     }
 
     /// ドラッグ移動（拡大中のパン。画像の隅まで動けるクランプ付き + 速度記録）
-    pub fn update_pan(
-        &mut self,
-        position: gpui::Point<f32>,
-        pan_max: gpui::Point<f32>,
-    ) {
+    pub fn update_pan(&mut self, position: gpui::Point<f32>, pan_max: gpui::Point<f32>) {
         if self.zoomed {
             // 可動範囲は呼び出し側で「拡大後の実際の画像サイズ」から計算する
             // （画像の隅まで動けるようにする）
@@ -849,21 +853,20 @@ impl ImageViewer {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
-                let stop = handle
-                    .update(cx, |this, cx| {
-                        if this.inertia_generation != generation {
-                            return true;
-                        }
-                        let v = this.pan_velocity;
-                        let max = this.pan_max;
-                        this.pan_offset = gpui::Point::new(
-                            (this.pan_offset.x + v.x * 0.016).clamp(-max.x, max.x),
-                            (this.pan_offset.y + v.y * 0.016).clamp(-max.y, max.y),
-                        );
-                        this.pan_velocity = gpui::Point::new(v.x * 0.94, v.y * 0.94);
-                        cx.notify();
-                        this.pan_velocity.x.abs() < 0.2 && this.pan_velocity.y.abs() < 0.2
-                    });
+                let stop = handle.update(cx, |this, cx| {
+                    if this.inertia_generation != generation {
+                        return true;
+                    }
+                    let v = this.pan_velocity;
+                    let max = this.pan_max;
+                    this.pan_offset = gpui::Point::new(
+                        (this.pan_offset.x + v.x * 0.016).clamp(-max.x, max.x),
+                        (this.pan_offset.y + v.y * 0.016).clamp(-max.y, max.y),
+                    );
+                    this.pan_velocity = gpui::Point::new(v.x * 0.94, v.y * 0.94);
+                    cx.notify();
+                    this.pan_velocity.x.abs() < 0.2 && this.pan_velocity.y.abs() < 0.2
+                });
                 if stop {
                     break;
                 }
@@ -982,12 +985,7 @@ impl ImageViewer {
         }
     }
 
-    fn handle_key(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         log::info!("handle_key: key={}", event.keystroke.key.as_str());
         let shift = event.keystroke.modifiers.shift;
         // 左綴じ（ページ順 →）: ←=前へ / →=次へ。右綴じでは矢印を反転する
@@ -1039,7 +1037,12 @@ impl ImageViewer {
         }
     }
 
-    fn render_page(&self, muted_foreground: gpui::Hsla, index: usize, zoom_progress: f32) -> impl IntoElement {
+    fn render_page(
+        &self,
+        _muted_foreground: gpui::Hsla,
+        index: usize,
+        zoom_progress: f32,
+    ) -> impl IntoElement {
         let image = self.images.get(index).cloned().flatten();
         match image {
             Some(image) => {
@@ -1047,7 +1050,9 @@ impl ImageViewer {
                 if self.zoomed && width > 0 && height > 0 {
                     let scale = self.zoom_scale;
                     let pan = self.pan_offset;
-                    log::info!("render_page: ZOOMED branch index={index} scale={scale} w={width} h={height}");
+                    log::info!(
+                        "render_page: ZOOMED branch index={index} scale={scale} w={width} h={height}"
+                    );
                     let handle = self.self_handle.clone().expect("viewer handle");
                     div()
                         .debug_selector(move || format!("viewer-page-{index}"))
@@ -1159,7 +1164,7 @@ impl ImageViewer {
                         // ダブルクリックで拡大（通常時でも効くようにここにも付ける）
                         .on_mouse_down(gpui::MouseButton::Left, {
                             let handle = handle.clone();
-                            move |event, _window, cx| {
+                            move |_event, _window, cx| {
                                 let now = std::time::Instant::now();
                                 let is_double = handle
                                     .read(cx)
@@ -1445,10 +1450,8 @@ impl Render for ImageViewer {
                 .on_mouse_down(gpui::MouseButton::Left, {
                     let handle = handle.clone();
                     move |event, _window, cx| {
-                        let position = gpui::Point::new(
-                            event.position.x.as_f32(),
-                            event.position.y.as_f32(),
-                        );
+                        let position =
+                            gpui::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
                         let now = std::time::Instant::now();
                         let is_double = handle
                             .read(cx)
@@ -1821,7 +1824,7 @@ impl Render for ImageViewer {
                         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         }),
-    
+
                 )
                 .child(
                     // ヘッダー（メニュートリガー）: アイコン + タイトル。

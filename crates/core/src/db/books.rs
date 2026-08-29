@@ -149,11 +149,13 @@ pub fn delete(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
 /// Set the favorite flag on a downloaded book.
 pub fn set_favorite(pool: &SqlitePool, id: &str, favorite: bool) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query("UPDATE books SET is_favorite = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(favorite as i64)
-            .bind(id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE books SET is_favorite = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(favorite as i64)
+        .bind(id)
+        .execute(pool)
+        .await?;
         Ok(())
     })
 }
@@ -161,11 +163,13 @@ pub fn set_favorite(pool: &SqlitePool, id: &str, favorite: bool) -> Result<(), s
 /// Set the hidden flag on a downloaded book.
 pub fn set_hidden(pool: &SqlitePool, id: &str, hidden: bool) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query("UPDATE books SET is_hidden = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(hidden as i64)
-            .bind(id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE books SET is_hidden = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(hidden as i64)
+        .bind(id)
+        .execute(pool)
+        .await?;
         Ok(())
     })
 }
