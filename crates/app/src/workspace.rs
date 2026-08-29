@@ -21,7 +21,7 @@ use gpui_component::{Icon, IconName, Theme, ThemeMode, ActiveTheme as _};
 
 use crate::app_state::AppState;
 use thundoku_core::db;
-use thundoku_core::db::{books, progress};
+use thundoku_core::db::{books, bookshelf, progress};
 use crate::icons::AppIcon;
 use crate::views::about::AboutView;
 use crate::views::auth::{AuthDialog, AuthProvider};
@@ -62,6 +62,8 @@ pub fn app_menus() -> Vec<Menu> {
 pub struct Workspace {
     pub active: NavTarget,
     pub sidebar_open: bool,
+    /// 自動クローズタイマーの世代（stale タイマー対策）。
+    sidebar_close_generation: u64,
     pub bookshelf_submenu_open: bool,
     /// 未読バッジ表示用の件数。
     unread_count: usize,
@@ -91,6 +93,7 @@ impl Workspace {
         let mut this = Self {
             active: NavTarget::Bookshelf,
             sidebar_open: false,
+            sidebar_close_generation: 0,
             bookshelf_submenu_open: false,
             unread_count: 0,
             toast_host_generation: 0,
@@ -136,37 +139,60 @@ impl Workspace {
 
     /// サイドバー開閉トグル（ツールバー・ショートカット）。
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        // ショートカットでの開閉はマウスオーバー判定に使うウィンドウを取れないため、
+        // 自動クローズは掛けず、手動で閉じる。
         self.sidebar_open = !self.sidebar_open;
-        if self.sidebar_open {
-            self.schedule_sidebar_auto_close(cx);
-        }
         cx.notify();
     }
 
     /// サイドバー操作後の接続。ホバーが外れてしばらくすると、
     /// アイコンのみの閉じた状態に戻す（タイマー方式）。
-    pub fn interact_sidebar(&mut self, cx: &mut Context<Self>) {
+    pub fn interact_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_open = true;
-        self.schedule_sidebar_auto_close(cx);
+        self.schedule_sidebar_auto_close(window, cx);
         cx.notify();
     }
 
     /// サイドバーを閉じるタイマー（マウスが離れてから数秒後に閉じる）。
-    fn schedule_sidebar_auto_close(&mut self, cx: &mut Context<Self>) {
+    /// サイドバーを閉じるタイマー（マウスがサイドバー上にいなければ 3 秒後に閉じる）。
+    /// タイマー発火時にマウス位置をポーリングし、サイドバー領域（ウィンドウ左端 256px）に
+    /// マウスが居る場合はタイマーを仕切り直す（GPUI の on_mouse_exit は
+    /// pointer capture 中しか発火しないため、位置ベースで判定する）。
+    fn schedule_sidebar_auto_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_close_generation += 1;
+        let generation = self.sidebar_close_generation;
         let handle = cx.entity();
-        let generation = std::any::TypeId::of::<Self>();
-        let _ = generation;
-        cx.spawn(async move |_window, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(9000))
-                .await;
-            let _ = handle.update(cx, |this, cx| {
-                if this.sidebar_open {
-                    this.sidebar_open = false;
-                    cx.notify();
+        cx.spawn_in(window, async move |handle, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(3000))
+                    .await;
+                // マウスがウィンドウ内のサイドバー領域（左端 256px）にあるか
+                let in_sidebar = cx
+                    .update(|window, _| {
+                        let m = window.mouse_position();
+                        let h = window.bounds().size.height.as_f32();
+                        let (mx, my) = (m.x.as_f32(), m.y.as_f32());
+                        mx >= 0.0 && mx <= 256.0 && my >= 0.0 && my <= h
+                    })
+                    .unwrap_or(false);
+                if in_sidebar {
+                    // まだサイドバー上にいる → もう一度 3 秒待つ
+                    continue;
                 }
-            });
-        }).detach();
+                let _ = cx.update(|_window, app| {
+                    handle.update(app, |this, cx| {
+                        if this.sidebar_open && this.sidebar_close_generation == generation {
+                            log::info!("sidebar: auto close (mouse outside)");
+                            this.sidebar_open = false;
+                            cx.notify();
+                        }
+                    });
+                });
+                break;
+            }
+        })
+        .detach();
     }
 
     /// テーマモード（ライト → ダーク → システム）の循環切替。
@@ -224,15 +250,38 @@ impl Workspace {
     /// 未読件数の再取得（ローカル本の未読状態から）。
     pub fn refresh_unread_count(&mut self, cx: &mut Context<Self>) {
         let db = AppState::global(cx).db_pool.clone();
-        let count = books::list(&db)
-            .map(|books| {
-                books
+        // サイトフィルタに連動する（すべての本 = フィルタなし。サイト選択中はそのサイトのみ）
+        let site_filter = self.bookshelf.update(cx, |b, _| b.site_filter());
+        // 所有している本（同期済みの本棚アイテム）から算出する。
+        // - 非表示の本は除外
+        // - ダウンロード済み: 進捗で未読判定（current_page == 0 かつ未完読）
+        // - 未ダウンロード: 未読としてカウント
+        let count = bookshelf::list_all(&db)
+            .map(|items| {
+                let local = books::list(&db).unwrap_or_default();
+                items
                     .iter()
-                    .filter(|book| {
-                        let progress = db::progress::get(&db, &book.id).ok().flatten();
-                        match progress {
-                            Some(p) => {
-                                p.current_page == 0 && p.total_pages.is_some() && p.finished_at.is_none()
+                    .filter(|item| item.is_hidden == 0)
+                    .filter(|item| {
+                        site_filter
+                            .as_ref()
+                            .is_none_or(|site| item.site_id == *site)
+                    })
+                    .filter(|item| {
+                        let book = local
+                            .iter()
+                            .find(|b| b.tbf_product_id.as_deref() == Some(item.database_id.as_str()));
+                        match book {
+                            Some(book) => {
+                                let progress = progress::get(&db, &book.id).ok().flatten();
+                                match progress {
+                                    Some(p) => {
+                                        p.current_page == 0
+                                            && p.total_pages.is_some()
+                                            && p.finished_at.is_none()
+                                    }
+                                    None => true,
+                                }
                             }
                             None => true,
                         }
@@ -667,16 +716,16 @@ impl Workspace {
         let handle = cx.entity();
         let active = self.active;
         let unread_count = self.unread_count;
-        let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
-        let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
-        let google = AppState::global(cx)
-            .google_profile
-            .lock()
-            .clone()
-            .is_some();
-        let theme_dark = matches!(Theme::global(cx).mode, ThemeMode::Dark);
         let theme_mode_name =
             self.theme_mode(cx).unwrap_or_else(|| "system".to_string());
+        // バッジ色分け: 100 件以上=赤 / 10〜99 件=黄 / 1〜9 件=緑
+        let badge_color = if unread_count >= 100 {
+            gpui::rgb(0xef4444)
+        } else if unread_count >= 10 {
+            gpui::rgb(0xeab308)
+        } else {
+            gpui::rgb(0x10b981)
+        };
 
         div()
             .id("sidebar")
@@ -685,39 +734,16 @@ impl Workspace {
             .flex()
             .flex_col()
             .relative()
-            // 透明のタイトルバー領域と重ならないよう上に余白を取る
-            .mt(px(28.0))
-            // マウスがサイドバー上にある間は閉じない（移動でタイマー延長、外れで即閉じ）
-            .on_mouse_move({
-                let handle = handle.clone();
-                move |_event, _window, cx| {
-                    handle.update(cx, |this, cx| {
-                        if this.sidebar_open {
-                            this.schedule_sidebar_auto_close(cx);
-                        }
-                    });
-                }
-            })
-            .on_mouse_exit({
-                let handle = handle.clone();
-                move |_event, _window, cx| {
-                    handle.update(cx, |this, cx| {
-                        if this.sidebar_open {
-                            // 外れても 4 秒間は猶予（戻れば閉じない）
-                            this.schedule_sidebar_auto_close(cx);
-                        }
-                    });
-                }
-            })
-            // アイコン以外の箇所（余白）クリックでサイドバーを開いた状態にする
+            .overflow_hidden()
+            .pt(px(30.0))
             .on_click({
                 let handle = handle.clone();
-                move |_event, _window, cx| {
+                move |_event, window, cx| {
                     handle.update(cx, |this, cx| {
                         if !this.sidebar_open {
                             this.sidebar_open = true;
                         }
-                        this.schedule_sidebar_auto_close(cx);
+                        this.schedule_sidebar_auto_close(window, cx);
                         cx.notify();
                     });
                 }
@@ -727,78 +753,39 @@ impl Workspace {
                     "sidebar-width-{}",
                     if open { "open" } else { "closed" }
                 )),
-                Animation::new(Duration::from_millis(200))
-                    .with_easing(gpui::ease_in_out),
+                Animation::new(if open {
+                    Duration::from_millis(180)
+                } else {
+                    Duration::from_millis(20)
+                })
+                .with_easing(gpui::quadratic)
+                .with_max_fps(30.0),
                 move |this, t| {
-                    let t = t.clamp(0.0, 1.0);
-                    let width = if open {
-                        72.0 + (256.0 - 72.0) * t
+                    if !open {
+                        // 閉じる時は即座に 72px（一瞬で閉じる）。
+                        this.w(px(72.0))
                     } else {
-                        256.0 - (256.0 - 72.0) * t
-                    };
-                    this.w(px(width))
+                        let t = t.clamp(0.0, 1.0);
+                        let width = 72.0 + (256.0 - 72.0) * t;
+                        this.w(px(width))
+                    }
                 },
             )
-            // ヘッダー（Web 版のロゴ行: h-16, border-b, BookMarked ロゴ）
+            // ヘッダー（ロゴ行）
             .child(
                 div()
-                    .h(px(64.0))
+                    .h(px(60.0))
                     .flex()
                     .items_center()
                     .px_2()
-                    .py_2()
                     .border_b_1()
                     .border_color(theme.border)
                     .when(!open, |this| this.justify_center())
-                    .when(open, |this| this.justify_start().gap_2())
-                    .child(
-                        div()
-                            .id("sidebar-logo")
-                            .debug_selector(|| "sidebar-logo".into())
-                            .relative()
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(40.0))
-                            .h(px(40.0))
-                            .rounded_xl()
-                            .bg(cx.theme().primary)
-                            .cursor_pointer()
-                            .on_click({
-                                let handle = handle.clone();
-                                move |_, _window, cx| {
-                                    cx.stop_propagation();
-                                    handle.update(cx, |this, cx| {
-                                        this.switch_to(NavTarget::Bookshelf, cx);
-                                    });
-                                }
-                            })
-                            .child(
-                                Icon::new(AppIcon::BookMarked)
-                                    .size(px(20.0))
-                                    .text_color(cx.theme().primary_foreground),
-                            )
-                            .child(if !open && unread_count > 0 {
-                                div()
-                                    .absolute()
-                                    .right(px(-4.0))
-                                    .top(px(-4.0))
-                                    .w(px(16.0))
-                                    .h(px(16.0))
-                                    .rounded_full()
-                                    .bg(theme.danger)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(theme.primary_foreground)
-                                    .text_xs()
-                                    .child(unread_count.min(9).to_string())
-                                    .into_any_element()
-                            } else {
-                                div().into_any_element()
-                            }),
-                    )
+                    .when(open, |this| {
+                        // ロゴを右へ 8px（閉じた状態のアイコン列中央からの位置を揃える）
+                        this.justify_start().gap_2().px(px(16.0))
+                    })
+                    .child(self.sidebar_logo(unread_count, badge_color, open, handle.clone(), cx))
                     .when(open, |this| {
                         this.child(
                             div()
@@ -821,8 +808,7 @@ impl Workspace {
                         )
                     }),
             )
-
-            // ナビゲーション
+            // ナビ
             .child(
                 div()
                     .id("sidebar-nav")
@@ -830,14 +816,14 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .pt_2()
                     .p_2()
                     .gap_1()
                     .child(
-                        // 本棚
                         self.nav_row(
                             NavTarget::Bookshelf,
-                            Icon::new(AppIcon::LibraryBig).size(px(22.0)).into_any_element(),
+                            Icon::new(AppIcon::LibraryBig)
+                                .size(px(24.0))
+                                .into_any_element(),
                             "本棚",
                             open,
                             active,
@@ -845,25 +831,22 @@ impl Workspace {
                             cx,
                         ),
                     )
-                    // 本棚のサイトメニュー（すべての本 / 技術書典 / BOOTH）
-                    .child(if open {
-                        self.bookshelf_submenu(cx).into_any_element()
-                    } else {
-                        div().into_any_element()
+                    .when(open, |this| {
+                        this.child(self.bookshelf_submenu(cx).into_any_element())
                     })
                     .child(
-                        // チェックリスト
                         self.nav_row(
                             NavTarget::Checklist,
-                            Icon::new(AppIcon::ListChecks).size(px(22.0)).into_any_element(),
+                            Icon::new(AppIcon::ListChecks)
+                                .size(px(24.0))
+                                .into_any_element(),
                             "チェックリスト",
                             open,
                             active,
                             handle.clone(),
                             cx,
                         ),
-                    )
-
+                    ),
             )
             // 下部: 設定 + テーマ + アカウント
             .child(
@@ -874,137 +857,123 @@ impl Workspace {
                     .p_2()
                     .gap_1()
                     .mt_auto()
-                    .pb(px(32.0))
+                    .pb(px(16.0))
                     .child(
-                        div()
-                            .id("sidebar-nav-settings-bottom")
-                            .debug_selector(|| "sidebar-nav-settings".into())
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_2p5()
-                            .rounded_xl()
-                            .when(open, |this| this.w_full())
-                            .when(!open, |this| {
-                                this.w(px(36.0)).h(px(36.0)).justify_center()
-                            })
-                            .hover(|style| style.bg(theme.secondary))
-                            .cursor_pointer()
-                            .on_click({
-                                let handle = handle.clone();
-                                move |_, _window, cx| {
-                                    cx.stop_propagation();
-                                    handle.update(cx, |this, cx| {
-                                        this.switch_to(NavTarget::Settings, cx);
-                                    });
-                                }
-                            })
-                            .child(
-                                Icon::new(IconName::Settings)
-                                    .size(px(22.0))
-                                    .text_color(theme.muted_foreground),
-                            )
-                            .when(open, |this| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child("設定"),
-                                )
-                            })
+                        self.bottom_item(
+                            Icon::new(IconName::Settings)
+                                .size(px(24.0))
+                                .text_color(theme.muted_foreground)
+                                .into_any_element(),
+                            "設定",
+                            open,
+                            |this, cx| {
+                                this.switch_to(NavTarget::Settings, cx);
+                            },
+                            handle.clone(),
+                            cx,
+                        ),
                     )
                     .child(
-                        div()
-                            .id("sidebar-theme")
-                            .debug_selector(|| "sidebar-theme".into())
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_2p5()
-                            .rounded_xl()
-                            .when(open, |this| this.w_full())
-                            .when(!open, |this| {
-                                this.w(px(36.0)).h(px(36.0)).justify_center()
+                        self.bottom_item(
+                            Icon::new(match theme_mode_name.as_str() {
+                                "dark" => AppIcon::Moon,
+                                "system" => AppIcon::Monitor,
+                                _ => AppIcon::Sun,
                             })
-                            .hover(|style| style.bg(theme.secondary))
-                            .cursor_pointer()
-                            .on_click({
-                                let handle = handle.clone();
-                                move |_, _window, cx| {
-                                    cx.stop_propagation();
-                                    handle.update(cx, |this, cx| {
-                                        this.cycle_theme(cx);
-                                    });
-                                }
-                            })
-                            .child(
-                                Icon::new(match theme_mode_name.as_str() {
-                                    "dark" => AppIcon::Moon,
-                                    "system" => AppIcon::Monitor,
-                                    _ => AppIcon::Sun,
-                                })
-                                .size(px(22.0))
-                                .text_color(theme.muted_foreground),
-                            )
-                            .when(open, |this| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child(match theme_mode_name.as_str() {
-                                            "dark" => "ダーク",
-                                            "system" => "システム",
-                                            _ => "ライト",
-                                        }),
-                                )
-                            })
+                            .size(px(24.0))
+                            .text_color(theme.muted_foreground)
+                            .into_any_element(),
+                            match theme_mode_name.as_str() {
+                                "dark" => "ダーク",
+                                "system" => "システム",
+                                _ => "ライト",
+                            },
+                            open,
+                            |this, cx| {
+                                this.cycle_theme(cx);
+                            },
+                            handle.clone(),
+                            cx,
+                        ),
                     )
                     .child(
-                        div()
-                            .id("sidebar-account")
-                            .debug_selector(|| "sidebar-account".into())
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_2p5()
-                            .rounded_xl()
-                            .when(open, |this| this.w_full())
-                            .when(!open, |this| {
-                                this.w(px(36.0)).h(px(36.0)).justify_center()
-                            })
-                            .hover(|style| style.bg(theme.secondary))
-                            .cursor_pointer()
-                            .on_click({
-                                let handle = handle.clone();
-                                move |_, _window, cx| {
-                                    cx.stop_propagation();
-                                    handle.update(cx, |this, cx| {
-                                        this.open_auth_panel(cx);
-                                    });
-                                }
-                            })
-                            .child(
-                                Icon::new(AppIcon::CircleUserRound)
-                                    .size(px(22.0))
-                                    .text_color(theme.muted_foreground),
-                            )
-                            .when(open, |this| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child("アカウント"),
-                                )
-                            })
-                    )
+                        self.bottom_item(
+                            Icon::new(AppIcon::CircleUserRound)
+                                .size(px(24.0))
+                                .text_color(theme.muted_foreground)
+                                .into_any_element(),
+                            "アカウント",
+                            open,
+                            |this, cx| {
+                                this.open_auth_panel(cx);
+                            },
+                            handle.clone(),
+                            cx,
+                        ),
+                    ),
             )
-
     }
 
-    /// メインのナビ行（アイコン + ラベルをまとめた共通化）。
+    /// サイドバーのロゴ（ブックマーク + 未読バッジ）。
+    fn sidebar_logo(
+        &self,
+        unread_count: usize,
+        badge_color: gpui::Rgba,
+        open: bool,
+        handle: Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .id("sidebar-logo")
+            .debug_selector(|| "sidebar-logo".into())
+            .relative()
+            .flex_shrink_0()
+            .w(px(40.0))
+            .h(px(40.0))
+            .rounded_xl()
+            .bg(theme.primary)
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_click({
+                let handle = handle.clone();
+                move |_, _window, cx| {
+                    cx.stop_propagation();
+                    handle.update(cx, |this, cx| {
+                        this.switch_to(NavTarget::Bookshelf, cx);
+                    });
+                }
+            })
+            .child(
+                Icon::new(AppIcon::BookMarked)
+                    .size(px(20.0))
+                    .text_color(theme.primary_foreground),
+            )
+            .child(if !open && unread_count > 0 {
+                div()
+                    .absolute()
+                    .right(px(-4.0))
+                    .top(px(-4.0))
+                    .min_w(px(16.0))
+                    .h(px(16.0))
+                    .px_1()
+                    .rounded_full()
+                    .bg(badge_color)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.primary_foreground)
+                    .text_xs()
+                    .child(unread_count.to_string())
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+    }
+
+    /// メインのナビ行（アイコン + ラベル）。サブメニュートグルは本棚のときのみ。
     fn nav_row(
         &mut self,
         target: NavTarget,
@@ -1017,15 +986,12 @@ impl Workspace {
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let label = label.to_string();
-        let target = target;
         let id = match target {
             NavTarget::Bookshelf => "sidebar-nav-bookshelf",
             NavTarget::Checklist => "sidebar-nav-checklist",
-            NavTarget::Settings => "sidebar-nav-settings",
-            NavTarget::About => "sidebar-nav-about",
+            _ => "sidebar-nav-other",
         };
         let is_active = active == target;
-        let handle = handle.clone();
         let site_menu = target == NavTarget::Bookshelf;
         div()
             .id(id)
@@ -1033,30 +999,28 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_2()
-            .px_2()
-            .py_2p5()
+            .py(px(6.0))
             .rounded_xl()
-            // 開状態はフル幅、閉じた状態はアイコン中心の正方形（ホバー選択も正方形）
+            .when(open, |this| this.ml(px(18.0)).px(px(6.0)))
             .when(open, |this| this.w_full())
-            .when(!open, |this| {
-                this.w(px(36.0)).h(px(36.0)).justify_center()
-            })
+            .when(!open, |this| this.w(px(36.0)).h(px(36.0)).justify_center())
             .when(is_active, |this| this.bg(theme.secondary))
             .hover(|style| style.bg(theme.secondary))
             .cursor_pointer()
             .on_click({
                 let handle = handle.clone();
-                move |event, _window, cx| {
+                move |event, window, cx| {
                     cx.stop_propagation();
                     handle.update(cx, |this, cx| {
                         let is_bookshelf = target == NavTarget::Bookshelf;
                         if is_bookshelf && event.click_count() >= 2 {
                             if !this.sidebar_open {
-                                // 閉じた状態でダブルクリック: メニュー表記オープンで開く
                                 this.sidebar_open = true;
                                 this.bookshelf_submenu_open = true;
+                                this.schedule_sidebar_auto_close(window, cx);
                             } else {
                                 this.bookshelf_submenu_open = !this.bookshelf_submenu_open;
+                                this.schedule_sidebar_auto_close(window, cx);
                             }
                         }
                         this.switch_to(target, cx);
@@ -1071,44 +1035,86 @@ impl Workspace {
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .whitespace_nowrap()
-                        .child(label),
+                        .child(label.clone()),
                 )
             })
             .when(open && site_menu, |this| {
-                // 未読等は出さず、サブメニューは chevron で開閉（ダブルクリックでも可）
                 this.child(
-                div()
-                    .id("bookshelf-submenu-toggle")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .p_1()
-                    .hover(|style| style.bg(theme.secondary))
-                    .cursor_pointer()
-                    .on_click({
-                        let handle = handle.clone();
-                        move |_, _window, cx| {
-                            cx.stop_propagation();
-                            handle.update(cx, |this, cx| {
-                                this.bookshelf_submenu_open = !this.bookshelf_submenu_open;
-                                this.interact_sidebar(cx);
-                            });
-                        }
-                    })
-                    .child(
-                        Icon::new(IconName::ChevronDown)
-                            .size(px(14.0))
-                            .text_color(theme.muted_foreground),
-                    )
-                    .into_any_element()
+                    div()
+                        .id("bookshelf-submenu-toggle")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .p_1()
+                        .hover(|style| style.bg(theme.secondary))
+                        .cursor_pointer()
+                        .on_click({
+                            let handle = handle.clone();
+                            move |_, window, cx| {
+                                cx.stop_propagation();
+                                handle.update(cx, |this, cx| {
+                                    this.bookshelf_submenu_open = !this.bookshelf_submenu_open;
+                                    this.interact_sidebar(window, cx);
+                                });
+                            }
+                        })
+                        .child(
+                            Icon::new(IconName::ChevronDown)
+                                .size(px(16.0))
+                                .text_color(theme.muted_foreground),
+                        ),
                 )
             })
     }
-}
 
-impl Workspace {
-    /// サイトメニュー（本棚の「すべての本 / 技術書典 / BOOTH」）の描画。
+    /// 下部のアイテム（設定 / テーマ / アカウント 共通）。
+    fn bottom_item(
+        &self,
+        icon: gpui::AnyElement,
+        label: &str,
+        open: bool,
+        on_click: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
+        handle: Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let label = label.to_string();
+        div()
+            .id(format!("sidebar-nav-{label}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .py(px(6.0))
+            .rounded_xl()
+            .when(open, |this| this.ml(px(18.0)).px(px(6.0)))
+            .when(open, |this| this.w_full())
+            .when(!open, |this| this.w(px(36.0)).h(px(36.0)).justify_center())
+            .hover(|style| style.bg(theme.secondary))
+            .cursor_pointer()
+            .on_click({
+                let handle = handle.clone();
+                move |_, _window, cx| {
+                    cx.stop_propagation();
+                    handle.update(cx, |this, cx| {
+                        on_click(this, cx);
+                    });
+                }
+            })
+            .child(icon)
+            .when(open, |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(label.clone()),
+                )
+            })
+            .into_any_element()
+    }
+
+
+
     fn bookshelf_submenu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.bookshelf_submenu_open;
         let theme = cx.theme().clone();
@@ -1121,13 +1127,15 @@ impl Workspace {
             .id("bookshelf-submenu-wrap")
             .debug_selector(|| "bookshelf-submenu".into())
             .overflow_hidden()
+            // ナビの中央寄せ（items_center）の影響を受けず、左寄せで表示する
+            .w_full()
             .child(
                 div()
                     .id(format!(
                         "bookshelf-submenu-{}",
                         if open { "open" } else { "closed" }
                     ))
-                    .ml_8()
+                    .ml_2()
                     .mt_1()
                     .flex()
                     .flex_col()
@@ -1154,6 +1162,7 @@ impl Workspace {
                                             b.set_site_filter(cx, None);
                                         });
                                         this.switch_to(NavTarget::Bookshelf, cx);
+                                        this.refresh_unread_count(cx);
                                     });
                                 }
                             })
@@ -1185,6 +1194,7 @@ impl Workspace {
                                                 b.set_site_filter(cx, Some("techbookfest"));
                                             });
                                             this.switch_to(NavTarget::Bookshelf, cx);
+                                            this.refresh_unread_count(cx);
                                         });
                                     }
                                 })
@@ -1217,6 +1227,7 @@ impl Workspace {
                                                 b.set_site_filter(cx, Some("booth"));
                                             });
                                             this.switch_to(NavTarget::Bookshelf, cx);
+                                            this.refresh_unread_count(cx);
                                         });
                                     }
                                 })
