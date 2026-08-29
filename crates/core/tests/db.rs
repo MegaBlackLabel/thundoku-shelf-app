@@ -39,6 +39,7 @@ fn migrate_creates_all_schema_tables() {
             "sites",
             "tbf_events",
             "token_analysis",
+            "view_history",
             "zenn_tag_metadata",
         ]
     );
