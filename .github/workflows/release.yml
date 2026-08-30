@@ -27,6 +27,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # cargo のビルドキャッシュを保存/復元。2 回目以降は依存のフルビルドを省略。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }} -p thundoku-shelf
 

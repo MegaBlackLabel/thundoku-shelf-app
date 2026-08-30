@@ -19,3 +19,7 @@ log = "0.4"
 # PDF レンダリング速度に直結するため常に最適化してビルドする。
 [profile.dev.package.mupdf-sys]
 opt-level = 3
+
+[profile.release]
+# リリースビルドにデバッグ情報を含めない（ビルド高速化・バイナリ縮小）
+debug = false

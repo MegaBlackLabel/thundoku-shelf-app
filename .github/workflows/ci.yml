@@ -19,6 +19,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
 
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
