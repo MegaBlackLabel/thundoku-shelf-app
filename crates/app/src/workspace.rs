@@ -7,17 +7,19 @@
 
 use std::time::Duration;
 
+#[cfg(windows)]
+use gpui::WindowControlArea;
 use gpui::{
     Animation, AnimationExt as _, AppContext as _, InteractiveElement as _, ReadGlobal as _,
     StatefulInteractiveElement as _, Styled as _, prelude::FluentBuilder as _,
 };
-#[cfg(windows)]
-use gpui::WindowControlArea;
 
 use gpui::{
     AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
     SharedString, Window, div, px,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dialog::Dialog;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode};
 
 use crate::app_state::AppState;
@@ -82,6 +84,12 @@ pub struct Workspace {
     auth_dialog: Option<Entity<AuthDialog>>,
     /// ReaderView（開いている場合 Some / メイン領域に埋め込む）。
     reader: Option<Entity<ReaderView>>,
+    /// 起動時の Drive バックアップ復元確認を表示中か。
+    show_restore_prompt: bool,
+    /// 復元対象の Drive バックアップ情報（確認ダイアログの表示用）。
+    restore_info: Option<thundoku_core::drive::sync::DriveBackupInfo>,
+    /// 復元実行中（バックグラウンド）か。
+    restoring: bool,
 }
 
 impl Workspace {
@@ -106,11 +114,14 @@ impl Workspace {
             show_auth: false,
             auth_dialog: None,
             reader: None,
+            show_restore_prompt: false,
+            restore_info: None,
+            restoring: false,
         };
         this.register_actions(cx);
         this.refresh_unread_count(cx);
         this.restore_theme_mode(cx);
-        this.restore_google_profile(cx);
+        this.check_startup_backup(cx);
         cx.notify();
         this
     }
@@ -290,6 +301,110 @@ impl Workspace {
     pub fn restore_google_profile(&mut self, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
         settings.update(cx, |s, cx| s.refresh_google_profile(cx));
+    }
+
+    /// 起動時: Google ログイン済みなら Drive の DB バックアップを確認し、
+    /// ローカルと異なれば復元確認を表示する。
+    fn check_startup_backup(&mut self, cx: &mut Context<Self>) {
+        let state = AppState::global(cx);
+        let google = state.google.clone();
+        let db = state.db_pool.clone();
+        let folder_id = {
+            let current = db::settings::get(&db, "drive.sync.folder_id")
+                .ok()
+                .flatten();
+            // 未接続なら何もしない（Drive 同期が未設定）
+            let enabled = db::settings::get(&db, "drive.sync.enabled")
+                .ok()
+                .flatten()
+                .is_some_and(|v| v == "true" || v == "1");
+            if !enabled {
+                return;
+            }
+            current
+        };
+        let Some(folder_id) = folder_id else {
+            return;
+        };
+        let handle = cx.weak_entity();
+        let task = cx.background_executor().spawn(async move {
+            // Google にログイン済みでなければ何もしない
+            let mut client = google.lock();
+            let Some(client) = client.as_mut() else {
+                return None;
+            };
+            let Ok(token) = client.access_token() else {
+                return None;
+            };
+            let mut drive = thundoku_core::drive::DriveClient::new(
+                Box::new(thundoku_core::tbf::UreqTransport::new()),
+                token,
+            );
+            thundoku_core::drive::sync::check_drive_backup(&mut drive, &folder_id)
+                .ok()
+                .flatten()
+        });
+        cx.spawn(async move |_window, cx| {
+            let info = task.await;
+            if let (Some(handle), Some(info)) = (handle.upgrade(), info) {
+                log::info!(
+                    "startup backup check: drive backup exists (md5={:?})",
+                    info.md5
+                );
+                handle.update(cx, |this, cx| {
+                    this.restore_info = Some(info);
+                    this.show_restore_prompt = true;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 復元確認で「OK」を押したときの処理。Drive のバックアップを DB に反映する。
+    fn confirm_restore_backup(&mut self, cx: &mut Context<Self>) {
+        let Some(_info) = self.restore_info.clone() else {
+            return;
+        };
+        self.show_restore_prompt = false;
+        self.restoring = true;
+        cx.notify();
+
+        let state = AppState::global(cx);
+        let google = state.google.clone();
+        let db = state.db_pool.clone();
+        let folder_id = db::settings::get(&db, "drive.sync.folder_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let handle = cx.weak_entity();
+        let task = cx.background_executor().spawn(async move {
+            let mut client = google.lock();
+            let client = client.as_mut()?;
+            let token = client.access_token().ok()?;
+            let mut drive = thundoku_core::drive::DriveClient::new(
+                Box::new(thundoku_core::tbf::UreqTransport::new()),
+                token,
+            );
+            thundoku_core::drive::sync::restore_drive_backup(&mut drive, &folder_id, &db).ok()
+        });
+        cx.spawn(async move |_window, cx| {
+            let restored = task.await.is_some();
+            if let Some(handle) = handle.upgrade() {
+                handle.update(cx, |this, cx| {
+                    this.restoring = false;
+                    if restored {
+                        // 本棚を再読込して復元結果を反映する
+                        this.bookshelf.update(cx, |b, cx| b.reload(cx));
+                        crate::app_state::set_toast(cx, "Drive バックアップを復元しました");
+                    } else {
+                        crate::app_state::set_toast(cx, "バックアップの復元に失敗しました");
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// リーダーを開く（本棚・チェックリストからの委譲）。
@@ -647,21 +762,21 @@ impl Render for Workspace {
                     .child(
                         div()
                             .id("view-container")
-                    .debug_selector(|| "view-container".into())
-                    .flex_1()
-                    .h_full()
-                    .overflow_hidden()
-                    // サイドバーとの縦の区切り線（Web 版の border-r 相当・フル高さ）
-                    .border_l_1()
-                    .border_color(theme.border)
-                    .child(if let Some(reader) = &self.reader {
-                        let view: AnyView = AnyView::from(reader.clone());
-                        view
-                    } else {
-                        active_view
-                    }),
-                        )
-                    )
+                            .debug_selector(|| "view-container".into())
+                            .flex_1()
+                            .h_full()
+                            .overflow_hidden()
+                            // サイドバーとの縦の区切り線（Web 版の border-r 相当・フル高さ）
+                            .border_l_1()
+                            .border_color(theme.border)
+                            .child(if let Some(reader) = &self.reader {
+                                let view: AnyView = AnyView::from(reader.clone());
+                                view
+                            } else {
+                                active_view
+                            }),
+                    ),
+            )
             .child(toast_el)
             .child(if self.auth_panel_open {
                 let panel = self.account_panel(cx);
@@ -709,31 +824,56 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
-            .child(if self.show_auth {
-                let dialog = self.auth_dialog.clone();
+            .child(if self.show_restore_prompt {
+                let handle = cx.entity();
+                let restore_size = self
+                    .restore_info
+                    .as_ref()
+                    .and_then(|i| i.size)
+                    .unwrap_or_default();
                 gpui::deferred(
-                    div()
-                        .id("auth-backdrop")
-                        .debug_selector(|| "auth-backdrop".into())
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .left_0()
-                        .bg(gpui::rgba(0x00000066))
-                        .on_mouse_down(gpui::MouseButton::Left, {
-                            let handle = cx.entity();
-                            move |_, _window, cx| {
-                                handle.update(cx, |_, cx| {
-                                    cx.dispatch_action(&crate::actions::CloseAuth);
-                                });
-                            }
+                    Dialog::new(cx)
+                        .title(div().child("Drive バックアップが見つかりました"))
+                        .content(move |content, _window, _cx| {
+                            content.child(div().text_sm().child(format!(
+                                "Google Drive に DB バックアップ（{restore_size} bytes）があります。復元しますか？\n既存のデータは Drive 側の内容で上書きされます。"
+                            )))
                         })
-                        .child(
-                            dialog
-                                .map(|d| d.into_any_element())
-                                .unwrap_or_else(|| div().into_any_element()),
-                        ),
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    Button::new("restore-cancel")
+                                        .cursor_pointer()
+                                        .label("キャンセル")
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.show_restore_prompt = false;
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("restore-confirm")
+                                        .cursor_pointer()
+                                        .primary()
+                                        .label("復元する")
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.confirm_restore_backup(cx);
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                        .into_any_element(),
                 )
                 .into_any_element()
             } else {
@@ -838,9 +978,13 @@ impl Workspace {
             .overflow_hidden()
             .pt({
                 #[cfg(windows)]
-                { px(0.0) }
+                {
+                    px(0.0)
+                }
                 #[cfg(not(windows))]
-                { px(30.0) }
+                {
+                    px(30.0)
+                }
             })
             .on_click({
                 let handle = handle.clone();

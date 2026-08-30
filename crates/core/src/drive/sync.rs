@@ -34,6 +34,8 @@ pub struct SyncOutcome {
     pub total_bytes: u64,
     /// DB（thundoku-shelf.db）を Drive にバックアップしたか
     pub database_backed_up: bool,
+    /// Drive の `thundoku-backup.json` から DB へ復元したか
+    pub database_restored: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -324,6 +326,54 @@ pub fn sync(
 /// Drive 上の DB バックアップのファイル名。
 const DB_BACKUP_NAME: &str = "thundoku-backup.json";
 
+/// Drive 上の `thundoku-backup.json` の要約（復元確認ダイアログの表示に使う）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveBackupInfo {
+    pub file_id: String,
+    pub md5: Option<String>,
+    pub size: Option<i64>,
+    pub modified_time: Option<String>,
+}
+
+/// Drive の `thundoku-backup.json` が存在するか確認し、要約を返す。
+/// バックアップが無ければ `Ok(None)`。起動時の復元確認で使う。
+pub fn check_drive_backup(
+    drive: &mut dyn DriveApi,
+    folder_id: &str,
+) -> Result<Option<DriveBackupInfo>, SyncError> {
+    let files = drive.list_files(folder_id)?;
+    Ok(files
+        .into_iter()
+        .find(|f| f.name == DB_BACKUP_NAME)
+        .map(|f| DriveBackupInfo {
+            file_id: f.id,
+            md5: f.md5_checksum,
+            size: f.size,
+            modified_time: f.modified_time,
+        }))
+}
+
+/// Drive の `thundoku-backup.json` をダウンロードして DB に反映する。
+/// UPSERT でマージするため既存のローカル行は残り、Drive 側の値が優先される。
+pub fn restore_drive_backup(
+    drive: &mut dyn DriveApi,
+    folder_id: &str,
+    pool: &SqlitePool,
+) -> Result<(), SyncError> {
+    let info = check_drive_backup(drive, folder_id)?
+        .ok_or_else(|| SyncError::Db(sqlx::Error::Protocol("no drive backup found".into())))?;
+    let bytes = drive.download(&info.file_id)?;
+    let json = String::from_utf8(bytes)
+        .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
+    log::info!(
+        "drive sync: restoring database backup ({} bytes, md5={:?})",
+        json.len(),
+        info.md5
+    );
+    crate::db::backup::import_json(pool, &json)?;
+    Ok(())
+}
+
 /// Drive 同期の状態（drive_sync_state の行と drive.* 設定）をクリアする。
 /// 次回同期時に全ファイルが再アップロード/再ダウンロードの対象になる。
 pub fn clear_sync_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -395,12 +445,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_drive_backup_reports_present_or_absent() {
+        let mut drive = MockDrive {
+            files: vec![crate::drive::DriveFile {
+                id: "backup-id".into(),
+                name: "thundoku-backup.json".into(),
+                size: Some(123),
+                md5_checksum: Some("abc123".into()),
+                modified_time: Some("2026-08-23T00:00:00Z".into()),
+            }],
+            uploaded: Default::default(),
+            deleted: Default::default(),
+            touched: Default::default(),
+            downloads: Default::default(),
+        };
+        let info = super::check_drive_backup(&mut drive, "folder").unwrap();
+        let info = info.expect("backup must be found");
+        assert_eq!(info.file_id, "backup-id");
+        assert_eq!(info.md5.as_deref(), Some("abc123"));
+
+        // バックアップが無いフォルダでは None
+        let empty = MockDrive {
+            files: Vec::new(),
+            uploaded: Default::default(),
+            deleted: Default::default(),
+            touched: Default::default(),
+            downloads: Default::default(),
+        };
+        let mut empty = empty;
+        assert!(
+            super::check_drive_backup(&mut empty, "folder")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn restore_drive_backup_imports_db_json() {
+        use crate::db::progress::ReadingProgress;
+
+        // ソース DB でバックアップを生成
+        let src = crate::db::test_pool();
+        migrate(&src).unwrap();
+        crate::db::books::insert(
+            &src,
+            &crate::db::books::Book {
+                id: "book-1".into(),
+                title: "復元される本".into(),
+                author: String::new(),
+                circle_name: "サークル".into(),
+                purchase_date: None,
+                file_name: "b.pdf".into(),
+                file_size: 1,
+                opfs_path: "b.opfspack".into(),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 0,
+                pack_id: Some("book-1".into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: "2026-08-23 00:00:00".into(),
+                updated_at: "2026-08-23 00:00:00".into(),
+            },
+        )
+        .unwrap();
+        crate::db::progress::upsert(
+            &src,
+            &ReadingProgress {
+                book_id: "book-1".into(),
+                current_page: 42,
+                total_pages: Some(200),
+                finished_at: None,
+                last_read_at: "2026-08-23 09:00:00".into(),
+                scroll_position: 0.0,
+            },
+        )
+        .unwrap();
+        let json = crate::db::backup::export_json(&src).unwrap();
+
+        let mut drive = MockDrive {
+            files: vec![crate::drive::DriveFile {
+                id: "backup-id".into(),
+                name: "thundoku-backup.json".into(),
+                size: Some(json.len() as i64),
+                md5_checksum: Some(format!("{:x}", md5::compute(json.as_bytes()))),
+                modified_time: None,
+            }],
+            uploaded: Default::default(),
+            deleted: Default::default(),
+            touched: Default::default(),
+            downloads: Default::default(),
+        };
+        drive
+            .downloads
+            .borrow_mut()
+            .insert("backup-id".into(), json.into_bytes());
+
+        // 空の DB に復元する
+        let dst = crate::db::test_pool();
+        migrate(&dst).unwrap();
+        super::restore_drive_backup(&mut drive, "folder", &dst).unwrap();
+
+        let restored = crate::db::books::get(&dst, "book-1").unwrap().unwrap();
+        assert_eq!(restored.title, "復元される本");
+        let progress = crate::db::progress::get(&dst, "book-1").unwrap().unwrap();
+        assert_eq!(progress.current_page, 42);
+    }
+
     /// Drive API のモック（アップロードを files に反映して md5 比較できるようにする）。
     struct MockDrive {
         files: Vec<crate::drive::DriveFile>,
         uploaded: std::cell::RefCell<Vec<(String, Vec<u8>)>>,
         deleted: std::cell::RefCell<Vec<String>>,
         touched: std::cell::RefCell<Vec<String>>,
+        downloads: std::cell::RefCell<std::collections::HashMap<String, Vec<u8>>>,
     }
 
     impl crate::drive::DriveApi for MockDrive {
@@ -410,8 +570,13 @@ mod tests {
         ) -> Result<Vec<crate::drive::DriveFile>, crate::drive::DriveError> {
             Ok(self.files.clone())
         }
-        fn download(&mut self, _file_id: &str) -> Result<Vec<u8>, crate::drive::DriveError> {
-            Ok(Vec::new())
+        fn download(&mut self, file_id: &str) -> Result<Vec<u8>, crate::drive::DriveError> {
+            Ok(self
+                .downloads
+                .borrow()
+                .get(file_id)
+                .cloned()
+                .unwrap_or_default())
         }
         fn upload_multipart(
             &mut self,
@@ -482,8 +647,8 @@ mod tests {
             uploaded: Default::default(),
             deleted: Default::default(),
             touched: Default::default(),
+            downloads: Default::default(),
         };
-
         // 初回: JSON バックアップがアップロードされる
         let outcome = super::sync(
             &pool,

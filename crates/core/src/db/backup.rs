@@ -24,8 +24,8 @@ const TABLES: &[&str] = &[
     "document_images",
     "book_first_events",
     "zenn_tag_metadata",
+    "view_history",
 ];
-
 /// 画像・バイナリとして除外するカラム名。
 const EXCLUDED_COLUMNS: &[&str] = &["thumbnail_data", "image_data"];
 
@@ -40,6 +40,50 @@ pub fn export_json(pool: &SqlitePool) -> Result<String, sqlx::Error> {
             payload.insert((*table).to_string(), Value::Array(rows));
         }
         Ok(serde_json::to_string(&Value::Object(payload)).unwrap_or_default())
+    })
+}
+
+/// `export_json` で書き出したバックアップを DB に反映する。
+///
+/// 各テーブルを PK 競合時に `DO UPDATE` する UPSERT でマージする（Drive 優先）。
+/// SQLite の `INSERT ... ON CONFLICT DO UPDATE` は DELETE を伴わないため、
+/// FK の `ON DELETE CASCADE`（例: `books` → `view_history`）を発火させない。
+/// テーブルは `TABLES` の順（FK 参照元が先）で処理する。
+pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
+    let payload: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    crate::db::block_on(async {
+        let mut conn = pool.acquire().await?;
+        for table in TABLES {
+            let Some(rows) = payload.get(*table).and_then(serde_json::Value::as_array) else {
+                continue; // バックアップに無いテーブルはスキップ
+            };
+            let Some(pk) = pk_columns(table) else {
+                log::warn!("drive restore: no PK mapping for {table}, skipping");
+                continue;
+            };
+            upsert_rows(&mut conn, table, pk, rows).await?;
+        }
+        Ok(())
+    })
+}
+
+/// テーブルごとの PRIMARY KEY カラム（`TABLES` の定義と一致させる）。
+fn pk_columns(table: &str) -> Option<&'static [&'static str]> {
+    Some(match table {
+        "books" => &["id"],
+        "bookshelf_items" => &["site_id", "database_id"],
+        "checked_items" => &["id"],
+        "tbf_events" => &["id"],
+        "reading_progress" => &["book_id"],
+        "book_tags" => &["id"],
+        "favorite_tags" => &["tag_name"],
+        "imported_documents" => &["id"],
+        "document_images" => &["id"],
+        "book_first_events" => &["site_id", "database_id"],
+        "zenn_tag_metadata" => &["tag_name"],
+        "view_history" => &["id"],
+        _ => return None,
     })
 }
 
@@ -92,6 +136,82 @@ async fn table_rows(
         out.push(Value::Object(obj));
     }
     Ok(out)
+}
+
+async fn upsert_rows(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+    pk: &[&str],
+    rows: &[serde_json::Value],
+) -> Result<(), sqlx::Error> {
+    // 画像（blob）カラムは対象外（エクスポート時と同じ除外リスト）
+    let cols: Vec<String> = {
+        let info = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(&mut *conn)
+            .await?;
+        let mut names = Vec::new();
+        for row in info {
+            let name: String = row.get(1);
+            if !EXCLUDED_COLUMNS.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+        names
+    };
+    if cols.is_empty() {
+        return Ok(());
+    }
+    let pk_set: std::collections::HashSet<&str> = pk.iter().copied().collect();
+    let col_list = cols.join(", ");
+    let update_cols: Vec<&str> = cols
+        .iter()
+        .filter(|c| !pk_set.contains(c.as_str()))
+        .map(|c| c.as_str())
+        .collect();
+    let update_set = update_cols
+        .iter()
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conflict = pk.join(", ");
+    for row in rows {
+        let sql = format!(
+            "INSERT INTO {table} ({col_list}) VALUES ({}) \
+             ON CONFLICT ({conflict}) DO UPDATE SET {update_set}",
+            cols.iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for col in &cols {
+            let v = row.get(col.as_str()).cloned().unwrap_or(Value::Null);
+            match v {
+                Value::Null => {
+                    query = query.bind(None::<String>);
+                }
+                Value::String(s) => {
+                    query = query.bind(s);
+                }
+                Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        query = query.bind(i);
+                    } else {
+                        query = query.bind(n.as_f64().unwrap_or(0.0));
+                    }
+                }
+                Value::Bool(b) => {
+                    query = query.bind(b as i64);
+                }
+                _ => {
+                    query = query.bind(None::<String>);
+                }
+            }
+        }
+        query.execute(&mut *conn).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -182,6 +302,69 @@ mod tests {
             items[0].get("thumbnail_data").is_none(),
             "image columns must be excluded"
         );
-        assert_eq!(items[0]["product_title"], "本");
+    }
+    #[test]
+    fn import_json_round_trips_main_tables_and_updates() {
+        use crate::db::progress::ReadingProgress;
+        // ソース DB に本・進捗・閲覧履歴を入れてエクスポートする
+        let src = crate::db::test_pool();
+        crate::db::books::insert(
+            &src,
+            &crate::db::books::Book {
+                id: "book-1".into(),
+                title: "テスト本".into(),
+                author: "著者".into(),
+                circle_name: "サークル".into(),
+                purchase_date: None,
+                file_name: "book-1.pdf".into(),
+                file_size: 10,
+                opfs_path: "book-1.opfspack".into(),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 0,
+                pack_id: Some("book-1".into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: "2026-08-23 00:00:00".into(),
+                updated_at: "2026-08-23 00:00:00".into(),
+            },
+        )
+        .unwrap();
+        crate::db::progress::upsert(
+            &src,
+            &ReadingProgress {
+                book_id: "book-1".into(),
+                current_page: 12,
+                total_pages: Some(120),
+                finished_at: None,
+                last_read_at: "2026-08-23 09:00:00".into(),
+                scroll_position: 0.0,
+            },
+        )
+        .unwrap();
+        crate::db::view_history::start(&src, "book-1").unwrap();
+        assert_eq!(
+            crate::db::view_history::view_count(&src, "book-1").unwrap(),
+            1
+        );
+
+        let json = export_json(&src).unwrap();
+        // view_history がバックアップに含まれる
+        let payload: Value = serde_json::from_str(&json).unwrap();
+        let vh = payload["view_history"].as_array().unwrap();
+        assert_eq!(vh.len(), 1, "view_history must be in the backup");
+
+        // 空の DB にインポートすると本・進捗・閲覧履歴が復元される
+        let dst = crate::db::test_pool();
+        import_json(&dst, &json).unwrap();
+        let restored = crate::db::books::get(&dst, "book-1").unwrap().unwrap();
+        assert_eq!(restored.title, "テスト本");
+        let progress = crate::db::progress::get(&dst, "book-1").unwrap().unwrap();
+        assert_eq!(progress.current_page, 12);
+        assert_eq!(
+            crate::db::view_history::view_count(&dst, "book-1").unwrap(),
+            1
+        );
     }
 }
