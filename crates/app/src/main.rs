@@ -11,20 +11,31 @@ fn main() {
     // Windows（Wine/CrossOver）ではコンソール出力が抑制されるためファイルにも出す
     #[cfg(windows)]
     {
-        std::panic::set_hook(Box::new(|info| {
+        // C:\ 直下は一般ユーザーが書き込めず `expect` でパニックし、
+        // 起動直後にクラッシュする（Windows で起動しない原因）。
+        // 書き込み可能な既知ディレクトリ（%TEMP%\thundoku-shelf）にログを出す。
+        let log_dir = std::env::temp_dir().join("thundoku-shelf");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_path = log_dir.join("thundoku.log");
+        let hook_log = log_path.clone();
+        std::panic::set_hook(Box::new(move |info| {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .append(true)
-                .open("C:\\thundoku.log")
+                .create(true)
+                .open(&hook_log)
             {
                 let _ = writeln!(f, "PANIC: {info}");
             }
         }));
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-            .target(env_logger::Target::Pipe(Box::new(
-                std::fs::File::create("C:\\thundoku.log").expect("create thundoku.log"),
-            )))
-            .init();
+        // ログファイルが開けなくてもアプリは起動を続ける（best-effort）。
+        if let Ok(f) = std::fs::File::create(&log_path) {
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+                .target(env_logger::Target::Pipe(Box::new(f)))
+                .init();
+        } else {
+            env_logger::init();
+        }
     }
     #[cfg(not(windows))]
     env_logger::init();
