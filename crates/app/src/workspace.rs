@@ -11,6 +11,9 @@ use gpui::{
     Animation, AnimationExt as _, AppContext as _, InteractiveElement as _, ReadGlobal as _,
     StatefulInteractiveElement as _, Styled as _, prelude::FluentBuilder as _,
 };
+#[cfg(windows)]
+use gpui::WindowControlArea;
+
 use gpui::{
     AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
     SharedString, Window, div, px,
@@ -622,13 +625,28 @@ impl Render for Workspace {
             .id("app-sidebar")
             .debug_selector(|| "app-sidebar".into())
             .flex()
+            .flex_col()
             .w_full()
             .h_full()
             .bg(theme.background)
-            .child(sidebar)
+            .child({
+                #[cfg(windows)]
+                {
+                    Self::win_title_bar(_window, &theme).into_any_element()
+                }
+                #[cfg(not(windows))]
+                div().into_any_element()
+            })
             .child(
                 div()
-                    .id("view-container")
+                    .flex()
+                    .flex_1()
+                    .relative()
+                    .overflow_hidden()
+                    .child(sidebar)
+                    .child(
+                        div()
+                            .id("view-container")
                     .debug_selector(|| "view-container".into())
                     .flex_1()
                     .h_full()
@@ -642,7 +660,8 @@ impl Render for Workspace {
                     } else {
                         active_view
                     }),
-            )
+                        )
+                    )
             .child(toast_el)
             .child(if self.auth_panel_open {
                 let panel = self.account_panel(cx);
@@ -725,6 +744,74 @@ impl Render for Workspace {
 
 /// サイドバーの描画（72px の閉状態 ↔ 256px の開状態を 200ms でアニメーション）。
 impl Workspace {
+    /// Windows の自前タイトルバー（MangaReader 方式）。
+    /// `.window_control_area()` でネイティブのドラッグ/最小化/最大化/閉じるを再現する。
+    #[cfg(windows)]
+    fn win_title_bar(window: &mut Window, theme: &gpui_component::Theme) -> gpui::AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(36.0))
+            .w_full()
+            .flex_shrink_0()
+            .bg(theme.secondary)
+            .text_color(theme.muted_foreground)
+            .child(
+                div()
+                    .flex_1()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .window_control_area(WindowControlArea::Drag)
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Thundoku Shelf"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .h_full()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(46.0))
+                            .h_full()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.secondary))
+                            .window_control_area(WindowControlArea::Min)
+                            .child("—"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(46.0))
+                            .h_full()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.secondary))
+                            .window_control_area(WindowControlArea::Max)
+                            .child(if window.is_maximized() { "❐" } else { "□" }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(46.0))
+                            .h_full()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(gpui::rgb(0xe11d48)))
+                            .text_color(theme.primary_foreground)
+                            .window_control_area(WindowControlArea::Close)
+                            .child("×"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.sidebar_open;
         let theme = cx.theme().clone();
@@ -749,7 +836,12 @@ impl Workspace {
             .flex_col()
             .relative()
             .overflow_hidden()
-            .pt(px(30.0))
+            .pt({
+                #[cfg(windows)]
+                { px(0.0) }
+                #[cfg(not(windows))]
+                { px(30.0) }
+            })
             .on_click({
                 let handle = handle.clone();
                 move |_event, window, cx| {
