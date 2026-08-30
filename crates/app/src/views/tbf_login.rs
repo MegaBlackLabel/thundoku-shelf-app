@@ -47,8 +47,20 @@ impl TbfLoginView {
         let builder = lb_wry::WebViewBuilder::new();
         #[cfg(debug_assertions)]
         let builder = builder.with_devtools(true);
-        let window_handle = window.window_handle().ok()?;
-        let webview = builder.build(&window_handle).ok()?;
+        let window_handle = match window.window_handle() {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("tbf login: window_handle() failed: {e:?}");
+                return None;
+            }
+        };
+        let webview = match builder.build(&window_handle) {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("tbf login: wry build() failed: {e:?} | {e}");
+                return None;
+            }
+        };
         let entity = cx.new(|cx| WebView::new(webview, window, cx));
         entity.update(cx, |view, _| view.hide());
         Some(entity)
@@ -150,23 +162,23 @@ impl EventEmitter<TbfLoginCancelled> for TbfLoginView {}
 impl Render for TbfLoginView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // モーダル領域（中央 480x640）に WebView を配置する
-        let bounds = {
-            let window_bounds = window.bounds();
-            let width = 480.0_f32;
-            let height = 640.0_f32;
-            let left = (window_bounds.size.width.as_f32() - width) / 2.0;
-            let top = (window_bounds.size.height.as_f32() - height) / 2.0;
-            gpui::bounds(
-                gpui::Point {
-                    x: px(left),
-                    y: px(top),
-                },
-                gpui::Size {
-                    width: px(width),
-                    height: px(height),
-                },
-            )
-        };
+        let window_bounds = window.bounds();
+        let window_w = window_bounds.size.width.as_f32();
+        let window_h = window_bounds.size.height.as_f32();
+        let width = 480.0_f32;
+        let height = 640.0_f32;
+        let left = (window_w - width) / 2.0;
+        let top = (window_h - height) / 2.0;
+        let bounds = gpui::bounds(
+            gpui::Point {
+                x: px(left),
+                y: px(top),
+            },
+            gpui::Size {
+                width: px(width),
+                height: px(height),
+            },
+        );
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| {
                 let _ = view.raw().set_bounds(lb_wry::Rect {
@@ -181,6 +193,16 @@ impl Render for TbfLoginView {
                 });
             });
         }
+        // 閉じるボタンは WebView の右上・すぐ外側に置く。WebView（ネイティブ子ウィンドウ）
+        // は GPUI 要素より常に最前面に描画され、ボタンを領域内に置くと隠れるため、
+        // 描画領域の外・直近（右外側、右に収まらない場合は左外側）へ配置する。
+        let close_size = 36.0_f32;
+        let close_gap = 10.0_f32;
+        let mut close_left = left + width + close_gap;
+        let close_top = top + close_gap;
+        if close_left + close_size > window_w {
+            close_left = left - close_gap - close_size;
+        }
         div()
             .id("tbf-login-backdrop")
             .absolute()
@@ -189,15 +211,14 @@ impl Render for TbfLoginView {
             .bottom_0()
             .left_0()
             .bg(gpui::hsla(0.0, 0.0, 0.0, 0.45))
-            // 閉じるボタンはウィンドウ右上（WebView 領域の外側）に配置
             .child(
                 div()
                     .id("tbf-login-cancel")
                     .absolute()
-                    .top_3()
-                    .right_3()
-                    .w(px(36.0))
-                    .h(px(36.0))
+                    .left(px(close_left))
+                    .top(px(close_top))
+                    .w(px(close_size))
+                    .h(px(close_size))
                     .flex()
                     .items_center()
                     .justify_center()

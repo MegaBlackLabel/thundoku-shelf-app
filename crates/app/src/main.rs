@@ -11,6 +11,15 @@ use thundoku_shelf::icons::AppAssets;
 use thundoku_shelf::workspace::{Workspace, app_menus};
 
 fn main() {
+    // Windows で WebView（gpui-wry）を描画させるには DirectComposition を
+    // 無効化する必要がある（gpui-component examples/webview に準拠）。
+    // 無効化しないと WebView2 子ウィンドウが GPUI ウィンドウに正しく表示されず、
+    // 技術書典・BOOTH・Google のログイン画面が「空」になる。
+    #[cfg(windows)]
+    unsafe {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
+    }
+
     // Windows（Wine/CrossOver）ではコンソール出力が抑制されるためファイルにも出す
     #[cfg(windows)]
     {

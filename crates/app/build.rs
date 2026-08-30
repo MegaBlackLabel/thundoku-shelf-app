@@ -9,7 +9,8 @@
 fn main() {
     let mut res = winres::WindowsResource::new();
     res.set_icon("assets/app-icon/icon.ico");
-    res.compile().expect("failed to compile Windows resources (icon.ico)");
+    res.compile()
+        .expect("failed to compile Windows resources (icon.ico)");
 }
 
 #[cfg(not(all(target_os = "windows", not(debug_assertions))))]

@@ -73,10 +73,14 @@ impl AuthDialog {
         let provider = provider.unwrap_or(AuthProvider::TechBookFest);
         self.provider = Some(provider);
         self.error = None;
-        // WebView は「〜ログイン画面を開く」ボタンを押すまで生成しない。
-        // 生成時に透明な WebView2 子ウィンドウがモーダルに被さって
-        // ボタンを押せなくなるため（Windows の dcomp との競合）。
-        // ボタン押下で show_xxx_login が立って初めて WebView を生成・表示する。
+        // プロバイダを指定したら中間の「〜ログイン画面を開く」ボタンを経由せず、
+        // そのまま WebView ログインモーダルを開く（Windows の dcomp 競合は
+        // GPUI_DISABLE_DIRECT_COMPOSITION で解消済みのため遅延は不要）。
+        match provider {
+            AuthProvider::TechBookFest => self.show_tbf_login = true,
+            AuthProvider::Google => self.show_google_login = true,
+            AuthProvider::Booth => self.show_booth_login = true,
+        }
     }
 
     /// 現在のプロバイダ（テスト用）。
@@ -264,7 +268,11 @@ impl Render for AuthDialog {
             } else {
                 div().into_any_element()
             })
-            .child(
+            .child(if self.show_booth_login || self.show_google_login || self.show_tbf_login {
+                // WebView ログインモーダル表示中は auth-modal（中央モーダル）を
+                // 重ねない。deferred の WebView が最前面に出るため不要な見た目になる。
+                div().into_any_element()
+            } else {
                 div()
                     .id("auth-modal")
                     .debug_selector(|| "auth-modal".into())
@@ -445,8 +453,9 @@ impl Render for AuthDialog {
                                     }),
                             )
                             .into_any_element(),
-                    }),
-            )
+                    })
+                    .into_any_element()
+            })
     }
 }
 
@@ -465,11 +474,10 @@ mod tests {
         dialog.update(cx, |dialog, _| {
             dialog.open_with_provider(Some(AuthProvider::TechBookFest));
         });
-        // モーダルを開いただけでは WebView を生成しない（遅延）。
-        // 「〜ログイン画面を開く」ボタン押下で初めて show_tbf_login が立つ。
+        // プロバイダ指定で WebView ログインモーダルを直接開く（遅延なし）。
         assert!(
-            !dialog.read_with(cx, |d, _| d.show_tbf_login()),
-            "TechBookFest provider should defer WebView until button press"
+            dialog.read_with(cx, |d, _| d.show_tbf_login()),
+            "TechBookFest provider should open webview login directly"
         );
     }
 }
@@ -524,10 +532,10 @@ mod dialog_render_tests {
         dialog.update(cx, |dialog, _| {
             dialog.open_with_provider(Some(AuthProvider::Booth));
         });
-        // モーダルを開いただけでは WebView を生成しない（遅延）。
+        // プロバイダ指定で WebView ログインモーダルを直接開く（遅延なし）。
         assert!(
-            !dialog.read_with(cx, |d, _| d.show_booth_login()),
-            "Booth provider should defer WebView until button press"
+            dialog.read_with(cx, |d, _| d.show_booth_login()),
+            "Booth provider should open webview login directly"
         );
     }
 
@@ -538,10 +546,10 @@ mod dialog_render_tests {
         dialog.update(cx, |dialog, _| {
             dialog.open_with_provider(Some(AuthProvider::Google));
         });
-        // モーダルを開いただけでは WebView を生成しない（遅延）。
+        // プロバイダ指定で WebView ログインモーダルを直接開く（遅延なし）。
         assert!(
-            !dialog.read_with(cx, |d, _| d.show_google_login()),
-            "Google provider should defer WebView until button press"
+            dialog.read_with(cx, |d, _| d.show_google_login()),
+            "Google provider should open webview login directly"
         );
     }
 
