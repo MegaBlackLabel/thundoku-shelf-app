@@ -73,12 +73,10 @@ impl AuthDialog {
         let provider = provider.unwrap_or(AuthProvider::TechBookFest);
         self.provider = Some(provider);
         self.error = None;
-        // 全プロバイダ WebView ログインをモーダルで直接開く
-        match provider {
-            AuthProvider::Booth => self.show_booth_login = true,
-            AuthProvider::Google => self.show_google_login = true,
-            AuthProvider::TechBookFest => self.show_tbf_login = true,
-        }
+        // WebView は「〜ログイン画面を開く」ボタンを押すまで生成しない。
+        // 生成時に透明な WebView2 子ウィンドウがモーダルに被さって
+        // ボタンを押せなくなるため（Windows の dcomp との競合）。
+        // ボタン押下で show_xxx_login が立って初めて WebView を生成・表示する。
     }
 
     /// 現在のプロバイダ（テスト用）。
@@ -467,10 +465,11 @@ mod tests {
         dialog.update(cx, |dialog, _| {
             dialog.open_with_provider(Some(AuthProvider::TechBookFest));
         });
-        // 技術書典プロバイダで開くと WebView ログインモーダルが有効になる
+        // モーダルを開いただけでは WebView を生成しない（遅延）。
+        // 「〜ログイン画面を開く」ボタン押下で初めて show_tbf_login が立つ。
         assert!(
-            dialog.read_with(cx, |d, _| d.show_tbf_login()),
-            "TechBookFest provider should set show_tbf_login"
+            !dialog.read_with(cx, |d, _| d.show_tbf_login()),
+            "TechBookFest provider should defer WebView until button press"
         );
     }
 }
@@ -525,10 +524,10 @@ mod dialog_render_tests {
         dialog.update(cx, |dialog, _| {
             dialog.open_with_provider(Some(AuthProvider::Booth));
         });
-        // BOOTH プロバイダで開くと WebView ログインモーダルが有効になる
+        // モーダルを開いただけでは WebView を生成しない（遅延）。
         assert!(
-            dialog.read_with(cx, |d, _| d.show_booth_login()),
-            "Booth provider should set show_booth_login"
+            !dialog.read_with(cx, |d, _| d.show_booth_login()),
+            "Booth provider should defer WebView until button press"
         );
     }
 
@@ -539,10 +538,10 @@ mod dialog_render_tests {
         dialog.update(cx, |dialog, _| {
             dialog.open_with_provider(Some(AuthProvider::Google));
         });
-        // Google プロバイダで開くと WebView ログインモーダルが有効になる
+        // モーダルを開いただけでは WebView を生成しない（遅延）。
         assert!(
-            dialog.read_with(cx, |d, _| d.show_google_login()),
-            "Google provider should set show_google_login"
+            !dialog.read_with(cx, |d, _| d.show_google_login()),
+            "Google provider should defer WebView until button press"
         );
     }
 
