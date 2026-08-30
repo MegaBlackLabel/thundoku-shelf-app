@@ -48,7 +48,7 @@ impl TbfLoginView {
         #[cfg(debug_assertions)]
         let builder = builder.with_devtools(true);
         let window_handle = window.window_handle().ok()?;
-        let webview = builder.build_as_child(&window_handle).ok()?;
+        let webview = builder.build(&window_handle).ok()?;
         let entity = cx.new(|cx| WebView::new(webview, window, cx));
         entity.update(cx, |view, _| view.hide());
         Some(entity)
