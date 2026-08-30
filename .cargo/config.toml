@@ -1,0 +1,4 @@
+# Windows ターゲットは静的 CRT（/MT）でリンクし、VCRUNTIME140.dll への
+# 実行時依存をなくす（Visual C++ Redistributable 未導入の PC でも起動できるように）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
