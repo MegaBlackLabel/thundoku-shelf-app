@@ -330,9 +330,7 @@ impl Workspace {
         let task = cx.background_executor().spawn(async move {
             // Google にログイン済みでなければ何もしない
             let mut client = google.lock();
-            let Some(client) = client.as_mut() else {
-                return None;
-            };
+            let client = client.as_mut()?;
             let Ok(token) = client.access_token() else {
                 return None;
             };
