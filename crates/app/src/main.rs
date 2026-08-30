@@ -1,5 +1,8 @@
 //! Thundoku Shelf desktop binary.
 
+// Windows ではコンソール（黒い cmd 窓）を出さない（GUI サブシステム）。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use gpui::*;
 use gpui_component::*;
 
