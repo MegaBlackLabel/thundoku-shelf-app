@@ -118,14 +118,26 @@ impl AppState {
         // プロフィール（email 等）の取得に失敗してもログイン状態は維持する。
         let google_logged_in = google.as_ref().is_some_and(|c| c.has_tokens());
 
-        // BOOTH セッションを keyring から復元する
-        let booth_session = secrets
-            .load(thundoku_core::secrets::USER_BOOTH)
+        // BOOTH セッションを DB（app_settings）から復元する。
+        // セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を
+        // 超えることがあるため、keyring ではなく DB に保存する。
+        let booth_session = db::settings::get(&db_pool, "booth.session")
             .ok()
             .flatten()
             .and_then(|json| serde_json::from_str(&json).ok())
             .filter(|session: &BoothSession| session.logged_in());
         let booth_logged_in = booth_session.is_some();
+        log::info!(
+            "booth session: 起動時復元 = {}",
+            if booth_logged_in {
+                format!(
+                    "ログイン済み（cookies={}）",
+                    booth_session.as_ref().map(|s| s.cookies.len()).unwrap_or(0)
+                )
+            } else {
+                "未ログイン".to_string()
+            }
+        );
 
         cx.set_global(Self {
             data_dir,
@@ -245,14 +257,20 @@ pub fn save_tbf_session(cx: &App, session: &TbfSession) {
     log::info!("tbf session saved -> tbf_logged_in = true");
 }
 
-/// BOOTH のセッションを keyring に永続化し、グローバル状態を更新する。
+/// BOOTH のセッションを DB（app_settings）に永続化し、グローバル状態を更新する。
+/// Windows Credential Manager の上限（2560 UTF-16 文字）を Cookie が超えることが
+/// あるため、keyring ではなく DB を使う。
 pub fn save_booth_session(cx: &App, session: &BoothSession) {
     let state = AppState::global(cx);
     let logged_in = session.logged_in();
     if let Ok(json) = serde_json::to_string(session) {
-        let _ = state
-            .secrets
-            .save(thundoku_core::secrets::USER_BOOTH, &json);
+        match db::settings::set(&state.db_pool, "booth.session", &json) {
+            Ok(()) => log::info!(
+                "booth session: DB 保存成功（cookies={}）",
+                session.cookies.len()
+            ),
+            Err(e) => log::error!("booth session: DB 保存失敗: {e}"),
+        }
     }
     *state.booth_session.lock() = Some(session.clone());
     *state.booth_logged_in.lock() = logged_in;
@@ -261,7 +279,7 @@ pub fn save_booth_session(cx: &App, session: &BoothSession) {
 /// BOOTH のセッションを破棄する（ログアウト）。
 pub fn clear_booth_session(cx: &App) {
     let state = AppState::global(cx);
-    let _ = state.secrets.delete(thundoku_core::secrets::USER_BOOTH);
+    let _ = db::settings::delete(&state.db_pool, "booth.session");
     *state.booth_session.lock() = None;
     *state.booth_logged_in.lock() = false;
 }

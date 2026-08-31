@@ -461,10 +461,10 @@ impl SettingsView {
             let state = AppState::global(cx);
             *state.booth_session.lock() = None;
             *state.booth_logged_in.lock() = false;
-            // keyring の削除はバックグラウンドで行う
-            let store = state.secrets.clone();
+            // DB（app_settings）からの削除はバックグラウンドで行う
+            let db = state.db_pool.clone();
             cx.background_spawn(async move {
-                let _ = store.delete(thundoku_core::secrets::USER_BOOTH);
+                let _ = db::settings::delete(&db, "booth.session");
             })
             .detach();
         }

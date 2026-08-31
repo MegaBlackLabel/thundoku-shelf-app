@@ -104,6 +104,7 @@ impl BoothLoginView {
         let Ok(url) = webview.read(cx).raw().url() else {
             return false;
         };
+        log::debug!("booth login check: url={url}");
         let is_booth = url
             .parse::<url::Url>()
             .map(|u| u.host_str().is_some_and(|h| h.ends_with("booth.pm")))
@@ -124,6 +125,7 @@ impl BoothLoginView {
                 .raw()
                 .cookies_for_url(url)
                 .unwrap_or_default();
+            log::debug!("booth login: cookies_for_url({url}) -> {}", cookies.len());
             for cookie in cookies {
                 let name = cookie.name().to_string();
                 let value = cookie.value().to_string();
@@ -131,6 +133,7 @@ impl BoothLoginView {
             }
         }
         if cookie_pairs.is_empty() {
+            log::warn!("booth login: セッション Cookie を取得できませんでした");
             return false;
         }
         let session = thundoku_core::booth::BoothSession {
