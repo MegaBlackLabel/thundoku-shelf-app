@@ -282,7 +282,12 @@ impl BookshelfView {
 
     /// グリッドの列数（Web と同じブレークポイント）
     fn columns_for_width(window_width: f32) -> usize {
-        if window_width >= 1280.0 {
+        if window_width >= 2560.0 {
+            // 4K 等の超広幅では、タイル幅を理想値に近づけるよう列数を増やす
+            // （固定 5 列だとタイルが横に間延びするため）。
+            let content = window_width - 255.0 - 24.0; // サイドバー + パディング
+            ((content / 320.0).round() as usize).clamp(5, 16)
+        } else if window_width >= 1280.0 {
             5
         } else if window_width >= 1024.0 {
             4
@@ -3437,15 +3442,7 @@ impl Render for BookshelfView {
                             // Web と同じブレークポイントで列数を決め、
                             // サイドバー(255px)・パディング・gap を差し引いてカード幅を計算
                             let window_width = window.bounds().size.width.as_f32();
-                            let columns = if window_width >= 1280.0 {
-                                5
-                            } else if window_width >= 1024.0 {
-                                4
-                            } else if window_width >= 640.0 {
-                                3
-                            } else {
-                                2
-                            };
+                            let columns = Self::columns_for_width(window_width);
                             let content_width = window_width - 255.0 - 24.0;
                             let card_width = ((content_width - (columns as f32 - 1.0) * 12.0)
                                 / columns as f32)
@@ -4038,6 +4035,19 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(unread, vec!["db-2".to_string()]);
+    }
+
+    #[test]
+    fn columns_for_width_grows_on_wide_screens() {
+        // 小〜中画面は従来どおりのブレークポイント
+        assert_eq!(BookshelfView::columns_for_width(800.0), 3);
+        assert_eq!(BookshelfView::columns_for_width(1024.0), 4);
+        assert_eq!(BookshelfView::columns_for_width(1280.0), 5);
+        // フルHD (1920) は 5 列のまま（従来と変わらない）
+        assert_eq!(BookshelfView::columns_for_width(1920.0), 5);
+        // 超広幅（4K 等）は列数を増やしてタイルの間延びを防ぐ
+        assert_eq!(BookshelfView::columns_for_width(2560.0), 7);
+        assert!(BookshelfView::columns_for_width(3840.0) > 5);
     }
 
     #[gpui::test]

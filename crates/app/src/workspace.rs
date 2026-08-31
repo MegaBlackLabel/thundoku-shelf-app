@@ -119,12 +119,12 @@ impl Workspace {
             show_restore_prompt: false,
             restore_info: None,
             restoring: false,
-             show_drive_prompt: false,
-         };
+            show_drive_prompt: false,
+        };
         this.register_actions(cx);
-         this.refresh_unread_count(cx);
-         this.restore_theme_mode(cx);
-         this.check_startup_backup(cx);
+        this.refresh_unread_count(cx);
+        this.restore_theme_mode(cx);
+        this.check_startup_backup(cx);
         this
     }
 
