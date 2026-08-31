@@ -78,8 +78,20 @@ impl GoogleLoginView {
         let builder = lb_wry::WebViewBuilder::new();
         #[cfg(debug_assertions)]
         let builder = builder.with_devtools(true);
-        let window_handle = window.window_handle().ok()?;
-        let webview = builder.build(&window_handle).ok()?;
+        let window_handle = match window.window_handle() {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("google login: window_handle() failed: {e:?}");
+                return None;
+            }
+        };
+        let webview = match builder.build(&window_handle) {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("google login: wry build() failed: {e:?} | {e}");
+                return None;
+            }
+        };
         let entity = cx.new(|cx| WebView::new(webview, window, cx));
         entity.update(cx, |view, _| view.hide());
         Some(entity)

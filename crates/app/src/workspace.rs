@@ -822,6 +822,36 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
+            .child(if self.show_auth {
+                let dialog = self.auth_dialog.clone();
+                gpui::deferred(
+                    div()
+                        .id("auth-backdrop")
+                        .debug_selector(|| "auth-backdrop".into())
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(gpui::rgba(0x00000066))
+                        .on_mouse_down(gpui::MouseButton::Left, {
+                            let handle = cx.entity();
+                            move |_, _window, cx| {
+                                handle.update(cx, |_, cx| {
+                                    cx.dispatch_action(&crate::actions::CloseAuth);
+                                });
+                            }
+                        })
+                        .child(
+                            dialog
+                                .map(|d| d.into_any_element())
+                                .unwrap_or_else(|| div().into_any_element()),
+                        ),
+                )
+                .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(if self.show_restore_prompt {
                 let handle = cx.entity();
                 let restore_size = self
