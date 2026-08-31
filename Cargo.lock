@@ -9037,6 +9037,7 @@ dependencies = [
  "usvg 0.44.0",
  "uuid",
  "webp",
+ "windows-sys 0.59.0",
  "winres",
 ]
 

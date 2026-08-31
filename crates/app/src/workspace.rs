@@ -21,6 +21,8 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::Dialog;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode};
+#[cfg(windows)]
+use raw_window_handle::HasWindowHandle;
 
 use crate::app_state::AppState;
 use crate::icons::AppIcon;
@@ -754,14 +756,23 @@ impl Render for Workspace {
         let sidebar = self.sidebar(cx);
 
         div()
-            .id("app-sidebar")
-            .debug_selector(|| "app-sidebar".into())
-            .flex()
-            .flex_col()
-            .w_full()
-            .h_full()
-            .bg(theme.background)
-            .child({
+             .id("app-sidebar")
+             .debug_selector(|| "app-sidebar".into())
+             .flex()
+             .flex_col()
+             .w_full()
+             .h_full()
+             .bg(theme.background)
+            .on_key_down({
+                move |event, window, _cx| {
+                    match event.keystroke.key.as_str() {
+                        "f11" => toggle_maximize(window),
+                        "escape" => restore_window(window),
+                        _ => {}
+                    }
+                }
+            })
+             .child({
                 #[cfg(windows)]
                 {
                     Self::win_title_bar(_window, &theme).into_any_element()
@@ -1046,11 +1057,8 @@ impl Workspace {
                             .h_full()
                             .cursor_pointer()
                             .hover(move |style| style.bg(hover_bg))
-                            .on_click({
-                                move |_, window, _| {
-                                    window.zoom_window();
-                                }
-                            })
+                            // ネイティブに最大化⇔復元のトグルを任せる（HTMAXBUTTON）
+                            .window_control_area(WindowControlArea::Max)
                             .child(if window.is_maximized() { "❐" } else { "□" }),
                     )
                     .child(
@@ -1780,5 +1788,59 @@ mod tests {
             cx.dispatch_action(&crate::actions::OpenAuth);
         });
         assert!(ws.read_with(cx, |w, _| w.show_auth));
+    }
+}
+
+/// F11 用: 最大化⇔復元をトグルする。
+fn toggle_maximize(window: &mut Window) {
+    if window.is_maximized() {
+        window_restore(window);
+    } else {
+        window_maximize(window);
+    }
+}
+
+/// ESC 用: 最大化中なら復元する。通常時は何もしない。
+fn restore_window(window: &mut Window) {
+    if window.is_maximized() {
+        window_restore(window);
+    }
+}
+
+fn window_maximize(window: &mut Window) {
+    #[cfg(windows)]
+    {
+        if let Ok(handle) = window.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, ShowWindow};
+                let hwnd = win.hwnd.get() as _;
+                unsafe {
+                    ShowWindow(hwnd, SW_MAXIMIZE);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        window.zoom_window();
+    }
+}
+
+fn window_restore(window: &mut Window) {
+    #[cfg(windows)]
+    {
+        if let Ok(handle) = window.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
+                let hwnd = win.hwnd.get() as _;
+                unsafe {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        window.zoom_window();
     }
 }

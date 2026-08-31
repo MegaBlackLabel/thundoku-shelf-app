@@ -39,8 +39,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 resvg = "0.44"
 usvg = { version = "0.44", default-features = false }
-tiny-skia = "0.11"
+ tiny-skia = "0.11"
 
-[build-dependencies]
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
+ [build-dependencies]
 # Windows exe のアイコン埋め込み（リリースビルド時のみ、build.rs から使用）
 winres = "0.1"

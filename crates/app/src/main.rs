@@ -64,7 +64,19 @@ fn main() {
             AppState::init(cx);
 
             cx.spawn(async move |cx| {
-                cx.open_window(TitleBar::window_options(), |window, cx| {
+                // 前回のウィンドウ配置・サイズがあれば復元する（macOS / Linux / Windows 共通）
+                let saved_bounds =
+                    cx.update(|cx| thundoku_shelf::app_state::load_window_bounds(cx));
+                let mut options = TitleBar::window_options();
+                if let Some(bounds) = saved_bounds {
+                    options.window_bounds = Some(bounds);
+                }
+                cx.open_window(options, |window, cx| {
+                    // ウィンドウを閉じる時に現在の配置・サイズを保存する。
+                    window.on_window_should_close(cx, |window, cx| {
+                        thundoku_shelf::app_state::save_window_bounds(window, cx);
+                        true
+                    });
                     let workspace = cx.new(Workspace::new);
                     cx.new(|cx| Root::new(workspace, window, cx).bg(cx.theme().background))
                 })

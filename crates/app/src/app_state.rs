@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::ReadGlobal as _;
-use gpui::{App, Global};
+use gpui::{App, Bounds, Global, Point, Size, Window, WindowBounds, px};
 use parking_lot::Mutex;
 use thundoku_core::booth::BoothSession;
 use thundoku_core::db;
@@ -264,4 +264,56 @@ pub fn clear_booth_session(cx: &App) {
     let _ = state.secrets.delete(thundoku_core::secrets::USER_BOOTH);
     *state.booth_session.lock() = None;
     *state.booth_logged_in.lock() = false;
+}
+
+/// 保存済みのウィンドウ状態（最大化/通常/フルスクリーン + 復元 size）の DB キー。
+const WINDOW_BOUNDS_KEY: &str = "window.bounds";
+
+///  を JSON 文字列に変換する（ に保存するため）。
+fn encode_window_bounds(bounds: WindowBounds) -> String {
+    let (state, b) = match bounds {
+        WindowBounds::Windowed(b) => ("windowed", b),
+        WindowBounds::Maximized(b) => ("maximized", b),
+        WindowBounds::Fullscreen(b) => ("fullscreen", b),
+    };
+    serde_json::json!({
+        "state": state,
+        "x": b.origin.x.as_f32(),
+        "y": b.origin.y.as_f32(),
+        "w": b.size.width.as_f32(),
+        "h": b.size.height.as_f32(),
+    })
+    .to_string()
+}
+
+/// 保存済みのウィンドウ状態 JSON を  に復元する。
+fn decode_window_bounds(json: &str) -> Option<WindowBounds> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let b = Bounds::new(
+        Point::new(px(v["x"].as_f64()? as f32), px(v["y"].as_f64()? as f32)),
+        Size::new(px(v["w"].as_f64()? as f32), px(v["h"].as_f64()? as f32)),
+    );
+    let state = v["state"].as_str()?;
+    Some(match state {
+        "maximized" => WindowBounds::Maximized(b),
+        "fullscreen" => WindowBounds::Fullscreen(b),
+        _ => WindowBounds::Windowed(b),
+    })
+}
+
+/// 現在のウィンドウ状態を  に保存する（ウィンドウを閉じる時に呼ぶ）。
+pub fn save_window_bounds(window: &Window, cx: &App) {
+    let state = AppState::global(cx);
+    let bounds = window.window_bounds();
+    let json = encode_window_bounds(bounds);
+    let _ = db::settings::set(&state.db_pool, WINDOW_BOUNDS_KEY, &json);
+}
+
+/// 保存済みのウィンドウ状態を復元する（起動時に呼ぶ）。
+pub fn load_window_bounds(cx: &App) -> Option<WindowBounds> {
+    let state = AppState::global(cx);
+    let json = db::settings::get(&state.db_pool, WINDOW_BOUNDS_KEY)
+        .ok()
+        .flatten()?;
+    decode_window_bounds(&json)
 }
