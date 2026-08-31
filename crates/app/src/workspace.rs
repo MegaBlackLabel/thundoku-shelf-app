@@ -431,8 +431,19 @@ impl Workspace {
 
     /// リーダーを閉じる。
     pub fn close_reader(&mut self, cx: &mut Context<Self>) {
+        // 読んでいた本を本棚の選択状態に戻し、フォーカスを取り直す
+        // （矢印キー・hjkl で再び選択操作できるようにする）。
+        let book_id = self
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.read(cx).book_id());
         if let Some(reader) = self.reader.take() {
             reader.update(cx, |r, cx| r.end_session(cx));
+        }
+        if let Some(book_id) = book_id {
+            self.bookshelf.update(cx, |b, cx| {
+                b.restore_selection(cx, book_id.as_ref());
+            });
         }
         cx.notify();
     }
@@ -684,6 +695,22 @@ impl Workspace {
         );
         reg!(crate::actions::CloseReader, |this, cx| this
             .close_reader(cx));
+        reg_with!(
+            crate::actions::OpenReader,
+            |action: &crate::actions::OpenReader,
+             this: &mut Workspace,
+             cx: &mut Context<Workspace>| {
+                this.open_reader(cx, action.book_id.to_string());
+            }
+        );
+        reg_with!(
+            crate::actions::OpenSampleReader,
+            |action: &crate::actions::OpenSampleReader,
+             this: &mut Workspace,
+             cx: &mut Context<Workspace>| {
+                this.open_sample_reader(cx, action.item_id.to_string());
+            }
+        );
         reg!(crate::actions::SyncDrive, |this, cx| this.sync_drive(cx));
         reg!(crate::actions::PromptDriveEnable, |this, cx| {
             // Drive 同期が未設定ならば確認ダイアログを表示する
@@ -754,15 +781,15 @@ impl Render for Workspace {
 
         let active_view = self.active_view(cx);
         let sidebar = self.sidebar(cx);
-
-        div()
-             .id("app-sidebar")
-             .debug_selector(|| "app-sidebar".into())
-             .flex()
-             .flex_col()
-             .w_full()
-             .h_full()
-             .bg(theme.background)
+         div()
+              .id("app-sidebar")
+              .debug_selector(|| "app-sidebar".into())
+              .flex()
+              .flex_col()
+              .w_full()
+              .h_full()
+             .relative()
+              .bg(theme.background)
             .on_key_down({
                 move |event, window, _cx| {
                     match event.keystroke.key.as_str() {
@@ -797,14 +824,28 @@ impl Render for Workspace {
                             // サイドバーとの縦の区切り線（Web 版の border-r 相当・フル高さ）
                             .border_l_1()
                             .border_color(theme.border)
-                            .child(if let Some(reader) = &self.reader {
-                                let view: AnyView = AnyView::from(reader.clone());
-                                view
-                            } else {
-                                active_view
-                            }),
+                            .child(active_view),
                     ),
-            )
+             )
+            // リーダーはサイドバー・タイトルバーの影響を受けないよう、ウィンドウ全体に
+            // absolute で重ねる（Mac はタイトルバーが無くリーダーが全ウィンドウに広がるため、
+            // Windows も同じ挙動にする）。これでリーダー内部のフィット計算
+            // （window.bounds().size）が実際の表示領域と一致し、見開き画像が右・下にはみ出さない。
+            .child(if let Some(reader) = &self.reader {
+                let view: AnyView = AnyView::from(reader.clone());
+                div()
+                    .id("reader-overlay")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .bg(theme.background.clone())
+                    .child(view)
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(toast_el)
             .child(if self.auth_panel_open {
                 let panel = self.account_panel(cx);
@@ -1680,6 +1721,20 @@ mod tests {
         });
         let closed = ws.read_with(cx, |w, _| w.reader.is_none());
         assert!(closed, "reader should close");
+    }
+    #[gpui::test]
+    async fn open_reader_action_dispatches_open_reader(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        // 本棚から dispatch される OpenReader アクションが register_actions の
+        // バインドを通って open_reader を呼ぶ（ビューアが開く）ことを検証する。
+        // 存在しない book_id でもリーダーは開ける（エラーはビューアー内で表示）。
+        cx.update(|cx| {
+            cx.dispatch_action(&crate::actions::OpenReader {
+                book_id: "action-dispatched-book".into(),
+            });
+        });
+        let opened = ws.read_with(cx, |w, _| w.reader.is_some());
+        assert!(opened, "OpenReader action should open the reader");
     }
 
     #[gpui::test]
