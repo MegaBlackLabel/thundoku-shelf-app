@@ -338,6 +338,8 @@ impl SettingsView {
         {
             let client = google.lock();
             let has = client.as_ref().map(|c| c.has_tokens()).unwrap_or(false);
+            // トークンがある時点で「ログイン済み」として扱う（プロフィール取得失敗でも維持）
+            *state.google_logged_in.lock() = has;
             if !has {
                 return;
             }
@@ -423,15 +425,16 @@ impl SettingsView {
             let state = AppState::global(cx);
             if let Some(client) = state.google.lock().as_mut() {
                 client.logout();
+                log::info!("logout_google: client logout ({:?})", t.elapsed());
+                *state.google_profile.lock() = None;
+                *state.google_logged_in.lock() = false;
+                // keyring の削除はバックグラウンドで行う
+                let store = state.secrets.clone();
+                cx.background_spawn(async move {
+                    let _ = store.delete(secrets::USER_GOOGLE);
+                })
+                .detach();
             }
-            log::info!("logout_google: client logout ({:?})", t.elapsed());
-            *state.google_profile.lock() = None;
-            // keyring の削除はバックグラウンドで行う
-            let store = state.secrets.clone();
-            cx.background_spawn(async move {
-                let _ = store.delete(secrets::USER_GOOGLE);
-            })
-            .detach();
         }
         self.show_toast("Google からログアウトしました", cx);
         log::info!("logout_google: done ({:?})", t.elapsed());
@@ -873,8 +876,9 @@ impl Render for SettingsView {
         let busy = self.busy;
         let error = self.error.clone();
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
-        let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let google_profile = AppState::global(cx).google_profile.lock().clone();
+        let google_logged_in = *AppState::global(cx).google_logged_in.lock();
+        let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let drive_enabled = self.drive_enabled(cx);
         let drive_last_sync = Self::read_setting(cx, "drive.last_sync_at")
             // 保存は UTC なのでローカル時間（JST 等）で表示する
@@ -1002,143 +1006,144 @@ impl Render for SettingsView {
                 ),
         );
 
-        let drive_settings = self.settings_card(
-            cx,
-            "Google Drive バックアップ",
-            Some("クラウドバックアップ設定"),
-            Icon::new(AppIcon::Cloud)
-                .size(px(16.0))
-                .text_color(muted_fg),
-            div()
-                .p_5()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(muted_fg)
-                                .child("同期フォルダ: My Drive/thundoku-shelf"),
-                        )
-                        .child(
-                            Switch::new("drive-sync-toggle")
-                                .checked(drive_enabled)
-                                .cursor_pointer()
-                                .on_click({
-                                    let handle = handle.clone();
-                                    move |checked, _window, cx| {
-                                        handle.update(cx, |this, cx| {
-                                            this.toggle_drive_sync(cx, *checked)
-                                        });
+        let drive_settings =
+            self.settings_card(
+                cx,
+                "Google Drive バックアップ",
+                Some("クラウドバックアップ設定"),
+                Icon::new(AppIcon::Cloud)
+                    .size(px(16.0))
+                    .text_color(muted_fg),
+                div()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted_fg)
+                                    .child("同期フォルダ: My Drive/thundoku-shelf"),
+                            )
+                            .child(
+                                Switch::new("drive-sync-toggle")
+                                    .checked(drive_enabled)
+                                    .cursor_pointer()
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |checked, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.toggle_drive_sync(cx, *checked)
+                                            });
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("drive-sync-now")
+                                    .cursor_pointer()
+                                    .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
+                                    .loading_icon(Icon::new(IconName::Loader).size(px(14.0)))
+                                    .label(if busy {
+                                        "同期中..."
+                                    } else {
+                                        "今すぐ同期"
+                                    })
+                                    .loading(busy)
+                                    .disabled(busy)
+                                    .cursor_pointer()
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| this.sync_drive_now(cx));
+                                        }
+                                    }),
+                            )
+                            .child(div().text_xs().text_color(muted_fg).child(
+                                if google_logged_in {
+                                    if drive_enabled {
+                                        "接続済み"
+                                    } else {
+                                        "同期オフ"
                                     }
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            Button::new("drive-sync-now")
-                                .cursor_pointer()
-                                .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
-                                .loading_icon(Icon::new(IconName::Loader).size(px(14.0)))
-                                .label(if busy {
-                                    "同期中..."
                                 } else {
-                                    "今すぐ同期"
-                                })
-                                .loading(busy)
-                                .disabled(busy)
+                                    "Google 未ログイン"
+                                },
+                            )),
+                    )
+                    // 最終同期日時
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .text_sm()
+                            .child(div().text_color(muted_fg).child("最終同期"))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(drive_last_sync.unwrap_or_else(|| "未同期".to_string())),
+                            ),
+                    )
+                    // ファイル数・容量
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .text_sm()
+                            .child(div().text_color(muted_fg).child("バックアップ"))
+                            .child(div().font_weight(FontWeight::MEDIUM).child(
+                                if drive_file_count == 0 && drive_total_bytes == 0 {
+                                    "なし".to_string()
+                                } else {
+                                    format!(
+                                        "{} ファイル / {} MB",
+                                        drive_file_count,
+                                        drive_total_bytes / 1024 / 1024
+                                    )
+                                },
+                            )),
+                    )
+                    // 同期情報をクリア
+                    .child(
+                        div().border_t_1().border_color(border).pt_2().child(
+                            Button::new("drive-clear-sync")
+                                .cursor_pointer()
+                                .label("同期情報をクリア")
+                                .danger()
+                                .ghost()
+                                .small()
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
                                     move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.sync_drive_now(cx));
+                                        handle.update(cx, |this, cx| {
+                                            {
+                                                let state = AppState::global(cx);
+                                                let db = &state.db_pool;
+                                                let _ = sync::clear_sync_state(db);
+                                            }
+                                            this.show_toast("同期情報をクリアしました", cx);
+                                        });
                                     }
                                 }),
-                        )
-                        .child(div().text_xs().text_color(muted_fg).child(
-                            if google_profile.is_some() {
-                                if drive_enabled {
-                                    "接続済み"
-                                } else {
-                                    "同期オフ"
-                                }
-                            } else {
-                                "Google 未ログイン"
-                            },
-                        )),
-                )
-                // 最終同期日時
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_between()
-                        .text_sm()
-                        .child(div().text_color(muted_fg).child("最終同期"))
-                        .child(
-                            div()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(drive_last_sync.unwrap_or_else(|| "未同期".to_string())),
                         ),
-                )
-                // ファイル数・容量
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_between()
-                        .text_sm()
-                        .child(div().text_color(muted_fg).child("バックアップ"))
-                        .child(div().font_weight(FontWeight::MEDIUM).child(
-                            if drive_file_count == 0 && drive_total_bytes == 0 {
-                                "なし".to_string()
-                            } else {
-                                format!(
-                                    "{} ファイル / {} MB",
-                                    drive_file_count,
-                                    drive_total_bytes / 1024 / 1024
-                                )
-                            },
-                        )),
-                )
-                // 同期情報をクリア
-                .child(
-                    div().border_t_1().border_color(border).pt_2().child(
-                        Button::new("drive-clear-sync")
-                            .cursor_pointer()
-                            .label("同期情報をクリア")
-                            .danger()
-                            .ghost()
-                            .small()
-                            .cursor_pointer()
-                            .on_click({
-                                let handle = handle.clone();
-                                move |_, _window, cx| {
-                                    handle.update(cx, |this, cx| {
-                                        {
-                                            let state = AppState::global(cx);
-                                            let db = &state.db_pool;
-                                            let _ = sync::clear_sync_state(db);
-                                        }
-                                        this.show_toast("同期情報をクリアしました", cx);
-                                    });
-                                }
-                            }),
                     ),
-                ),
-        );
+            );
 
         let db_settings =
             self.settings_card(
@@ -1325,11 +1330,12 @@ impl Render for SettingsView {
                                             profile.email.clone()
                                         }
                                         Some(profile) => profile.name.clone(),
+                                        None if google_logged_in => "ログイン済み".to_string(),
                                         None => "未ログイン".to_string(),
                                     },
                                 )),
                         )
-                        .child(if google_profile.is_some() {
+                        .child(if google_logged_in {
                             Button::new("logout-google")
                                 .cursor_pointer()
                                 .label("ログアウト")

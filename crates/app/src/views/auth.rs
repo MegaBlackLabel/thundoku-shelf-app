@@ -147,12 +147,14 @@ impl AuthDialog {
                     this.google_profile = Some(profile.clone());
                     let state = AppState::global(cx);
                     *state.google_profile.lock() = Some(profile);
+                    *state.google_logged_in.lock() = true;
                     *state.google_login_error.lock() = None;
-                    this.show_google_login = false;
                     // WebView は完了処理で隠される。次回は新しい認可フローを開始する
                     this.google_login = None;
                     this.google_subscription = None;
                     cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
+                    // Drive バックアップ有効化の確認（未設定の場合のみ Workspace が表示）
+                    cx.defer(|cx| cx.dispatch_action(&crate::actions::PromptDriveEnable));
                 },
             );
             // 失敗: エラーを保持してモーダル全体を閉じる（成功時と同じ挙動）

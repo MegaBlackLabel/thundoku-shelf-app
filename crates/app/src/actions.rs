@@ -95,3 +95,8 @@ pub struct HideBook {
 pub struct OpenAuthProvider {
     pub provider: crate::views::auth::AuthProvider,
 }
+
+/// Google ログイン成功後に Drive バックアップ有効化の確認を表示する。
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = thundoku, no_json)]
+pub struct PromptDriveEnable;

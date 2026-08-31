@@ -374,6 +374,53 @@ pub fn restore_drive_backup(
     Ok(())
 }
 
+/// ローカル DB と Drive の DB バックアップに差分があるかを判定する。
+/// バックアップが無ければ `Ok(false)`（復元対象なし）。
+/// ローカルは `backup::export_json` の md5 で比較する（DB ファイル全体ではなく
+/// バックアップと同じ生データで比較するため、毎回アップロードされるのを防ぐ）。
+pub fn backup_has_diff(
+    pool: &SqlitePool,
+    drive: &mut dyn DriveApi,
+    folder_id: &str,
+) -> Result<bool, SyncError> {
+    let Some(info) = check_drive_backup(drive, folder_id)? else {
+        return Ok(false);
+    };
+    // Drive のバックアップ JSON をダウンロードして、そこに含まれるテーブルだけを
+    // 比較対象にする。`view_history` など新しく追加されたテーブルが Drive 側に
+    // まだ無い場合、その差分で毎回復元確認が出るのを防ぐ。
+    let drive_bytes = drive.download(&info.file_id)?;
+    let drive_json: serde_json::Value = serde_json::from_slice(&drive_bytes)
+        .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
+    let local_json: serde_json::Value =
+        serde_json::from_str(&crate::db::backup::export_json(pool)?)
+            .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
+    // 両方を「Drive に存在するテーブルだけ」に絞って正規化し、決定的な順序で比較する。
+    let drive_obj = drive_json.as_object();
+    let table_names: Vec<&String> = drive_obj.map(|o| o.keys().collect()).unwrap_or_default();
+    let norm = |value: &serde_json::Value| -> serde_json::Value {
+        let obj = value.as_object().cloned().unwrap_or_default();
+        let mut filtered = serde_json::Map::new();
+        for name in &table_names {
+            if let Some(v) = obj.get(*name) {
+                filtered.insert((*name).clone(), v.clone());
+            }
+        }
+        serde_json::Value::Object(filtered)
+    };
+    let drive_norm = norm(&drive_json);
+    let local_norm = norm(&local_json);
+    let drive_md5 = format!(
+        "{:x}",
+        md5::compute(serde_json::to_string(&drive_norm).unwrap().as_bytes())
+    );
+    let local_md5 = format!(
+        "{:x}",
+        md5::compute(serde_json::to_string(&local_norm).unwrap().as_bytes())
+    );
+    Ok(local_md5 != drive_md5)
+}
+
 /// Drive 同期の状態（drive_sync_state の行と drive.* 設定）をクリアする。
 /// 次回同期時に全ファイルが再アップロード/再ダウンロードの対象になる。
 pub fn clear_sync_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -552,6 +599,220 @@ mod tests {
         assert_eq!(restored.title, "復元される本");
         let progress = crate::db::progress::get(&dst, "book-1").unwrap().unwrap();
         assert_eq!(progress.current_page, 42);
+    }
+
+    #[test]
+    fn backup_has_diff_reports_only_when_data_differs() {
+        use crate::db::progress::ReadingProgress;
+
+        // ソース DB でバックアップを生成し、その md5 を Drive に置く
+        let src = crate::db::test_pool();
+        migrate(&src).unwrap();
+        crate::db::books::insert(
+            &src,
+            &crate::db::books::Book {
+                id: "book-1".into(),
+                title: "本".into(),
+                author: String::new(),
+                circle_name: "サークル".into(),
+                purchase_date: None,
+                file_name: "b.pdf".into(),
+                file_size: 1,
+                opfs_path: "b.opfspack".into(),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 0,
+                pack_id: Some("book-1".into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: "2026-08-23 00:00:00".into(),
+                updated_at: "2026-08-23 00:00:00".into(),
+            },
+        )
+        .unwrap();
+        crate::db::progress::upsert(
+            &src,
+            &ReadingProgress {
+                book_id: "book-1".into(),
+                current_page: 42,
+                total_pages: Some(200),
+                finished_at: None,
+                last_read_at: "2026-08-23 09:00:00".into(),
+                scroll_position: 0.0,
+            },
+        )
+        .unwrap();
+        let json = crate::db::backup::export_json(&src).unwrap();
+        let json_md5 = format!("{:x}", md5::compute(json.as_bytes()));
+
+        // 同一データの DB: md5 一致 -> 差分なし
+        let same = crate::db::test_pool();
+        migrate(&same).unwrap();
+        crate::db::books::insert(
+            &same,
+            &crate::db::books::Book {
+                id: "book-1".into(),
+                title: "本".into(),
+                author: String::new(),
+                circle_name: "サークル".into(),
+                purchase_date: None,
+                file_name: "b.pdf".into(),
+                file_size: 1,
+                opfs_path: "b.opfspack".into(),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 0,
+                pack_id: Some("book-1".into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: "2026-08-23 00:00:00".into(),
+                updated_at: "2026-08-23 00:00:00".into(),
+            },
+        )
+        .unwrap();
+        crate::db::progress::upsert(
+            &same,
+            &ReadingProgress {
+                book_id: "book-1".into(),
+                current_page: 42,
+                total_pages: Some(200),
+                finished_at: None,
+                last_read_at: "2026-08-23 09:00:00".into(),
+                scroll_position: 0.0,
+            },
+        )
+        .unwrap();
+        let mut drive = MockDrive {
+            files: vec![crate::drive::DriveFile {
+                id: "backup-id".into(),
+                name: "thundoku-backup.json".into(),
+                size: Some(json.len() as i64),
+                md5_checksum: Some(json_md5.clone()),
+                modified_time: None,
+            }],
+            uploaded: Default::default(),
+            deleted: Default::default(),
+            touched: Default::default(),
+            downloads: Default::default(),
+        };
+        drive
+            .downloads
+            .borrow_mut()
+            .insert("backup-id".into(), json.as_bytes().to_vec());
+        assert!(
+            !super::backup_has_diff(&same, &mut drive, "folder").unwrap(),
+            "identical data must not report a diff"
+        );
+
+        // バックアップが無い -> 差分なし
+        let empty = MockDrive {
+            files: Vec::new(),
+            uploaded: Default::default(),
+            deleted: Default::default(),
+            touched: Default::default(),
+            downloads: Default::default(),
+        };
+        let mut empty = empty;
+        assert!(
+            !super::backup_has_diff(&same, &mut empty, "folder").unwrap(),
+            "no backup must not report a diff"
+        );
+
+        // データを変えた DB -> 差分あり
+        crate::db::progress::upsert(
+            &same,
+            &ReadingProgress {
+                book_id: "book-1".into(),
+                current_page: 100,
+                total_pages: Some(200),
+                finished_at: None,
+                last_read_at: "2026-08-23 10:00:00".into(),
+                scroll_position: 0.0,
+            },
+        )
+        .unwrap();
+        assert!(
+            super::backup_has_diff(&same, &mut drive, "folder").unwrap(),
+            "changed data must report a diff"
+        );
+    }
+
+    #[test]
+    fn backup_has_diff_ignores_tables_not_in_drive() {
+        use crate::db::progress::ReadingProgress;
+
+        // ローカル DB に本・進捗・閲覧履歴を入れる
+        let local = crate::db::test_pool();
+        migrate(&local).unwrap();
+        crate::db::books::insert(
+            &local,
+            &crate::db::books::Book {
+                id: "book-1".into(),
+                title: "本".into(),
+                author: String::new(),
+                circle_name: "サークル".into(),
+                purchase_date: None,
+                file_name: "b.pdf".into(),
+                file_size: 1,
+                opfs_path: "b.opfspack".into(),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 0,
+                pack_id: Some("book-1".into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: "2026-08-23 00:00:00".into(),
+                updated_at: "2026-08-23 00:00:00".into(),
+            },
+        )
+        .unwrap();
+        crate::db::progress::upsert(
+            &local,
+            &ReadingProgress {
+                book_id: "book-1".into(),
+                current_page: 42,
+                total_pages: Some(200),
+                finished_at: None,
+                last_read_at: "2026-08-23 09:00:00".into(),
+                scroll_position: 0.0,
+            },
+        )
+        .unwrap();
+        crate::db::view_history::start(&local, "book-1").unwrap();
+
+        // Drive のバックアップは古い形式: view_history キーを含まない
+        let local_json: serde_json::Value =
+            serde_json::from_str(&crate::db::backup::export_json(&local).unwrap()).unwrap();
+        let mut drive_obj = local_json.as_object().cloned().unwrap();
+        drive_obj.remove("view_history");
+        let drive_bytes = serde_json::to_vec(&serde_json::Value::Object(drive_obj)).unwrap();
+
+        let mut drive = MockDrive {
+            files: vec![crate::drive::DriveFile {
+                id: "backup-id".into(),
+                name: "thundoku-backup.json".into(),
+                size: Some(drive_bytes.len() as i64),
+                md5_checksum: None,
+                modified_time: None,
+            }],
+            uploaded: Default::default(),
+            deleted: Default::default(),
+            touched: Default::default(),
+            downloads: Default::default(),
+        };
+        drive
+            .downloads
+            .borrow_mut()
+            .insert("backup-id".into(), drive_bytes);
+
+        // view_history は Drive 側に無いため比較対象から外れ、データが一致していれば差分なし
+        assert!(
+            !super::backup_has_diff(&local, &mut drive, "folder").unwrap(),
+            "tables missing in drive must be ignored when other data matches"
+        );
     }
 
     /// Drive API のモック（アップロードを files に反映して md5 比較できるようにする）。

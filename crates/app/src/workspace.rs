@@ -90,6 +90,8 @@ pub struct Workspace {
     restore_info: Option<thundoku_core::drive::sync::DriveBackupInfo>,
     /// 復元実行中（バックグラウンド）か。
     restoring: bool,
+    /// Google ログイン後に Drive バックアップ有効化の確認を表示中か。
+    show_drive_prompt: bool,
 }
 
 impl Workspace {
@@ -117,12 +119,12 @@ impl Workspace {
             show_restore_prompt: false,
             restore_info: None,
             restoring: false,
-        };
+             show_drive_prompt: false,
+         };
         this.register_actions(cx);
-        this.refresh_unread_count(cx);
-        this.restore_theme_mode(cx);
-        this.check_startup_backup(cx);
-        cx.notify();
+         this.refresh_unread_count(cx);
+         this.restore_theme_mode(cx);
+         this.check_startup_backup(cx);
         this
     }
 
@@ -338,6 +340,12 @@ impl Workspace {
                 Box::new(thundoku_core::tbf::UreqTransport::new()),
                 token,
             );
+            // ローカルと Drive のバックアップに差分があるときだけ復元候補にする
+            let has_diff =
+                thundoku_core::drive::sync::backup_has_diff(&db, &mut drive, &folder_id).ok()?;
+            if !has_diff {
+                return None;
+            }
             thundoku_core::drive::sync::check_drive_backup(&mut drive, &folder_id)
                 .ok()
                 .flatten()
@@ -346,7 +354,7 @@ impl Workspace {
             let info = task.await;
             if let (Some(handle), Some(info)) = (handle.upgrade(), info) {
                 log::info!(
-                    "startup backup check: drive backup exists (md5={:?})",
+                    "startup backup check: drive backup differs from local (md5={:?})",
                     info.md5
                 );
                 handle.update(cx, |this, cx| {
@@ -438,7 +446,7 @@ impl Workspace {
     fn account_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let handle = cx.entity();
-        let google_logged_in = AppState::global(cx).google_profile.lock().clone().is_some();
+        let google_logged_in = *AppState::global(cx).google_logged_in.lock();
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
 
@@ -675,6 +683,17 @@ impl Workspace {
         reg!(crate::actions::CloseReader, |this, cx| this
             .close_reader(cx));
         reg!(crate::actions::SyncDrive, |this, cx| this.sync_drive(cx));
+        reg!(crate::actions::PromptDriveEnable, |this, cx| {
+            // Drive 同期が未設定ならば確認ダイアログを表示する
+            let enabled = db::settings::get(&AppState::global(cx).db_pool, "drive.sync.enabled")
+                .ok()
+                .flatten()
+                .is_some_and(|v| v == "true" || v == "1");
+            if !enabled {
+                this.show_drive_prompt = true;
+                cx.notify();
+            }
+        });
     }
 }
 
@@ -907,6 +926,60 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
+            .child(if self.show_drive_prompt {
+                let handle = cx.entity();
+                gpui::deferred(
+                    Dialog::new(cx)
+                        .title(div().child("Googleドライブでバックアップを有効にしますか？"))
+                        .content(move |content, _window, _cx| {
+                            content.child(div().text_sm().child(
+                                "Google ログインできました。Google Drive にバックアップを自動保存して、複数の端末で本棚を同期できます。有効にしますか？"
+                            ))
+                        })
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    Button::new("drive-cancel")
+                                        .cursor_pointer()
+                                        .label("キャンセル")
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.show_drive_prompt = false;
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("drive-confirm")
+                                        .cursor_pointer()
+                                        .primary()
+                                        .label("有効にする")
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.show_drive_prompt = false;
+                                                    let db = &AppState::global(cx).db_pool;
+                                                    let _ = db::settings::set(db, "drive.sync.enabled", "true");
+                                                    crate::app_state::set_toast(cx, "Google Drive バックアップを有効にしました");
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+                .into_any_element()
+            } else {
+                div().into_any_element()
+            })
     }
 }
 
@@ -916,6 +989,13 @@ impl Workspace {
     /// `.window_control_area()` でネイティブのドラッグ/最小化/最大化/閉じるを再現する。
     #[cfg(windows)]
     fn win_title_bar(window: &mut Window, theme: &gpui_component::Theme) -> gpui::AnyElement {
+        // Windows 標準のタイトルバーボタンのホバー色（テーマに応じて明暗を出す）。
+        // 背景（theme.secondary）と区別できるよう、ダークは明るめ・ライトは濃いめのグレー。
+        let hover_bg = match theme.mode {
+            gpui_component::ThemeMode::Dark => gpui::rgb(0x3e3e3e),
+            // ライトモードは背景（白）と区別しやすい濃いめのグレー
+            gpui_component::ThemeMode::Light => gpui::rgb(0xcfcfcf),
+        };
         div()
             .flex()
             .items_center()
@@ -941,40 +1021,56 @@ impl Workspace {
                     .h_full()
                     .child(
                         div()
+                            .id("win-min-button")
                             .flex()
                             .items_center()
                             .justify_center()
                             .w(px(46.0))
                             .h_full()
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme.secondary))
-                            .window_control_area(WindowControlArea::Min)
+                            .hover(move |style| style.bg(hover_bg))
+                            .on_click({
+                                move |_, window, _| {
+                                    window.minimize_window();
+                                }
+                            })
                             .child("—"),
                     )
                     .child(
                         div()
+                            .id("win-max-button")
                             .flex()
                             .items_center()
                             .justify_center()
                             .w(px(46.0))
                             .h_full()
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme.secondary))
-                            .window_control_area(WindowControlArea::Max)
+                            .hover(move |style| style.bg(hover_bg))
+                            .on_click({
+                                move |_, window, _| {
+                                    window.zoom_window();
+                                }
+                            })
                             .child(if window.is_maximized() { "❐" } else { "□" }),
                     )
                     .child(
                         div()
+                            .id("win-close-button")
                             .flex()
                             .items_center()
                             .justify_center()
                             .w(px(46.0))
                             .h_full()
                             .cursor_pointer()
-                            .hover(|style| style.bg(gpui::rgb(0xe11d48)))
-                            .text_color(theme.primary_foreground)
+                            // 閉じるボタンは Windows 標準に合わせて赤背景（アイコンは継承色をキープ）
+                            .hover(move |style| style.bg(gpui::rgb(0xe11d48)))
                             .window_control_area(WindowControlArea::Close)
-                            .child("×"),
+                            .child(
+                                Icon::new(IconName::Close)
+                                    .size(px(16.0))
+                                    // 最小化・最大化のアイコンと同じ色（muted_foreground を継承）
+                                    .text_color(theme.muted_foreground),
+                            ),
                     ),
             )
             .into_any_element()

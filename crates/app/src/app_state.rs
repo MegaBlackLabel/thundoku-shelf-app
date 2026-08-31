@@ -40,6 +40,8 @@ pub struct AppState {
     pub google: Arc<Mutex<Option<GoogleClient>>>,
     pub secrets: SecretStore,
     pub google_profile: Arc<Mutex<Option<GoogleProfile>>>,
+    /// Google ログイン状態（keyring にトークンがあるか）。プロフィール未取得でも維持する。
+    pub google_logged_in: Arc<Mutex<bool>>,
     /// モーダルなし Google ログインの直近のエラー（ログイン状態パネルに表示）
     pub google_login_error: Arc<Mutex<Option<String>>>,
     pub tbf_logged_in: Arc<Mutex<bool>>,
@@ -112,6 +114,9 @@ impl AppState {
         } else {
             None
         };
+        // keyring に保存済みトークンがあるかでログイン状態を判定する。
+        // プロフィール（email 等）の取得に失敗してもログイン状態は維持する。
+        let google_logged_in = google.as_ref().is_some_and(|c| c.has_tokens());
 
         // BOOTH セッションを keyring から復元する
         let booth_session = secrets
@@ -131,6 +136,7 @@ impl AppState {
             google: Arc::new(Mutex::new(google)),
             secrets,
             google_profile: Arc::new(Mutex::new(google_profile)),
+            google_logged_in: Arc::new(Mutex::new(google_logged_in)),
             google_login_error: Arc::new(Mutex::new(None)),
             tbf_logged_in: Arc::new(Mutex::new(tbf_logged_in)),
             booth_session: Arc::new(Mutex::new(booth_session)),
@@ -178,6 +184,7 @@ impl AppState {
             })),
             secrets: SecretStore::new(),
             google_profile: Arc::new(Mutex::new(None)),
+            google_logged_in: Arc::new(Mutex::new(false)),
             google_login_error: Arc::new(Mutex::new(None)),
             tbf_logged_in: Arc::new(Mutex::new(false)),
             booth_session: Arc::new(Mutex::new(None)),

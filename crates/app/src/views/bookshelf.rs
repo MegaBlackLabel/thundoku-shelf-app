@@ -997,7 +997,7 @@ impl BookshelfView {
                 self.sync_booth(cx);
             }
         }
-        let drive_ready = AppState::global(cx).google_profile.lock().is_some();
+        let drive_ready = *AppState::global(cx).google_logged_in.lock();
         if drive_ready {
             cx.defer(move |cx| cx.dispatch_action(&SyncDrive));
         }
