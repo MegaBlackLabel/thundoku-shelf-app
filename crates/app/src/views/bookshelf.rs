@@ -18,6 +18,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::popover::Popover;
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::theme::Colorize as _;
 use gpui_component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::booth::BoothClient;
@@ -3463,11 +3464,11 @@ impl Render for BookshelfView {
                                 .w_full()
                                 .h_full()
                                 .child(
-                                    div()
-                                        .w(px(content_width))
-                                        .h_full()
-                                        .child(gpui::list(
-                                            list_state,
+                                     div()
+                                         .w(px(content_width))
+                                         .h_full()
+                                         .child(gpui::list(
+                                             list_state,
                                             move |ix, window, cx| {
                                                 // 借用を閉じるため可視行のカードと状態を先にコピーする
                                                 // （可視行のみなので全カード構築より桁違いに軽い）
@@ -3539,15 +3540,15 @@ impl Render for BookshelfView {
                                 )
                                 .into_any_element()
                         }
-                        // リスト表示（Web の table 相当）
-                        ViewMode::List => div()
-                            .flex()
-                            .flex_col()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .overflow_hidden()
-                            .children(visible.iter().map(|entry| {
+                          ViewMode::List => div()
+                              .flex()
+                              .flex_col()
+                              .rounded_lg()
+                              .border_1()
+                              .border_color(cx.theme().border)
+                              .overflow_hidden()
+                             .overflow_y_scrollbar()
+                              .children(visible.iter().map(|entry| {
                                 self.render_list_row(window, cx, entry).into_any_element()
                             }))
                             .into_any_element(),
