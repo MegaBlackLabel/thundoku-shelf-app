@@ -34,5 +34,11 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [target.'cfg(not(windows))'.dependencies]
 mupdf = "0.8"
 
+# Windows では PDFium（Apache-2.0）を使用。mupdf は AGPL のため MIT アプリと
+# 互換性がない。pdfium-render は実行時ロード（動的リンク）で、ビルド時に
+# ライブラリ不要。pdfium.dll は実行時に exe と同じ場所からロードする。
+[target.'cfg(windows)'.dependencies]
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7881", "image_latest", "thread_safe"] }
+
 [dev-dependencies]
 parking_lot = "0.12"

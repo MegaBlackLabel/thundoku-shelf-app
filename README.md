@@ -9,7 +9,7 @@ Rust + [GPUI](https://github.com/zed-industries/zed)（+ gpui-component）で実
 - **本棚** — カードグリッド（仮想化）・リスト表示、サイト/タグ/イベント/読了/
   お気に入りフィルタ、検索、キーボード選択（`hjkl` / 矢印 / `Enter`）
 - **リーダー** — 単一 / 見開き / スクロールの 3 モード、ズーム（ダブルクリックで
-  2 倍 → 6 倍 → 解除）、慣性付きパン、読書進捗・閲覧履歴の記録、
+  2 倍 -> 6 倍 -> 解除）、慣性付きパン、読書進捗・閲覧履歴の記録、
   libwebp による高速デコード（詳細: [docs/features.md](docs/features.md)）
 - **チェックリスト** — イベント・サークル管理、試し読み
 - **同期** — 技術書典（直接ログイン）、Google Drive（.opfspack 双方向同期）、
@@ -27,6 +27,19 @@ mise run build        # ビルド
 mise run run          # アプリ起動
 mise run test         # 全テスト
 mise run lint         # clippy
+```
+
+### Windows の PDF レンダリング（pdfium.dll）
+
+Windows では PDF のレンダリングに PDFium（Apache-2.0）を使います。`pdfium.dll` を
+動的ロードするため、実行時は exe と同じフォルダ（またはカレントディレクトリ）に
+`pdfium.dll` を配置してください（PDF を取り込むときのみ必要）。
+
+```sh
+# pdfium.dll（pdfium_7881 に対応する chromium/7881）を取得して配置
+curl -fL -o pdfium.zip \
+  https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-win-x64.tgz
+tar -xzf pdfium.zip && cp bin/pdfium.dll .
 ```
 
 ## ドキュメント

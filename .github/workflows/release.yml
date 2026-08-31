@@ -43,7 +43,14 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path "target/${{ matrix.target }}/release/thundoku-shelf.exe" -DestinationPath "${{ matrix.artifact }}"
+        run: |
+          # PDFium (Apache-2.0) は動的ロードなので、exe と同じフォルダに同梱する。
+          # pdfium-render の pdfium_7881 バインディングに対応するバージョンを使う。
+          curl -fL -o pdfium.zip `
+            https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-win-x64.tgz
+          tar -xzf pdfium.zip
+          Copy-Item bin/pdfium.dll "target/${{ matrix.target }}/release/pdfium.dll"
+          Compress-Archive -Path @("target/${{ matrix.target }}/release/thundoku-shelf.exe", "target/${{ matrix.target }}/release/pdfium.dll") -DestinationPath "${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
         with:

@@ -1,2 +1,4 @@
 /target
 .DS_Store
+# PDFium 動的ライブラリはリポジトリにコミットせず、CI/ビルド時に入手する
+pdfium.dll

@@ -44,6 +44,14 @@ jobs:
 
       - name: Test (opfspack + core) + build app — Windows
         if: runner.os == 'Windows'
+        shell: bash
         run: |
+          # PDFium (Apache-2.0) を取得し、テストの CWD（crates/core）に配置する。
+          # テストが PDF をレンダリングする際、実行時ロードで ./pdfium.dll を使う。
+          # pdfium-render の pdfium_7881 バインディングに対応するバージョンを使う。
+          curl -fL -o pdfium.zip \
+            https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-win-x64.tgz
+          tar -xzf pdfium.zip
+          cp bin/pdfium.dll crates/core/pdfium.dll
           cargo test -p opfspack -p thundoku-core
           cargo build -p thundoku-shelf
