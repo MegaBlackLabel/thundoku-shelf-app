@@ -257,3 +257,16 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
 - マイグレーションは `crates/core/migrations/0001_init.sql` で管理されるが、
   追加のテーブル（`view_history`）はマイグレーションファイルを作らず、
   `migrate()` 内の冪等な DDL（IF NOT EXISTS）で適用される
+
+---
+
+## 今後の課題（TODO）
+
+- [ ] **PC の保存先を変更できるようにする**
+  - 現在、書籍データ・DB・表紙キャッシュの保存先は OS 既定のデータディレクトリ
+    （Windows: `%APPDATA%\thundoku-shelf`、macOS: `~/Library/Application Support/thundoku-shelf`）
+    に固定されている
+  - 設定画面から保存先（データディレクトリ）を変更できるようにする
+  - **変更時は既存のファイル（`thundoku-shelf.db` / `packs` / `thumbnails` / `downloads`）を
+    新しい保存先に移動する**（既存データを引き継ぐ。移動に失敗した場合は変更を
+    ロールバックするか、移行完了まで元の保存先を使い続ける）
