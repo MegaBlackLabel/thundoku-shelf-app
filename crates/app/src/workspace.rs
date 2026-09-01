@@ -836,7 +836,9 @@ impl Render for Workspace {
                 div()
                     .id("reader-overlay")
                     .absolute()
-                    .top_0()
+                    // ウィンドウのタイトルバー（閉じる/最小化/最大化）は
+                    // リーダー表示中も使えるように残す（top = タイトルバー高さ）。
+                    .top(px(36.0))
                     .right_0()
                     .bottom_0()
                     .left_0()

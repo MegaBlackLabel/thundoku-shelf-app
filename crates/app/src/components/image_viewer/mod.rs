@@ -31,7 +31,14 @@ pub const AUTOPLAY_MIN_MS: u64 = 3000;
 pub const AUTOPLAY_MAX_MS: u64 = 30000;
 pub const AUTOPLAY_DEFAULT_MS: u64 = 5000;
 pub const AUTOPLAY_STEP_MS: u64 = 1000;
-const OVERLAY_HIDE_MS: u64 = 5000;
+ const OVERLAY_HIDE_MS: u64 = 5000;
+
+/// ウィンドウカスタムタイトルバーの高さ（px）。リーダーはタイトルバーを残すため、
+/// 画像のフィット計算でウィンドウ全体の高さから差し引く（Windows のみ。Mac は 0）。
+#[cfg(windows)]
+const WIN_TITLE_BAR_HEIGHT: f32 = 36.0;
+#[cfg(not(windows))]
+const WIN_TITLE_BAR_HEIGHT: f32 = 0.0;
 
 /// Page data source (pack entries or base64 sample pages).
 pub trait PageLoader: Send + Sync + 'static {
@@ -1102,7 +1109,7 @@ impl ImageViewer {
                                 // 毎フレーム再描画する（Google マップのように滑らかに）
                                 let vwp = gpui::Point::new(
                                     window.bounds().size.width.as_f32(),
-                                    window.bounds().size.height.as_f32(),
+                                    window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
                                 );
                                 let max = pan_max_for(pan_scale, vwp, pan_aspect);
                                 handle.update(cx, |this, cx| {
@@ -1373,7 +1380,7 @@ impl Render for ImageViewer {
             // （h_full / aspect_ratio は flex のレイアウトで縮みがちなため使わない）
             let vwp = gpui::Point::new(
                 window.bounds().size.width.as_f32(),
-                window.bounds().size.height.as_f32(),
+                window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
             );
             let ch = vwp.y;
             let animated_scale = 1.0 + (self.zoom_scale - 1.0) * zoom_progress;
@@ -1477,7 +1484,7 @@ impl Render for ImageViewer {
                         // を拡大して可動範囲を計算する
                         let vwp = gpui::Point::new(
                             window.bounds().size.width.as_f32(),
-                            window.bounds().size.height.as_f32(),
+                            window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
                         );
                         let max = gpui::Point::new(
                             ((base_h * total_aspect * animated_scale - vwp.x) / 2.0).max(0.0),
@@ -1533,7 +1540,7 @@ impl Render for ImageViewer {
             };
             let win = window.bounds();
             let cw = win.size.width.as_f32();
-            let ch = win.size.height.as_f32();
+            let ch = win.size.height.as_f32() - WIN_TITLE_BAR_HEIGHT;
             let img_w = if cw / ch > aspect { ch * aspect } else { cw };
             let img_h = if img_w > 0.0 { img_w / aspect } else { 0.0 };
             let img_left = ((cw - img_w) / 2.0).max(0.0);
