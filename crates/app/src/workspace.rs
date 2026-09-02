@@ -215,8 +215,15 @@ impl Workspace {
     /// ナビゲーション先を切り替える。
     fn switch_to(&mut self, target: NavTarget, cx: &mut Context<Self>) {
         self.active = target;
+        let had_reader = self.reader.is_some();
         if self.reader.is_some() {
             self.reader = None;
+        }
+        // リーダーを開いたままナビゲーションを切り替えた場合（サイドバー等）も、
+        // 読書で進んだ進捗・読了フラグを本棚キャッシュへ反映する
+        if had_reader {
+            self.bookshelf.update(cx, |b, cx| b.reload(cx));
+            self.refresh_unread_count(cx);
         }
         // ナビゲーションを切り替えたらログイン中のダミー画面を終了する
         // （例: ブックマークアイコンで説明画面を開いたとき）。
@@ -521,11 +528,16 @@ impl Workspace {
         if let Some(reader) = self.reader.take() {
             reader.update(cx, |r, cx| r.end_session(cx));
         }
+        // 読書で進んだ進捗・読了フラグを本棚カードと未読バッジに反映する
+        // （reload しないと本棚キャッシュが開く前のまま残り、
+        //  読了済みなのに未読・1/XX 表示が残ってしまう）
         if let Some(book_id) = book_id {
             self.bookshelf.update(cx, |b, cx| {
+                b.reload(cx);
                 b.restore_selection(cx, book_id.as_ref());
             });
         }
+        self.refresh_unread_count(cx);
         cx.notify();
     }
 
@@ -2035,6 +2047,116 @@ mod tests {
         });
         let closed = ws.read_with(cx, |w, _| w.reader.is_none());
         assert!(closed, "reader should close");
+    }
+    #[gpui::test]
+    async fn closing_reader_refreshes_bookshelf_read_state(cx: &mut TestAppContext) {
+        use thundoku_core::db::documents;
+        cx.update(gpui_component::init);
+        cx.update(AppState::init_test);
+        // b1: 3 ページの本（ダウンロード直後は reading_progress が無く
+        // 本棚は imported_documents の total_pages から "1/3" 未読と表示する）
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let db = &state.db_pool;
+            books::insert(
+                db,
+                &books::Book {
+                    id: "b1".into(),
+                    title: "本1".into(),
+                    author: String::new(),
+                    circle_name: "サークルA".into(),
+                    purchase_date: None,
+                    file_name: "b1.pdf".into(),
+                    file_size: 10,
+                    opfs_path: "b1.opfspack".into(),
+                    cover_thumbnail: None,
+                    tbf_product_id: None,
+                    site_id: None,
+                    tags_fetched: 1,
+                    pack_id: Some("b1".into()),
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                },
+            )
+            .unwrap();
+            documents::insert_document(
+                db,
+                &documents::ImportedDocument {
+                    id: "d1".into(),
+                    book_id: "b1".into(),
+                    source_type: "pdf".into(),
+                    file_hash: "h".into(),
+                    total_pages: 3,
+                    metadata: None,
+                    status: "done".into(),
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                },
+            )
+            .unwrap();
+            for page in 0..3 {
+                documents::insert_image(
+                    db,
+                    &documents::DocumentImage {
+                        id: format!("img{page}"),
+                        document_id: "d1".into(),
+                        page_number: page,
+                        image_type: "page".into(),
+                        opfs_path: format!("b1/p{page}").into(),
+                        width: 1,
+                        height: 1,
+                        mime_type: "image/webp".into(),
+                        file_size: 1,
+                        extracted_text: None,
+                        pack_entry_path: None,
+                        created_at: "2026-08-21 00:00:00".into(),
+                    },
+                )
+                .unwrap();
+            }
+        });
+        // 本棚は構築時点の進捗（未読 1/3）をキャッシュしている
+        let ws = cx.new(Workspace::new);
+        let before = ws.read_with(cx, |w, _| {
+            w.bookshelf
+                .read_with(cx, |b, _| b.progress_for_book("b1").unwrap_or((0, None, false)))
+        });
+        assert_eq!(before.0, 1, "before reading the cache shows page 1");
+        assert!(!before.2, "before reading the book is unread");
+
+        // リーダーを開き、save_progress が最終ページで finished_at を立てた状態を
+        // DB 書き込みで再現する（本棚キャッシュはまだ古い）
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| w.open_reader(cx, "b1".into()));
+        });
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            progress::upsert(
+                &state.db_pool,
+                &progress::ReadingProgress {
+                    book_id: "b1".into(),
+                    current_page: 3,
+                    total_pages: Some(3),
+                    finished_at: Some("2026-09-01 00:00:00".into()),
+                    last_read_at: "2026-09-01 00:00:00".into(),
+                    scroll_position: 0.0,
+                },
+            )
+            .unwrap();
+        });
+
+        // リーダーを閉じたとき、本棚の進捗キャッシュが DB と一致する
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| w.close_reader(cx));
+        });
+        let after = ws.read_with(cx, |w, _| {
+            w.bookshelf
+                .read_with(cx, |b, _| b.progress_for_book("b1").unwrap_or((0, None, false)))
+        });
+        assert_eq!(after.0, 3, "closing the reader must show the last page");
+        assert!(after.2, "closing the reader must mark the book as read");
     }
     #[gpui::test]
     async fn open_reader_action_dispatches_open_reader(cx: &mut TestAppContext) {

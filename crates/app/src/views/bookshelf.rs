@@ -395,6 +395,19 @@ impl BookshelfView {
         self.filtered_dirty = true;
     }
 
+    /// 本棚キャッシュ上の 1 冊の進捗表示状態（(current_page, total_pages, is_read)）。
+    /// 本棚カードの表示に使うキャッシュ（`entries`）の値を返す。テストからも参照する。
+    #[cfg(test)]
+    pub(crate) fn progress_for_book(&self, book_id: &str) -> Option<(i64, Option<i64>, bool)> {
+        self.entries
+            .iter()
+            .find(|e| e.book.id == book_id)
+            .map(|e| {
+                let (current, total) = e.progress.unwrap_or((0, None));
+                (current, total, e.is_read)
+            })
+    }
+
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         log::info!("reload: 開始");
         let reload_start = std::time::Instant::now();
