@@ -328,12 +328,18 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
   - 現在の本棚はカードに `circle_name` を表示する実装（`format_event_label` 等）があるが、
     作者名（`author`）は DB に保存されているものの UI 未活用の可能性が高い
 
-- [ ] **閲覧情報を 1 ページ毎の閲覧回数・時間も記録する**
+- [x] **閲覧情報を 1 ページ毎の閲覧回数・時間も記録する**（実装済み）
   - 現在の `view_history` は `id, book_id, started_at, ended_at` のみで、書籍単位の
     閲覧セッション（開始・終了時刻）しか記録していない
   - **ページ毎の閲覧回数・閲覧時間**も記録できるようにする
     （ビューアーでページを表示した時刻・滞在時間・ページめくり回数を `document_images` や
     新テーブルに記録する）
+  - **実装**: 新テーブル `page_views`（`book_id, page_number, view_count, total_seconds,
+    last_viewed_at`、PK = book_id + page_number）を `db/mod.rs::migrate()` に
+    `IF NOT EXISTS` で追加（マイグレーションファイルは変更しない）。リーダーのページ移動
+    （初回表示・ページ遷移）で `view_count` を +1、ページを離れるとき・ビューアーを閉じるときに
+    `total_seconds`（= 滞在秒数）を加算。`view_history` は書籍単位セッションのまま補完。
+    試し読みは対象外
 
 - [ ] **統計機能を追加する**
   - **どの書籍をどれだけ見たかの統計**（総閲覧回数・総閲覧時間・平均閲覧時間等）

@@ -122,6 +122,23 @@ Drive 同期設定など）。
 - `view_history::end(session_id)` で終了時刻記録
 - `view_count(book_id)` / `total_duration_secs(book_id)` で集計
 
+### page_views
+
+ページ毎の閲覧記録（1 書籍 × 1 ページ 1 行）。`view_history` と同様に
+**`migrate()` 内の冪等 DDL で作成**。Google Drive バックアップにも含まれる。
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| book_id | TEXT PK FK→books (ON DELETE CASCADE) | 本 |
+| page_number | INTEGER PK | **1-indexed**（表示ページ番号） |
+| view_count | INTEGER | そのページが表示された累計回数 |
+| total_seconds | REAL | そのページでの累計滞在秒数 |
+| last_viewed_at | TEXT | 最終表示時刻 |
+
+- `page_views::record_view(book_id, page)` で表示回数を +1（単一表示は 1 ページ、見開きは左右両ページ）
+- `page_views::add_dwell(book_id, page, secs)` で滞在秒数を加算
+- `page_views::for_book(book_id)` でページ毎の記録を取得
+
 ### checked_items
 
 チェックリスト項目（サークルごと。`tbf_events` に関連）。

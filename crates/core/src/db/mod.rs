@@ -10,6 +10,7 @@ pub mod books;
 pub mod bookshelf;
 pub mod checklist;
 pub mod documents;
+pub mod page_views;
 pub mod progress;
 pub mod samples;
 pub mod settings;
@@ -83,6 +84,14 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         // checksum 管理されるため変更せず、IF NOT EXISTS で冪等に適用する）
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS view_history (               id TEXT PRIMARY KEY,               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               started_at TEXT NOT NULL,               ended_at TEXT             );             CREATE INDEX IF NOT EXISTS idx_view_history_book ON view_history(book_id)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        // ページ毎の閲覧記録（プログラム的マイグレーション。view_history と同様に
+        // マイグレーションファイルは checksum 管理されるため変更せず、IF NOT EXISTS で
+        // 冪等に適用する。1 冊 × 1 ページの累計表示回数・累計滞在秒数を持つ集計表）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS page_views (               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               page_number INTEGER NOT NULL,               view_count INTEGER NOT NULL DEFAULT 0,               total_seconds REAL NOT NULL DEFAULT 0,               last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               PRIMARY KEY (book_id, page_number)             );             CREATE INDEX IF NOT EXISTS idx_page_views_book ON page_views(book_id)",
         )
         .execute(&mut *conn)
         .await?;

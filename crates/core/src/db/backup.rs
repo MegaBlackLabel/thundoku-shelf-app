@@ -18,6 +18,7 @@ const TABLES: &[&str] = &[
     "checked_items",
     "tbf_events",
     "reading_progress",
+    "page_views",
     "book_tags",
     "favorite_tags",
     "imported_documents",
@@ -76,6 +77,7 @@ fn pk_columns(table: &str) -> Option<&'static [&'static str]> {
         "checked_items" => &["id"],
         "tbf_events" => &["id"],
         "reading_progress" => &["book_id"],
+        "page_views" => &["book_id", "page_number"],
         "book_tags" => &["id"],
         "favorite_tags" => &["tag_name"],
         "imported_documents" => &["id"],
@@ -348,12 +350,23 @@ mod tests {
             crate::db::view_history::view_count(&src, "book-1").unwrap(),
             1
         );
+        // ページ毎閲覧記録を入れる（バックアップ対象に含まれるべき）
+        crate::db::page_views::record_view(&src, "book-1", 1).unwrap();
+        crate::db::page_views::record_view(&src, "book-1", 2).unwrap();
+        crate::db::page_views::add_dwell(&src, "book-1", 1, 3.5).unwrap();
+        crate::db::page_views::add_dwell(&src, "book-1", 2, 1.25).unwrap();
 
         let json = export_json(&src).unwrap();
         // view_history がバックアップに含まれる
         let payload: Value = serde_json::from_str(&json).unwrap();
         let vh = payload["view_history"].as_array().unwrap();
         assert_eq!(vh.len(), 1, "view_history must be in the backup");
+        // page_views もバックアップに含まれる
+        let pv = payload["page_views"].as_array().unwrap();
+        assert_eq!(pv.len(), 2, "page_views must be in the backup");
+        let p1 = pv.iter().find(|r| r["page_number"] == 1).unwrap();
+        assert_eq!(p1["view_count"], 1);
+        assert!((p1["total_seconds"].as_f64().unwrap() - 3.5).abs() < 1e-9);
 
         // 空の DB にインポートすると本・進捗・閲覧履歴が復元される
         let dst = crate::db::test_pool();
@@ -366,5 +379,12 @@ mod tests {
             crate::db::view_history::view_count(&dst, "book-1").unwrap(),
             1
         );
+        // page_views も復元される
+        let rows = crate::db::page_views::for_book(&dst, "book-1").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].page_number, 1);
+        assert_eq!(rows[0].view_count, 1);
+        assert!((rows[0].total_seconds - 3.5).abs() < 1e-9);
+        assert!((rows[1].total_seconds - 1.25).abs() < 1e-9);
     }
 }
