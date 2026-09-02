@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use gpui::ReadGlobal as _;
 use gpui::{App, Bounds, Global, Point, Size, Window, WindowBounds, px};
@@ -56,16 +57,64 @@ pub struct AppState {
     pub workspace: Arc<Mutex<Option<gpui::WeakEntity<crate::workspace::Workspace>>>>,
     /// 本棚の再読込が必要（設定画面の非表示解除等）。render で確認して reload する
     pub bookshelf_invalidated: Arc<Mutex<bool>>,
+    /// 終了確認ダイアログ（バックアップ対象の確認）を表示済みかどうか。
+    /// キャンセル時は false に戻し、再度終了時に確認を出す。
+    pub exit_checked: Arc<AtomicBool>,
+    /// Google ログイン（成功・失敗）が完了したことを Workspace 監視タスクへ通知する。
+    /// Workspace 側で show_auth をリセットする（RefCell 再入問題を回避するため）。
+    pub google_login_done: Arc<AtomicBool>,
+    /// 認証モーダルを開く要求。Workspace 監視タスクが検知して show_auth を
+    /// 設定する（SettingsView → Workspace の直接 update による RefCell 再入を回避）。
+    pub auth_open_requested: Arc<AtomicBool>,
+    /// auth_open_requested 時の認証プロバイダ。
+    pub auth_open_provider: Arc<Mutex<Option<crate::views::auth::AuthProvider>>>,
 }
 
 impl Global for AppState {}
 
+/// データ保存先の設定ファイルの場所。データディレクトリとは独立し、
+/// 保存先を変更しても常に読めるように config ディレクトリに置く。
+fn data_settings_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("thundoku-shelf")
+        .join("settings.json")
+}
+
+/// 変更された保存先（データディレクトリ）を読み込む。未設定は None。
+fn loaded_data_path() -> Option<PathBuf> {
+    let path = data_settings_path();
+    let json = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    value
+        .get("data_path")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+}
+
+/// データ保存先を設定ファイルに保存する（保存先変更時に呼ぶ）。
+pub fn save_data_path(path: &std::path::Path) {
+    let file = data_settings_path();
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::json!({ "data_path": path.to_string_lossy() });
+    let _ = std::fs::write(
+        &file,
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    );
+}
+
 impl AppState {
     /// Initialize from the real data directory and the OS keyring.
     pub fn init(cx: &mut App) {
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("thundoku-shelf");
+        // 保存先が変更されている場合はそのパスを使う（設定ファイルは
+        // データディレクトリとは独立した場所に保存し、必ず読めるようにする）。
+        let data_dir = loaded_data_path().unwrap_or_else(|| {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("thundoku-shelf")
+        });
         Self::init_with_data_dir(cx, data_dir);
     }
 
@@ -157,6 +206,10 @@ impl AppState {
             toast_generation: Arc::new(Mutex::new(0)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
+            exit_checked: Arc::new(AtomicBool::new(false)),
+            google_login_done: Arc::new(AtomicBool::new(false)),
+            auth_open_requested: Arc::new(AtomicBool::new(false)),
+            auth_open_provider: Arc::new(Mutex::new(None)),
         });
         // Zenn タグを起動時に 1 回だけ取得する（取り込み時のネットワーク待ちをなくす）
         std::thread::spawn(|| {
@@ -205,6 +258,10 @@ impl AppState {
             toast_generation: Arc::new(Mutex::new(0)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
+            exit_checked: Arc::new(AtomicBool::new(false)),
+            google_login_done: Arc::new(AtomicBool::new(false)),
+            auth_open_requested: Arc::new(AtomicBool::new(false)),
+            auth_open_provider: Arc::new(Mutex::new(None)),
         });
     }
 }

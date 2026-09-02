@@ -51,6 +51,7 @@ fn main() {
     }
     #[cfg(not(windows))]
     env_logger::init();
+
     gpui_platform::application()
         .with_assets(AppAssets)
         .run(move |cx| {
@@ -73,11 +74,32 @@ fn main() {
                 }
                 cx.open_window(options, |window, cx| {
                     // ウィンドウを閉じる時に現在の配置・サイズを保存する。
-                    window.on_window_should_close(cx, |window, cx| {
+                    // 終了時確認ダイアログを一度だけ出す（request_exit_upload_check）。
+                    // 「キャンセル」後は再度確認を出すため、確認済みフラグは AppState で管理し、
+                    // キャンセル時（cancel_exit_upload）に false へ戻す。
+                    window.on_window_should_close(cx, move |window, cx| {
                         thundoku_shelf::app_state::save_window_bounds(window, cx);
-                        true
+                        let app = thundoku_shelf::app_state::AppState::global(cx);
+                        if app.exit_checked.load(std::sync::atomic::Ordering::SeqCst) {
+                            // 確認ダイアログを既に表示し、キャンセルされていない → そのまま閉じる
+                            true
+                        } else {
+                            // 初回: 終了時確認ダイアログを出して一時的に閉じない
+                            app.exit_checked
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            let ws_weak = app.workspace.lock().clone();
+                            if let Some(ws) = ws_weak.and_then(|ws_weak| ws_weak.upgrade()) {
+                                ws.update(cx, |ws, cx| ws.request_exit_upload_check(cx));
+                            }
+                            false
+                        }
                     });
                     let workspace = cx.new(Workspace::new);
+                    // 終了時確認（on_window_should_close）から workspace にアクセスできるよう、
+                    // AppState.workspace に弱参照を設定する。
+                    *thundoku_shelf::app_state::AppState::global(cx)
+                        .workspace
+                        .lock() = Some(workspace.downgrade());
                     cx.new(|cx| Root::new(workspace, window, cx).bg(cx.theme().background))
                 })
                 .unwrap_or_else(|e| panic!("failed to open window: {e:?}"));

@@ -79,14 +79,18 @@ impl GoogleLoginView {
         #[cfg(debug_assertions)]
         let builder = builder.with_devtools(true);
         let window_handle = match window.window_handle() {
-            Ok(h) => h,
+            Ok(h) => {
+                h
+            }
             Err(e) => {
                 log::error!("google login: window_handle() failed: {e:?}");
                 return None;
             }
         };
         let webview = match builder.build(&window_handle) {
-            Ok(w) => w,
+            Ok(w) => {
+                w
+            }
             Err(e) => {
                 log::error!("google login: wry build() failed: {e:?} | {e}");
                 return None;
@@ -142,11 +146,25 @@ impl GoogleLoginView {
                                 .secrets
                                 .save(thundoku_core::secrets::USER_GOOGLE, &json);
                         }
-                        cx.emit(GoogleLoginDone(profile));
+                        // cx.emit は AsyncApp::update の RefCell 再入でパニックするため、
+                        // AppState のグローバル状態を直接更新する。
+                        // （Workspace の監視タスクが google_login_done を検知して show_auth を閉じる）
+                        *state.google_profile.lock() = Some(profile.clone());
+                        *state.google_logged_in.lock() = true;
+                        *state.google_login_error.lock() = None;
+                        state
+                            .google_login_done
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     // キャンセルは ✕ ボタンが既に GoogleLoginCancelled を発行済み
                     Err(GoogleError::Cancelled) => {}
-                    Err(error) => cx.emit(GoogleLoginFailed(error.to_string())),
+                    Err(error) => {
+                        let state = AppState::global(cx);
+                        *state.google_login_error.lock() = Some(error.to_string());
+                        state
+                            .google_login_done
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             });
         })
@@ -178,23 +196,23 @@ impl EventEmitter<GoogleLoginCancelled> for GoogleLoginView {}
 impl Render for GoogleLoginView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // モーダル領域（中央 480x640）に WebView を配置する
-        let bounds = {
-            let window_bounds = window.bounds();
-            let width = 480.0_f32;
-            let height = 640.0_f32;
-            let left = (window_bounds.size.width.as_f32() - width) / 2.0;
-            let top = (window_bounds.size.height.as_f32() - height) / 2.0;
-            gpui::bounds(
-                gpui::Point {
-                    x: px(left),
-                    y: px(top),
-                },
-                gpui::Size {
-                    width: px(width),
-                    height: px(height),
-                },
-            )
-        };
+        let window_bounds = window.bounds();
+        let window_w = window_bounds.size.width.as_f32();
+        let window_h = window_bounds.size.height.as_f32();
+        let width = 480.0_f32;
+        let height = 640.0_f32;
+        let left = (window_w - width) / 2.0;
+        let top = (window_h - height) / 2.0;
+        let bounds = gpui::bounds(
+            gpui::Point {
+                x: px(left),
+                y: px(top),
+            },
+            gpui::Size {
+                width: px(width),
+                height: px(height),
+            },
+        );
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| {
                 let _ = view.raw().set_bounds(lb_wry::Rect {
@@ -209,6 +227,15 @@ impl Render for GoogleLoginView {
                 });
             });
         }
+        // 閉じるボタンは WebView の右上・すぐ外側に置く。技術書典ログインと同じ配置
+        // （WebView はネイティブ子ウィンドウで GPUI 要素より常に最前面。領域内だと隠れる）。
+        let close_size = 36.0_f32;
+        let close_gap = 10.0_f32;
+        let mut close_left = left + width + close_gap;
+        let close_top = top + close_gap;
+        if close_left + close_size > window_w {
+            close_left = left - close_gap - close_size;
+        }
         div()
             .id("google-login-backdrop")
             .absolute()
@@ -220,15 +247,14 @@ impl Render for GoogleLoginView {
             .flex()
             .items_center()
             .justify_center()
-            // 閉じるボタンはウィンドウ右上（WebView 領域の外側）に配置
             .child(
                 div()
                     .id("google-login-cancel")
                     .absolute()
-                    .top_3()
-                    .right_3()
-                    .w(px(36.0))
-                    .h(px(36.0))
+                    .left(px(close_left))
+                    .top(px(close_top))
+                    .w(px(close_size))
+                    .h(px(close_size))
                     .flex()
                     .items_center()
                     .justify_center()

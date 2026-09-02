@@ -237,11 +237,21 @@ fn respond(stream: &mut TcpStream, message: &str) {
 }
 
 fn bind_loopback() -> Result<TcpListener, GoogleError> {
-    let preferred = format!("127.0.0.1:{DEFAULT_REDIRECT_PORT}");
-    match TcpListener::bind(&preferred) {
-        Ok(listener) => Ok(listener),
-        Err(_) => TcpListener::bind("127.0.0.1:0").map_err(|e| GoogleError::Io(e.to_string())),
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    // Google Cloud Console に登録した redirect_uri（http://127.0.0.1:38387）と
+    // 必ず一致させるため、SO_REUSEADDR を設定して固定ポートに確実にバインドする。
+    // （動的ポートにフォールバックすると redirect_uri が一致せず invalid_request になる）
+    let preferred: SocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), DEFAULT_REDIRECT_PORT);
+    if let Ok(socket) = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) {
+        let _ = socket.set_reuse_address(true);
+        if socket.bind(&preferred.into()).is_ok() {
+            let _ = socket.listen(128);
+            return Ok(socket.into());
+        }
     }
+    TcpListener::bind("127.0.0.1:0").map_err(|e| GoogleError::Io(e.to_string()))
 }
 fn percent_encode(value: &str) -> String {
     use percent_encoding::{AsciiSet, NON_ALPHANUMERIC};

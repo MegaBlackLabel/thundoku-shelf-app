@@ -14,10 +14,12 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, prelude::FluentBuilder as _,
 };
 
+use crate::components::dialog::{dialog_surface, fade_dialog};
 use gpui::{
     AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
     SharedString, Window, div, px,
 };
+use gpui_component::Disableable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::Dialog;
 use gpui_component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode};
@@ -94,6 +96,12 @@ pub struct Workspace {
     restoring: bool,
     /// Google ログイン後に Drive バックアップ有効化の確認を表示中か。
     show_drive_prompt: bool,
+    /// ログイン中（専用のダミー画面を表示中）か。
+    auth_loading: bool,
+    /// ウィンドウを閉じる時に、バックアップ対象の変更を確認中か。
+    exit_upload_prompt: bool,
+    /// 終了時のバックアップアップロード実行中か。
+    exit_uploading: bool,
 }
 
 impl Workspace {
@@ -122,12 +130,77 @@ impl Workspace {
             restore_info: None,
             restoring: false,
             show_drive_prompt: false,
+            auth_loading: false,
+            exit_upload_prompt: false,
+            exit_uploading: false,
         };
         this.register_actions(cx);
         this.refresh_unread_count(cx);
         this.restore_theme_mode(cx);
         this.check_startup_backup(cx);
+        this.start_login_done_watcher(cx);
         this
+    }
+
+    /// Google ログイン（成功・失敗）完了フラグを監視し、認証モーダルを閉じる。
+    /// `AuthDialog` から `Workspace` を直接 update すると RefCell 再入問題で固まるため、
+    /// AppState のフラグを追ってここで状態をリセットする。
+    fn start_login_done_watcher(&mut self, cx: &mut Context<Self>) {
+        let handle = cx.entity();
+        let flag = AppState::global(cx).google_login_done.clone();
+        let auth_open = AppState::global(cx).auth_open_requested.clone();
+        let auth_provider = AppState::global(cx).auth_open_provider.clone();
+        let db = AppState::global(cx).db_pool.clone();
+        cx.spawn(async move |_window, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                // 認証モーダルを開く要求（SettingsView → 直接 update の RefCell 再入を回避）
+                if auth_open.load(std::sync::atomic::Ordering::SeqCst) {
+                    auth_open.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let provider = auth_provider.lock().take();
+                    handle.update(cx, |this, cx| {
+                        this.show_auth = true;
+                        let dialog = this
+                            .auth_dialog
+                            .get_or_insert_with(|| cx.new(AuthDialog::new))
+                            .clone();
+                        if let Some(provider) = provider {
+                            dialog.update(cx, |d, _| {
+                                d.open_with_provider(Some(provider));
+                            });
+                        }
+                        // Workspace 自身の Context でエンティティ通知
+                        // （サイドバーと同じ構造。cx.refresh より安全）
+                        cx.notify();
+                    });
+                }
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                    // Drive 設定をバックグラウンドで照会（RefCell 借用中のブロッキング SQL を避ける）
+                    let enabled = db::settings::get(&db, "drive.sync.enabled")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|v| v == "true" || v == "1");
+                    handle.update(cx, |this, _cx| {
+                        this.show_auth = false;
+                        this.auth_dialog = None;
+                        // ログイン完了後は設定画面に戻す
+                        this.auth_loading = false;
+                        this.active = NavTarget::Settings;
+                        this.sidebar_open = true;
+                        if !enabled {
+                            this.show_drive_prompt = true;
+                        }
+                    });
+                    // cx.notify() は RefCell already borrowed を起こすため、
+                    // AsyncApp::refresh()（&self）で再描画を要求する。
+                    cx.refresh();
+                }
+            }
+        })
+        .detach();
     }
 
     /// 現在のアクティブビューを返す（エンティティの参照）。
@@ -145,6 +218,9 @@ impl Workspace {
         if self.reader.is_some() {
             self.reader = None;
         }
+        // ナビゲーションを切り替えたらログイン中のダミー画面を終了する
+        // （例: ブックマークアイコンで説明画面を開いたとき）。
+        self.auth_loading = false;
         cx.notify();
     }
 
@@ -231,11 +307,16 @@ impl Workspace {
     /// テーマモードを設定して保存する。
     pub fn set_theme(&mut self, mode: &str, cx: &mut Context<Self>) {
         let _ = db::settings::set(&AppState::global(cx).db_pool, "theme.mode", mode);
-        let theme_mode = match mode {
-            "dark" => ThemeMode::Dark,
-            _ => ThemeMode::Light,
-        };
-        Theme::change(theme_mode, None, cx);
+        if mode == "system" {
+            // システムの明暗に追従する
+            Theme::sync_system_appearance(None, cx);
+        } else {
+            let theme_mode = match mode {
+                "dark" => ThemeMode::Dark,
+                _ => ThemeMode::Light,
+            };
+            Theme::change(theme_mode, None, cx);
+        }
         cx.refresh_windows();
         cx.notify();
     }
@@ -448,6 +529,144 @@ impl Workspace {
         cx.notify();
     }
 
+    /// ウィンドウを閉じる時に、バックアップ対象に変更があるかを確認する。
+    pub fn request_exit_upload_check(&mut self, cx: &mut Context<Self>) {
+        self.exit_upload_prompt = true;
+        cx.notify();
+    }
+
+    /// 指定プロバイダの認証モーダルを開く。`dispatch_action` を使わず直接 state を
+    /// 更新する（RefCell 再入で固まるのを回避）。設定画面のログインボタンから呼ばれる。
+    pub fn open_auth(
+        &mut self,
+        cx: &mut Context<Self>,
+        provider: crate::views::auth::AuthProvider,
+    ) {
+        // SettingsView を非表示にしてからダイアログを表示する（WebView 作成時の RefCell 競合回避）。
+        // 本棚ではなく専用のダミー画面を表示する。
+        self.auth_loading = true;
+        self.show_auth = true;
+        let dialog = self
+            .auth_dialog
+            .get_or_insert_with(|| cx.new(AuthDialog::new))
+            .clone();
+        dialog.update(cx, |d, _| {
+            d.open_with_provider(Some(provider));
+        });
+        // 本棚に切り替えた（SettingsView 非表示）ので、cx.notify で再描画しても
+        // WebView 作成時の RefCell 競合は発生しない。
+        cx.notify();
+    }
+
+    /// 認証モーダルを閉じる。`dispatch_action` を使わず直接 state を更新する
+    /// （ウィンドウの RefCell 再入問題でアプリが固まるのを避ける）。
+    pub fn close_auth(&mut self, cx: &mut Context<Self>) {
+        self.show_auth = false;
+        self.auth_dialog = None;
+        // cx.notify() はウィンドウの RefCell 借用中だと RefCell already borrowed で
+        // アプリが固まるため、次のフレームで通知する。
+        let entity_id = cx.entity().entity_id();
+        cx.defer(move |cx| cx.notify(entity_id));
+    }
+
+    /// Google ログイン完了時の後処理。認証モーダルを閉じ、Drive 同期が未設定なら
+    /// 確認ダイアログを表示する（`PromptDriveEnable` と同じ分岐）。
+    pub fn login_done(&mut self, cx: &mut Context<Self>) {
+        self.show_auth = false;
+        self.auth_dialog = None;
+        // ブロッキング SQL（db::settings::get）を cx の RefCell 借用中に実行すると
+        // RefCell already borrowed でアプリが固まるため、バックグラウンドで取得する。
+        let db = AppState::global(cx).db_pool.clone();
+        let handle = cx.entity();
+        cx.spawn(async move |_window, cx| {
+            let enabled = db::settings::get(&db, "drive.sync.enabled")
+                .ok()
+                .flatten()
+                .is_some_and(|v| v == "true" || v == "1");
+            handle.update(cx, |this, _cx| {
+                if !enabled {
+                    this.show_drive_prompt = true;
+                }
+            });
+            // cx.notify() は RefCell already borrowed を起こすため、
+            // AsyncApp::refresh()（&self）で再描画を要求する。
+            cx.refresh();
+        })
+        .detach();
+    }
+
+    /// 終了時の確認ダイアログで「アップロードして終了」を押したとき。
+    pub fn confirm_exit_upload(&mut self, cx: &mut Context<Self>) {
+        self.exit_upload_prompt = false;
+        self.exit_uploading = true;
+        AppState::global(cx)
+            .exit_checked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        cx.notify();
+        let handle = cx.entity();
+        let state = AppState::global(cx);
+        let google = state.google.clone();
+        let db = state.db_pool.clone();
+        let packs_dir = state.packs_dir.clone();
+        let downloads_dir = state.downloads_dir.clone();
+        let db_path = state.data_dir.join("thundoku-shelf.db");
+        let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+        let task: gpui::Task<Result<(), String>> = cx.background_executor().spawn(async move {
+            let folder_id = db::settings::get(&db, "drive.sync.folder_id")
+                .ok()
+                .flatten()
+                .ok_or_else(|| "Drive 同期が未設定です".to_string())?;
+            let mut google_guard = google.lock();
+            let client = google_guard
+                .as_mut()
+                .ok_or_else(|| "Google にログインしてください".to_string())?;
+            let token = client.access_token().map_err(|e| e.to_string())?;
+            let mut drive = thundoku_core::drive::DriveClient::new(
+                Box::new(thundoku_core::tbf::UreqTransport::new()),
+                token,
+            );
+            let _ = thundoku_core::drive::sync::sync(
+                &db,
+                &mut drive,
+                &packs_dir,
+                &downloads_dir,
+                google_sub.as_deref(),
+                &folder_id,
+                Some(&db_path),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        });
+        cx.spawn(async move |_window, cx| {
+            let _ = task.await;
+            handle.update(cx, |this, cx| {
+                this.exit_uploading = false;
+                cx.notify();
+            });
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    }
+
+    /// 終了時の確認ダイアログで「キャンセル」を押したとき。
+    pub fn cancel_exit_upload(&mut self, cx: &mut Context<Self>) {
+        self.exit_upload_prompt = false;
+        // キャンセル後は再度終了時に確認ダイアログを出すため、確認済みフラグを戻す。
+        AppState::global(cx)
+            .exit_checked
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        cx.notify();
+    }
+
+    /// 終了時の確認ダイアログで「保存せずにアプリ終了」を押したとき。
+    pub fn quit_without_upload(&mut self, cx: &mut Context<Self>) {
+        self.exit_upload_prompt = false;
+        AppState::global(cx)
+            .exit_checked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        cx.notify();
+        cx.quit();
+    }
     /// Drive 同期のトリガー（設定画面の同期ボタンと同じ処理を委譲）。
     pub fn sync_drive(&mut self, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
@@ -779,9 +998,29 @@ impl Render for Workspace {
             div().into_any_element()
         };
 
-        let active_view = self.active_view(cx);
+        // ログイン中は専用のダミー画面を表示する（SettingsView を描画せず、
+        // WebView 作成時の RefCell 競合を回避）。
+        let active_view: gpui::AnyElement = if self.auth_loading {
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .flex_col()
+                .gap_2()
+                .text_color(theme.muted_foreground)
+                .child(div().text_lg().child("Google ログイン中..."))
+                .child(
+                    div()
+                        .text_sm()
+                        .child("認証ウィンドウでログインを完了してください"),
+                )
+                .into_any_element()
+        } else {
+            self.active_view(cx).into_any_element()
+        };
         let sidebar = self.sidebar(cx);
-         div()
+        div()
               .id("app-sidebar")
               .debug_selector(|| "app-sidebar".into())
               .flex()
@@ -1030,6 +1269,73 @@ impl Render for Workspace {
                         )
                         .into_any_element(),
                 )
+                .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.exit_upload_prompt {
+                let handle = cx.entity();
+                let uploading = self.exit_uploading;
+                let content = dialog_surface(cx)
+                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("バックアップのアップロード"))
+                    .child(div().text_sm().child(
+                        if uploading {
+                            "バックアップ対象に変更があります。アップロードしています…"
+                        } else {
+                            "バックアップ対象に変更があります。Google Drive にアップロードして終了しますか？"
+                        },
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_center()
+                            .gap_2()
+                            .child(
+                                Button::new("exit-upload-cancel")
+                                    .cursor_pointer()
+                                    .label("キャンセル")
+                                    .disabled(uploading)
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.cancel_exit_upload(cx);
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("exit-upload-quit")
+                                    .cursor_pointer()
+                                    .label("保存せずにアプリ終了")
+                                    .disabled(uploading)
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.quit_without_upload(cx);
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("exit-upload-confirm")
+                                    .cursor_pointer()
+                                    .primary()
+                                    .label("アップロードして終了")
+                                    .disabled(uploading)
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.confirm_exit_upload(cx);
+                                            });
+                                        }
+                                    }),
+                            )
+                    );
+                fade_dialog(_window, cx, self.exit_upload_prompt, content).into_any_element()
                 .into_any_element()
             } else {
                 div().into_any_element()
@@ -1367,7 +1673,7 @@ impl Workspace {
                 move |_, _window, cx| {
                     cx.stop_propagation();
                     handle.update(cx, |this, cx| {
-                        this.switch_to(NavTarget::Bookshelf, cx);
+                        this.switch_to(NavTarget::About, cx);
                     });
                 }
             })

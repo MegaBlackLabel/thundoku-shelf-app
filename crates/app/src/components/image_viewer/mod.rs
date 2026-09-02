@@ -31,7 +31,7 @@ pub const AUTOPLAY_MIN_MS: u64 = 3000;
 pub const AUTOPLAY_MAX_MS: u64 = 30000;
 pub const AUTOPLAY_DEFAULT_MS: u64 = 5000;
 pub const AUTOPLAY_STEP_MS: u64 = 1000;
- const OVERLAY_HIDE_MS: u64 = 5000;
+const OVERLAY_HIDE_MS: u64 = 5000;
 
 /// ウィンドウカスタムタイトルバーの高さ（px）。リーダーはタイトルバーを残すため、
 /// 画像のフィット計算でウィンドウ全体の高さから差し引く（Windows のみ。Mac は 0）。

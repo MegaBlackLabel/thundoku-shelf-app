@@ -180,7 +180,7 @@ impl BookshelfView {
                             .cloned()
                         else {
                             return;
-        };
+                        };
                         this.redownload_item(cx, &card);
                     })
                     .ok();
@@ -199,7 +199,7 @@ impl BookshelfView {
                         .cloned()
                     else {
                         return;
-        };
+                    };
                     this.toggle_hidden(cx, &card);
                 })
                 .ok();
@@ -723,12 +723,12 @@ impl BookshelfView {
                             let Some((site_id, database_id, url)) = pending.get(i) else {
                                 log::info!("cover worker: 終了 (i={i}, len={})", pending.len());
                                 break;
-        };
+                            };
                             let resolved = if url.starts_with('/') {
                                 format!("https://techbookfest.org{url}")
                             } else {
                                 url.clone()
-        };
+                            };
                             let bytes = if site_id == "booth" {
                                 // BOOTH の表紙は公開画像（booth.pximg.net — Cookie 不要）。
                                 // 商品ページの共有画像（オリジナル・高解像度）を優先し、
@@ -757,7 +757,7 @@ impl BookshelfView {
                                         tbf_client.lock().download(&resolved).ok()
                                     }
                                 }
-        };
+                            };
                             let Some(bytes) = bytes else {
                                 fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 log::warn!(
@@ -767,7 +767,7 @@ impl BookshelfView {
                                 );
                                 let _ = fail_tx.send((site_id.clone(), database_id.clone()));
                                 continue;
-        };
+                            };
                             let _ext = match &bytes[..] {
                                 _ if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8 => {
                                     "jpg"
@@ -782,7 +782,7 @@ impl BookshelfView {
                                     "webp"
                                 }
                                 _ => "jpg",
-        };
+                            };
                             // 縮小済みサムネイルを PNG で保存する（reload 時のキャッシュ
                             // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）
                             let cache_path =
@@ -798,7 +798,7 @@ impl BookshelfView {
                                 log::warn!("表紙のデコード失敗: {site_id} / {database_id}");
                                 let _ = fail_tx.send((site_id.clone(), database_id.clone()));
                                 continue;
-        };
+                            };
                             ok_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             // 1 枚取得完了 → UI に通知
                             let _ = tx.send((site_id.clone(), database_id.clone(), image));
@@ -833,7 +833,7 @@ impl BookshelfView {
                     this.filtered_dirty = true;
                     cx.notify();
                 });
-        };
+            };
             loop {
                 match rx.try_recv() {
                     Ok(update) => {
@@ -1158,7 +1158,7 @@ impl BookshelfView {
                                 query.execute(pool).await
                             }
                         })
-        };
+                    };
                 let _ = delete_not_in_library(&db, &current_ids);
                 // 商品ページが消えた本（お探しの本は見つかりませんでした）も削除する。
                 // ダウンロード済み（books に紐づく）は残す。
@@ -1189,7 +1189,7 @@ impl BookshelfView {
                             .await;
                     }
                 }
-        };
+            };
             handle.update(cx, |this, cx| {
                 this.sync_busy = this.sync_busy.saturating_sub(1);
                 match result {
@@ -1258,7 +1258,7 @@ impl BookshelfView {
                             .await;
                     }
                 }
-        };
+            };
             handle.update(cx, |this, cx| {
                 this.sync_busy = this.sync_busy.saturating_sub(1);
                 match result {
@@ -1329,12 +1329,12 @@ impl BookshelfView {
                             downloaded as f32 / total as f32
                         } else {
                             0.0
-        };
+                        };
                         let _ = download_tx.send((
                             download_progress_id.clone(),
                             DownloadState::Downloading(fraction),
                         ));
-        };
+                    };
                     client
                         .download_with_progress(&url, &mut on_download)
                         .map_err(|e| e.to_string())?
@@ -1361,12 +1361,12 @@ impl BookshelfView {
                             downloaded as f32 / total as f32
                         } else {
                             0.0
-        };
+                        };
                         let _ = download_tx.send((
                             download_progress_id.clone(),
                             DownloadState::Downloading(fraction),
                         ));
-        };
+                    };
                     let bytes = client
                         .download_with_progress(&resolved, &mut on_download)
                         .map_err(|e| e.to_string())?;
@@ -1374,7 +1374,7 @@ impl BookshelfView {
                     // に入る。保持したままだと同期等の他操作がブロックされる。
                     drop(client);
                     bytes
-        };
+                };
                 let file_name = item_file_name(&title, &item);
                 let extension = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
                 let import_tx = progress_tx.clone();
@@ -1389,7 +1389,7 @@ impl BookshelfView {
                             DownloadState::Processing(fraction),
                         ));
                     }
-        };
+                };
                 let imported = if extension == "pdf" {
                     // PDF レンダリング（重い）は DB ロック外で行い、UI スレッドの
                     // DB 操作をブロックしないようにする。
@@ -1456,7 +1456,7 @@ impl BookshelfView {
                         other => Err(thundoku_core::import::ImportError::UnsupportedType(
                             other.to_string(),
                         )),
-        };
+                    };
                     if let Ok(imported) = &imported {
                         // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
                         if !site_id.is_empty() {
@@ -1481,7 +1481,7 @@ impl BookshelfView {
                         }
                     }
                     imported.map_err(|e| e.to_string())
-        };
+                };
                 imported
                     .map(|imported| imported.book.title)
                     .map_err(|e| e.to_string())
@@ -1768,7 +1768,7 @@ impl BookshelfView {
                     .find(|item| item.database_id == book_id)
                     .map(bookshelf::tags_of)
                     .unwrap_or_default()
-        };
+            };
             // Web の tagSuggestions 相当: 後で読む + お気に入りタグ
             let mut suggestions = vec!["後で読む".to_string()];
             for tag in db::tags::list_favorites(db).unwrap_or_default() {
@@ -1884,13 +1884,13 @@ impl BookshelfView {
         }
         if let Some(pos) = self.filtered.iter().position(|&card_idx| {
             self.shelf_cards[card_idx]
-            .local
-            .as_ref()
-            .is_some_and(|e| e.book.id == book_id)
+                .local
+                .as_ref()
+                .is_some_and(|e| e.book.id == book_id)
         }) {
             self.selected_index = Some(pos);
         }
-     }
+    }
 
     /// ビューアーから本棚に戻った時に呼ばれる。読んでいた本を選択状態に戻し、
     /// 次の描画でフォーカスを取り直す（矢印キー・hjkl 入力を再開する）。
@@ -4017,7 +4017,7 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(titles, vec!["React 入門".to_string()]);
-     }
+    }
 
     #[gpui::test]
     async fn select_book_sets_selection_from_book_id(cx: &mut TestAppContext) {

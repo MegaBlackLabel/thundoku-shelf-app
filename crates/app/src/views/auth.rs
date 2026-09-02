@@ -152,9 +152,12 @@ impl AuthDialog {
                     // WebView は完了処理で隠される。次回は新しい認可フローを開始する
                     this.google_login = None;
                     this.google_subscription = None;
-                    cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
-                    // Drive バックアップ有効化の確認（未設定の場合のみ Workspace が表示）
-                    cx.defer(|cx| cx.dispatch_action(&crate::actions::PromptDriveEnable));
+                    // Workspace の状態更新は、RefCell already borrowed でアプリが固まるため
+                    // ここでは行わない。グローバルフラグを立て、Workspace の監視タスクが
+                    // show_auth をリセットする（Workspace::new で開始）。
+                    AppState::global(cx)
+                        .google_login_done
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 },
             );
             // 失敗: エラーを保持してモーダル全体を閉じる（成功時と同じ挙動）
@@ -166,7 +169,9 @@ impl AuthDialog {
                     this.google_subscription = None;
                     let state = AppState::global(cx);
                     *state.google_login_error.lock() = Some(event.0.clone());
-                    cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
+                    AppState::global(cx)
+                        .google_login_done
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 },
             );
             // キャンセル: WebView を破棄してログイン画面に戻る（次回は新規フロー）

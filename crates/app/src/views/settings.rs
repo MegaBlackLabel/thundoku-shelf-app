@@ -1,12 +1,14 @@
 //! 設定ビュー: アカウント・Google Drive・外観・データ管理。
 
+use std::path::PathBuf;
+
+use crate::components::dialog::{dialog_surface, fade_dialog};
 use gpui::StyledImage as _;
 use gpui::{
     App, AppContext as _, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
     Render, SharedString, StatefulInteractiveElement as _, Window, div, img, px,
 };
 use gpui::{ReadGlobal as _, Styled as _};
-use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::Dialog;
 
@@ -19,7 +21,7 @@ use thundoku_core::drive::{DriveApi, DriveClient};
 use thundoku_core::secrets;
 use thundoku_core::tbf::UreqTransport;
 
-use crate::actions::{OpenAuthProvider, ToggleTheme};
+use crate::actions::OpenAuthProvider;
 use crate::app_state::AppState;
 
 /// 本棚の表示状態（非表示フラグ等）が変わったことを通知するイベント
@@ -38,6 +40,12 @@ pub struct SettingsView {
     /// 非表示リストの表紙取得の進行中フラグ（二重実行防止）
     fetch_covers_in_progress: bool,
     confirm_delete: bool,
+    /// 保存先変更で選択された新しいデータディレクトリ（移動確認用）
+    pending_data_dir: Option<std::path::PathBuf>,
+    /// 保存先変更の移動確認ダイアログの表示フラグ
+    confirm_data_dir: bool,
+    /// 「同期情報をクリア」の確認ダイアログ表示フラグ
+    confirm_clear_sync: bool,
     storage_bytes: u64,
     /// 技術書典サイトのビューアー表示モード（viewer.mode.techbookfest と同期）
     tbf_viewer_mode: String,
@@ -54,6 +62,8 @@ pub struct SettingsView {
     profile_fetching: bool,
     /// 総本数（render での毎回の DB 読みを避けるためのキャッシュ）
     book_count: usize,
+    /// Drive 同期有効フラグ（render での毎回の DB 読みを避けるためのキャッシュ）
+    drive_enabled: bool,
 }
 
 impl SettingsView {
@@ -68,6 +78,9 @@ impl SettingsView {
             hidden_items: Vec::new(),
             fetch_covers_in_progress: false,
             confirm_delete: false,
+            pending_data_dir: None,
+            confirm_data_dir: false,
+            confirm_clear_sync: false,
             storage_bytes,
             // サイト別キー → 既存のグローバル設定（viewer.mode 等）にフォールバック
             tbf_viewer_mode: Self::read_setting(cx, "viewer.mode.techbookfest")
@@ -83,6 +96,10 @@ impl SettingsView {
             status_counts: (0, 0, 0),
             profile_fetching: false,
             book_count: 0,
+            drive_enabled: db::settings::get(&AppState::global(cx).db_pool, "drive.sync.enabled")
+                .ok()
+                .flatten()
+                .is_some_and(|v| v == "true"),
         }
     }
 
@@ -483,15 +500,6 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn drive_enabled(&self, cx: &App) -> bool {
-        let state = AppState::global(cx);
-        let db = &state.db_pool;
-        db::settings::get(db, "drive.sync.enabled")
-            .ok()
-            .flatten()
-            .is_some_and(|v| v == "true")
-    }
-
     pub fn toggle_drive_sync(&mut self, cx: &mut Context<Self>, enabled: bool) {
         {
             let state = AppState::global(cx);
@@ -502,6 +510,7 @@ impl SettingsView {
                 if enabled { "true" } else { "false" },
             );
         }
+        self.drive_enabled = enabled;
         cx.notify();
     }
 
@@ -628,6 +637,132 @@ impl SettingsView {
             });
         })
         .detach();
+    }
+
+    /// フォルダ選択ダイアログで新しいデータ保存先を選ぶ。
+    pub fn pick_data_dir(&mut self, cx: &mut Context<Self>) {
+        let current = AppState::global(cx).data_dir.clone();
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("データ保存先を選択")
+            .set_directory(&current)
+            .pick_folder()
+        {
+            // 現在のデータ保存先と同じなら何もしない
+            if path == current {
+                return;
+            }
+            self.pending_data_dir = Some(path);
+            self.confirm_data_dir = true;
+            cx.notify();
+        }
+    }
+
+    /// 移動確認で「OK」: 既存ファイルを新しい保存先に移動し、保存先を更新する。
+    pub fn confirm_data_dir_change(&mut self, cx: &mut Context<Self>) {
+        let Some(new_dir) = self.pending_data_dir.take() else {
+            return;
+        };
+        self.confirm_data_dir = false;
+        cx.notify();
+        let handle = cx.entity();
+        let state = AppState::global(cx);
+        let current_dir = state.data_dir.clone();
+        // 新しい保存先に移動する（packs / thumbnails / downloads / DB）
+        let (db_path, packs, thumbnails, downloads) = (
+            current_dir.join("thundoku-shelf.db"),
+            current_dir.join("packs"),
+            current_dir.join("thumbnails"),
+            current_dir.join("downloads"),
+        );
+        let (ndb, npacks, nthumbs, ndl) = (
+            new_dir.join("thundoku-shelf.db"),
+            new_dir.join("packs"),
+            new_dir.join("thumbnails"),
+            new_dir.join("downloads"),
+        );
+        let new_dir2 = new_dir.clone();
+        let task: gpui::Task<(PathBuf, Vec<String>)> = cx.background_executor().spawn(async move {
+            // 新規ディレクトリを作成
+            for d in [&ndb, &npacks, &nthumbs, &ndl] {
+                if let Some(parent) = d.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+            }
+            // 既存ファイル/ディレクトリを移動。DB（+WAL/SHM）と各サブディレクトリ。
+            let mut moved = Vec::new();
+            // 移動（rename）は同一ボリューム間でしか動かないため、
+            // 別ドライブ（C: → D: など）では コピー → 削除 でフォールバックする。
+            let move_item =
+                |from: &std::path::Path, to: &std::path::Path, moved: &mut Vec<String>| {
+                    if from.exists() && from != to && !to.exists() {
+                        let ok = std::fs::rename(from, to).is_ok() || {
+                            // rename 失敗（別ボリューム等）は コピー → 削除 で試す
+                            let copy_ok = if from.is_dir() {
+                                copy_dir_recursive(from, to).is_ok()
+                            } else {
+                                std::fs::copy(from, to).map(|_| ()).is_ok()
+                            };
+                            if copy_ok {
+                                std::fs::remove_dir_all(from)
+                                    .or_else(|_| std::fs::remove_file(from))
+                                    .ok();
+                            }
+                            copy_ok
+                        };
+                        if ok {
+                            if let Some(name) = from.file_name() {
+                                moved.push(name.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                };
+            for (from, to) in [
+                (&db_path, &ndb),
+                (
+                    &db_path.with_extension("db-shm"),
+                    &ndb.with_extension("db-shm"),
+                ),
+                (
+                    &db_path.with_extension("db-wal"),
+                    &ndb.with_extension("db-wal"),
+                ),
+                (&packs, &npacks),
+                (&thumbnails, &nthumbs),
+                (&downloads, &ndl),
+            ] {
+                move_item(from, to, &mut moved);
+            }
+            (new_dir2, moved)
+        });
+        cx.spawn(async move |_window, cx| {
+            let (new_dir, moved) = task.await;
+            handle.update(cx, |this, cx| {
+                if moved.is_empty() {
+                    this.show_toast(
+                        "ファイルを移動できませんでした。保存先は変更されていません。".to_string(),
+                        cx,
+                    );
+                } else {
+                    crate::app_state::save_data_path(&new_dir);
+                    this.show_toast(
+                        format!(
+                            "保存先を変更しました（移動 {} 件）。反映のためアプリを再起動してください。\n{}",
+                            moved.len(),
+                            new_dir.display()
+                        ),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 移動確認で「キャンセル」: 変更を破棄する。
+    pub fn cancel_data_dir_change(&mut self, cx: &mut Context<Self>) {
+        self.pending_data_dir = None;
+        self.confirm_data_dir = false;
+        cx.notify();
     }
 
     pub fn delete_all_data(&mut self, cx: &mut Context<Self>) {
@@ -843,6 +978,22 @@ impl SettingsView {
     }
 }
 
+/// ディレクトリを再帰的にコピーする（別ボリュームへの移動フォールバック用）。
+fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 fn dir_size(path: &std::path::Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
@@ -879,7 +1030,11 @@ impl Render for SettingsView {
         let google_profile = AppState::global(cx).google_profile.lock().clone();
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
-        let drive_enabled = self.drive_enabled(cx);
+        let data_dir = AppState::global(cx).data_dir.clone();
+        let confirm_data_dir = self.confirm_data_dir;
+        let confirm_clear_sync = self.confirm_clear_sync;
+        let pending_data_dir = self.pending_data_dir.clone();
+        let drive_enabled = self.drive_enabled;
         let drive_last_sync = Self::read_setting(cx, "drive.last_sync_at")
             // 保存は UTC なのでローカル時間（JST 等）で表示する
             .and_then(|v| {
@@ -1018,7 +1173,7 @@ impl Render for SettingsView {
                     .p_5()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                            .gap_3()
                     .child(
                         div()
                             .flex()
@@ -1028,12 +1183,24 @@ impl Render for SettingsView {
                             .gap_3()
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(muted_fg)
-                                    .child("同期フォルダ: My Drive/thundoku-shelf"),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("Google バックアップ"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child("ON にすると、本棚・進捗のデータを Google Drive に自動バックアップします。"),
+                                    ),
                             )
-                            .child(
-                                Switch::new("drive-sync-toggle")
+                             .child(
+                                 Switch::new("drive-sync-toggle")
                                     .checked(drive_enabled)
                                     .cursor_pointer()
                                     .on_click({
@@ -1057,13 +1224,15 @@ impl Render for SettingsView {
                                     .cursor_pointer()
                                     .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
                                     .loading_icon(Icon::new(IconName::Loader).size(px(14.0)))
-                                    .label(if busy {
+                                    .label(if !google_logged_in {
+                                        "Google未ログイン"
+                                    } else if busy {
                                         "同期中..."
                                     } else {
                                         "今すぐ同期"
                                     })
                                     .loading(busy)
-                                    .disabled(busy)
+                                    .disabled(!google_logged_in || busy)
                                     .cursor_pointer()
                                     .on_click({
                                         let handle = handle.clone();
@@ -1072,18 +1241,39 @@ impl Render for SettingsView {
                                         }
                                     }),
                             )
-                            .child(div().text_xs().text_color(muted_fg).child(
-                                if google_logged_in {
-                                    if drive_enabled {
-                                        "接続済み"
-                                    } else {
-                                        "同期オフ"
-                                    }
-                                } else {
-                                    "Google 未ログイン"
-                                },
-                            )),
+                            .child(
+                                // データ保存先の変更
+                                Button::new("change-data-dir")
+                                    .cursor_pointer()
+                                    .icon(Icon::new(AppIcon::HardDrive).size(px(14.0)))
+                                    .label("保存先変更")
+                                    .cursor_pointer()
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.pick_data_dir(cx);
+                                            });
+                                        }
+                                    }),
+                            )
                     )
+                    // 現在の保存先（ローカルパス）
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .text_xs()
+                            .child(div().text_color(muted_fg).child("保存先"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(data_dir.display().to_string()),
+                            ),
+                    )
+
                     // 最終同期日時
                     .child(
                         div()
@@ -1120,24 +1310,26 @@ impl Render for SettingsView {
                     )
                     // 同期情報をクリア
                     .child(
-                        div().border_t_1().border_color(border).pt_2().child(
+                        div().border_t_1().border_color(border).pt_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .mb_1()
+                                        .child("クリックすると、Google Drive との同期状態（ファイル数・容量・最終同期日時）をリセットします。本棚の本データや進捗は削除されません。"),
+                                )
+                                .child(
                             Button::new("drive-clear-sync")
                                 .cursor_pointer()
                                 .label("同期情報をクリア")
                                 .danger()
-                                .ghost()
-                                .small()
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
                                     move |_, _window, cx| {
                                         handle.update(cx, |this, cx| {
-                                            {
-                                                let state = AppState::global(cx);
-                                                let db = &state.db_pool;
-                                                let _ = sync::clear_sync_state(db);
-                                            }
-                                            this.show_toast("同期情報をクリアしました", cx);
+                                            this.confirm_clear_sync = true;
+                                            cx.notify();
                                         });
                                     }
                                 }),
@@ -1272,6 +1464,64 @@ impl Render for SettingsView {
                                 .items_center()
                                 .gap_2()
                                 .text_sm()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("Google"))
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    match &google_profile {
+                                        Some(profile) if !profile.email.is_empty() => {
+                                            profile.email.clone()
+                                        }
+                                        Some(profile) => profile.name.clone(),
+                                        None if google_logged_in => "ログイン済み".to_string(),
+                                        None => "未ログイン".to_string(),
+                                    },
+                                )),
+                        )
+                        .child(if google_logged_in {
+                            Button::new("logout-google")
+                                .cursor_pointer()
+                                .label("ログアウト")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.logout_google(cx));
+                                    }
+                                })
+                                .into_any_element()
+                        } else {
+                            Button::new("login-google")
+                                .cursor_pointer()
+                                .label("ログイン")
+                                .cursor_pointer()
+                                .on_click(|_, _window, cx| {
+                                    // 本棚に切り替えてからダイアログ表示（SettingsView を非表示にして
+                                    // WebView 作成時の RefCell 競合を回避する）。
+                                    cx.defer(move |cx| {
+                                        let ws_weak = AppState::global(cx).workspace.lock().clone();
+                                        if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                                            ws.update(cx, |ws, cx| {
+                                                ws.open_auth(cx, AuthProvider::Google);
+                                            });
+                                        }
+                                    });
+                                })
+                                .into_any_element()
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
                                 .child(div().font_weight(FontWeight::MEDIUM).child("技術書典"))
                                 .child(div().text_xs().text_color(muted_fg).child(
                                     if tbf_logged_in {
@@ -1303,60 +1553,6 @@ impl Render for SettingsView {
                                     cx.defer(move |cx| {
                                         cx.dispatch_action(&OpenAuthProvider {
                                             provider: AuthProvider::TechBookFest,
-                                        })
-                                    });
-                                })
-                                .into_any_element()
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .text_sm()
-                                .child(div().font_weight(FontWeight::MEDIUM).child("Google"))
-                                .child(div().text_xs().text_color(muted_fg).child(
-                                    match &google_profile {
-                                        Some(profile) if !profile.email.is_empty() => {
-                                            profile.email.clone()
-                                        }
-                                        Some(profile) => profile.name.clone(),
-                                        None if google_logged_in => "ログイン済み".to_string(),
-                                        None => "未ログイン".to_string(),
-                                    },
-                                )),
-                        )
-                        .child(if google_logged_in {
-                            Button::new("logout-google")
-                                .cursor_pointer()
-                                .label("ログアウト")
-                                .cursor_pointer()
-                                .on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_google(cx));
-                                    }
-                                })
-                                .into_any_element()
-                        } else {
-                            Button::new("login-google")
-                                .cursor_pointer()
-                                .label("ログイン")
-                                .cursor_pointer()
-                                .on_click(|_, _window, cx| {
-                                    // アプリ内 WebView で Google 認可（ログインモーダル）へ進む
-                                    cx.defer(move |cx| {
-                                        cx.dispatch_action(&OpenAuthProvider {
-                                            provider: AuthProvider::Google,
                                         })
                                     });
                                 })
@@ -1482,12 +1678,43 @@ impl Render for SettingsView {
                                 .items_center()
                                 .gap_2()
                                 .child(
-                                    Button::new("settings-toggle-theme").cursor_pointer()
-                                        .label("ライト/ダーク切替").cursor_pointer().on_click(|_, _window, cx| {
-                                        cx.defer(move |cx| {
-                                            cx.dispatch_action(&ToggleTheme)
-                                        });
-                                    }),
+                                    Button::new("theme-light")
+                                        .cursor_pointer()
+                                        .label("ライト")
+                                        .on_click(|_, _window, cx| {
+                                            cx.defer(move |cx| {
+                                                let ws_weak = AppState::global(cx).workspace.lock().clone();
+                                                if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                                                    ws.update(cx, |ws, cx| ws.set_theme("light", cx));
+                                                }
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("theme-dark")
+                                        .cursor_pointer()
+                                        .label("ダーク")
+                                        .on_click(|_, _window, cx| {
+                                            cx.defer(move |cx| {
+                                                let ws_weak = AppState::global(cx).workspace.lock().clone();
+                                                if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                                                    ws.update(cx, |ws, cx| ws.set_theme("dark", cx));
+                                                }
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("theme-system")
+                                        .cursor_pointer()
+                                        .label("システム")
+                                        .on_click(|_, _window, cx| {
+                                            cx.defer(move |cx| {
+                                                let ws_weak = AppState::global(cx).workspace.lock().clone();
+                                                if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                                                    ws.update(cx, |ws, cx| ws.set_theme("system", cx));
+                                                }
+                                            });
+                                        }),
                                 ),
                         ),
                     )
@@ -1629,17 +1856,28 @@ impl Render for SettingsView {
                         div().into_any_element()
                     })
                     .child(if confirm_delete {
-                        Dialog::new(cx)
-                            .title(div().child("ローカルデータの全削除"))
-                            .content(move |content, _window, _cx| {
-                                content.child(div().text_sm().child(
-                                    "本・進捗・タグ・サムネイルなどローカルの全データを削除します。この操作は取り消せません。",
-                                ))
-                            })
-                            .footer(
+                        let content = dialog_surface(cx)
+                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("ローカルデータの全削除"))
+                            .child(div().text_sm().child(
+                                "削除されるもの（この操作は取り消せません）:",
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_sm().child("・本棚の本（書籍データ・一覧）"))
+                                    .child(div().text_sm().child("・読書進捗・閲覧履歴"))
+                                    .child(div().text_sm().child("・タグ・お気に入りタグ"))
+                                    .child(div().text_sm().child("・表紙サムネイル・ダウンロード済みデータ"))
+                                    .child(div().text_sm().child("・チェックリスト・イベント・試し読み"))
+                                    .child(div().text_sm().child("・Google Drive 同期状態"))
+                            )
+                            .child(
                                 div()
                                     .flex()
                                     .flex_row()
+                                    .justify_center()
                                     .gap_2()
                                     .child(
                                         Button::new("delete-cancel").cursor_pointer()
@@ -1665,8 +1903,99 @@ impl Render for SettingsView {
                                             }
                                         }),
                                     ),
+                            );
+                        fade_dialog(_window, cx, confirm_delete, content).into_any_element()
+                    } else {
+                        div().into_any_element()
+                    	                    })
+                    .child(if confirm_data_dir {
+                        Dialog::new(cx)
+                            .title(div().child("データ保存先の変更"))
+                            .content(move |content, _window, _cx| {
+                                let msg = pending_data_dir
+                                    .as_ref()
+                                    .map(|p| format!("保存先を {} に変更します。現在のファイルを移動しますか？", p.display()))
+                                    .unwrap_or_else(|| "保存先を変更します。".to_string());
+                                content.child(div().text_sm().child(msg))
+                            })
+                            .footer(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("datadir-cancel").cursor_pointer()
+                                            .label("キャンセル").cursor_pointer().on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.cancel_data_dir_change(cx);
+                                                });
+                                            }
+                                        }),
+                                    )
+                                    .child(
+                                        Button::new("datadir-confirm").cursor_pointer()
+                                            .primary()
+                                            .label("移動して変更").cursor_pointer().on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.confirm_data_dir_change(cx);
+                                                });
+                                            }
+                                        }),
+                                    ),
                             )
                             .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(if confirm_clear_sync {
+                        let handle = cx.entity();
+                        let content = dialog_surface(cx)
+                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("同期情報をクリア"))
+                            .child(div().text_sm().child(
+                                "Google Drive との同期状態（ファイル数・容量・最終同期日時）をリセットします。本棚の本データや進捗は削除されません。よろしいですか？",
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("clear-sync-cancel").cursor_pointer()
+                                            .label("キャンセル").cursor_pointer().on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.confirm_clear_sync = false;
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                    )
+                                    .child(
+                                        Button::new("clear-sync-confirm").cursor_pointer()
+                                            .primary()
+                                            .label("クリアする").cursor_pointer().on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    {
+                                                        let state = AppState::global(cx);
+                                                        let db = &state.db_pool;
+                                                        let _ = sync::clear_sync_state(db);
+                                                    }
+                                                    this.confirm_clear_sync = false;
+                                                    this.show_toast("同期情報をクリアしました", cx);
+                                                });
+                                            }
+                                        }),
+                                    )
+                            );
+                        fade_dialog(_window, cx, confirm_clear_sync, content).into_any_element()
                     } else {
                         div().into_any_element()
                     }),
