@@ -60,6 +60,9 @@ pub struct AppState {
     /// 終了確認ダイアログ（バックアップ対象の確認）を表示済みかどうか。
     /// キャンセル時は false に戻し、再度終了時に確認を出す。
     pub exit_checked: Arc<AtomicBool>,
+    /// 終了時の「アップロードして終了」実行中か（本棚のダウンロード・ビューアー起動を
+    /// ブロックするために Workspace と本棚で共有する）。
+    pub exit_uploading: Arc<AtomicBool>,
     /// Google ログイン（成功・失敗）が完了したことを Workspace 監視タスクへ通知する。
     /// Workspace 側で show_auth をリセットする（RefCell 再入問題を回避するため）。
     pub google_login_done: Arc<AtomicBool>,
@@ -207,6 +210,7 @@ impl AppState {
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
             exit_checked: Arc::new(AtomicBool::new(false)),
+            exit_uploading: Arc::new(AtomicBool::new(false)),
             google_login_done: Arc::new(AtomicBool::new(false)),
             auth_open_requested: Arc::new(AtomicBool::new(false)),
             auth_open_provider: Arc::new(Mutex::new(None)),
@@ -259,6 +263,7 @@ impl AppState {
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
             exit_checked: Arc::new(AtomicBool::new(false)),
+            exit_uploading: Arc::new(AtomicBool::new(false)),
             google_login_done: Arc::new(AtomicBool::new(false)),
             auth_open_requested: Arc::new(AtomicBool::new(false)),
             auth_open_provider: Arc::new(Mutex::new(None)),

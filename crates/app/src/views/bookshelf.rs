@@ -248,6 +248,13 @@ impl BookshelfView {
     fn app_state(cx: &App) -> &AppState {
         AppState::global(cx)
     }
+    /// 終了時の「アップロードして終了」実行中か（ダウンロード・ビューアー起動を
+    /// ブロックし、アップロードとバッティングしないようにする）。
+    fn is_exit_uploading(cx: &App) -> bool {
+        AppState::global(cx)
+            .exit_uploading
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 
     /// Reload bookshelf items + local books; resolve covers (local pack ->
     /// cached file -> placeholder), then scheduled remote fetch for the rest.
@@ -316,6 +323,9 @@ impl BookshelfView {
     /// 選択中のカードを開く（カードクリックと同じ動作: ローカル本はビューアー、
     /// リモート本はダウンロード）
     fn activate_selected(&mut self, cx: &mut Context<Self>) {
+        if Self::is_exit_uploading(cx) {
+            return;
+        }
         let Some(idx) = self.selected_index else {
             return;
         };
@@ -1298,6 +1308,10 @@ impl BookshelfView {
         if self.fetching_covers || self.sync_busy > 0 {
             return;
         }
+        // 終了時アップロード中はダウンロードを開始しない
+        if Self::is_exit_uploading(cx) {
+            return;
+        }
         self.error = None;
         let database_id = item.database_id.clone();
         self.download_states
@@ -1874,6 +1888,10 @@ impl BookshelfView {
     }
 
     fn open_book(&mut self, cx: &mut Context<Self>, book_id: &str) {
+        // 終了時アップロード中はビューアーの起動をブロックする
+        if Self::is_exit_uploading(cx) {
+            return;
+        }
         // 開こうとしている本を選択状態にする（ビューアーから戻った時に
         // 読んでいた本が選択されているようにする）。
         self.select_book(cx, book_id);

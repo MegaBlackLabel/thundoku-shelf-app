@@ -600,6 +600,9 @@ impl Workspace {
         self.exit_upload_prompt = false;
         self.exit_uploading = true;
         AppState::global(cx)
+            .exit_uploading
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        AppState::global(cx)
             .exit_checked
             .store(true, std::sync::atomic::Ordering::SeqCst);
         cx.notify();
@@ -641,6 +644,9 @@ impl Workspace {
             let _ = task.await;
             handle.update(cx, |this, cx| {
                 this.exit_uploading = false;
+                AppState::global(cx)
+                    .exit_uploading
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 cx.notify();
             });
             cx.update(|cx| cx.quit());
