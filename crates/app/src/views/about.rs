@@ -57,21 +57,22 @@ impl Render for AboutView {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .w(px(48.0))
-                                    .h(px(48.0))
+                                    .w(px(64.0))
+                                    .h(px(64.0))
                                     .rounded_xl()
+                                    .overflow_hidden()
                                     .bg(primary)
                                     .child(
                                         if let Some(logo) = crate::views::bookshelf::app_logo_image()
                                         {
                                             gpui::img(logo)
-                                                .w(px(44.0))
-                                                .h(px(44.0))
+                                                .w(px(64.0))
+                                                .h(px(64.0))
                                                 .object_fit(gpui::ObjectFit::Contain)
                                                 .into_any_element()
                                         } else {
                                             Icon::new(AppIcon::BookMarked)
-                                                .size(px(24.0))
+                                                .size(px(30.0))
                                                 .text_color(primary_fg)
                                                 .into_any_element()
                                         },
@@ -245,24 +246,34 @@ impl Render for AboutView {
                                                 .border_color(card_border)
                                                 .bg(card_bg)
                                                 .p_4()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap_2()
-                                                        .child(
-                                                            Icon::new(icon)
-                                                                .size(px(20.0))
-                                                                .text_color(primary),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_sm()
-                                                                .font_weight(FontWeight::MEDIUM)
-                                                                .child(title),
-                                                        ),
-                                                )
+                                                                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .gap_2()
+                                                                    .child(
+                                                                        div()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .justify_center()
+                                                                            .w(px(32.0))
+                                                                            .h(px(32.0))
+                                                                            .rounded_lg()
+                                                                            .bg(gpui::white())
+                                                                            .child(
+                                                                                Icon::new(icon)
+                                                                                    .size(px(18.0))
+                                                                                    .text_color(gpui::rgb(0x1d4ed8)),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_sm()
+                                                                            .font_weight(FontWeight::MEDIUM)
+                                                                            .child(title),
+                                                                    ),
+                                                            )
                                                 .child(
                                                     div()
                                                         .text_sm()
