@@ -18,7 +18,6 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::popover::Popover;
-use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::theme::Colorize as _;
 use gpui_component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::booth::BoothClient;
@@ -134,6 +133,8 @@ pub struct BookshelfView {
     last_search: String,
     /// 本棚グリッドの仮想化リスト状態
     list_state: gpui::ListState,
+    /// リスト表示のスクロール追跡（選択行のスクロール連動用）
+    scroll_handle: gpui::ScrollHandle,
     /// キーバインド用フォーカス
     focus_handle: gpui::FocusHandle,
     /// フォーカス初回付与済みフラグ
@@ -233,6 +234,7 @@ impl BookshelfView {
             last_search: String::new(),
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(100.0))
                 .measure_all(),
+            scroll_handle: gpui::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
             selected_index: Some(0),
@@ -336,15 +338,24 @@ impl BookshelfView {
         if self.filtered.is_empty() {
             return;
         }
-        let cols = Self::columns_for_width(window.bounds().size.width.as_f32());
+        // リスト表示は 1 列（上下・左右とも ±1）、カード表示は列数分のグリッド移動。
+        let cols = if self.view_mode == ViewMode::List {
+            1
+        } else {
+            Self::columns_for_width(window.bounds().size.width.as_f32())
+        };
         let len = self.filtered.len() as i64;
         let current = self.selected_index.unwrap_or(0) as i64;
         let next = (current + dx + dy * cols as i64).clamp(0, len - 1);
         if next != current {
             self.selected_index = Some(next as usize);
             // 選択行が見えるようにスクロールを連動させる
-            let row = (next as usize) / cols;
-            self.list_state.scroll_to_reveal_item(row);
+            if self.view_mode == ViewMode::List {
+                self.scroll_handle.scroll_to_item(next as usize);
+            } else {
+                let row = (next as usize) / cols;
+                self.list_state.scroll_to_reveal_item(row);
+            }
             cx.notify();
         }
     }
@@ -2620,6 +2631,7 @@ impl BookshelfView {
         window: &mut Window,
         cx: &mut Context<Self>,
         card: &ShelfCard,
+        selected: bool,
     ) -> impl IntoElement {
         let shelf = &card.shelf;
         let title = shelf.title.clone();
@@ -2783,6 +2795,7 @@ impl BookshelfView {
             .p_2()
             .border_b_1()
             .border_color(cx.theme().border)
+            .when(selected, |style| style.bg(cx.theme().secondary))
             .hover(|style| style.bg(cx.theme().secondary));
 
         row = row.cursor_pointer().on_click({
@@ -3573,15 +3586,18 @@ impl Render for BookshelfView {
                                 .into_any_element()
                         }
                           ViewMode::List => div()
+                              .id("bookshelf-list")
                               .flex()
                               .flex_col()
                               .rounded_lg()
                               .border_1()
                               .border_color(cx.theme().border)
                               .overflow_hidden()
-                             .overflow_y_scrollbar()
-                              .children(visible.iter().map(|entry| {
-                                self.render_list_row(window, cx, entry).into_any_element()
+                              .overflow_y_scroll()
+                              .track_scroll(&self.scroll_handle)
+                              .children(visible.iter().enumerate().map(|(idx, entry)| {
+                                let selected = self.selected_index == Some(idx);
+                                self.render_list_row(window, cx, entry, selected).into_any_element()
                             }))
                             .into_any_element(),
                     }),
