@@ -344,6 +344,7 @@ fn checklist_events_items_and_toggle() {
         is_cancelled: 0,
         display_order: 0,
         is_featured: 1,
+        poll_sync_enabled: 0,
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
     };

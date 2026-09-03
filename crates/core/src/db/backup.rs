@@ -263,6 +263,7 @@ mod tests {
                 is_cancelled: 0,
                 display_order: 0,
                 is_featured: 1,
+                poll_sync_enabled: 0,
                 created_at: "2026-08-23 00:00:00".into(),
                 updated_at: "2026-08-23 00:00:00".into(),
             },

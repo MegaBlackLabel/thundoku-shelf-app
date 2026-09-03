@@ -5,12 +5,14 @@ use std::path::PathBuf;
 use crate::components::dialog::{dialog_surface, fade_dialog};
 use gpui::StyledImage as _;
 use gpui::{
-    App, AppContext as _, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement as _, Window, div, img, px,
+    App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Subscription, Window,
+    div, img, px,
 };
 use gpui::{ReadGlobal as _, Styled as _};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::Dialog;
+use gpui_component::input::{Input, InputEvent, InputState};
 
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::switch::Switch;
@@ -64,6 +66,10 @@ pub struct SettingsView {
     book_count: usize,
     /// Drive 同期有効フラグ（render での毎回の DB 読みを避けるためのキャッシュ）
     drive_enabled: bool,
+    /// チェックリスト定期取得間隔の編集入力（render で遅延生成）。
+    poll_interval_input: Option<Entity<InputState>>,
+    /// 入力の変更（Blur / Enter）を購読して確定するための Subscription。
+    poll_interval_subscription: Option<Subscription>,
 }
 
 impl SettingsView {
@@ -100,6 +106,8 @@ impl SettingsView {
                 .ok()
                 .flatten()
                 .is_some_and(|v| v == "true"),
+            poll_interval_input: None,
+            poll_interval_subscription: None,
         }
     }
 
@@ -113,6 +121,39 @@ impl SettingsView {
         let state = AppState::global(cx);
         let db = &state.db_pool;
         let _ = db::settings::set(db, key, value);
+    }
+
+    /// チェックリスト定期取得間隔の編集入力を遅延生成する（初回のみ）。
+    /// Enter / Blur で確定して `checklist.poll.interval_min` に保存する。
+    fn ensure_poll_interval_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.poll_interval_input.is_some() {
+            return;
+        }
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder("5"));
+        let interval = Self::read_setting(cx, "checklist.poll.interval_min")
+            .unwrap_or_else(|| "5".to_string());
+        state.update(cx, |s, cx| s.set_value(interval, window, cx));
+        let sub = cx.subscribe(
+            &state,
+            |this: &mut Self, _: Entity<InputState>, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.commit_poll_interval(cx);
+                }
+            },
+        );
+        self.poll_interval_input = Some(state);
+        self.poll_interval_subscription = Some(sub);
+    }
+
+    /// 入力値（分）を 1 以上にクランプして `checklist.poll.interval_min` に保存する。
+    fn commit_poll_interval(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.poll_interval_input.as_ref() else {
+            return;
+        };
+        let text = state.read(cx).value().to_string();
+        let n: i64 = text.trim().parse().unwrap_or(5).max(1);
+        Self::write_setting(cx, "checklist.poll.interval_min", &n.to_string());
+        cx.notify();
     }
 
     /// 技術書典サイトの表示モードを保存（ビューアー起動時に
@@ -1011,6 +1052,8 @@ fn dir_size(path: &std::path::Path) -> u64 {
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // チェックリスト定期取得間隔の編集入力を確保（初回のみ生成・購読）
+        self.ensure_poll_interval_input(_window, cx);
         // 同期中は DB の Mutex を長時間握るため、UI 側の DB 読みをスキップ
         // してフリーズを避ける（完了後は自動で再開される）
         if !self.busy {
@@ -1334,6 +1377,53 @@ impl Render for SettingsView {
                                     }
                                 }),
                         ),
+                    ),
+            );
+
+        let poll_state = self.poll_interval_input.clone().expect("poll input ensured");
+        let checklist_poll_settings =
+            self.settings_card(
+                cx,
+                "チェックリストの定期取得",
+                Some("イベント画面で、技術書典サイトからのサークルチェック情報を取得する間隔を設定します"),
+                Icon::new(AppIcon::RefreshCw)
+                    .size(px(16.0))
+                    .text_color(muted_fg),
+                div()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("定期取得間隔（分）"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child("1, 5, 10, 15, 30, 60 のいずれか。ON にしたイベントをこの間隔で自動同期します。"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(120.0))
+                                    .child(Input::new(&poll_state).cursor_text()),
+                            ),
                     ),
             );
 
@@ -1661,6 +1751,7 @@ impl Render for SettingsView {
                     )
                     .child(storage_settings)
                     .child(drive_settings)
+                    .child(checklist_poll_settings)
                     .child(db_settings)
                     // 外観
                     .child(

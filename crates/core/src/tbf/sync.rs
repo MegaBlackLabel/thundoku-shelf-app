@@ -3,7 +3,7 @@
 //! UTC strings in the same formats the Web uses.
 
 use crate::db::{SqlitePool, bookshelf, checklist};
-use crate::tbf::{SITE_ID_TECHBOOKFEST, TbfChecklistEntry, TbfEventInfo, TbfShelfItem};
+use crate::tbf::{SITE_ID_TECHBOOKFEST, TbfChecklistEntry, TbfClient, TbfEventInfo, TbfShelfItem};
 
 fn now() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -59,6 +59,7 @@ fn ensure_event(
             is_cancelled: 0,
             display_order: 0,
             is_featured: is_featured as i64,
+            poll_sync_enabled: 0,
             created_at: timestamp.clone(),
             updated_at: timestamp,
         },
@@ -132,6 +133,7 @@ pub fn save_events(pool: &SqlitePool, events: &[TbfEventInfo]) -> Result<usize, 
                 is_cancelled: event.is_cancelled as i64,
                 display_order: event.display_order,
                 is_featured: event.is_featured as i64,
+                poll_sync_enabled: 0,
                 created_at: timestamp.clone(),
                 updated_at: timestamp.clone(),
             },
@@ -191,12 +193,173 @@ pub fn save_checklist(
     Ok(entries.len())
 }
 
+/// 1 回の同期（ポーリング）結果。`changed` は本棚/チェックリストに変化が
+/// あったか（Drive 同期が必要か）を表す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncPollOutcome {
+    pub count: usize,
+    pub changed: bool,
+}
+
+/// イベント（slug + event_name）の比較用シグネチャ。
+fn event_signature(events: &[checklist::TbfEvent]) -> Vec<(Option<String>, String)> {
+    events
+        .iter()
+        .map(|e| (e.slug.clone(), e.event_name.clone()))
+        .collect()
+}
+
+/// チェック項目（id + circle_name + space_number + product_title）の比較用シグネチャ。
+/// `is_checked` 等のユーザー状態は比較対象外（変化させないため）。
+fn item_signature(items: &[checklist::CheckedItem]) -> Vec<(String, String, String, String)> {
+    items
+        .iter()
+        .map(|i| {
+            (
+                i.id.clone(),
+                i.circle_name.clone(),
+                i.space_number.clone(),
+                i.product_title.clone(),
+            )
+        })
+        .collect()
+}
+
+/// 1 つのイベントについて、技術書典手から最新状況を同期する。
+/// イベントマスタ（`events()`）とチェックリスト（`checklist(slug)`）を取得して保存し、
+/// `api.last_sync_at` を更新する。`changed` は保存前後でイベント・項目に差分が
+/// あったか（Drive 同期が必要か）を返す。
+pub fn refresh_checklist(
+    db: &SqlitePool,
+    client: &mut TbfClient,
+    event_slug: &str,
+) -> Result<SyncPollOutcome, String> {
+    let before_events = checklist::list_events(db).map_err(|e| e.to_string())?;
+    let before_items = checklist::list_items(db, event_slug).map_err(|e| e.to_string())?;
+
+    let events = client.events().map_err(|e| e.to_string())?;
+    let entries = client.checklist(event_slug).map_err(|e| e.to_string())?;
+
+    save_events(db, &events).map_err(|e| e.to_string())?;
+    save_checklist(db, event_slug, &entries).map_err(|e| e.to_string())?;
+
+    let _ = crate::db::settings::set(
+        db,
+        "api.last_sync_at",
+        &chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    );
+
+    let after_events = checklist::list_events(db).map_err(|e| e.to_string())?;
+    let after_items = checklist::list_items(db, event_slug).map_err(|e| e.to_string())?;
+
+    let changed = event_signature(&before_events) != event_signature(&after_events)
+        || item_signature(&before_items) != item_signature(&after_items);
+
+    Ok(SyncPollOutcome {
+        count: entries.len(),
+        changed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
     use crate::db::{checklist, migrate};
+    use crate::tbf::{RequestSpec, ResponseSpec, TbfError, Transport};
+    use serde_json::Value;
 
     use super::*;
+
+    /// スクリプト化されたトランスポート。URL で応答を分岐する。
+    struct MockTransport {
+        handler: Box<dyn FnMut(RequestSpec) -> Result<ResponseSpec, TbfError> + Send>,
+    }
+
+    impl Transport for MockTransport {
+        fn send(&mut self, spec: RequestSpec) -> Result<ResponseSpec, TbfError> {
+            (self.handler)(spec)
+        }
+    }
+
+    /// `checklist()` の GraphQL 応答を組み立てる（イベント tbf20 として扱う）。
+    fn checklist_node(pid: &str, circle: &str, space: &str, title: &str) -> Value {
+        serde_json::json!({
+            "productInfo": {
+                "databaseID": pid,
+                "organization": {
+                    "name": circle,
+                    "circles": { "edges": [ { "node": {
+                        "databaseID": format!("{pid}-db"),
+                        "event": { "databaseID": "Event:tbf20" },
+                        "spaces": [space],
+                        "hasOfflineCourse": true
+                    }}] }
+                },
+                "name": title,
+                "productVariants": { "edges": [ { "node": { "price": 1000, "status": "ACTIVE" } } ] },
+                "loginUserBookShelfItem": {}
+            },
+            "createdAt": "2026-04-12T00:00:00Z"
+        })
+    }
+
+    fn mock_client(items: &[(&str, &str, &str, &str)]) -> TbfClient {
+        let nodes: Vec<Value> = items
+            .iter()
+            .map(|(pid, circle, space, title)| checklist_node(pid, circle, space, title))
+            .collect();
+        let transport = MockTransport {
+            handler: Box::new(move |spec: RequestSpec| -> Result<ResponseSpec, TbfError> {
+                if spec.url.contains("operationName=TbfEventQuery") {
+                    // 将来イベントの発見を無効化 → events() は canonical のみ返す
+                    return Ok(ResponseSpec {
+                        status: 404,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    });
+                }
+                if spec.url.contains("operationName=EventOfflineCircleChecklistQuery") {
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "data": { "viewer": { "checkedProductInfos": {
+                            "edges": nodes
+                                .iter()
+                                .map(|n| serde_json::json!({ "node": n }))
+                                .collect::<Vec<_>>(),
+                            "pageInfo": { "hasNextPage": false }
+                        }}}
+                    }))
+                    .unwrap();
+                    return Ok(ResponseSpec {
+                        status: 200,
+                        headers: Vec::new(),
+                        body,
+                    });
+                }
+                Ok(ResponseSpec {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+            }),
+        };
+        TbfClient::with_transport(Box::new(transport))
+    }
+
+    fn checklist_entry(id: &str, circle: &str, space: &str, title: &str) -> TbfChecklistEntry {
+        let product_id = id.split_once(':').map(|(_, rest)| rest).unwrap_or(id);
+        TbfChecklistEntry {
+            id: id.into(),
+            circle_name: circle.into(),
+            space_number: space.into(),
+            tbf_circle_id: Some(format!("{product_id}-db")),
+            product_id: Some(product_id.to_string()),
+            product_title: title.into(),
+            thumbnail_url: None,
+            price: Some(1000),
+            is_purchased: true,
+            created_at: Some("2026-04-12T00:00:00Z".into()),
+        }
+    }
 
     fn entry(id: &str, circle: &str) -> TbfChecklistEntry {
         TbfChecklistEntry {
@@ -242,5 +405,38 @@ mod tests {
         save_checklist(&pool, "tbf20", &[entry("tbf20:p1", "A")]).unwrap();
         assert_eq!(checklist::list_items(&pool, "tbf20").unwrap().len(), 1);
         assert_eq!(checklist::list_items(&pool, "tbf19").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn refresh_checklist_reports_no_change_when_data_identical() {
+        let pool = crate::db::test_pool();
+        migrate(&pool).unwrap();
+        let mut client = mock_client(&[("p1", "A", "あ-01", "本")]);
+        // サーバーと同じ状態を先に作る → 再同期で差分なし
+        let events = client.events().unwrap();
+        save_events(&pool, &events).unwrap();
+        save_checklist(&pool, "tbf20", &[checklist_entry("tbf20:p1", "A", "あ-01", "本")])
+            .unwrap();
+        let outcome = refresh_checklist(&pool, &mut client, "tbf20").unwrap();
+        assert_eq!(outcome.count, 1);
+        assert!(!outcome.changed);
+    }
+
+    #[test]
+    fn refresh_checklist_reports_change_when_items_diff() {
+        let pool = crate::db::test_pool();
+        migrate(&pool).unwrap();
+        let mut client = mock_client(&[
+            ("p1", "A", "あ-01", "本"),
+            ("p2", "B", "い-02", "別の本"),
+        ]);
+        // DB には p1 のみ → 同期で p2 が追加され差分あり
+        let events = client.events().unwrap();
+        save_events(&pool, &events).unwrap();
+        save_checklist(&pool, "tbf20", &[checklist_entry("tbf20:p1", "A", "あ-01", "本")])
+            .unwrap();
+        let outcome = refresh_checklist(&pool, &mut client, "tbf20").unwrap();
+        assert_eq!(outcome.count, 2);
+        assert!(outcome.changed);
     }
 }

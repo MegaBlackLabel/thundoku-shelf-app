@@ -36,6 +36,7 @@ use crate::views::reader::ReaderView;
 use crate::views::settings::SettingsView;
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, progress};
+use thundoku_core::tbf;
 
 /// アクティブなナビゲーション先。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +140,7 @@ impl Workspace {
         this.restore_theme_mode(cx);
         this.check_startup_backup(cx);
         this.start_login_done_watcher(cx);
+        this.start_checklist_poller(cx);
         this
     }
 
@@ -198,6 +200,81 @@ impl Workspace {
                     // AsyncApp::refresh()（&self）で再描画を要求する。
                     cx.refresh();
                 }
+            }
+        })
+        .detach();
+    }
+
+    /// チェックリストの定期取得（ポーリング）を開始する。Workspace 常駐で、
+    /// アプリ起動中はいつでも取得する。各周期で `checklist.poll.interval_min` と
+    /// 各イベントの ON/OFF（`tbf_events.poll_sync_enabled`）を再読みするため、
+    /// 設定・トグルの変更は次の周期から反映される。tbf クライアントの Mutex が
+    /// 手動同期と直列化する。Drive 同期はデータ変化時のみ（`sync_drive_now` が
+    /// 内部で md5 差分を判定するので無変化ならノーコスト）。
+    fn start_checklist_poller(&mut self, cx: &mut Context<Self>) {
+        let db = AppState::global(cx).db_pool.clone();
+        let tbf_client = AppState::global(cx).tbf.clone();
+        let tbf_logged_in = AppState::global(cx).tbf_logged_in.clone();
+        let settings_entity = self.settings.clone();
+        cx.spawn(async move |_window, cx| {
+            // セッション切れの OpenAuth は 1 回だけ出す（連続で出さない）
+            let mut auth_dispatched = false;
+            loop {
+                let interval_min = db::settings::get(&db, "checklist.poll.interval_min")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .map(|n| n.max(1))
+                    .unwrap_or(5);
+                // 未ログインならスキップ（次の周期へ）。tbf ログイン必須。
+                if !*tbf_logged_in.lock() {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(interval_min as u64 * 60))
+                        .await;
+                    continue;
+                }
+                let enabled = db::checklist::list_enabled_slugs(&db).unwrap_or_default();
+                if enabled.is_empty() {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(interval_min as u64 * 60))
+                        .await;
+                    continue;
+                }
+                // tbf クライアントの Mutex ロックで手動 sync() と直列化する。
+                // スコープを限定して await の前に必ず解放する（clippy: await_holding_lock）。
+                let (any_changed, session_expired) = {
+                    let mut client = tbf_client.lock();
+                    let mut any_changed = false;
+                    let mut session_expired = false;
+                    for slug in &enabled {
+                        match tbf::sync::refresh_checklist(&db, &mut client, slug) {
+                            Ok(outcome) => {
+                                if outcome.changed {
+                                    any_changed = true;
+                                }
+                            }
+                            Err(message) => {
+                                log::error!("checklist poll failed for {slug}: {message}");
+                                if message.contains("session expired") {
+                                    session_expired = true;
+                                }
+                            }
+                        }
+                    }
+                    (any_changed, session_expired)
+                };
+                if session_expired && !auth_dispatched {
+                    auth_dispatched = true;
+                    cx.update(|app| {
+                        app.defer(|app| app.dispatch_action(&crate::actions::OpenAuth));
+                    });
+                }
+                if any_changed {
+                    settings_entity.update(cx, |settings, cx| settings.sync_drive_now(cx));
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(interval_min as u64 * 60))
+                    .await;
             }
         })
         .detach();

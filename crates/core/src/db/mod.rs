@@ -80,6 +80,24 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                     .await?;
             }
         }
+        // チェックリストのポーリング有効フラグ（プログラム的マイグレーション。
+        // hidden_at と同様に PRAGMA で存在確認してから ALTER TABLE する。
+        // 既存の migration ファイルは checksum 管理されるため変更しない）
+        {
+            let has_poll_enabled: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('tbf_events') \
+                 WHERE name = 'poll_sync_enabled'",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if !has_poll_enabled {
+                sqlx::query(
+                    "ALTER TABLE tbf_events ADD COLUMN poll_sync_enabled INTEGER NOT NULL DEFAULT 0",
+                )
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
         // 閲覧履歴（プログラム的マイグレーション。既存の migration ファイルは
         // checksum 管理されるため変更せず、IF NOT EXISTS で冪等に適用する）
         sqlx::query(

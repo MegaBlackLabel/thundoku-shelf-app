@@ -90,6 +90,7 @@ fn bookshelf_sync_keeps_existing_event_row() {
             is_cancelled: 0,
             display_order: 5,
             is_featured: 1,
+            poll_sync_enabled: 0,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
         },

@@ -15,6 +15,7 @@ use gpui::{
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::switch::Switch;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, IconName};
 use thundoku_core::db;
 use thundoku_core::db::checklist::{CheckedItem, TbfEvent};
@@ -326,18 +327,9 @@ impl ChecklistView {
         let slug_for_task = slug.clone();
         let task: gpui::Task<Result<usize, String>> = cx.background_executor().spawn(async move {
             let mut client = tbf_client.lock();
-            let events = client.events().map_err(|e| e.to_string())?;
-            let entries = client
-                .checklist(&slug_for_task)
+            let outcome = tbf::sync::refresh_checklist(&db, &mut client, &slug_for_task)
                 .map_err(|e| e.to_string())?;
-            tbf::sync::save_events(&db, &events).map_err(|e| e.to_string())?;
-            tbf::sync::save_checklist(&db, &slug_for_task, &entries).map_err(|e| e.to_string())?;
-            let _ = db::settings::set(
-                &db,
-                "api.last_sync_at",
-                &chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            );
-            Ok(entries.len())
+            Ok(outcome.count)
         });
         cx.spawn(async move |_window, cx| {
             let result = task.await;
@@ -1076,6 +1068,40 @@ impl ChecklistView {
                                     .into_any_element()
                             } else {
                                 div().into_any_element()
+                            })
+                            // ポーリング ON/OFF
+                            .child(if let Some(event) = &event {
+                                let poll_slug = event.slug.clone().unwrap_or_default();
+                                let poll_enabled = event.poll_sync_enabled != 0;
+                                let poll_handle = handle.clone();
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Switch::new("event-poll-sync-toggle")
+                                            .checked(poll_enabled)
+                                            .cursor_pointer()
+                                            .on_click(move |checked, _window, cx| {
+                                                let slug = poll_slug.clone();
+                                                poll_handle.update(cx, |this, cx| {
+                                                    let state = AppState::global(cx);
+                                                    let db = &state.db_pool;
+                                                    let _ = db::checklist::set_poll_enabled(db, &slug, *checked);
+                                                    this.reload(cx);
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(muted_fg)
+                                            .child("このイベントについて、技術書典手から最新状況を同期する"),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
                             }),
                     )
                     // ツールバー
@@ -1370,6 +1396,7 @@ mod tests {
                     is_cancelled: 0,
                     display_order: 0,
                     is_featured: 0,
+                    poll_sync_enabled: 0,
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-21 00:00:00".into(),
                 },
