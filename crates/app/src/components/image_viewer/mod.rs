@@ -1559,7 +1559,7 @@ impl Render for ImageViewer {
                             .top(px(img_top))
                             .w(px(edge_w))
                             .h(px(img_h))
-                            .cursor(gpui::CursorStyle::ResizeLeft)
+                            .cursor(gpui::CursorStyle::PointingHand)
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1592,7 +1592,7 @@ impl Render for ImageViewer {
                             .top(px(img_top))
                             .w(px(edge_w))
                             .h(px(img_h))
-                            .cursor(gpui::CursorStyle::ResizeRight)
+                            .cursor(gpui::CursorStyle::PointingHand)
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1739,7 +1739,8 @@ impl Render for ImageViewer {
             // 左右 10% のクリックナビ領域（見開き用。単一モードは
             // 画像の上に重ねて実装している）。左エッジ = 前へ、
             // 右エッジ = 次へ（見開きでは 2 ページ単位）。
-            // カーソルは方向に合わせて左向き/右向き矢印。
+            // 方向付き左右矢印カーソルは GPUI の CursorStyle に存在せず、カスタム画像カーソルも不可。
+            // Windows では ResizeLeft/Right が IDC_SIZEWE(左右リサイズカーソル)になるため、慣例のハンドカーソルを使う。
             // スクロールモードでは非表示。Shift 押しで 1 ページ移動。
             .when(mode == ViewMode::Spread && !self.zoomed, |this| {
                 this.child(
@@ -1750,7 +1751,7 @@ impl Render for ImageViewer {
                         .top_0()
                         .bottom_0()
                         .w(gpui::Length::Definite(gpui::DefiniteLength::Fraction(0.1)))
-                        .cursor(gpui::CursorStyle::ResizeLeft)
+                        .cursor(gpui::CursorStyle::PointingHand)
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1784,7 +1785,7 @@ impl Render for ImageViewer {
                         .top_0()
                         .bottom_0()
                         .w(gpui::Length::Definite(gpui::DefiniteLength::Fraction(0.1)))
-                        .cursor(gpui::CursorStyle::ResizeRight)
+                        .cursor(gpui::CursorStyle::PointingHand)
                         .flex()
                         .items_center()
                         .justify_center()
