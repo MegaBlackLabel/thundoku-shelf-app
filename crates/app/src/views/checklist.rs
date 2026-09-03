@@ -5,18 +5,18 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::sync::Arc;
 
-use gpui::{
+use gpui_kit::{
     Context, FontWeight, IntoElement, ParentElement, Render, RenderImage, SharedString,
     StyledImage, Window, div, img, px,
 };
-use gpui::{
+use gpui_kit::{
     InteractiveElement as _, ReadGlobal as _, StatefulInteractiveElement as _, Styled as _,
 };
-use gpui_component::Sizable as _;
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::switch::Switch;
-use gpui_component::{ActiveTheme as _, Disableable as _, Icon, IconName};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName};
 use thundoku_core::db;
 use thundoku_core::db::checklist::{CheckedItem, TbfEvent};
 use thundoku_core::tbf;
@@ -325,7 +325,7 @@ impl ChecklistView {
         let tbf_client = state.tbf.clone();
         let db = state.db_pool.clone();
         let slug_for_task = slug.clone();
-        let task: gpui::Task<Result<usize, String>> = cx.background_executor().spawn(async move {
+        let task: gpui_kit::Task<Result<usize, String>> = cx.background_executor().spawn(async move {
             let mut client = tbf_client.lock();
             let outcome = tbf::sync::refresh_checklist(&db, &mut client, &slug_for_task)
                 .map_err(|e| e.to_string())?;
@@ -373,7 +373,7 @@ impl ChecklistView {
         let tbf_client = state.tbf.clone();
         let db = state.db_pool.clone();
         let slug_for_task = slug.clone();
-        let task: gpui::Task<Result<usize, String>> = cx.background_executor().spawn(async move {
+        let task: gpui_kit::Task<Result<usize, String>> = cx.background_executor().spawn(async move {
             let mut client = tbf_client.lock();
             let entries = client
                 .favorites(&slug_for_task)
@@ -437,7 +437,7 @@ impl ChecklistView {
         let item_id = item.id.clone();
         let open_item_id = item_id.clone();
         type SamplePages = Vec<(String, u32, u32)>;
-        let task: gpui::Task<Result<SamplePages, String>> =
+        let task: gpui_kit::Task<Result<SamplePages, String>> =
             cx.background_executor().spawn(async move {
                 let mut client = tbf_client.lock();
                 let pages = client
@@ -898,7 +898,7 @@ impl ChecklistView {
                             img(image)
                                 .w_full()
                                 .h_full()
-                                .object_fit(gpui::ObjectFit::Cover)
+                                .object_fit(gpui_kit::ObjectFit::Cover)
                                 .into_any_element()
                         } else {
                             div()
@@ -922,12 +922,12 @@ impl ChecklistView {
                                 .text_center()
                                 .text_size(px(10.0))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(gpui::white())
+                                .text_color(gpui_kit::white())
                                 .py_0p5()
                                 .bg(if purchased {
-                                    gpui::rgb(0x10b981).opacity(0.8)
+                                    gpui_kit::rgb(0x10b981).opacity(0.8)
                                 } else {
-                                    gpui::rgb(0xec4899).opacity(0.8)
+                                    gpui_kit::rgb(0xec4899).opacity(0.8)
                                 })
                                 .child(if purchased { "購入済" } else { "未購入" }),
                         )
@@ -941,9 +941,9 @@ impl ChecklistView {
                                 .text_center()
                                 .text_size(px(10.0))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(gpui::white())
+                                .text_color(gpui_kit::white())
                                 .py_0p5()
-                                .bg(gpui::rgba(0x00000099))
+                                .bg(gpui_kit::rgba(0x00000099))
                                 .child(if sample_fetched {
                                     "サンプルを読む"
                                 } else {
@@ -1370,8 +1370,8 @@ fn truncate_text(text: &str, max_length: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use gpui::AppContext as _;
-    use gpui::TestAppContext;
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
 
     use thundoku_core::db::checklist as checklist_db;
 
@@ -1434,9 +1434,9 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn loads_events_and_items_for_selection(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_event(cx, "tbf20", "技術書典20");
         seed_event(cx, "tbf19", "技術書典19");
@@ -1459,9 +1459,9 @@ mod tests {
         assert!(view.read_with(cx, |v, _| v.selected_slug.is_none()));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn toggle_sort_changes_field_and_direction(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_event(cx, "tbf20", "技術書典20");
         let view = cx.new(ChecklistView::new);
@@ -1482,9 +1482,9 @@ mod tests {
         assert!(!view.read_with(cx, |v, _| v.sort_ascending));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn toggle_updates_checked_state(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_event(cx, "tbf20", "技術書典20");
         seed_item(cx, "item-1", "tbf20", "サークルA");
@@ -1605,9 +1605,9 @@ mod tests {
         assert_eq!(pending.len(), 9, "failed item must be skipped");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn sample_store_writes_base64_rows(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_event(cx, "tbf20", "技術書典20");
         seed_item(cx, "item-1", "tbf20", "サークルA");

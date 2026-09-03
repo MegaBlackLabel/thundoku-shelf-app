@@ -8,12 +8,12 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use gpui::{
+use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, ReadGlobal as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
     div, px,
 };
-use gpui_component::{Icon, IconName};
+use gpui_kit::component::{Icon, IconName};
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
 use thundoku_core::google::{GoogleError, GoogleProfile, PendingGoogleAuth};
@@ -203,12 +203,12 @@ impl Render for GoogleLoginView {
         let height = 640.0_f32;
         let left = (window_w - width) / 2.0;
         let top = (window_h - height) / 2.0;
-        let bounds = gpui::bounds(
-            gpui::Point {
+        let bounds = gpui_kit::bounds(
+            gpui_kit::Point {
                 x: px(left),
                 y: px(top),
             },
-            gpui::Size {
+            gpui_kit::Size {
                 width: px(width),
                 height: px(height),
             },
@@ -243,7 +243,7 @@ impl Render for GoogleLoginView {
             .right_0()
             .bottom_0()
             .left_0()
-            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.45))
             .flex()
             .items_center()
             .justify_center()
@@ -259,9 +259,9 @@ impl Render for GoogleLoginView {
                     .items_center()
                     .justify_center()
                     .rounded_md()
-                    .bg(gpui::rgba(0xffffff26))
-                    .text_color(gpui::white())
-                    .hover(|style| style.bg(gpui::rgba(0xffffff40)))
+                    .bg(gpui_kit::rgba(0xffffff26))
+                    .text_color(gpui_kit::white())
+                    .hover(|style| style.bg(gpui_kit::rgba(0xffffff40)))
                     .cursor_pointer()
                     .on_click({
                         let handle = cx.weak_entity();
@@ -281,8 +281,8 @@ impl Render for GoogleLoginView {
                     .max_w(px(420.0))
                     .p_4()
                     .rounded_lg()
-                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.75))
-                    .text_color(gpui::white())
+                    .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.75))
+                    .text_color(gpui_kit::white())
                     .text_sm()
                     .child(message)
                     .into_any_element()

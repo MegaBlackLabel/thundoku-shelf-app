@@ -3,15 +3,15 @@
 //! Web 版の記載（ブラウザアプリ・OPFS・PWA インストール・Cookie セッション）
 //! はネイティブアプリの実態に合わせて修正してある。
 
-use gpui::Styled as _;
-use gpui::StyledImage as _;
-use gpui::{
+use gpui_kit::Styled as _;
+use gpui_kit::StyledImage as _;
+use gpui_kit::{
     Context, FontWeight, IntoElement, ParentElement, Render, SharedString, Window, div, px,
     relative,
 };
-use gpui_component::ActiveTheme as _;
-use gpui_component::Icon;
-use gpui_component::scroll::ScrollableElement as _;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Icon;
+use gpui_kit::component::scroll::ScrollableElement as _;
 
 use crate::icons::AppIcon;
 
@@ -65,10 +65,10 @@ impl Render for AboutView {
                                     .child(
                                         if let Some(logo) = crate::views::bookshelf::app_logo_image()
                                         {
-                                            gpui::img(logo)
+                                            gpui_kit::img(logo)
                                                 .w(px(64.0))
                                                 .h(px(64.0))
-                                                .object_fit(gpui::ObjectFit::Contain)
+                                                .object_fit(gpui_kit::ObjectFit::Contain)
                                                 .into_any_element()
                                         } else {
                                             Icon::new(AppIcon::BookMarked)
@@ -133,8 +133,8 @@ impl Render for AboutView {
                         div()
                             .rounded_xl()
                             .border_1()
-                            .border_color(gpui::rgb(0xfcd34d))
-                            .bg(gpui::rgb(0xfefce8))
+                            .border_color(gpui_kit::rgb(0xfcd34d))
+                            .bg(gpui_kit::rgb(0xfefce8))
                             .p_6()
                             .flex()
                             .flex_col()
@@ -146,12 +146,12 @@ impl Render for AboutView {
                                     .px_2()
                                     .py_1()
                                     .rounded_md()
-                                    .bg(gpui::rgb(0xfef3c7))
+                                    .bg(gpui_kit::rgb(0xfef3c7))
                                     .child(
                                         div()
                                             .text_xs()
                                             .font_weight(FontWeight::MEDIUM)
-                                            .text_color(gpui::rgb(0x92400e))
+                                            .text_color(gpui_kit::rgb(0x92400e))
                                             .child("ご利用前の注意"),
                                     ),
                             )
@@ -159,13 +159,13 @@ impl Render for AboutView {
                                 div()
                                     .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(gpui::rgb(0x78350f))
+                                    .text_color(gpui_kit::rgb(0x78350f))
                                     								.child("Google ログインは Google ドライブでのバックアップに使用します"),
                             )
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(gpui::rgb(0x92400e))
+                                    .text_color(gpui_kit::rgb(0x92400e))
                                     .line_height(relative(1.7))
                                     								.child(
 									"書籍を読むのに Google ログインは必要ありません。Google ログインを行うと、本棚の DB や画像を Google Drive にバックアップ・同期できます。サイドバーのアカウントアイコンからログインしてください。",
@@ -174,7 +174,7 @@ impl Render for AboutView {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(gpui::rgb(0x92400e))
+                                    .text_color(gpui_kit::rgb(0x92400e))
                                     .line_height(relative(1.7))
                                     .child(
                                         "技術書典で購入済みの書籍を同期する場合は、サイドバーまたは本棚の同期ボタンから技術書典にログイン（メールアドレスとパスワード）してください。",
@@ -260,11 +260,11 @@ impl Render for AboutView {
                                                                             .w(px(32.0))
                                                                             .h(px(32.0))
                                                                             .rounded_lg()
-                                                                            .bg(gpui::white())
+                                                                            .bg(gpui_kit::white())
                                                                             .child(
                                                                                 Icon::new(icon)
                                                                                     .size(px(18.0))
-                                                                                    .text_color(gpui::rgb(0x1d4ed8)),
+                                                                                    .text_color(gpui_kit::rgb(0x1d4ed8)),
                                                                             ),
                                                                     )
                                                                     .child(

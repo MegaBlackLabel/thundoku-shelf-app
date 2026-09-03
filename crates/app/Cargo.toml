@@ -11,12 +11,8 @@ path = "src/main.rs"
 [dependencies]
 # windows-manifest は xwin クロスビルドで llvm-rc の相対パス解決に失敗するため外す
 # （macOS / Windows のアプリ実行には不要。default の wayland/x11 も不要）
-gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed", default-features = false, features = ["font-kit", "profiler", "test-support"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
-gpui-base = { git = "https://github.com/longbridge/gpui-component" }
-gpui-wry = { git = "https://github.com/longbridge/gpui-component" }
+gpui-kit = { version = "0.6", features = ["test-support"] }
+gpui-wry = { version = "0.6" }
 thundoku-core = { path = "../core" }
 url = "2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }

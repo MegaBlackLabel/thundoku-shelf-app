@@ -1,14 +1,14 @@
 //! 認証ダイアログ: 技術書典・Google・BOOTH をアプリ内 WebView（gpui-wry）でログインする。
 //! 各プロバイダは WebView でログイン画面を開き、Cookie / 認可フローを自動処理する。
 
-use gpui::{AppContext as _, ReadGlobal as _, Styled as _};
-use gpui::{
+use gpui_kit::{AppContext as _, ReadGlobal as _, Styled as _};
+use gpui_kit::{
     Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement, Render,
     StatefulInteractiveElement as _, Window, deferred, div, px,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{ActiveTheme as _, Icon, IconName};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::google::GoogleProfile;
 
 use crate::app_state::AppState;
@@ -36,15 +36,15 @@ pub struct AuthDialog {
     show_booth_login: bool,
     booth_login: Option<Entity<BoothLoginView>>,
     /// BoothLoginView の完了イベント購読（保持して drop を防ぐ）
-    booth_subscription: Option<gpui::Subscription>,
+    booth_subscription: Option<gpui_kit::Subscription>,
     /// Google の WebView ログインモーダルを表示中か
     show_google_login: bool,
     google_login: Option<Entity<GoogleLoginView>>,
-    google_subscription: Option<gpui::Subscription>,
+    google_subscription: Option<gpui_kit::Subscription>,
     /// 技術書典の WebView ログインモーダルを表示中か
     show_tbf_login: bool,
     tbf_login: Option<Entity<TbfLoginView>>,
-    tbf_subscription: Option<gpui::Subscription>,
+    tbf_subscription: Option<gpui_kit::Subscription>,
 }
 
 impl AuthDialog {
@@ -468,13 +468,13 @@ impl Render for AuthDialog {
 
 #[cfg(test)]
 mod tests {
-    use gpui::AppContext as _;
-    use gpui::TestAppContext;
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
 
     use super::{AuthDialog, AuthProvider};
     use crate::app_state::AppState;
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn tbf_provider_opens_webview_login_flag(cx: &mut TestAppContext) {
         cx.update(AppState::init_test);
         let dialog = cx.new(AuthDialog::new);
@@ -491,26 +491,26 @@ mod tests {
 
 #[cfg(test)]
 mod dialog_render_tests {
-    use gpui::AppContext as _;
-    use gpui::TestAppContext;
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
 
     use crate::app_state::AppState;
 
     use super::*;
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn auth_dialog_renders_without_panic(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let dialog = cx.new(AuthDialog::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(480.0),
-                height: gpui::px(360.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(480.0),
+                height: gpui_kit::px(360.0),
             },
-            |window, cx| gpui_component::Root::new(dialog.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(dialog.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         visual.update(|window, cx| {
             let arena_clear = window.draw(cx);
             arena_clear.clear(cx);
@@ -518,7 +518,7 @@ mod dialog_render_tests {
         // reaching here without panicking = render works
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn open_without_provider_falls_back_to_techbookfest(cx: &mut TestAppContext) {
         cx.update(AppState::init_test);
         let dialog = cx.new(AuthDialog::new);
@@ -532,7 +532,7 @@ mod dialog_render_tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn booth_provider_opens_webview_login_flag(cx: &mut TestAppContext) {
         cx.update(AppState::init_test);
         let dialog = cx.new(AuthDialog::new);
@@ -546,7 +546,7 @@ mod dialog_render_tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn google_provider_opens_webview_login_flag(cx: &mut TestAppContext) {
         cx.update(AppState::init_test);
         let dialog = cx.new(AuthDialog::new);
@@ -560,19 +560,19 @@ mod dialog_render_tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn overlay_open_and_close_actions_toggle_workspace(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let workspace = cx.new(crate::workspace::Workspace::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(900.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(workspace.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx),
         );
-        let mut visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let mut visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         visual.update(|window, cx| {
             let arena_clear = window.draw(cx);
             arena_clear.clear(cx);

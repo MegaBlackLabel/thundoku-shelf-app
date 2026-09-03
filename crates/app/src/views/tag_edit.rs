@@ -1,17 +1,17 @@
 //! タグ編集ダイアログ: カンマ区切りでマニュアルタグを保存する。
 
-use gpui::{
+use gpui_kit::{
     App, Context, Entity, IntoElement, ParentElement, Render, SharedString, Window, div, px,
 };
-use gpui::{
+use gpui_kit::{
     AppContext as _, InteractiveElement as _, ReadGlobal as _, StatefulInteractiveElement as _,
     Styled as _,
 };
-use gpui_component::ActiveTheme as _;
-use gpui_component::Sizable as _;
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputState};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputState};
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf};
 use thundoku_core::tbf;
@@ -39,9 +39,9 @@ impl TagEditDialog {
 
     pub fn open(cx: &mut App, book_id: String) {
         cx.spawn(async move |cx| {
-            cx.open_window(gpui_component::TitleBar::window_options(), |window, cx| {
+            cx.open_window(gpui_kit::component::TitleBar::window_options(), |window, cx| {
                 let dialog = cx.new(|cx| TagEditDialog::new(cx, book_id.clone()));
-                cx.new(|cx| gpui_component::Root::new(dialog, window, cx))
+                cx.new(|cx| gpui_kit::component::Root::new(dialog, window, cx))
             })
             .expect("failed to open tag edit window");
         })
@@ -166,7 +166,7 @@ impl Render for TagEditDialog {
                 Dialog::new(cx)
                     .title(
                         div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                             .child("タグ編集"),
                     )
                     .content(move |content, _window, _cx| {

@@ -1,5 +1,5 @@
 //! Thundoku Shelf desktop application library. The binary entry point is
-//! `main.rs`; everything else lives here so `#[gpui::test]` can exercise it.
+//! `main.rs`; everything else lives here so `#[gpui_kit::test]` can exercise it.
 
 pub mod actions;
 pub mod app_state;
@@ -14,8 +14,8 @@ pub use workspace::Workspace;
 mod icon_assets_tests {
     use std::sync::Arc;
 
-    use gpui::AssetSource as _;
-    use gpui::SvgRenderer;
+    use gpui_kit::AssetSource as _;
+    use gpui_kit::SvgRenderer;
 
     use crate::icons::AppAssets;
 

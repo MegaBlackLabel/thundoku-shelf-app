@@ -8,21 +8,21 @@
 use std::time::Duration;
 
 #[cfg(windows)]
-use gpui::WindowControlArea;
-use gpui::{
+use gpui_kit::WindowControlArea;
+use gpui_kit::{
     Animation, AnimationExt as _, AppContext as _, InteractiveElement as _, ReadGlobal as _,
     StatefulInteractiveElement as _, Styled as _, prelude::FluentBuilder as _,
 };
 
 use crate::components::dialog::{dialog_surface, fade_dialog};
-use gpui::{
+use gpui_kit::{
     AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
     SharedString, Window, div, px,
 };
-use gpui_component::Disableable as _;
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dialog::Dialog;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode};
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode};
 #[cfg(windows)]
 use raw_window_handle::HasWindowHandle;
 
@@ -703,7 +703,7 @@ impl Workspace {
         let downloads_dir = state.downloads_dir.clone();
         let db_path = state.data_dir.join("thundoku-shelf.db");
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
-        let task: gpui::Task<Result<(), String>> = cx.background_executor().spawn(async move {
+        let task: gpui_kit::Task<Result<(), String>> = cx.background_executor().spawn(async move {
             let folder_id = db::settings::get(&db, "drive.sync.folder_id")
                 .ok()
                 .flatten()
@@ -832,7 +832,7 @@ impl Workspace {
                         .child(
                             Icon::new(IconName::CircleCheck)
                                 .size(px(16.0))
-                                .text_color(gpui::rgb(0x16a34a)),
+                                .text_color(gpui_kit::rgb(0x16a34a)),
                         )
                         .child(
                             div()
@@ -1067,7 +1067,7 @@ impl Render for Workspace {
 
         let toast_el = if let Some(message) = &toast {
             // 設定画面のスクロール要素より上に表示するため deferred レイヤー。
-            gpui::deferred(
+            gpui_kit::deferred(
                 div()
                     .id("toast")
                     .absolute()
@@ -1095,7 +1095,7 @@ impl Render for Workspace {
 
         // ログイン中は専用のダミー画面を表示する（SettingsView を描画せず、
         // WebView 作成時の RefCell 競合を回避）。
-        let active_view: gpui::AnyElement = if self.auth_loading {
+        let active_view: gpui_kit::AnyElement = if self.auth_loading {
             div()
                 .flex()
                 .flex_1()
@@ -1185,7 +1185,7 @@ impl Render for Workspace {
             .child(toast_el)
             .child(if self.auth_panel_open {
                 let panel = self.account_panel(cx);
-                gpui::deferred(
+                gpui_kit::deferred(
                     div()
                         .id("account-panel-backdrop")
                         .debug_selector(|| "account-panel-backdrop".into())
@@ -1231,7 +1231,7 @@ impl Render for Workspace {
             })
             .child(if self.show_auth {
                 let dialog = self.auth_dialog.clone();
-                gpui::deferred(
+                gpui_kit::deferred(
                     div()
                         .id("auth-backdrop")
                         .debug_selector(|| "auth-backdrop".into())
@@ -1240,8 +1240,8 @@ impl Render for Workspace {
                         .right_0()
                         .bottom_0()
                         .left_0()
-                        .bg(gpui::rgba(0x00000066))
-                        .on_mouse_down(gpui::MouseButton::Left, {
+                        .bg(gpui_kit::rgba(0x00000066))
+                        .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = cx.entity();
                             move |_, _window, cx| {
                                 handle.update(cx, |_, cx| {
@@ -1266,7 +1266,7 @@ impl Render for Workspace {
                     .as_ref()
                     .and_then(|i| i.size)
                     .unwrap_or_default();
-                gpui::deferred(
+                gpui_kit::deferred(
                     Dialog::new(cx)
                         .title(div().child("Drive バックアップが見つかりました"))
                         .content(move |content, _window, _cx| {
@@ -1316,7 +1316,7 @@ impl Render for Workspace {
             })
             .child(if self.show_drive_prompt {
                 let handle = cx.entity();
-                gpui::deferred(
+                gpui_kit::deferred(
                     Dialog::new(cx)
                         .title(div().child("Googleドライブでバックアップを有効にしますか？"))
                         .content(move |content, _window, _cx| {
@@ -1443,13 +1443,13 @@ impl Workspace {
     /// Windows の自前タイトルバー（MangaReader 方式）。
     /// `.window_control_area()` でネイティブのドラッグ/最小化/最大化/閉じるを再現する。
     #[cfg(windows)]
-    fn win_title_bar(window: &mut Window, theme: &gpui_component::Theme) -> gpui::AnyElement {
+    fn win_title_bar(window: &mut Window, theme: &gpui_kit::component::Theme) -> gpui_kit::AnyElement {
         // Windows 標準のタイトルバーボタンのホバー色（テーマに応じて明暗を出す）。
         // 背景（theme.secondary）と区別できるよう、ダークは明るめ・ライトは濃いめのグレー。
         let hover_bg = match theme.mode {
-            gpui_component::ThemeMode::Dark => gpui::rgb(0x3e3e3e),
+            gpui_kit::component::ThemeMode::Dark => gpui_kit::rgb(0x3e3e3e),
             // ライトモードは背景（白）と区別しやすい濃いめのグレー
-            gpui_component::ThemeMode::Light => gpui::rgb(0xcfcfcf),
+            gpui_kit::component::ThemeMode::Light => gpui_kit::rgb(0xcfcfcf),
         };
         div()
             .flex()
@@ -1515,7 +1515,7 @@ impl Workspace {
                             .h_full()
                             .cursor_pointer()
                             // 閉じるボタンは Windows 標準に合わせて赤背景（アイコンは継承色をキープ）
-                            .hover(move |style| style.bg(gpui::rgb(0xe11d48)))
+                            .hover(move |style| style.bg(gpui_kit::rgb(0xe11d48)))
                             .window_control_area(WindowControlArea::Close)
                             .child(
                                 Icon::new(IconName::Close)
@@ -1537,11 +1537,11 @@ impl Workspace {
         let theme_mode_name = self.theme_mode(cx).unwrap_or_else(|| "system".to_string());
         // バッジ色分け: 100 件以上=赤 / 10〜99 件=黄 / 1〜9 件=緑
         let badge_color = if unread_count >= 100 {
-            gpui::rgb(0xef4444)
+            gpui_kit::rgb(0xef4444)
         } else if unread_count >= 10 {
-            gpui::rgb(0xeab308)
+            gpui_kit::rgb(0xeab308)
         } else {
-            gpui::rgb(0x10b981)
+            gpui_kit::rgb(0x10b981)
         };
 
         div()
@@ -1584,7 +1584,7 @@ impl Workspace {
                 } else {
                     Duration::from_millis(20)
                 })
-                .with_easing(gpui::quadratic)
+                .with_easing(gpui_kit::quadratic)
                 .with_max_fps(30.0),
                 move |this, t| {
                     if !open {
@@ -1744,7 +1744,7 @@ impl Workspace {
     fn sidebar_logo(
         &self,
         unread_count: usize,
-        badge_color: gpui::Rgba,
+        badge_color: gpui_kit::Rgba,
         open: bool,
         handle: Entity<Workspace>,
         cx: &mut Context<Self>,
@@ -1804,7 +1804,7 @@ impl Workspace {
     fn nav_row(
         &mut self,
         target: NavTarget,
-        icon: gpui::AnyElement,
+        icon: gpui_kit::AnyElement,
         label: &str,
         open: bool,
         active: NavTarget,
@@ -1898,13 +1898,13 @@ impl Workspace {
     /// 下部のアイテム（設定 / テーマ / アカウント 共通）。
     fn bottom_item(
         &self,
-        icon: gpui::AnyElement,
+        icon: gpui_kit::AnyElement,
         label: &str,
         open: bool,
         on_click: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
         handle: Entity<Workspace>,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let theme = cx.theme().clone();
         let label = label.to_string();
         div()
@@ -2062,7 +2062,7 @@ impl Workspace {
                             "bookshelf-submenu-anim-{}",
                             if open { "open" } else { "closed" }
                         )),
-                        Animation::new(Duration::from_millis(200)).with_easing(gpui::ease_in_out),
+                        Animation::new(Duration::from_millis(200)).with_easing(gpui_kit::ease_in_out),
                         move |this, t| {
                             let t = t.clamp(0.0, 1.0);
                             let height = if open { 120.0 * t } else { 120.0 * (1.0 - t) };
@@ -2078,15 +2078,15 @@ impl Workspace {
 mod tests {
     use super::*;
     use crate::app_state::AppState;
-    use gpui::TestAppContext;
+    use gpui_kit::TestAppContext;
 
-    fn setup(cx: &mut TestAppContext) -> gpui::Entity<Workspace> {
-        cx.update(gpui_component::init);
+    fn setup(cx: &mut TestAppContext) -> gpui_kit::Entity<Workspace> {
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         cx.new(Workspace::new)
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn sidebar_toggle_flips_open_state(cx: &mut TestAppContext) {
         let ws = setup(cx);
         let initial = ws.read_with(cx, |w, _| w.sidebar_open);
@@ -2097,7 +2097,7 @@ mod tests {
         assert_ne!(initial, after, "sidebar toggle must flip the open state");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn navigation_switches_active_view(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
@@ -2110,7 +2110,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn reader_opens_and_closes_in_same_workspace(cx: &mut TestAppContext) {
         let ws = setup(cx);
         // 存在しない book_id でもリーダーは開ける（エラーはビューアー内で表示）
@@ -2125,10 +2125,10 @@ mod tests {
         let closed = ws.read_with(cx, |w, _| w.reader.is_none());
         assert!(closed, "reader should close");
     }
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn closing_reader_refreshes_bookshelf_read_state(cx: &mut TestAppContext) {
         use thundoku_core::db::documents;
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         // b1: 3 ページの本（ダウンロード直後は reading_progress が無く
         // 本棚は imported_documents の total_pages から "1/3" 未読と表示する）
@@ -2235,7 +2235,7 @@ mod tests {
         assert_eq!(after.0, 3, "closing the reader must show the last page");
         assert!(after.2, "closing the reader must mark the book as read");
     }
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn open_reader_action_dispatches_open_reader(cx: &mut TestAppContext) {
         let ws = setup(cx);
         // 本棚から dispatch される OpenReader アクションが register_actions の
@@ -2250,7 +2250,7 @@ mod tests {
         assert!(opened, "OpenReader action should open the reader");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn overlay_open_and_close_actions_toggle_workspace(cx: &mut TestAppContext) {
         let ws = setup(cx);
         assert!(!ws.read_with(cx, |w, _| w.show_auth));
@@ -2264,7 +2264,7 @@ mod tests {
         assert!(!ws.read_with(cx, |w, _| w.show_auth));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn theme_switch_persists_mode(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
@@ -2278,7 +2278,7 @@ mod tests {
         assert_eq!(saved.as_deref(), Some("dark"), "theme.mode should persist");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn theme_toggle_switches_mode(cx: &mut TestAppContext) {
         let ws = setup(cx);
         let mode = |cx: &mut TestAppContext| {
@@ -2296,14 +2296,14 @@ mod tests {
         assert_ne!(before, after, "cycle_theme should flip the mode");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn unread_count_counts_unread_books(cx: &mut TestAppContext) {
         let ws = setup(cx);
         let count = ws.read_with(cx, |w, _| w.unread_count);
         assert_eq!(count, 0, "no books in an empty DB");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn sidebar_logo_stays_square_when_collapsed(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
@@ -2317,14 +2317,14 @@ mod tests {
         assert!(!logo_size.0);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn sidebar_defaults_to_closed(cx: &mut TestAppContext) {
         let ws = setup(cx);
         let open = ws.read_with(cx, |w, _| w.sidebar_open);
         assert!(!open, "sidebar はデフォルトで閉じた状態");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn sidebar_logo_stays_square_when_expanded(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
@@ -2337,7 +2337,7 @@ mod tests {
         assert!(logo_size.0);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn sidebar_logo_click_does_not_toggle_sidebar(cx: &mut TestAppContext) {
         let ws = setup(cx);
         let before = ws.read_with(cx, |w, _| w.sidebar_open);
@@ -2349,7 +2349,7 @@ mod tests {
         assert_eq!(before, after, "logo click must not toggle the sidebar");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn auth_panel_shows_status_and_opens_selected_provider(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {

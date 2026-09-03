@@ -4,11 +4,11 @@
 //! WebView 内でログインを完了して booth.pm に戻ったら、booth.pm のセッション
 //! Cookie を自動取得して永続化する（Cookie の手動コピーは不要）。
 
-use gpui::{
+use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_component::{Icon, IconName};
+use gpui_kit::component::{Icon, IconName};
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
 
@@ -179,12 +179,12 @@ impl Render for BoothLoginView {
             let height = 640.0_f32;
             let left = (window_bounds.size.width.as_f32() - width) / 2.0;
             let top = (window_bounds.size.height.as_f32() - height) / 2.0;
-            gpui::bounds(
-                gpui::Point {
+            gpui_kit::bounds(
+                gpui_kit::Point {
                     x: px(left),
                     y: px(top),
                 },
-                gpui::Size {
+                gpui_kit::Size {
                     width: px(width),
                     height: px(height),
                 },
@@ -214,7 +214,7 @@ impl Render for BoothLoginView {
             .right_0()
             .bottom_0()
             .left_0()
-            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.45))
             // 閉じるボタンはウィンドウ右上（WebView 領域の外側）に配置
             .child(
                 div()
@@ -228,9 +228,9 @@ impl Render for BoothLoginView {
                     .items_center()
                     .justify_center()
                     .rounded_md()
-                    .bg(gpui::rgba(0xffffff26))
-                    .text_color(gpui::white())
-                    .hover(|style| style.bg(gpui::rgba(0xffffff40)))
+                    .bg(gpui_kit::rgba(0xffffff26))
+                    .text_color(gpui_kit::white())
+                    .hover(|style| style.bg(gpui_kit::rgba(0xffffff40)))
                     .cursor_pointer()
                     .on_click({
                         let handle = cx.weak_entity();

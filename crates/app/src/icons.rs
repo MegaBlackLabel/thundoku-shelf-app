@@ -8,8 +8,8 @@
 
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, SharedString};
-use gpui_component::IconNamed;
+use gpui_kit::{AssetSource, Result, SharedString};
+use gpui_kit::component::IconNamed;
 
 /// Web 版で使われている lucide アイコンのうち、gpui-component に無いもの。
 #[derive(Clone, Copy)]
@@ -82,11 +82,11 @@ impl AssetSource for AppAssets {
         if let Some(bytes) = custom_icon(path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        gpui_component_assets::Assets.load(path)
+        gpui_kit::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        gpui_component_assets::Assets.list(path)
+        gpui_kit::assets::Assets.list(path)
     }
 }
 

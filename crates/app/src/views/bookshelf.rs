@@ -4,22 +4,22 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use gpui::StyledImage as _;
-use gpui::prelude::FluentBuilder as _;
-use gpui::{
+use gpui_kit::StyledImage as _;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
     Anchor, AppContext as _, InteractiveElement as _, ReadGlobal as _,
     StatefulInteractiveElement as _, Styled as _,
 };
-use gpui::{
+use gpui_kit::{
     App, Context, Entity, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
     SharedString, Window, div, img, px,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputState};
-use gpui_component::menu::ContextMenuExt as _;
-use gpui_component::popover::Popover;
-use gpui_component::theme::Colorize as _;
-use gpui_component::{ActiveTheme as _, Icon, IconName};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::theme::Colorize as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::booth::BoothClient;
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, documents, progress};
@@ -132,11 +132,11 @@ pub struct BookshelfView {
     /// 直前の検索文字列（変更検出用）
     last_search: String,
     /// 本棚グリッドの仮想化リスト状態
-    list_state: gpui::ListState,
+    list_state: gpui_kit::ListState,
     /// リスト表示のスクロール追跡（選択行のスクロール連動用）
-    scroll_handle: gpui::ScrollHandle,
+    scroll_handle: gpui_kit::ScrollHandle,
     /// キーバインド用フォーカス
-    focus_handle: gpui::FocusHandle,
+    focus_handle: gpui_kit::FocusHandle,
     /// フォーカス初回付与済みフラグ
     focus_initialized: bool,
     /// 選択中のカード（filtered 内のインデックス）
@@ -232,9 +232,9 @@ impl BookshelfView {
             filtered: Vec::new(),
             filtered_dirty: true,
             last_search: String::new(),
-            list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(100.0))
+            list_state: gpui_kit::ListState::new(0, gpui_kit::ListAlignment::Top, gpui_kit::px(100.0))
                 .measure_all(),
-            scroll_handle: gpui::ScrollHandle::new(),
+            scroll_handle: gpui_kit::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
             selected_index: Some(0),
@@ -849,8 +849,8 @@ impl BookshelfView {
             // 数枚ずつバッチにしてまとめて反映する。
             let mut batch: Vec<(String, String, Arc<RenderImage>)> = Vec::new();
             let apply_batch = |batch: Vec<(String, String, Arc<RenderImage>)>,
-                               handle: &gpui::Entity<BookshelfView>,
-                               cx: &mut gpui::AsyncApp| {
+                               handle: &gpui_kit::Entity<BookshelfView>,
+                               cx: &mut gpui_kit::AsyncApp| {
                 handle.update(cx, |this, cx| {
                     for (site_id, database_id, image) in batch {
                         if let Some(card) = this.shelf_cards.iter_mut().find(|c| {
@@ -1946,8 +1946,8 @@ impl BookshelfView {
     #[allow(clippy::too_many_arguments)]
     fn render_card(
         window: &mut Window,
-        theme: &gpui_component::Theme,
-        handle: &gpui::Entity<BookshelfView>,
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
         card: &ShelfCard,
         card_width: f32,
         download_state: Option<DownloadState>,
@@ -1955,7 +1955,7 @@ impl BookshelfView {
         favorite_tags: &[String],
         editing_tags: &[String],
         editing_suggestions: &[String],
-        editing_input: Option<&gpui::Entity<InputState>>,
+        editing_input: Option<&gpui_kit::Entity<InputState>>,
         selected: bool,
     ) -> impl IntoElement {
         let shelf = &card.shelf;
@@ -1997,7 +1997,7 @@ impl BookshelfView {
         // -- 表紙: 画像 + 未読/既読バッジ + ダウンロード状態アイコン + 進捗リング --
         // 画像は枠（144x192）に必ず収まるよう overflow-hidden のラッパーで包む
         // （オーバーレイ・アイコンは枠基準で配置されるため、はみ出しによるズレを防ぐ）。
-        let image: gpui::AnyElement = match &cover {
+        let image: gpui_kit::AnyElement = match &cover {
             Some(render) => div()
                 .w(px(144.0))
                 .h(px(192.0))
@@ -2006,7 +2006,7 @@ impl BookshelfView {
                     img(render.clone())
                         .w_full()
                         .h_full()
-                        .object_fit(gpui::ObjectFit::Cover),
+                        .object_fit(gpui_kit::ObjectFit::Cover),
                 )
                 .into_any_element(),
             None => div()
@@ -2030,8 +2030,8 @@ impl BookshelfView {
                     .rounded_br_md()
                     .px_1()
                     .py_0p5()
-                    .bg(gpui::rgb(0xd1fae5))
-                    .text_color(gpui::rgb(0x047857))
+                    .bg(gpui_kit::rgb(0xd1fae5))
+                    .text_color(gpui_kit::rgb(0x047857))
                     .text_xs()
                     .child("読了")
                     .into_any_element()
@@ -2043,8 +2043,8 @@ impl BookshelfView {
                     .rounded_br_md()
                     .px_1()
                     .py_0p5()
-                    .bg(gpui::rgb(0xfef3c7))
-                    .text_color(gpui::rgb(0xb45309))
+                    .bg(gpui_kit::rgb(0xfef3c7))
+                    .text_color(gpui_kit::rgb(0xb45309))
                     .text_xs()
                     .child("未読")
                     .into_any_element()
@@ -2071,11 +2071,11 @@ impl BookshelfView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x00000040))
+                    .bg(gpui_kit::rgba(0x00000040))
                     .text_color(if is_favorite {
-                        gpui::rgb(0xf43f5e)
+                        gpui_kit::rgb(0xf43f5e)
                     } else {
-                        gpui::rgb(0xffffff)
+                        gpui_kit::rgb(0xffffff)
                     })
                     .text_sm()
                     .child(if is_favorite { "♥" } else { "♡" })
@@ -2093,12 +2093,12 @@ impl BookshelfView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x05966933))
+                    .bg(gpui_kit::rgba(0x05966933))
                     .child(
                         div()
-                            .text_color(gpui::rgb(0x059669))
+                            .text_color(gpui_kit::rgb(0x059669))
                             .text_sm()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_weight(gpui_kit::FontWeight::BOLD)
                             .child("✓"),
                     )
                     .into_any_element()
@@ -2113,12 +2113,12 @@ impl BookshelfView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x00000033))
+                    .bg(gpui_kit::rgba(0x00000033))
                     .child(
                         div()
-                            .text_color(gpui::white())
+                            .text_color(gpui_kit::white())
                             .text_sm()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_weight(gpui_kit::FontWeight::BOLD)
                             .child("↓"),
                     )
                     .into_any_element()
@@ -2136,7 +2136,7 @@ impl BookshelfView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x00000080))
+                    .bg(gpui_kit::rgba(0x00000080))
                     .child(
                         div()
                             .flex()
@@ -2151,15 +2151,15 @@ impl BookshelfView {
                                     .items_center()
                                     .child(
                                         div()
-                                            .text_color(gpui::white())
+                                            .text_color(gpui_kit::white())
                                             .text_xs()
                                             .child(state.label()),
                                     )
                                     .child(
                                         div()
-                                            .text_color(gpui::white())
+                                            .text_color(gpui_kit::white())
                                             .text_sm()
-                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .font_weight(gpui_kit::FontWeight::BOLD)
                                             .child(format!("{percentage}%")),
                                     ),
                             ),
@@ -2237,7 +2237,7 @@ impl BookshelfView {
             .child(
                 div()
                     .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(title),
             )
             // イベント名 or 購入日（BOOTH はイベントがないため購入日を表示）
@@ -2353,11 +2353,11 @@ impl BookshelfView {
 
     /// タグチップ行（Web の TagList 相当: お気に入りは ♥ + ピンク）。
     fn render_tag_chips(
-        theme: &gpui_component::Theme,
-        handle: &gpui::Entity<BookshelfView>,
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
         favorite_tags: &[String],
         card: &ShelfCard,
-    ) -> Vec<gpui::AnyElement> {
+    ) -> Vec<gpui_kit::AnyElement> {
         let shelf = &card.shelf;
         let tags = card.tags.clone();
         let favorite_tags = favorite_tags.to_vec();
@@ -2382,12 +2382,12 @@ impl BookshelfView {
                     .py_0p5()
                     .rounded_full()
                     .bg(if is_favorite {
-                        gpui::rgb(0xfbcfe8).into()
+                        gpui_kit::rgb(0xfbcfe8).into()
                     } else {
                         theme.muted
                     })
                     .text_color(if is_favorite {
-                        gpui::rgb(0x9d174d).into()
+                        gpui_kit::rgb(0x9d174d).into()
                     } else {
                         theme.muted_foreground
                     })
@@ -2395,7 +2395,7 @@ impl BookshelfView {
                     .child(
                         div()
                             .text_color(if is_favorite {
-                                gpui::rgb(0xbe185d).into()
+                                gpui_kit::rgb(0xbe185d).into()
                             } else {
                                 theme.muted_foreground
                             })
@@ -2418,11 +2418,11 @@ impl BookshelfView {
     /// サジェスチョン + 保存/キャンセル）。
     fn render_tag_editor(
         _window: &mut Window,
-        theme: &gpui_component::Theme,
-        handle: &gpui::Entity<BookshelfView>,
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
         editing_tags: &[String],
         editing_suggestions: &[String],
-        editing_input: &gpui::Entity<InputState>,
+        editing_input: &gpui_kit::Entity<InputState>,
     ) -> impl IntoElement {
         let handle = handle.clone();
         let tags = editing_tags.to_vec();
@@ -2479,7 +2479,7 @@ impl BookshelfView {
                                 .rounded_full()
                                 .bg(muted)
                                 .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .child(div().truncate().child(tag.clone()))
                                 .child(
                                     div()
@@ -2625,10 +2625,10 @@ impl BookshelfView {
     /// タグ編集ボタン（✎）。
     fn render_tag_edit_button(
         window: &mut Window,
-        theme: &gpui_component::Theme,
-        handle: &gpui::Entity<BookshelfView>,
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
         database_id: &str,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let _ = window;
         let edit_id = database_id.to_string();
         let handle = handle.clone();
@@ -2696,7 +2696,7 @@ impl BookshelfView {
         let _ = window;
 
         // 表紙（Web の h-24 w-20 = 80x96 相当）
-        let image: gpui::AnyElement = match &cover {
+        let image: gpui_kit::AnyElement = match &cover {
             Some(render) => div()
                 .w(px(64.0))
                 .h(px(90.0))
@@ -2705,7 +2705,7 @@ impl BookshelfView {
                     img(render.clone())
                         .w_full()
                         .h_full()
-                        .object_fit(gpui::ObjectFit::Cover),
+                        .object_fit(gpui_kit::ObjectFit::Cover),
                 )
                 .into_any_element(),
             None => div()
@@ -2728,8 +2728,8 @@ impl BookshelfView {
                     .rounded_br_md()
                     .px_1()
                     .py_0p5()
-                    .bg(gpui::rgb(0xd1fae5))
-                    .text_color(gpui::rgb(0x047857))
+                    .bg(gpui_kit::rgb(0xd1fae5))
+                    .text_color(gpui_kit::rgb(0x047857))
                     .text_xs()
                     .child("読了")
                     .into_any_element()
@@ -2741,8 +2741,8 @@ impl BookshelfView {
                     .rounded_br_md()
                     .px_1()
                     .py_0p5()
-                    .bg(gpui::rgb(0xfef3c7))
-                    .text_color(gpui::rgb(0xb45309))
+                    .bg(gpui_kit::rgb(0xfef3c7))
+                    .text_color(gpui_kit::rgb(0xb45309))
                     .text_xs()
                     .child("未読")
                     .into_any_element()
@@ -2758,12 +2758,12 @@ impl BookshelfView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x05966933))
+                    .bg(gpui_kit::rgba(0x05966933))
                     .child(
                         div()
-                            .text_color(gpui::rgb(0x059669))
+                            .text_color(gpui_kit::rgb(0x059669))
                             .text_xs()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_weight(gpui_kit::FontWeight::BOLD)
                             .child("✓"),
                     )
                     .into_any_element()
@@ -2778,12 +2778,12 @@ impl BookshelfView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x00000033))
+                    .bg(gpui_kit::rgba(0x00000033))
                     .child(
                         div()
-                            .text_color(gpui::white())
+                            .text_color(gpui_kit::white())
                             .text_xs()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_weight(gpui_kit::FontWeight::BOLD)
                             .child("↓"),
                     )
                     .into_any_element()
@@ -2800,7 +2800,7 @@ impl BookshelfView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x00000080))
+                    .bg(gpui_kit::rgba(0x00000080))
                     .child(
                         div()
                             .flex()
@@ -2810,7 +2810,7 @@ impl BookshelfView {
                             .child(img(ring).w(px(48.0)).h(px(48.0)))
                             .child(
                                 div()
-                                    .text_color(gpui::white())
+                                    .text_color(gpui_kit::white())
                                     .text_xs()
                                     .child(format!("{percentage}%")),
                             ),
@@ -2858,7 +2858,7 @@ impl BookshelfView {
                 .child(
                     div()
                         .text_sm()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .child(title),
                 )
                 .child(
@@ -3065,7 +3065,7 @@ impl Render for BookshelfView {
                     .child(
                         div()
                             .text_lg()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_weight(gpui_kit::FontWeight::BOLD)
                             .child(site_title),
                     )
                     .child(
@@ -3188,7 +3188,7 @@ impl Render for BookshelfView {
                                                             .bg(theme_primary)
                                                             .text_color(theme_primary_fg)
                                                             .text_size(px(10.0))
-                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                                                             .child(
                                                                 selected_events.len().to_string(),
                                                             )
@@ -3280,7 +3280,7 @@ impl Render for BookshelfView {
                                                                     .bg(if is_selected {
                                                                         theme_primary
                                                                     } else {
-                                                                        gpui::transparent_black()
+                                                                        gpui_kit::transparent_black()
                                                                     })
                                                                     .child(if is_selected {
                                                                         Icon::new(IconName::Check)
@@ -3410,7 +3410,7 @@ impl Render for BookshelfView {
                                                                                                                                     })
                                                                                                                                     .text_xs()
                                                                                                                                     .font_weight(
-                                                                    gpui::FontWeight::MEDIUM,
+                                                                    gpui_kit::FontWeight::MEDIUM,
                                                                                                                                     ).cursor_pointer().on_click(move |_, _window, cx| {
                                                                         handle.update(cx, |this, cx| {
                                                                             this.toggle_tag(
@@ -3543,7 +3543,7 @@ impl Render for BookshelfView {
                                      div()
                                          .w(px(content_width))
                                          .h_full()
-                                         .child(gpui::list(
+                                         .child(gpui_kit::list(
                                              list_state,
                                             move |ix, window, cx| {
                                                 // 借用を閉じるため可視行のカードと状態を先にコピーする
@@ -3641,7 +3641,7 @@ impl Render for BookshelfView {
             .child(if let Some(error) = error {
                 div()
                     .text_sm()
-                    .text_color(gpui::red())
+                    .text_color(gpui_kit::red())
                     .child(error)
                     .into_any_element()
             } else {
@@ -3774,7 +3774,7 @@ pub fn app_logo_image() -> Option<Arc<RenderImage>> {
         for pixel in rgba.chunks_exact_mut(4) {
             pixel.swap(0, 2);
         }
-        Some(Arc::new(gpui::RenderImage::new([image::Frame::new(rgba)])))
+        Some(Arc::new(gpui_kit::RenderImage::new([image::Frame::new(rgba)])))
     });
     LOGO.clone()
 }
@@ -3892,8 +3892,8 @@ fn item_file_name(title: &str, item: &bookshelf::BookshelfItem) -> String {
 
 #[cfg(test)]
 mod tests {
-    use gpui::AppContext as _;
-    use gpui::TestAppContext;
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
 
     use thundoku_core::db::{books, progress};
 
@@ -4034,9 +4034,9 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn search_filters_entries(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_shelf_item(cx, "db-1", "React 入門", "サークルA", None);
         seed_shelf_item(cx, "db-2", "Rust の本", "サークルB", None);
@@ -4045,11 +4045,11 @@ mod tests {
 
         // set search value through a window-bound state
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
         cx.update_window(*window, |_root, window, cx| {
             view.update(cx, |this, cx| {
@@ -4070,9 +4070,9 @@ mod tests {
         assert_eq!(titles, vec!["React 入門".to_string()]);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn select_book_sets_selection_from_book_id(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "book-1", "本1", "サークルA");
         seed_book(cx, "book-2", "本2", "サークルB");
@@ -4097,9 +4097,9 @@ mod tests {
         assert_eq!(sel, Some(Some("book-2".to_string())));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn read_filter_separates_unread(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "既読本", "サークルA");
         seed_book(cx, "b2", "未読本", "サークルB");
@@ -4161,9 +4161,9 @@ mod tests {
         assert!(BookshelfView::columns_for_width(3840.0) > 5);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn card_rows_left_align_while_grid_is_centered(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         // 800px 幅 → 3 列: 1 行目 db-1..3、2 行目 db-4
         // （tag_editor テストと同じ構成: book id と shelf database_id を分離してリンク）
@@ -4190,13 +4190,13 @@ mod tests {
             "shelf cards must be built from seeded items"
         );
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4220,16 +4220,16 @@ mod tests {
             .expect("second row card rendered");
         // 2 行目の先頭は 1 枚目と同じ x（左端）に揃う（行内左寄せ）
         assert!(
-            (last.origin.x - first.origin.x).abs() < gpui::px(1.0),
+            (last.origin.x - first.origin.x).abs() < gpui_kit::px(1.0),
             "second row must start at the same x as the first: {} vs {}",
             last.origin.x.as_f32(),
             first.origin.x.as_f32()
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn tag_filter_uses_or_semantics(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_book(cx, "b2", "本2", "サークルB");
@@ -4282,9 +4282,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn tag_editor_save_and_cancel_do_not_trigger_card_download(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
@@ -4299,13 +4299,13 @@ mod tests {
         });
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(900.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4318,7 +4318,7 @@ mod tests {
         let edit = visual
             .debug_bounds("tag-edit-db-1")
             .expect("tag edit button rendered");
-        visual.simulate_click(edit.center(), gpui::Modifiers::default());
+        visual.simulate_click(edit.center(), gpui_kit::Modifiers::default());
         assert!(view.read_with(cx, |this, _| this.editing_book_id.is_some()));
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
@@ -4333,11 +4333,11 @@ mod tests {
             .debug_bounds("tag-editor-root")
             .expect("tag editor rendered");
         // 枠の中央付近（チップや入力に当たらない余白）をクリック
-        let empty_point = gpui::Point::new(
-            editor.origin.x + gpui::px(10.0),
-            editor.origin.y + gpui::px(6.0),
+        let empty_point = gpui_kit::Point::new(
+            editor.origin.x + gpui_kit::px(10.0),
+            editor.origin.y + gpui_kit::px(6.0),
         );
-        visual.simulate_click(empty_point, gpui::Modifiers::default());
+        visual.simulate_click(empty_point, gpui_kit::Modifiers::default());
         assert!(
             view.read_with(cx, |this, _| this.download_states.is_empty()),
             "clicking the tag editor must not trigger a card download"
@@ -4352,7 +4352,7 @@ mod tests {
         let suggestion = visual
             .debug_bounds("edit-suggestion-後で読む")
             .expect("suggestion chip rendered");
-        visual.simulate_click(suggestion.center(), gpui::Modifiers::default());
+        visual.simulate_click(suggestion.center(), gpui_kit::Modifiers::default());
         assert!(
             view.read_with(cx, |this, _| this
                 .editing_tags
@@ -4364,7 +4364,7 @@ mod tests {
         let cancel = visual
             .debug_bounds("tag-edit-cancel-btn")
             .expect("cancel button rendered");
-        visual.simulate_click(cancel.center(), gpui::Modifiers::default());
+        visual.simulate_click(cancel.center(), gpui_kit::Modifiers::default());
         assert_eq!(
             view.read_with(cx, |this, _| this.editing_book_id.clone()),
             None
@@ -4375,9 +4375,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn tag_editor_save_button_persists_tags(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
@@ -4392,13 +4392,13 @@ mod tests {
         });
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(900.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4411,7 +4411,7 @@ mod tests {
         let edit = visual
             .debug_bounds("tag-edit-db-1")
             .expect("tag edit button rendered");
-        visual.simulate_click(edit.center(), gpui::Modifiers::default());
+        visual.simulate_click(edit.center(), gpui_kit::Modifiers::default());
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4422,11 +4422,11 @@ mod tests {
         let suggestion = visual
             .debug_bounds("edit-suggestion-後で読む")
             .expect("suggestion chip rendered");
-        visual.simulate_click(suggestion.center(), gpui::Modifiers::default());
+        visual.simulate_click(suggestion.center(), gpui_kit::Modifiers::default());
         let save = visual
             .debug_bounds("tag-edit-save-btn")
             .expect("save button rendered");
-        visual.simulate_click(save.center(), gpui::Modifiers::default());
+        visual.simulate_click(save.center(), gpui_kit::Modifiers::default());
 
         // 保存される + 編集モード解除 + ダウンロード発火しない
         let stored = cx.update(|cx| {
@@ -4449,9 +4449,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn tag_edit_click_does_not_trigger_card_download(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
@@ -4466,13 +4466,13 @@ mod tests {
         });
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(900.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4485,7 +4485,7 @@ mod tests {
         let edit = visual
             .debug_bounds("tag-edit-db-1")
             .expect("tag edit button rendered");
-        visual.simulate_click(edit.center(), gpui::Modifiers::default());
+        visual.simulate_click(edit.center(), gpui_kit::Modifiers::default());
         assert_eq!(
             view.read_with(cx, |this, _| this.editing_book_id.clone()),
             Some("db-1".to_string()),
@@ -4497,9 +4497,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn inline_tag_edit_adds_suggestion_and_saves(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
@@ -4514,13 +4514,13 @@ mod tests {
         });
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(900.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4533,7 +4533,7 @@ mod tests {
         let edit = visual
             .debug_bounds("tag-edit-db-1")
             .expect("tag edit button rendered");
-        visual.simulate_click(edit.center(), gpui::Modifiers::default());
+        visual.simulate_click(edit.center(), gpui_kit::Modifiers::default());
         assert_eq!(
             view.read_with(cx, |this, _| this.editing_book_id.clone()),
             Some("db-1".to_string())
@@ -4550,7 +4550,7 @@ mod tests {
         let suggestion = visual
             .debug_bounds("edit-suggestion-後で読む")
             .expect("suggestion chip rendered");
-        visual.simulate_click(suggestion.center(), gpui::Modifiers::default());
+        visual.simulate_click(suggestion.center(), gpui_kit::Modifiers::default());
         assert!(
             view.read_with(cx, |this, _| this
                 .editing_tags
@@ -4577,9 +4577,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn last_page_marks_book_as_read(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_book(cx, "b2", "本2", "サークルB");
@@ -4624,9 +4624,9 @@ mod tests {
         assert!(!unread, "mid-book must stay unread");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn event_list_sorts_latest_techbookfest_first(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         for (id, event) in [
             ("db-1", "技術書典10"),
@@ -4650,9 +4650,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn event_name_matched_by_purchase_date(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         // 開催日付きイベント（tbf19: 2025-11-15〜11-30）
         cx.update(|cx| {
@@ -4727,9 +4727,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn reload_shows_page_count_from_document(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
@@ -4770,9 +4770,9 @@ mod tests {
         assert_eq!(progress, Some((1, Some(65))));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn reload_completes_event_name_from_tbf_events(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         // tbf_events に tbf18 のイベント名を登録
         cx.update(|cx| {
@@ -4844,9 +4844,9 @@ mod tests {
         assert_eq!(event_name.as_deref(), Some("技術書典18"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn heart_click_registers_favorite_tag(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
@@ -4862,13 +4862,13 @@ mod tests {
         });
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(900.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4880,7 +4880,7 @@ mod tests {
         let chip = visual
             .debug_bounds("tag-chip-db-1-後で読む")
             .expect("tag chip rendered");
-        visual.simulate_click(chip.center(), gpui::Modifiers::default());
+        visual.simulate_click(chip.center(), gpui_kit::Modifiers::default());
         assert!(
             view.read_with(cx, |this, _| this
                 .favorite_tags
@@ -4895,9 +4895,9 @@ mod tests {
         assert_eq!(stored, vec!["後で読む".to_string()]);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn tag_filter_popover_toggles_tag_selection(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         // お気に入りタグと本を seed
         cx.update(|cx| {
@@ -4911,13 +4911,13 @@ mod tests {
         });
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(900.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4930,7 +4930,7 @@ mod tests {
         let trigger = visual
             .debug_bounds("tag-filter-trigger")
             .expect("tag filter trigger rendered");
-        visual.simulate_click(trigger.center(), gpui::Modifiers::default());
+        visual.simulate_click(trigger.center(), gpui_kit::Modifiers::default());
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4943,7 +4943,7 @@ mod tests {
         let chip = visual
             .debug_bounds("tag-option-react")
             .expect("tag chip should be visible in popover");
-        visual.simulate_click(chip.center(), gpui::Modifiers::default());
+        visual.simulate_click(chip.center(), gpui_kit::Modifiers::default());
         assert!(
             view.read_with(cx, |this, _| this
                 .selected_tags
@@ -4952,7 +4952,7 @@ mod tests {
         );
 
         // もう一度クリックで解除
-        visual.simulate_click(chip.center(), gpui::Modifiers::default());
+        visual.simulate_click(chip.center(), gpui_kit::Modifiers::default());
         assert!(
             !view.read_with(cx, |this, _| this
                 .selected_tags
@@ -4961,20 +4961,20 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn event_filter_popover_toggles_event_selection(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_shelf_item_with_event(cx, "db-1", "本1", "サークルA", "技術書典18");
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(900.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -4987,7 +4987,7 @@ mod tests {
         let trigger = visual
             .debug_bounds("event-filter-trigger")
             .expect("event filter trigger rendered");
-        visual.simulate_click(trigger.center(), gpui::Modifiers::default());
+        visual.simulate_click(trigger.center(), gpui_kit::Modifiers::default());
         // List（仮想化グリッド）はアイテム測定に複数フレーム必要なため追加描画する
         for _ in 0..4 {
             visual.update(|window, cx| {
@@ -5000,7 +5000,7 @@ mod tests {
         let option = visual
             .debug_bounds("event-option-技術書典18")
             .expect("event option should be visible in popover");
-        visual.simulate_click(option.center(), gpui::Modifiers::default());
+        visual.simulate_click(option.center(), gpui_kit::Modifiers::default());
         assert_eq!(
             view.read_with(cx, |this, _| this.selected_events.clone()),
             vec!["技術書典18".to_string()],
@@ -5008,9 +5008,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn site_filter_filters_bookshelf_items(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         // 技術書典の本 2 冊 + ローカルだけの本 1 冊（インポート済み）
         seed_shelf_item(cx, "s1", "本A", "サークルA", None);
@@ -5053,9 +5053,9 @@ mod tests {
         assert_eq!(tbf, 2, "techbookfest filter must show only tbf items");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn event_filter_filters_by_selected_event(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_shelf_item_with_event(cx, "db-1", "本1", "サークルA", "技術書典17");
         seed_shelf_item_with_event(cx, "db-2", "本2", "サークルB", "技術書典18");
@@ -5103,9 +5103,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn tag_fetch_toggle_persists_setting(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let view = cx.new(BookshelfView::new);
         // デフォルトは OFF
@@ -5132,9 +5132,9 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("false"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn view_mode_toggles_between_card_and_list(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let view = cx.new(BookshelfView::new);
         assert_eq!(view.read_with(cx, |this, _| this.view_mode), ViewMode::Card);
@@ -5144,9 +5144,9 @@ mod tests {
         assert_eq!(view.read_with(cx, |this, _| this.view_mode), ViewMode::Card);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn delete_book_removes_row_and_pack(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         // create a pack file
@@ -5200,9 +5200,9 @@ mod tests {
         assert_eq!(format_event_label("コミティア 150"), "コミティア 150");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn shelf_card_carries_local_progress(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_progress(cx, "b1", 2, Some(10));
@@ -5223,9 +5223,9 @@ mod tests {
         assert_eq!(entry.progress, Some((2, Some(10))));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn favorite_filter_shows_only_favorites(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
@@ -5250,9 +5250,9 @@ mod tests {
         assert_eq!(visible, vec!["db-1".to_string()]);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn hidden_book_is_excluded_from_shelf(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);

@@ -7,18 +7,18 @@
 
 use std::time::Duration;
 
-use gpui::{
+use gpui_kit::{
     App, BoxShadow, IntoElement, ParentElement, Styled as _, anchored, div, hsla, point,
     prelude::FluentBuilder as _, px,
 };
-use gpui_base::{Transition, transition};
-use gpui_component::ActiveTheme as _;
-use gpui_component::animation::ease_out_cubic;
+use gpui_kit::base::{Transition, transition};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::animation::ease_out_cubic;
 
 /// ダイアログを表示する。`open` が `true` の間、中央にフェードイン表示する。
 /// `content` にはダイアログ本体（`dialog_surface` で構築したサーフェス）を渡す。
 pub fn fade_dialog(
-    window: &mut gpui::Window,
+    window: &mut gpui_kit::Window,
     cx: &mut App,
     open: bool,
     content: impl IntoElement,
@@ -32,7 +32,7 @@ pub fn fade_dialog(
     );
     let overlay = cx.theme().colors.overlay;
     let view_size = window.viewport_size();
-    gpui::deferred(
+    gpui_kit::deferred(
         anchored().snap_to_window().child(
             div()
                 .w(view_size.width)
@@ -53,7 +53,7 @@ pub fn fade_dialog(
 ///
 /// 呼び出し側では `let mut surface = dialog_surface(cx);` と先に評価し、
 /// `fade_dialog` に渡す（`cx` の借用を分離するため）。
-pub fn dialog_surface(cx: &App) -> gpui::Div {
+pub fn dialog_surface(cx: &App) -> gpui_kit::Div {
     // ダークモードでは黒い影が背景（暗い）に沈んで見えないため、
     // Web のダークモード標準に合わせて白の薄い縁（ハイライト）で区別する。
     let is_dark = cx.theme().mode.is_dark();

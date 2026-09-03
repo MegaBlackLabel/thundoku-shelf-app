@@ -4,13 +4,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use gpui::Styled as _;
-use gpui::Subscription;
-use gpui::{
+use gpui_kit::Styled as _;
+use gpui_kit::Subscription;
+use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement, ReadGlobal as _, Render,
     SharedString, Window, div,
 };
-use gpui_component::ActiveTheme as _;
+use gpui_kit::component::ActiveTheme as _;
 use thundoku_core::db;
 
 use crate::app_state::AppState;
@@ -274,8 +274,7 @@ impl Render for ReaderView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
-    use gpui_component;
+    use gpui_kit::TestAppContext;
     use thundoku_core::db::documents;
     use thundoku_core::db::page_views;
 
@@ -344,9 +343,9 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn reading_records_per_page_view_and_dwell(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
         seed_book_with_pages(cx, "b1", "本1", 3);
 
@@ -383,9 +382,9 @@ mod tests {
         assert!(rows[2].total_seconds >= 0.0, "closing finalizes last page dwell");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn spread_mode_records_both_pages_of_each_spread(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
         // 見開き（spread）モードで開く（サイト別キーが無いグローバル設定へ）
         cx.update(|cx| {

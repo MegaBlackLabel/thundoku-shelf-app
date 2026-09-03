@@ -4,24 +4,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{
+use gpui_kit::{
     AppContext as _, InteractiveElement as _, ReadGlobal as _, ScrollHandle,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
     prelude::FluentBuilder as _,
 };
-use gpui::{
+use gpui_kit::{
     Context, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
     SharedString, Window, div, img, px,
 };
-use gpui_base::{Transition, transition};
-use gpui_component::animation::ease_out_cubic;
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputState};
-use gpui_component::kbd::Kbd;
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::slider::{Slider, SliderState};
-use gpui_component::{ActiveTheme as _, Disableable as _};
-use gpui_component::{Icon, IconName};
+use gpui_kit::base::{Transition, transition};
+use gpui_kit::component::animation::ease_out_cubic;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::slider::{Slider, SliderState};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _};
+use gpui_kit::component::{Icon, IconName};
 use thundoku_core::db;
 
 use crate::actions::CloseReader;
@@ -142,29 +142,29 @@ impl PageLoader for Base64PageLoader {
 }
 
 /// ビューアー背景: 真っ白だと本の白いページと区別できないため薄グレー。
-fn viewer_bg() -> gpui::Hsla {
-    gpui::rgb(0xf4f4f5).into()
+fn viewer_bg() -> gpui_kit::Hsla {
+    gpui_kit::rgb(0xf4f4f5).into()
 }
 
 /// Web 版の `rounded-[1.25rem]`（20px）相当の角丸を設定する。
-fn rounded_web<E: gpui::Styled>(mut element: E) -> E {
-    element.style().corner_radii.top_left = Some(gpui::AbsoluteLength::Pixels(px(20.0)));
-    element.style().corner_radii.top_right = Some(gpui::AbsoluteLength::Pixels(px(20.0)));
-    element.style().corner_radii.bottom_left = Some(gpui::AbsoluteLength::Pixels(px(20.0)));
-    element.style().corner_radii.bottom_right = Some(gpui::AbsoluteLength::Pixels(px(20.0)));
+fn rounded_web<E: gpui_kit::Styled>(mut element: E) -> E {
+    element.style().corner_radii.top_left = Some(gpui_kit::AbsoluteLength::Pixels(px(20.0)));
+    element.style().corner_radii.top_right = Some(gpui_kit::AbsoluteLength::Pixels(px(20.0)));
+    element.style().corner_radii.bottom_left = Some(gpui_kit::AbsoluteLength::Pixels(px(20.0)));
+    element.style().corner_radii.bottom_right = Some(gpui_kit::AbsoluteLength::Pixels(px(20.0)));
     element
 }
 
 /// 上端のみ 20px 角丸（ヘッダー用: ホバーで背景が変わっても角が丸いまま）。
-fn rounded_top_web<E: gpui::Styled>(mut element: E) -> E {
-    element.style().corner_radii.top_left = Some(gpui::AbsoluteLength::Pixels(px(20.0)));
-    element.style().corner_radii.top_right = Some(gpui::AbsoluteLength::Pixels(px(20.0)));
+fn rounded_top_web<E: gpui_kit::Styled>(mut element: E) -> E {
+    element.style().corner_radii.top_left = Some(gpui_kit::AbsoluteLength::Pixels(px(20.0)));
+    element.style().corner_radii.top_right = Some(gpui_kit::AbsoluteLength::Pixels(px(20.0)));
     element
 }
 
 /// ヘッダーの角丸: メニューが開いてる時は上端のみ（ビューと繋がる）、
 /// 閉じてる時は全角丸（パネル単体で表示されるため下端も丸くする）。
-fn header_radius<E: gpui::Styled>(element: E, panel_open: bool) -> E {
+fn header_radius<E: gpui_kit::Styled>(element: E, panel_open: bool) -> E {
     if panel_open {
         rounded_top_web(element)
     } else {
@@ -206,14 +206,14 @@ fn decode_render_image(data: &[u8]) -> Result<Arc<RenderImage>, String> {
 
 /// ズーム時の可動範囲を計算する（画像をウィンドウに contain した表示サイズの
 /// 拡大後とビューポートの差の半分。画像の隅まで動けるようになる）
-fn pan_max_for(scale: f32, viewport: gpui::Point<f32>, aspect: f32) -> gpui::Point<f32> {
+fn pan_max_for(scale: f32, viewport: gpui_kit::Point<f32>, aspect: f32) -> gpui_kit::Point<f32> {
     // contain した表示サイズ
     let (iw, ih) = if viewport.x / viewport.y > aspect {
         (viewport.y * aspect, viewport.y)
     } else {
         (viewport.x, viewport.x / aspect)
     };
-    gpui::Point::new(
+    gpui_kit::Point::new(
         ((iw * scale - viewport.x) / 2.0).max(0.0),
         ((ih * scale - viewport.y) / 2.0).max(0.0),
     )
@@ -266,15 +266,15 @@ pub struct ImageViewer {
     zoomed: bool,
     zoom_scale: f32,
     /// ズーム時のパン（ドラッグ移動）オフセット（ピクセル）
-    pan_offset: gpui::Point<f32>,
+    pan_offset: gpui_kit::Point<f32>,
     /// ドラッグ中の開始位置
-    drag_start: Option<gpui::Point<f32>>,
+    drag_start: Option<gpui_kit::Point<f32>>,
     /// 直前のクリック時刻（400ms 以内の再クリックをダブルクリックと判定）
     last_click_at: Option<std::time::Instant>,
     /// パンの速度（慣性用。px/フレーム相当）
-    pan_velocity: gpui::Point<f32>,
+    pan_velocity: gpui_kit::Point<f32>,
     /// パンの可動範囲（ビューポート × (scale-1) / 2。画像の隅まで動ける）
-    pan_max: gpui::Point<f32>,
+    pan_max: gpui_kit::Point<f32>,
     /// 慣性ループの世代（ドラッグ開始で無効化する）
     inertia_generation: u64,
     /// ズームトグルのデバウンス（ダブルクリック 1 回で複数回呼ばれるのを防ぐ）
@@ -291,7 +291,7 @@ pub struct ImageViewer {
     /// ロード中のページ（二重ロード防止）。
     loading: std::collections::HashSet<usize>,
     /// 自身のエンティティハンドル（render_page は &self のため）
-    self_handle: Option<gpui::Entity<ImageViewer>>,
+    self_handle: Option<gpui_kit::Entity<ImageViewer>>,
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
     /// ページめくり方向（Web の pageTurnDirection 相当）。true = 右→左（日本の本）
@@ -384,11 +384,11 @@ impl ImageViewer {
             autoplay_generation: 0,
             zoomed: false,
             zoom_scale: 1.5,
-            pan_offset: gpui::Point::new(0.0, 0.0),
+            pan_offset: gpui_kit::Point::new(0.0, 0.0),
             drag_start: None,
             last_click_at: None,
-            pan_velocity: gpui::Point::new(0.0, 0.0),
-            pan_max: gpui::Point::new(0.0, 0.0),
+            pan_velocity: gpui_kit::Point::new(0.0, 0.0),
+            pan_max: gpui_kit::Point::new(0.0, 0.0),
             inertia_generation: 0,
             last_zoom_toggle: None,
             active_panel: None,
@@ -766,7 +766,7 @@ impl ImageViewer {
         );
         if self.zoom_scale <= 1.0 {
             self.zoomed = false;
-            self.pan_offset = gpui::Point::new(0.0, 0.0);
+            self.pan_offset = gpui_kit::Point::new(0.0, 0.0);
         }
         cx.notify();
     }
@@ -795,8 +795,8 @@ impl ImageViewer {
             // 上限到達後のダブルクリックで拡大終了
             self.zoomed = false;
             self.zoom_scale = 1.5;
-            self.pan_offset = gpui::Point::new(0.0, 0.0);
-            self.pan_velocity = gpui::Point::new(0.0, 0.0);
+            self.pan_offset = gpui_kit::Point::new(0.0, 0.0);
+            self.pan_velocity = gpui_kit::Point::new(0.0, 0.0);
         }
         log::info!(
             "toggle_zoom: zoomed={} scale={}",
@@ -807,16 +807,16 @@ impl ImageViewer {
     }
 
     /// ドラッグ開始（拡大中のパン用。前の慣性を止める）
-    pub fn start_pan(&mut self, position: gpui::Point<f32>) {
+    pub fn start_pan(&mut self, position: gpui_kit::Point<f32>) {
         if self.zoomed {
             self.drag_start = Some(position);
-            self.pan_velocity = gpui::Point::new(0.0, 0.0);
+            self.pan_velocity = gpui_kit::Point::new(0.0, 0.0);
             self.inertia_generation += 1;
         }
     }
 
     /// ドラッグ移動（拡大中のパン。画像の隅まで動けるクランプ付き + 速度記録）
-    pub fn update_pan(&mut self, position: gpui::Point<f32>, pan_max: gpui::Point<f32>) {
+    pub fn update_pan(&mut self, position: gpui_kit::Point<f32>, pan_max: gpui_kit::Point<f32>) {
         if self.zoomed {
             // 可動範囲は呼び出し側で「拡大後の実際の画像サイズ」から計算する
             // （画像の隅まで動けるようにする）
@@ -826,16 +826,16 @@ impl ImageViewer {
                 let dy = position.y - start.y;
                 let max = self.pan_max;
                 // 目標位置へ補間して移動する（移動開始時のジャンプを滑らかに）
-                let target = gpui::Point::new(
+                let target = gpui_kit::Point::new(
                     (self.pan_offset.x + dx).clamp(-max.x, max.x),
                     (self.pan_offset.y + dy).clamp(-max.y, max.y),
                 );
-                self.pan_offset = gpui::Point::new(
+                self.pan_offset = gpui_kit::Point::new(
                     self.pan_offset.x + (target.x - self.pan_offset.x) * 0.6,
                     self.pan_offset.y + (target.y - self.pan_offset.y) * 0.6,
                 );
                 // 慣性用の速度（1 イベントあたりの移動量を 16ms 換算で記録）
-                self.pan_velocity = gpui::Point::new(
+                self.pan_velocity = gpui_kit::Point::new(
                     (dx / 0.016).clamp(-4000.0, 4000.0),
                     (dy / 0.016).clamp(-4000.0, 4000.0),
                 );
@@ -849,7 +849,7 @@ impl ImageViewer {
         self.drag_start = None;
         let velocity = self.pan_velocity;
         if velocity.x.abs() < 0.5 && velocity.y.abs() < 0.5 {
-            self.pan_velocity = gpui::Point::new(0.0, 0.0);
+            self.pan_velocity = gpui_kit::Point::new(0.0, 0.0);
             return;
         }
         self.inertia_generation += 1;
@@ -866,11 +866,11 @@ impl ImageViewer {
                     }
                     let v = this.pan_velocity;
                     let max = this.pan_max;
-                    this.pan_offset = gpui::Point::new(
+                    this.pan_offset = gpui_kit::Point::new(
                         (this.pan_offset.x + v.x * 0.016).clamp(-max.x, max.x),
                         (this.pan_offset.y + v.y * 0.016).clamp(-max.y, max.y),
                     );
-                    this.pan_velocity = gpui::Point::new(v.x * 0.94, v.y * 0.94);
+                    this.pan_velocity = gpui_kit::Point::new(v.x * 0.94, v.y * 0.94);
                     cx.notify();
                     this.pan_velocity.x.abs() < 0.2 && this.pan_velocity.y.abs() < 0.2
                 });
@@ -1046,7 +1046,7 @@ impl ImageViewer {
 
     fn render_page(
         &self,
-        _muted_foreground: gpui::Hsla,
+        _muted_foreground: gpui_kit::Hsla,
         index: usize,
         zoom_progress: f32,
     ) -> impl IntoElement {
@@ -1070,10 +1070,10 @@ impl ImageViewer {
                         .bg(viewer_bg())
                         .overflow_hidden()
                         // ダブルクリックで拡大トグル、拡大中はドラッグでパン
-                        .on_mouse_down(gpui::MouseButton::Left, {
+                        .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |event, _window, cx| {
-                                let position = gpui::Point::new(
+                                let position = gpui_kit::Point::new(
                                     event.position.x.as_f32(),
                                     event.position.y.as_f32(),
                                 );
@@ -1107,7 +1107,7 @@ impl ImageViewer {
                             move |event, window, cx| {
                                 // ドラッグ中（start_pan 済み）ならパン位置を更新して
                                 // 毎フレーム再描画する（Google マップのように滑らかに）
-                                let vwp = gpui::Point::new(
+                                let vwp = gpui_kit::Point::new(
                                     window.bounds().size.width.as_f32(),
                                     window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
                                 );
@@ -1115,7 +1115,7 @@ impl ImageViewer {
                                 handle.update(cx, |this, cx| {
                                     if this.drag_start.is_some() {
                                         this.update_pan(
-                                            gpui::Point::new(
+                                            gpui_kit::Point::new(
                                                 event.position.x.as_f32(),
                                                 event.position.y.as_f32(),
                                             ),
@@ -1126,13 +1126,13 @@ impl ImageViewer {
                                 });
                             }
                         })
-                        .on_mouse_up(gpui::MouseButton::Left, {
+                        .on_mouse_up(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |_, _window, cx| {
                                 handle.update(cx, |this, cx| this.end_pan(cx));
                             }
                         })
-                        .on_mouse_up_out(gpui::MouseButton::Left, {
+                        .on_mouse_up_out(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |_, _window, cx| {
                                 handle.update(cx, |this, cx| this.end_pan(cx));
@@ -1140,13 +1140,13 @@ impl ImageViewer {
                         })
                         .child(
                             img(image)
-                                .id(gpui::ElementId::Name(SharedString::from(format!(
+                                .id(gpui_kit::ElementId::Name(SharedString::from(format!(
                                     "viewer-page-image-{index}"
                                 ))))
                                 // ズーム時は指定サイズで画像を描画する
                                 // （object_fit: Fill で w/h 指定がそのまま表示サイズになる。
                                 //   flex の shrink で幅が潰れないよう shrink_0 を付ける）
-                                .object_fit(gpui::ObjectFit::Fill)
+                                .object_fit(gpui_kit::ObjectFit::Fill)
                                 .flex_shrink_0()
                                 .w(px(width as f32 * (1.0 + (scale - 1.0) * zoom_progress)))
                                 .h(px(height as f32 * (1.0 + (scale - 1.0) * zoom_progress)))
@@ -1169,7 +1169,7 @@ impl ImageViewer {
                         .bg(viewer_bg())
                         .overflow_hidden()
                         // ダブルクリックで拡大（通常時でも効くようにここにも付ける）
-                        .on_mouse_down(gpui::MouseButton::Left, {
+                        .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |_event, _window, cx| {
                                 let now = std::time::Instant::now();
@@ -1189,11 +1189,11 @@ impl ImageViewer {
                         })
                         .child(
                             img(image)
-                                .id(gpui::ElementId::Name(SharedString::from(format!(
+                                .id(gpui_kit::ElementId::Name(SharedString::from(format!(
                                     "viewer-page-image-{index}"
                                 ))))
                                 .size_full()
-                                .object_fit(gpui::ObjectFit::Contain),
+                                .object_fit(gpui_kit::ObjectFit::Contain),
                         )
                         .into_any_element()
                 }
@@ -1206,7 +1206,7 @@ impl ImageViewer {
                 .justify_center()
                 // 開いた直後などの読み込み待ちはスピナーを表示して
                 // 「止まってる感じ」を出さない（数十 ms で画像に差し替わる）
-                .child(gpui_component::spinner::Spinner::new())
+                .child(gpui_kit::component::spinner::Spinner::new())
                 .into_any_element(),
         }
     }
@@ -1263,14 +1263,14 @@ impl Render for ImageViewer {
         let active_panel = self.active_panel;
         // Web 版のパネル/ドックの背景: ライト = 白 80%、ダーク = 黒 70%（パネル）/ 60%（ドック）
         let panel_bg = if cx.theme().is_dark() {
-            gpui::black().alpha(0.7)
+            gpui_kit::black().alpha(0.7)
         } else {
-            gpui::white().alpha(0.8)
+            gpui_kit::white().alpha(0.8)
         };
         let dock_bg = if cx.theme().is_dark() {
-            gpui::black().alpha(0.6)
+            gpui_kit::black().alpha(0.6)
         } else {
-            gpui::white().alpha(0.8)
+            gpui_kit::white().alpha(0.8)
         };
         // ズームのアニメーション進捗（0→1。拡大/解除を 200ms で補間）
         let zoom_progress = transition(
@@ -1332,7 +1332,7 @@ impl Render for ImageViewer {
                 })
         };
         let main = if mode == ViewMode::Scroll {
-            let rendered: Vec<gpui::AnyElement> = pages
+            let rendered: Vec<gpui_kit::AnyElement> = pages
                 .iter()
                 .map(|index| {
                     // 各ページはコンテナ幅にフィットした高さ（アスペクト比）で
@@ -1350,7 +1350,7 @@ impl Render for ImageViewer {
                         .justify_center()
                         .child(
                             div()
-                                .w(gpui::Length::Definite(gpui::DefiniteLength::Fraction(0.8)))
+                                .w(gpui_kit::Length::Definite(gpui_kit::DefiniteLength::Fraction(0.8)))
                                 .aspect_ratio(aspect)
                                 .bg(viewer_bg())
                                 .overflow_hidden()
@@ -1378,7 +1378,7 @@ impl Render for ImageViewer {
                 .all(|&index| self.images.get(index).is_some_and(|slot| slot.is_some()));
             // 各ページのサイズを明示してペア全体を 1 枚の画像のように扱う
             // （h_full / aspect_ratio は flex のレイアウトで縮みがちなため使わない）
-            let vwp = gpui::Point::new(
+            let vwp = gpui_kit::Point::new(
                 window.bounds().size.width.as_f32(),
                 window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
             );
@@ -1400,7 +1400,7 @@ impl Render for ImageViewer {
             // 横が溢れる場合は幅基準に落とす）。これが表示上の基準サイズ
             let fit = (vwp.x / (ch * total_aspect)).min(1.0);
             let base_h = ch * fit;
-            let rendered: Vec<gpui::AnyElement> = pages
+            let rendered: Vec<gpui_kit::AnyElement> = pages
                 .iter()
                 .map(|index| {
                     let (width, height) = self.loader.page_size(*index).unwrap_or((0, 0));
@@ -1416,7 +1416,7 @@ impl Render for ImageViewer {
                             .clone()
                             .map(|image| {
                                 img(image)
-                                    .object_fit(gpui::ObjectFit::Fill)
+                                    .object_fit(gpui_kit::ObjectFit::Fill)
                                     .flex_shrink_0()
                                     .w(px(base_h * aspect * animated_scale))
                                     .h(px(base_h * animated_scale))
@@ -1426,14 +1426,14 @@ impl Render for ImageViewer {
                                 div()
                                     .w(px(base_h * aspect * animated_scale))
                                     .h(px(base_h * animated_scale))
-                                    .bg(gpui::white())
+                                    .bg(gpui_kit::white())
                                     .into_any_element()
                             })
                     } else {
                         div()
                             .w(px(base_h * aspect * animated_scale))
                             .h(px(base_h * animated_scale))
-                            .bg(gpui::white())
+                            .bg(gpui_kit::white())
                             .into_any_element()
                     }
                 })
@@ -1454,11 +1454,11 @@ impl Render for ImageViewer {
                 .size_full()
                 .relative()
                 .overflow_hidden()
-                .on_mouse_down(gpui::MouseButton::Left, {
+                .on_mouse_down(gpui_kit::MouseButton::Left, {
                     let handle = handle.clone();
                     move |event, _window, cx| {
                         let position =
-                            gpui::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
+                            gpui_kit::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
                         let now = std::time::Instant::now();
                         let is_double = handle
                             .read(cx)
@@ -1482,18 +1482,18 @@ impl Render for ImageViewer {
                     move |event, window, cx| {
                         // 見開きペアの表示サイズ（幅 = コンテナ高さ × 合計アスペクト比）
                         // を拡大して可動範囲を計算する
-                        let vwp = gpui::Point::new(
+                        let vwp = gpui_kit::Point::new(
                             window.bounds().size.width.as_f32(),
                             window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
                         );
-                        let max = gpui::Point::new(
+                        let max = gpui_kit::Point::new(
                             ((base_h * total_aspect * animated_scale - vwp.x) / 2.0).max(0.0),
                             ((base_h * animated_scale - vwp.y) / 2.0).max(0.0),
                         );
                         handle.update(cx, |this, cx| {
                             if this.drag_start.is_some() {
                                 this.update_pan(
-                                    gpui::Point::new(
+                                    gpui_kit::Point::new(
                                         event.position.x.as_f32(),
                                         event.position.y.as_f32(),
                                     ),
@@ -1504,13 +1504,13 @@ impl Render for ImageViewer {
                         });
                     }
                 })
-                .on_mouse_up(gpui::MouseButton::Left, {
+                .on_mouse_up(gpui_kit::MouseButton::Left, {
                     let handle = handle.clone();
                     move |_, _window, cx| {
                         handle.update(cx, |this, cx| this.end_pan(cx));
                     }
                 })
-                .on_mouse_up_out(gpui::MouseButton::Left, {
+                .on_mouse_up_out(gpui_kit::MouseButton::Left, {
                     let handle = handle.clone();
                     move |_, _window, cx| {
                         handle.update(cx, |this, cx| this.end_pan(cx));
@@ -1559,19 +1559,19 @@ impl Render for ImageViewer {
                             .top(px(img_top))
                             .w(px(edge_w))
                             .h(px(img_h))
-                            .cursor(gpui::CursorStyle::PointingHand)
+                            .cursor(gpui_kit::CursorStyle::PointingHand)
                             .flex()
                             .items_center()
                             .justify_center()
                             // 非ホバーは透明、ホバーで半透明オーバーレイ + アイコン表示
                             .opacity(0.0)
-                            .hover(|style| style.bg(gpui::rgba(0x0000001f)).opacity(1.0))
+                            .hover(|style| style.bg(gpui_kit::rgba(0x0000001f)).opacity(1.0))
                             .child(
                                 Icon::new(IconName::ChevronLeft)
                                     .size(px(28.0))
-                                    .text_color(gpui::rgba(0x00000099)),
+                                    .text_color(gpui_kit::rgba(0x00000099)),
                             )
-                            .on_mouse_down(gpui::MouseButton::Left, {
+                            .on_mouse_down(gpui_kit::MouseButton::Left, {
                                 let handle = handle.clone();
                                 move |event, _window, cx| {
                                     handle.update(cx, |this, cx| {
@@ -1592,18 +1592,18 @@ impl Render for ImageViewer {
                             .top(px(img_top))
                             .w(px(edge_w))
                             .h(px(img_h))
-                            .cursor(gpui::CursorStyle::PointingHand)
+                            .cursor(gpui_kit::CursorStyle::PointingHand)
                             .flex()
                             .items_center()
                             .justify_center()
                             .opacity(0.0)
-                            .hover(|style| style.bg(gpui::rgba(0x0000001f)).opacity(1.0))
+                            .hover(|style| style.bg(gpui_kit::rgba(0x0000001f)).opacity(1.0))
                             .child(
                                 Icon::new(IconName::ChevronRight)
                                     .size(px(28.0))
-                                    .text_color(gpui::rgba(0x00000099)),
+                                    .text_color(gpui_kit::rgba(0x00000099)),
                             )
-                            .on_mouse_down(gpui::MouseButton::Left, {
+                            .on_mouse_down(gpui_kit::MouseButton::Left, {
                                 let handle = handle.clone();
                                 move |event, _window, cx| {
                                     handle.update(cx, |this, cx| {
@@ -1642,7 +1642,7 @@ impl Render for ImageViewer {
                     .right_0()
                     .bottom_0()
                     .left_0()
-                    .on_mouse_down(gpui::MouseButton::Left, {
+                    .on_mouse_down(gpui_kit::MouseButton::Left, {
                         let handle = handle.clone();
                         move |event, _window, cx| {
                             // 中央ダブルクリックでトップ/ボトムメニューを
@@ -1728,8 +1728,8 @@ impl Render for ImageViewer {
                                     return;
                                 }
                                 let delta = match event.delta {
-                                    gpui::ScrollDelta::Pixels(point) => f32::from(point.y),
-                                    gpui::ScrollDelta::Lines(point) => point.y * 20.0,
+                                    gpui_kit::ScrollDelta::Pixels(point) => f32::from(point.y),
+                                    gpui_kit::ScrollDelta::Lines(point) => point.y * 20.0,
                                 } * -0.001;
                                 this.adjust_zoom(cx, delta);
                             });
@@ -1750,21 +1750,21 @@ impl Render for ImageViewer {
                         .left_0()
                         .top_0()
                         .bottom_0()
-                        .w(gpui::Length::Definite(gpui::DefiniteLength::Fraction(0.1)))
-                        .cursor(gpui::CursorStyle::PointingHand)
+                        .w(gpui_kit::Length::Definite(gpui_kit::DefiniteLength::Fraction(0.1)))
+                        .cursor(gpui_kit::CursorStyle::PointingHand)
                         .flex()
                         .items_center()
                         .justify_center()
                         .opacity(0.0)
                         .hover(|style| {
-                            style.bg(gpui::rgba(0x0000001f)).opacity(1.0)
+                            style.bg(gpui_kit::rgba(0x0000001f)).opacity(1.0)
                         })
                         .child(
                             Icon::new(IconName::ChevronLeft)
                                 .size(px(28.0))
-                                .text_color(gpui::rgba(0x00000099)),
+                                .text_color(gpui_kit::rgba(0x00000099)),
                         )
-                        .on_mouse_down(gpui::MouseButton::Left, {
+                        .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |event, _window, cx| {
                                 handle.update(cx, |this, cx| {
@@ -1784,21 +1784,21 @@ impl Render for ImageViewer {
                         .right_0()
                         .top_0()
                         .bottom_0()
-                        .w(gpui::Length::Definite(gpui::DefiniteLength::Fraction(0.1)))
-                        .cursor(gpui::CursorStyle::PointingHand)
+                        .w(gpui_kit::Length::Definite(gpui_kit::DefiniteLength::Fraction(0.1)))
+                        .cursor(gpui_kit::CursorStyle::PointingHand)
                         .flex()
                         .items_center()
                         .justify_center()
                         .opacity(0.0)
                         .hover(|style| {
-                            style.bg(gpui::rgba(0x0000001f)).opacity(1.0)
+                            style.bg(gpui_kit::rgba(0x0000001f)).opacity(1.0)
                         })
                         .child(
                             Icon::new(IconName::ChevronRight)
                                 .size(px(28.0))
-                                .text_color(gpui::rgba(0x00000099)),
+                                .text_color(gpui_kit::rgba(0x00000099)),
                         )
-                        .on_mouse_down(gpui::MouseButton::Left, {
+                        .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |event, _window, cx| {
                                 handle.update(cx, |this, cx| {
@@ -1829,7 +1829,7 @@ impl Render for ImageViewer {
                         .shadow_md()
                         .overflow_hidden()
                         // パネル内のクリックは下の画像（戻る・ズーム等）に伝達しない
-                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
                         }),
 
@@ -1871,7 +1871,7 @@ impl Render for ImageViewer {
                                     div()
                                         .truncate()
                                         .text_sm()
-                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .font_weight(gpui_kit::FontWeight::BOLD)
                                         .child(title),
                                 ),
                             ),
@@ -1913,7 +1913,7 @@ impl Render for ImageViewer {
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
                                                 .child("ページ一覧"),
                                         )
                                         .child(
@@ -1947,7 +1947,7 @@ impl Render for ImageViewer {
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
                                                 .child("ショートカット"),
                                         )
                                         .child(
@@ -1984,7 +1984,7 @@ impl Render for ImageViewer {
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
                                                 .child("自動再生設定"),
                                         )
                                         .child(
@@ -2037,13 +2037,13 @@ impl Render for ImageViewer {
                                                         .w(px(100.0))
                                                         .aspect_ratio(100.0 / 141.0)
                                                         .rounded_sm()
-                                                        .bg(gpui::white())
+                                                        .bg(gpui_kit::white())
                                                         .overflow_hidden()
                                                         .child(match image {
                                                             Some(image) => img(image)
                                                                 .size_full()
                                                                 .object_fit(
-                                                                    gpui::ObjectFit::Contain,
+                                                                    gpui_kit::ObjectFit::Contain,
                                                                 )
                                                                 .into_any_element(),
                                                             None => {
@@ -2070,7 +2070,7 @@ impl Render for ImageViewer {
                                 )
                                 .child(self.panel_back(&handle, cx)),
                             PanelView::Shortcuts => {
-                                let kbd = |stroke: &str| Kbd::new(gpui::Keystroke::parse(stroke).unwrap());
+                                let kbd = |stroke: &str| Kbd::new(gpui_kit::Keystroke::parse(stroke).unwrap());
                                 let row = |label: String, strokes: Vec<&str>| {
                                     div()
                                         .flex()
@@ -2080,7 +2080,7 @@ impl Render for ImageViewer {
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
                                                 .child(label),
                                         )
                                         .child(
@@ -2110,7 +2110,7 @@ impl Render for ImageViewer {
                                 .child(
                                     div()
                                         .text_sm()
-                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
                                         .child("ページ送りの間隔"),
                                 )
                                 .child(Slider::new(&autoplay_slider).horizontal().w(px(300.0)))
@@ -2354,9 +2354,9 @@ impl Render for ImageViewer {
 
 #[cfg(test)]
 mod tests {
-    use gpui::AppContext as _;
-    use gpui::TestAppContext;
-    use gpui_component::slider::SliderValue;
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
+    use gpui_kit::component::slider::SliderValue;
 
     use super::*;
 
@@ -2403,9 +2403,9 @@ mod tests {
         cx.new(|cx| ImageViewer::new(cx, Arc::new(FakeLoader { count, png }), "テスト本", 0, None))
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn view_mode_persists_across_instances(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         // スクロールモードに切り替えると永続化される
         let view = viewer(cx, 3);
         cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Scroll)));
@@ -2423,9 +2423,9 @@ mod tests {
         assert_eq!(view2.read_with(cx, |v, _| v.mode), ViewMode::Scroll);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn page_navigation_clamps_at_bounds(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         cx.update(|cx| view.update(cx, |this, cx| this.next_page(cx)));
         assert_eq!(view.read_with(cx, |v, _| v.current_page), 1);
@@ -2438,9 +2438,9 @@ mod tests {
         assert_eq!(view.read_with(cx, |v, _| v.current_page), 0);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn spread_mode_pairs_and_advances_by_two(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 5);
         cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
         // デフォルトは左→右（技術書典の本は左綴じ想定）: 小さい番号が左
@@ -2451,34 +2451,34 @@ mod tests {
         assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![4]);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn shift_arrow_key_moves_single_page_in_spread(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 5);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         visual.update(|window, cx| {
             let _ = window.draw(cx);
         });
         cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
 
         // 通常の右矢印: 見開きなので 2 ページ進む
-        visual.simulate_event(gpui::KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("right").unwrap(),
+        visual.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: gpui_kit::Keystroke::parse("right").unwrap(),
             is_held: false,
             prefer_character_input: false,
         });
         assert_eq!(view.read_with(cx, |v, _| v.current_page), 2);
 
         // Shift + 右矢印: 1 ページだけ進む（見開きの位置調整）
-        visual.simulate_event(gpui::KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("shift-right").unwrap(),
+        visual.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: gpui_kit::Keystroke::parse("shift-right").unwrap(),
             is_held: false,
             prefer_character_input: false,
         });
@@ -2489,8 +2489,8 @@ mod tests {
         );
 
         // Shift + 左矢印: 1 ページだけ戻る
-        visual.simulate_event(gpui::KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("shift-left").unwrap(),
+        visual.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: gpui_kit::Keystroke::parse("shift-left").unwrap(),
             is_held: false,
             prefer_character_input: false,
         });
@@ -2501,18 +2501,18 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn scroll_mode_updates_current_page_from_position(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 5);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         visual.update(|window, cx| {
             let _ = window.draw(cx);
         });
@@ -2540,9 +2540,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn binding_switch_persists_and_flips_spread(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
         let view = viewer(cx, 5);
         cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
@@ -2575,9 +2575,9 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("left-to-right"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn spread_navigation_shift_moves_single_page(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 5);
         cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
         // 通常の次へ: 見開きなので 2 ページ進む
@@ -2594,9 +2594,9 @@ mod tests {
         assert_eq!(view.read_with(cx, |v, _| v.current_page), 0);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn page_turn_direction_flips_spread_order(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
         // 左→右（洋書）: 小さい番号が左
         cx.update(|cx| {
@@ -2624,9 +2624,9 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn autoplay_starts_stops_and_advances(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 5);
         cx.update(|cx| view.update(cx, |this, cx| this.set_autoplay_interval(cx, 3000)));
         cx.update(|cx| view.update(cx, |this, cx| this.toggle_autoplay(cx)));
@@ -2640,9 +2640,9 @@ mod tests {
         assert!(!view.read_with(cx, |v, _| v.autoplay));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn zoom_hides_dock_and_scroll_disables_autoplay(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         assert!(!view.read_with(cx, |v, _| v.is_dock_hidden()));
         cx.update(|cx| view.update(cx, |this, cx| this.adjust_zoom(cx, 0.5)));
@@ -2651,9 +2651,9 @@ mod tests {
         assert!(!view.read_with(cx, |v, _| v.autoplay));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn toggle_overlay_switches_visibility(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         // 初期状態は表示
         assert!(view.read_with(cx, |v, _| v.overlay_visible));
@@ -2664,9 +2664,9 @@ mod tests {
         assert!(view.read_with(cx, |v, _| v.overlay_visible));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn page_list_loads_all_thumbnails(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         assert!(!view.read_with(cx, |v, _| v.active_panel.is_some()));
         cx.update(|cx| {
@@ -2684,26 +2684,26 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn keyboard_shortcuts_dispatch_through_focus(cx: &mut TestAppContext) {
         // 回帰: ビューアーのルートに track_focus を付けてキーイベントを
         // 受け取れるようにした（workspace 埋め込み後もショートカットが効く）。
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         visual.update(|window, cx| {
             let _ = window.draw(cx);
         });
         // 実イベント配送: 右矢印 → 次ページ
         visual.simulate_event(KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("right").unwrap(),
+            keystroke: gpui_kit::Keystroke::parse("right").unwrap(),
             is_held: false,
             prefer_character_input: false,
         });
@@ -2714,7 +2714,7 @@ mod tests {
         );
         // 左矢印 → 前ページ
         visual.simulate_event(KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("left").unwrap(),
+            keystroke: gpui_kit::Keystroke::parse("left").unwrap(),
             is_held: false,
             prefer_character_input: false,
         });
@@ -2725,18 +2725,18 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn keyboard_arrows_move_pages(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // simulate the handler directly (key event delivery is covered by
         // the element wiring; the logic under test is the page stepping)
         visual.update(|window, cx| {
@@ -2749,16 +2749,16 @@ mod tests {
         assert_eq!(view.read_with(cx, |v, _| v.current_page), 0);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn autoplay_slider_initializes_with_valid_range(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
         cx.update_window(*window, |_root, window, cx| {
             view.update(cx, |this, cx| this.ensure_panel_states(window, cx));
@@ -2796,18 +2796,18 @@ mod tests {
         assert_eq!(&frame[0..4], &[0, 0, 255, 255]);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn page_navigation_replaces_image_element(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         cx.run_until_parked();
         visual.update(|window, cx| {
             let _ = window.draw(cx);
@@ -2846,18 +2846,18 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn scroll_mode_stacks_pages_vertically(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(800.0),
-                height: gpui::px(600.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Scroll)));
         cx.run_until_parked();
         visual.update(|window, cx| {
@@ -2886,7 +2886,7 @@ mod tests {
 
     fn right_event() -> KeyDownEvent {
         KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("right").unwrap(),
+            keystroke: gpui_kit::Keystroke::parse("right").unwrap(),
             is_held: false,
             prefer_character_input: false,
         }
@@ -2894,7 +2894,7 @@ mod tests {
 
     fn left_event() -> KeyDownEvent {
         KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("left").unwrap(),
+            keystroke: gpui_kit::Keystroke::parse("left").unwrap(),
             is_held: false,
             prefer_character_input: false,
         }

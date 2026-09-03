@@ -4,11 +4,11 @@
 //! メールアドレス・パスワードでログインしてログイン後のページに遷移したら、
 //! セッション Cookie を自動取得して永続化する（BOOTH と同じ方式）。
 
-use gpui::{
+use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_component::{Icon, IconName};
+use gpui_kit::component::{Icon, IconName};
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
 use thundoku_core::tbf::TbfSession;
@@ -169,12 +169,12 @@ impl Render for TbfLoginView {
         let height = 640.0_f32;
         let left = (window_w - width) / 2.0;
         let top = (window_h - height) / 2.0;
-        let bounds = gpui::bounds(
-            gpui::Point {
+        let bounds = gpui_kit::bounds(
+            gpui_kit::Point {
                 x: px(left),
                 y: px(top),
             },
-            gpui::Size {
+            gpui_kit::Size {
                 width: px(width),
                 height: px(height),
             },
@@ -210,7 +210,7 @@ impl Render for TbfLoginView {
             .right_0()
             .bottom_0()
             .left_0()
-            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.45))
+            .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.45))
             .child(
                 div()
                     .id("tbf-login-cancel")
@@ -223,9 +223,9 @@ impl Render for TbfLoginView {
                     .items_center()
                     .justify_center()
                     .rounded_md()
-                    .bg(gpui::rgba(0xffffff26))
-                    .text_color(gpui::white())
-                    .hover(|style| style.bg(gpui::rgba(0xffffff40)))
+                    .bg(gpui_kit::rgba(0xffffff26))
+                    .text_color(gpui_kit::white())
+                    .hover(|style| style.bg(gpui_kit::rgba(0xffffff40)))
                     .cursor_pointer()
                     .on_click({
                         let handle = cx.weak_entity();

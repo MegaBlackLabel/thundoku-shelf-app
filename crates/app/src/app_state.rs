@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use gpui::ReadGlobal as _;
-use gpui::{App, Bounds, Global, Point, Size, Window, WindowBounds, px};
+use gpui_kit::ReadGlobal as _;
+use gpui_kit::{App, Bounds, Global, Point, Size, Window, WindowBounds, px};
 use parking_lot::Mutex;
 use thundoku_core::booth::BoothSession;
 use thundoku_core::db;
@@ -54,7 +54,7 @@ pub struct AppState {
     /// トーストの世代（新メッセージごとに増える。タイマー再起動用）
     pub toast_generation: Arc<Mutex<u64>>,
     /// トーストホストを持つ workspace（トースト表示時の notify 用）
-    pub workspace: Arc<Mutex<Option<gpui::WeakEntity<crate::workspace::Workspace>>>>,
+    pub workspace: Arc<Mutex<Option<gpui_kit::WeakEntity<crate::workspace::Workspace>>>>,
     /// 本棚の再読込が必要（設定画面の非表示解除等）。render で確認して reload する
     pub bookshelf_invalidated: Arc<Mutex<bool>>,
     /// 終了確認ダイアログ（バックアップ対象の確認）を表示済みかどうか。

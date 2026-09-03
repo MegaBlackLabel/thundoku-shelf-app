@@ -3,20 +3,20 @@
 use std::path::PathBuf;
 
 use crate::components::dialog::{dialog_surface, fade_dialog};
-use gpui::StyledImage as _;
-use gpui::{
+use gpui_kit::StyledImage as _;
+use gpui_kit::{
     App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement as _, Subscription, Window,
     div, img, px,
 };
-use gpui::{ReadGlobal as _, Styled as _};
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_kit::{ReadGlobal as _, Styled as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 
-use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::switch::Switch;
-use gpui_component::{ActiveTheme as _, Disableable as _, Icon, IconName};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName};
 use thundoku_core::db;
 use thundoku_core::drive::sync;
 use thundoku_core::drive::{DriveApi, DriveClient};
@@ -30,7 +30,7 @@ use crate::app_state::AppState;
 #[derive(Clone, Copy)]
 pub struct BookshelfDataChanged;
 
-impl gpui::EventEmitter<BookshelfDataChanged> for SettingsView {}
+impl gpui_kit::EventEmitter<BookshelfDataChanged> for SettingsView {}
 use crate::icons::AppIcon;
 use crate::views::auth::AuthProvider;
 
@@ -294,7 +294,7 @@ impl SettingsView {
         data_dir: &std::path::Path,
         site_id: &str,
         database_id: &str,
-    ) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    ) -> Option<std::sync::Arc<gpui_kit::RenderImage>> {
         // png 優先（縮小キャッシュ）、なければ元の拡張子を試す
         let base = data_dir
             .join("thumbnails")
@@ -308,7 +308,7 @@ impl SettingsView {
         for pixel in rgba.chunks_exact_mut(4) {
             pixel.swap(0, 2);
         }
-        Some(std::sync::Arc::new(gpui::RenderImage::new([
+        Some(std::sync::Arc::new(gpui_kit::RenderImage::new([
             image::Frame::new(rgba),
         ])))
     }
@@ -320,16 +320,16 @@ impl SettingsView {
         cx: &Context<Self>,
         title: &str,
         description: Option<&str>,
-        icon: impl Into<gpui::AnyElement>,
+        icon: impl Into<gpui_kit::AnyElement>,
         content: impl IntoElement,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted;
         let muted_fg = cx.theme().muted_foreground;
         let card_bg = cx.theme().background;
         let title = title.to_string();
         let description = description.map(String::from);
-        let icon: gpui::AnyElement = icon.into();
+        let icon: gpui_kit::AnyElement = icon.into();
         div()
             .rounded_xl()
             .border_1()
@@ -570,7 +570,7 @@ impl SettingsView {
         let db_path = state.data_dir.join("thundoku-shelf.db");
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
         log::info!("sync_drive_now: start");
-        let task: gpui::Task<Result<sync::SyncOutcome, String>> =
+        let task: gpui_kit::Task<Result<sync::SyncOutcome, String>> =
             cx.background_executor().spawn(async move {
                 let folder_id = {
                     db::settings::get(&db, "drive.sync.folder_id")
@@ -722,7 +722,7 @@ impl SettingsView {
             new_dir.join("downloads"),
         );
         let new_dir2 = new_dir.clone();
-        let task: gpui::Task<(PathBuf, Vec<String>)> = cx.background_executor().spawn(async move {
+        let task: gpui_kit::Task<(PathBuf, Vec<String>)> = cx.background_executor().spawn(async move {
             // 新規ディレクトリを作成
             for d in [&ndb, &npacks, &nthumbs, &ndl] {
                 if let Some(parent) = d.parent() {
@@ -1863,7 +1863,7 @@ impl Render for SettingsView {
                                                         img(thumb)
                                                             .w(px(56.0))
                                                             .h(px(78.0))
-                                                            .object_fit(gpui::ObjectFit::Cover)
+                                                            .object_fit(gpui_kit::ObjectFit::Cover)
                                                             .into_any_element()
                                                     } else {
                                                         div()
@@ -1940,7 +1940,7 @@ impl Render for SettingsView {
                     .child(if let Some(message) = error {
                         div()
                             .text_sm()
-                            .text_color(gpui::red())
+                            .text_color(gpui_kit::red())
                             .child(message)
                             .into_any_element()
                     } else {
@@ -2096,16 +2096,16 @@ impl Render for SettingsView {
 
 #[cfg(test)]
 mod tests {
-    use gpui::AppContext as _;
-    use gpui::TestAppContext;
+    use gpui_kit::AppContext as _;
+    use gpui_kit::TestAppContext;
 
     use thundoku_core::db;
 
     use super::*;
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn viewer_mode_setting_persists(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let view = cx.new(SettingsView::new);
         cx.update(|cx| view.update(cx, |this, cx| this.set_viewer_mode(cx, "scroll")));
@@ -2117,9 +2117,9 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("scroll"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn page_turn_setting_persists(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let view = cx.new(SettingsView::new);
         cx.update(|cx| view.update(cx, |this, cx| this.set_page_turn(cx, "left-to-right")));
@@ -2131,19 +2131,19 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("left-to-right"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn settings_view_renders_without_panic(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let view = cx.new(SettingsView::new);
         let window = cx.open_window(
-            gpui::Size {
-                width: gpui::px(1000.0),
-                height: gpui::px(700.0),
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(700.0),
             },
-            |window, cx| gpui_component::Root::new(view.clone(), window, cx),
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
-        let visual = gpui::VisualTestContext::from_window(*window, cx).into_mut();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         visual.update(|window, cx| {
             let arena_clear = window.draw(cx);
             arena_clear.clear(cx);
@@ -2151,9 +2151,9 @@ mod tests {
         // パニックせず描画できれば OK（Web 構成のカード群が描画される）
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn drive_sync_toggle_persists(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let view = cx.new(SettingsView::new);
         cx.update(|cx| view.update(cx, |this, cx| this.toggle_drive_sync(cx, true)));
@@ -2165,9 +2165,9 @@ mod tests {
         assert_eq!(enabled.as_deref(), Some("true"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     async fn delete_all_data_clears_books_and_settings(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         cx.update(|cx| {
             let state = AppState::global(cx);

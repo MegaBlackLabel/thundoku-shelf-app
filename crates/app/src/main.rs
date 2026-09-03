@@ -3,8 +3,8 @@
 // Windows ではコンソール（黒い cmd 窓）を出さない（GUI サブシステム）。
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use gpui::*;
-use gpui_component::*;
+use gpui_kit::*;
+use gpui_kit::component::*;
 
 use thundoku_shelf::app_state::AppState;
 use thundoku_shelf::icons::AppAssets;
@@ -52,11 +52,11 @@ fn main() {
     #[cfg(not(windows))]
     env_logger::init();
 
-    gpui_platform::application()
+    gpui_kit::application()
         .with_assets(AppAssets)
         .run(move |cx| {
             // Must be called before using any GPUI Component features.
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             cx.set_app_identity("com.megablacklabel.thundoku-shelf", "Thundoku Shelf");
             Theme::sync_system_appearance(None, cx);
             cx.set_menus(app_menus());
