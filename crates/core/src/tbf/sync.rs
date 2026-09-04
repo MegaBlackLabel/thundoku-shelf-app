@@ -84,6 +84,8 @@ pub fn save_bookshelf(pool: &SqlitePool, items: &[TbfShelfItem]) -> Result<usize
                 database_id: item.id.clone(),
                 title: item.title.clone(),
                 circle_name: item.circle_name.clone(),
+                // 技術書典の product には作者名が無いため空（UI では author 非表示）
+                author: String::new(),
                 thumbnail_url: item.thumbnail_url.clone(),
                 format: item.format.clone(),
                 caused_at: item.caused_at.clone(),

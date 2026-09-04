@@ -603,6 +603,7 @@ impl BookshelfView {
                             database_id: entry.book.id.clone(),
                             title: entry.book.title.clone(),
                             circle_name: entry.book.circle_name.clone(),
+                            author: entry.book.author.clone(),
                             thumbnail_url: None,
                             format: "BOOK".into(),
                             caused_at: None,
@@ -1134,6 +1135,8 @@ impl BookshelfView {
                             database_id: item.item_id.to_string(),
                             title: item.title.clone(),
                             circle_name: item.shop_name.clone(),
+                            // BOOTH の shop は作成者（作者）を兼ねる。作者名として表示する
+                            author: item.shop_name.clone(),
                             thumbnail_url: covers.get(&item.item_id).cloned(),
                             format: "PDF".into(),
                             caused_at: bought_at.get(&item.title).cloned(),
@@ -1960,6 +1963,10 @@ impl BookshelfView {
     ) -> impl IntoElement {
         let shelf = &card.shelf;
         let title = shelf.title.clone();
+        // サークル名（技術書典: organization / BOOTH: shop）
+        let circle_name = shelf.circle_name.clone();
+        // 作者名（技術書典は空のため非表示。BOOTH 等は作成者名）
+        let author = shelf.author.clone();
         let event = shelf
             .event_name
             .clone()
@@ -2252,6 +2259,26 @@ impl BookshelfView {
                         _ => event_text.clone(),
                     }),
             )
+            // サークル名（非空のときだけ表示）
+            .child(if !circle_name.is_empty() {
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("サークル: {circle_name}"))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            // 作者名（BOOTH 等。空 or サークル名と同一なら非表示 = 技術書典は出ない）
+            .child(if !author.is_empty() && author != circle_name {
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("作者: {author}"))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(match progress_text.as_deref() {
                 Some(text) => div()
                     .text_xs()
@@ -2666,6 +2693,10 @@ impl BookshelfView {
     ) -> impl IntoElement {
         let shelf = &card.shelf;
         let title = shelf.title.clone();
+        // サークル名（技術書典: organization / BOOTH: shop）
+        let circle_name = shelf.circle_name.clone();
+        // 作者名（技術書典は空のため非表示。BOOTH 等は作成者名）
+        let author = shelf.author.clone();
         let event = shelf
             .event_name
             .clone()
@@ -2869,6 +2900,26 @@ impl BookshelfView {
                         // 「イベント不明」を表示
                         .child(event_text.clone()),
                 )
+                // サークル名（非空のときだけ表示）
+                .child(if !circle_name.is_empty() {
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("サークル: {circle_name}"))
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                })
+                // 作者名（BOOTH 等。空 or サークル名と同一なら非表示 = 技術書典は出ない）
+                .child(if !author.is_empty() && author != circle_name {
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("作者: {author}"))
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                })
                 .child(match progress_text.as_deref() {
                     Some(text) => div()
                         .text_xs()
@@ -3946,6 +3997,7 @@ mod tests {
                     database_id: database_id.into(),
                     title: title.into(),
                     circle_name: circle.into(),
+                    author: String::new(),
                     thumbnail_url: thumbnail_url.map(String::from),
                     format: "PDF".into(),
                     caused_at: None,
@@ -3989,6 +4041,7 @@ mod tests {
                     database_id: database_id.into(),
                     title: title.into(),
                     circle_name: circle.into(),
+                    author: String::new(),
                     thumbnail_url: None,
                     format: "PDF".into(),
                     caused_at: None,
@@ -4689,6 +4742,7 @@ mod tests {
                     database_id: "db-1".into(),
                     title: "本1".into(),
                     circle_name: "サークルA".into(),
+                    author: String::new(),
                     thumbnail_url: None,
                     format: "PDF".into(),
                     caused_at: Some("2025-11-20T10:00:00".into()),
@@ -4809,6 +4863,7 @@ mod tests {
                     database_id: "db-1".into(),
                     title: "本1".into(),
                     circle_name: "サークルA".into(),
+                    author: String::new(),
                     thumbnail_url: None,
                     format: "PDF".into(),
                     caused_at: None,

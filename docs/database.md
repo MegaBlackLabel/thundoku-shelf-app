@@ -81,7 +81,7 @@ Drive 同期設定など）。
 | カラム | 型 | 説明 |
 |---|---|---|
 | site_id + database_id | TEXT PK | サイトごとの商品 ID |
-| title / circle_name | TEXT | 書名・サークル名 |
+| title / circle_name / author | TEXT | 書名・サークル名・作者名（技術書典は author 空、BOOTH 等は作成者名） |
 | thumbnail_url | TEXT | 表紙 URL（リモート） |
 | format | TEXT | PDF / EPUB 等 |
 | causedAt | TEXT | 購入日時 |

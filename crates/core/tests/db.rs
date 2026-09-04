@@ -34,6 +34,7 @@ fn migrate_creates_all_schema_tables() {
             "drive_sync_state",
             "favorite_tags",
             "imported_documents",
+            "page_views",
             "product_sample_pages",
             "reading_progress",
             "sites",
@@ -166,6 +167,7 @@ fn bookshelf_upsert_replaces_existing_row() {
         database_id: "db-1".into(),
         title: title.into(),
         circle_name: "circle".into(),
+        author: String::new(),
         thumbnail_url: None,
         format: "pdf".into(),
         caused_at: None,
@@ -195,6 +197,47 @@ fn bookshelf_upsert_replaces_existing_row() {
 }
 
 #[test]
+fn bookshelf_upsert_preserves_author() {
+    let pool = memory_db();
+    // 技術書典: author 空（非表示）、BOOTH 等: author に作成者名が入る
+    let item = |author: &str, site_id: &str, database_id: &str| bookshelf::BookshelfItem {
+        site_id: site_id.into(),
+        database_id: database_id.into(),
+        title: "本".into(),
+        circle_name: "circle".into(),
+        author: author.into(),
+        thumbnail_url: None,
+        format: "pdf".into(),
+        caused_at: None,
+        event_name: None,
+        event_slug: None,
+        event_id: None,
+        file_name: None,
+        download_url: None,
+        is_downloadable: 1,
+        is_checked: 0,
+        is_purchased: 1,
+        is_new: 0,
+        is_active: 1,
+        is_favorite: 0,
+        is_hidden: 0,
+        hidden_at: None,
+        tags_json: None,
+        synced_at: "2026-08-21 00:00:00".into(),
+        created_at: "2026-08-21 00:00:00".into(),
+        updated_at: "2026-08-21 00:00:00".into(),
+    };
+    // BOOTH は shop = 作成者名を author に格納する
+    bookshelf::upsert(&pool, &item("YORIMIYA STUDIO", "booth", "b-1")).unwrap();
+    // 技術書典は author 空のまま（従来の非表示挙動を壊さない）
+    bookshelf::upsert(&pool, &item("", "techbookfest", "db-1")).unwrap();
+    let booth = bookshelf::list(&pool, "booth").unwrap();
+    assert_eq!(booth[0].author, "YORIMIYA STUDIO");
+    let tbf = bookshelf::list(&pool, "techbookfest").unwrap();
+    assert_eq!(tbf[0].author, "");
+}
+
+#[test]
 fn bookshelf_list_orders_by_caused_at_desc() {
     let pool = memory_db();
     let item = |title: &str, caused_at: Option<&str>, database_id: &str| bookshelf::BookshelfItem {
@@ -202,6 +245,7 @@ fn bookshelf_list_orders_by_caused_at_desc() {
         database_id: database_id.into(),
         title: title.into(),
         circle_name: "circle".into(),
+        author: String::new(),
         thumbnail_url: None,
         format: "pdf".into(),
         caused_at: caused_at.map(String::from),
@@ -240,6 +284,7 @@ fn bookshelf_list_all_returns_every_site() {
         database_id: "db-1".into(),
         title: "技術書典の本".into(),
         circle_name: "circle".into(),
+        author: String::new(),
         thumbnail_url: None,
         format: "pdf".into(),
         caused_at: Some("2026-01-01 00:00:00".into()),
@@ -291,6 +336,7 @@ fn bookshelf_update_tags_writes_tags_json() {
         database_id: "db-1".into(),
         title: "本".into(),
         circle_name: "circle".into(),
+        author: String::new(),
         thumbnail_url: None,
         format: "pdf".into(),
         caused_at: None,

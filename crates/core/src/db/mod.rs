@@ -80,6 +80,24 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                     .await?;
             }
         }
+        // 作者名カラム（プログラム的マイグレーション。hidden_at と同様に PRAGMA で
+        // 存在確認してから ALTER TABLE する。技術書典は author を持たないため空のまま、
+        // BOOTH 等は作成者（shop）に相当する作者名を格納する）
+        {
+            let has_author: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('bookshelf_items') \
+                 WHERE name = 'author'",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if !has_author {
+                sqlx::query(
+                    "ALTER TABLE bookshelf_items ADD COLUMN author TEXT NOT NULL DEFAULT ''",
+                )
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
         // チェックリストのポーリング有効フラグ（プログラム的マイグレーション。
         // hidden_at と同様に PRAGMA で存在確認してから ALTER TABLE する。
         // 既存の migration ファイルは checksum 管理されるため変更しない）

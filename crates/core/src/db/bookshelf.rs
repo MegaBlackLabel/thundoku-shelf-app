@@ -9,6 +9,8 @@ pub struct BookshelfItem {
     pub database_id: String,
     pub title: String,
     pub circle_name: String,
+    /// 作者名（技術書典は提供されないため空。BOOTH 等は作成者名）
+    pub author: String,
     pub thumbnail_url: Option<String>,
     pub format: String,
     #[sqlx(rename = "causedAt")]
@@ -33,7 +35,7 @@ pub struct BookshelfItem {
     pub updated_at: String,
 }
 
-const COLUMNS: &str = "site_id, database_id, title, circle_name, thumbnail_url, format, \
+const COLUMNS: &str = "site_id, database_id, title, circle_name, author, thumbnail_url, format, \
      causedAt, event_name, event_slug, event_id, file_name, download_url, is_downloadable, \
      is_checked, is_purchased, is_new, is_active, is_favorite, is_hidden, hidden_at, tags_json, \
      synced_at, created_at, updated_at";
@@ -44,10 +46,11 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
         sqlx::query(&format!(
             "INSERT INTO bookshelf_items ({COLUMNS}) VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-             ?19, ?20, ?21, ?22, ?23, ?24)
+             ?19, ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(site_id, database_id) DO UPDATE SET
                title = excluded.title,
                circle_name = excluded.circle_name,
+               author = excluded.author,
                thumbnail_url = excluded.thumbnail_url,
                format = excluded.format,
                causedAt = excluded.causedAt,
@@ -71,6 +74,7 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
         .bind(&item.database_id)
         .bind(&item.title)
         .bind(&item.circle_name)
+        .bind(&item.author)
         .bind(&item.thumbnail_url)
         .bind(&item.format)
         .bind(&item.caused_at)

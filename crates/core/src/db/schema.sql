@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS bookshelf_items (
   database_id TEXT NOT NULL,
   title TEXT NOT NULL,
   circle_name TEXT NOT NULL DEFAULT '',
+  author TEXT NOT NULL DEFAULT '',
   thumbnail_url TEXT,
   format TEXT NOT NULL DEFAULT '',
   causedAt TEXT,
