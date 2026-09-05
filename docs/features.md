@@ -240,6 +240,39 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
 
 ---
 
+## データの復元
+
+**DB は「どのサイトのどのデータか（属性）」を保持し、「本の中身（ページ画像）」は
+`.opfspack` パックにのみ存在する**、という関係。
+
+### DB が保持するもの（属性・参照）
+
+| データ | 内容 |
+|---|---|
+| サイト / 商品 | `books.site_id`、`books.tbf_product_id`、`bookshelf_items.site_id` / `database_id` |
+| 再取得元 | `bookshelf_items.download_url`、`file_name` |
+| メタ / 進捗 / 履歴 | タイトル・作者・サークル・タグ・読書進捗・閲覧履歴・ページ毎視聴（全 DB テーブル） |
+| 参照 | `books.opfs_path`、`document_images.opfs_path` / `pack_entry_path`（どのパックの何ページか） |
+| 一部画像 | 本棚の表紙サムネ（`thumbnail_data`）・試し読み（`image_data`）は base64 で DB に有る |
+
+### DB が保持しないもの
+
+- **本のページ画像** — `document_images` は width / height / mime / file_size / `pack_entry_path` のみで、
+  **バイト列は無い**。画像は `.opfspack` パックにだけ存在。
+
+### 復元シナリオ（DB 無事を前提）
+
+| シナリオ | できること |
+|---|---|
+| DB + パック両方無事 | 完全復元 |
+| DB だけ無事、パック消失 | メタ・進捗・属性は復元。ページ画像はパックが必要 → ① Drive からパック再取得（`drive.sync.enabled` 連動でバックアップ済み）② or サイトから再ダウンロード（`download_url` / `tbf_product_id` が DB に有る。ただしログインセッション（keyring）が要る） |
+| パックだけ無事、DB 消失 | パックは「名前の無い画像の山」。DB を Drive バックアップ（`thundoku-backup.json`）から復元すればパックと再リンク |
+
+> まとめ: **属性（どこ・何・どこから取るか）は DB、中身（画像）はパック。**
+> パックが Drive にバックアップされていれば、DB さえ無事なら復元可能。
+
+---
+
 ## 注意点（実装メモ）
 
 - **ビューアーの進捗は 1-indexed**。DB の `reading_progress.current_page` は
