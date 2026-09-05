@@ -972,7 +972,9 @@ impl BookshelfView {
         }
         if let Some(query) = self.current_search(cx) {
             let query = query.to_lowercase();
-            let haystack = format!("{} {}", shelf.title, shelf.circle_name).to_lowercase();
+            // placeholder（タイトル・サークル・著者）に合わせて author も検索対象にする
+            let haystack =
+                format!("{} {} {}", shelf.title, shelf.circle_name, shelf.author).to_lowercase();
             if !haystack.contains(&query) {
                 return false;
             }
@@ -2590,55 +2592,56 @@ impl BookshelfView {
                                 ),
                             ),
                     )
-                    // サジェスチョン（Web の suggestions 相当: 後で読む + お気に入りタグ）
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .top_full()
-                            .mt_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border_color)
-                            .bg(background)
-                            .shadow_lg()
-                            .p_2()
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .gap_1p5()
-                            .children(suggestions.iter().map({
-                                let handle = handle.clone();
-                                move |suggestion| {
-                                    let handle = handle.clone();
-                                    let suggestion_id = suggestion.clone();
-                                    let suggestion_selector =
-                                        format!("edit-suggestion-{suggestion_id}");
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "edit-suggestion-{suggestion_id}"
-                                        )))
-                                        .debug_selector(move || suggestion_selector.clone())
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .bg(muted)
-                                        .text_xs()
-                                        .text_color(muted_fg)
-                                        .hover(|style| style.bg(primary))
-                                        .cursor_pointer()
-                                        .on_click(move |_, _window, cx| {
-                                            cx.stop_propagation();
-                                            handle.update(cx, |this, cx| {
-                                                this.add_editing_tag(cx, &suggestion_id);
-                                            });
-                                        })
-                                        .child(suggestion.clone())
-                                }
-                            })),
-                    ),
             )
+            // サジェスチョン（Web の suggestions 相当: 後で読む + お気に入りタグ）
+            // カード（グリッドの List 行）にはみ出して後続カードに上書きされるのを避けるため、
+            // absolute ではなくエディタ内の通常フロー（flex_col）で下に展開する
+            .child(if !suggestions.is_empty() {
+                div()
+                    .w_full()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border_color)
+                    .bg(background)
+                    .shadow_lg()
+                    .p_2()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(suggestions.iter().map({
+                        let handle = handle.clone();
+                        move |suggestion| {
+                            let handle = handle.clone();
+                            let suggestion_id = suggestion.clone();
+                            let suggestion_selector =
+                                format!("edit-suggestion-{suggestion_id}");
+                            div()
+                                .id(SharedString::from(format!(
+                                    "edit-suggestion-{suggestion_id}"
+                                )))
+                                .debug_selector(move || suggestion_selector.clone())
+                                .px_2()
+                                .py_0p5()
+                                .rounded_full()
+                                .bg(muted)
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .hover(|style| style.bg(primary))
+                                .cursor_pointer()
+                                .on_click(move |_, _window, cx| {
+                                    cx.stop_propagation();
+                                    handle.update(cx, |this, cx| {
+                                        this.add_editing_tag(cx, &suggestion_id);
+                                    });
+                                })
+                                .child(suggestion.clone())
+                        }
+                    }))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
     }
 
     /// 編集入力の状態を確保（初回のみ生成）。
@@ -3479,18 +3482,20 @@ impl Render for BookshelfView {
                                     ),
                             )
                             .child(
-                                // Web と同じ: 検索ボックス左に Search アイコン
-                                div()
-                                    .relative()
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left_2()
-                                            .top_1p5()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(Icon::new(IconName::Search).size(px(14.0))),
-                                    )
-                                    .child(Input::new(&search_state).cursor_text().w(px(192.0)).pl(px(28.0))),
+                                // Web と同じ: 検索ボックス左に Search アイコン。
+                                // absolute で重ねると Input の背景に隠れて見えず、
+                                // placeholder が 28px 右に寄って見えるため、
+                                // Input の prefix（インフロー）でインプット内に配置する
+                                Input::new(&search_state)
+                                    .cursor_text()
+                                    // placeholder「検索（タイトル・サークル・著者）」と打ち込み文字が
+                                    // 切れない幅を確保する
+                                    .w(px(320.0))
+                                    .prefix(
+                                        Icon::new(IconName::Search)
+                                            .size(px(14.0))
+                                            .text_color(cx.theme().muted_foreground),
+                                    ),
                             ),
                     )
                     .child(
@@ -4121,6 +4126,73 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(titles, vec!["React 入門".to_string()]);
+    }
+
+    #[gpui_kit::test]
+    async fn search_filters_by_author(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // seed_shelf_item は author 空のため、author を直接 upsert して seeded する
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            for (id, title, author) in [("db-1", "本A", "田中"), ("db-2", "本B", "佐藤")] {
+                bookshelf::upsert(
+                    db,
+                    &bookshelf::BookshelfItem {
+                        site_id: "techbookfest".into(),
+                        database_id: id.into(),
+                        title: title.into(),
+                        circle_name: "circle".into(),
+                        author: author.into(),
+                        thumbnail_url: None,
+                        format: "PDF".into(),
+                        caused_at: None,
+                        event_name: None,
+                        event_slug: None,
+                        event_id: None,
+                        file_name: None,
+                        download_url: None,
+                        is_downloadable: 1,
+                        is_checked: 0,
+                        is_purchased: 1,
+                        is_new: 0,
+                        is_active: 1,
+                        is_favorite: 0,
+                        is_hidden: 0,
+                        hidden_at: None,
+                        tags_json: None,
+                        synced_at: "2026-08-21 00:00:00".into(),
+                        created_at: "2026-08-21 00:00:00".into(),
+                        updated_at: "2026-08-21 00:00:00".into(),
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        // 著者名「佐藤」で検索 → author が一致した本だけ表示される
+        cx.update_window(*window, |_root, window, cx| {
+            view.update(cx, |this, cx| {
+                this.ensure_search_state(window, cx);
+                let state = this.search_state.clone().expect("state");
+                state.update(cx, |state, cx| state.set_value("佐藤", window, cx));
+            });
+        })
+        .unwrap();
+        let titles = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.title.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(titles, vec!["本B".to_string()]);
     }
 
     #[gpui_kit::test]
