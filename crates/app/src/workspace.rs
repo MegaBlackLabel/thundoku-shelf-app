@@ -618,6 +618,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 起動時の Drive バックアップ復元確認（show_restore_prompt）が表示中か。
+    /// 終了判定（close ハンドラ）から参照するための公開アクセサ。
+    pub fn restore_prompt_active(&self) -> bool {
+        self.show_restore_prompt
+    }
+
     /// ウィンドウを閉じる時に、バックアップ対象に変更があるかを確認する。
     pub fn request_exit_upload_check(&mut self, cx: &mut Context<Self>) {
         self.exit_upload_prompt = true;
@@ -1368,7 +1374,7 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
-            .child(if self.exit_upload_prompt {
+            .child(if self.exit_upload_prompt && !self.show_restore_prompt {
                 let handle = cx.entity();
                 let uploading = self.exit_uploading;
                 let content = dialog_surface(cx)

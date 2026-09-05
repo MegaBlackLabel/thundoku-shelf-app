@@ -84,14 +84,27 @@ fn main() {
                             // 確認ダイアログを既に表示し、キャンセルされていない → そのまま閉じる
                             true
                         } else {
-                            // 初回: 終了時確認ダイアログを出して一時的に閉じない
                             app.exit_checked
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             let ws_weak = app.workspace.lock().clone();
                             if let Some(ws) = ws_weak.and_then(|ws_weak| ws_weak.upgrade()) {
-                                ws.update(cx, |ws, cx| ws.request_exit_upload_check(cx));
+                                // 起動時の Drive 復元確認（show_restore_prompt）が表示中の
+                                // まま閉じようとしたら、アップロード確認は出さずにそのまま閉じる。
+                                // Drive 側のバックアップをローカル（旧/空）で上書きしないため。
+                                let restoring_pending = ws.read_with(cx, |ws, _| {
+                                    ws.restore_prompt_active()
+                                });
+                                if restoring_pending {
+                                    true
+                                } else {
+                                    ws.update(cx, |ws, cx| {
+                                        ws.request_exit_upload_check(cx)
+                                    });
+                                    false
+                                }
+                            } else {
+                                false
                             }
-                            false
                         }
                     });
                     let workspace = cx.new(Workspace::new);
