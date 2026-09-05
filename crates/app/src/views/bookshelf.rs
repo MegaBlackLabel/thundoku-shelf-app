@@ -2269,8 +2269,8 @@ impl BookshelfView {
             } else {
                 div().into_any_element()
             })
-            // 作者名（BOOTH 等。空 or サークル名と同一なら非表示 = 技術書典は出ない）
-            .child(if !author.is_empty() && author != circle_name {
+            // 作者名（BOOTH 等。空でなければ表示。技術書典は author が空なので出ない）
+            .child(if !author.is_empty() {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
@@ -2910,8 +2910,8 @@ impl BookshelfView {
                 } else {
                     div().into_any_element()
                 })
-                // 作者名（BOOTH 等。空 or サークル名と同一なら非表示 = 技術書典は出ない）
-                .child(if !author.is_empty() && author != circle_name {
+                // 作者名（BOOTH 等。空でなければ表示。技術書典は author が空なので出ない）
+                .child(if !author.is_empty() {
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
