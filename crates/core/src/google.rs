@@ -149,15 +149,22 @@ pub fn receive_callback(
         .map_err(|e| GoogleError::Io(e.to_string()))?;
     let started = Instant::now();
     let timeout = Duration::from_secs(300);
+    if !expected_state.is_empty() {
+        log::info!("google auth: loopback listener 待機中（5分タイムアウト）");
+    }
     let (mut stream, _) = loop {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(GoogleError::Cancelled);
         }
         if started.elapsed() > timeout {
+            log::error!("google auth: loopback callback タイムアウト（接続なし）");
             return Err(GoogleError::Auth("authorization timed out".into()));
         }
         match listener.accept() {
-            Ok(accepted) => break accepted,
+            Ok(accepted) => {
+                log::info!("google auth: loopback 接続を受信");
+                break accepted;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -418,6 +425,9 @@ impl GoogleClient {
         let challenge = build_challenge(&verifier);
         let state = generate_state();
         let url = build_authorize_url(&self.client_id, &redirect_uri, &challenge, &state);
+        log::info!(
+            "google auth: begin_authorize url={url} redirect_uri={redirect_uri}"
+        );
         Ok(PendingGoogleAuth {
             listener,
             verifier,
