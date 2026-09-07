@@ -417,7 +417,6 @@ impl SettingsView {
                 this.profile_fetching = false;
                 if let Some(profile) = profile {
                     let state = AppState::global(cx);
-                    log::info!("owner-model(login): sub={} email={}", profile.sub, profile.email);
                     *state.google_profile.lock() = Some(profile);
                     log::info!("google profile restored from stored tokens");
                 }

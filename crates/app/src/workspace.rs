@@ -196,9 +196,8 @@ impl Workspace {
                         if last_sync.is_none() {
                             this.show_drive_prompt = true;
                         }
-                        // ログイン状態が変わったので本棚を再フィルタ（owner モデル）。、
+                        // ログイン状態が変わったので本棚を再フィルタ（owner モデル）。
                         this.bookshelf.update(cx, |b, bx| b.reload(bx));
-                        log::info!("owner-model: ログイン完了→本棚 reload");
                     });
                     // cx.notify() は RefCell already borrowed を起こすため、
                     // AsyncApp::refresh()（&self）で再描画を要求する。
@@ -209,7 +208,6 @@ impl Workspace {
                     logout_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                     let _ = handle.update(cx, |this, cx| {
                         this.bookshelf.update(cx, |b, bx| b.reload(bx));
-                        log::info!("owner-model: ログアウト→本棚 reload");
                     });
                     cx.refresh();
                 }

@@ -132,7 +132,6 @@ impl GoogleLoginView {
                 }
                 match result {
                     Ok(profile) => {
-                        log::info!("google auth: login 成功 sub={}", profile.sub);
                         // トークンを keyring に永続化する（再起動時の復元用）。
                         // refresh_token も含まれるため、期限切れ後も自動リフレッシュできる。
                         let state = AppState::global(cx);
@@ -160,7 +159,6 @@ impl GoogleLoginView {
                     // キャンセルは ✕ ボタンが既に GoogleLoginCancelled を発行済み
                     Err(GoogleError::Cancelled) => {}
                     Err(error) => {
-                        log::error!("google auth: login 失敗: {error}");
                         let state = AppState::global(cx);
                         *state.google_login_error.lock() = Some(error.to_string());
                         state

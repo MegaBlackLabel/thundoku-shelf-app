@@ -435,13 +435,6 @@ impl BookshelfView {
                     .unwrap_or_default(),
                 }
             };
-            let total_books = books::list(db).unwrap_or_default().len();
-            log::info!(
-                "owner-model(本棚): sub={:?} 表示対象={} (全本={})",
-                google_sub,
-                owned.len(),
-                total_books
-            );
             let mut entries = Vec::new();
             for book in books::list(db)
                 .unwrap_or_default()
@@ -1482,10 +1475,6 @@ impl BookshelfView {
                     let pack_id = reuse_id
                         .clone()
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    log::info!(
-                        "owner-model(DL): sub={sub} site={site_id} product={product_id} reuse={:?} pack_id={pack_id}",
-                        reuse_id
-                    );
                     Some(opfspack::Identity {
                         sub: sub.to_string(),
                         pack_id,
@@ -1541,7 +1530,6 @@ impl BookshelfView {
                             &imported.book.id,
                             Some(thundoku_core::owner::encrypt(key, sub)),
                         );
-                        log::info!("owner-model(DL): owner_sub セット book={}", imported.book.id);
                     }
                     Ok::<_, String>(imported)
                 } else {
@@ -1595,10 +1583,6 @@ impl BookshelfView {
                                 &db,
                                 &imported.book.id,
                                 Some(thundoku_core::owner::encrypt(key, sub)),
-                            );
-                            log::info!(
-                                "owner-model(DL): owner_sub セット book={}",
-                                imported.book.id
                             );
                         }
                     }

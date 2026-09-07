@@ -135,12 +135,11 @@ impl AppState {
         // sqlx で接続 + マイグレーション適用（migrations/ ディレクトリ管理）
         let db_pool = db::connect(&db_path).expect("open database");
         // P4: 初回起動（新旧モデル移行）で既存データをクリアして新モデルで開始する。
-        match db::clear_owner_model_if_first_run(&db_pool, &packs_dir, &data_dir.join("thumbnails"))
-        {
-            Ok(true) => log::info!("owner-model(P4): 初回起動のため既存データをクリア"),
-            Ok(false) => log::debug!("owner-model(P4): 初回クリアをスキップ（済み）"),
-            Err(e) => log::error!("owner-model(P4): 初回クリアに失敗: {e}"),
-        }
+        let _ = db::clear_owner_model_if_first_run(
+            &db_pool,
+            &packs_dir,
+            &data_dir.join("thumbnails"),
+        );
 
         let secrets = SecretStore::new();
         let mut tbf = TbfClient::new();
@@ -180,11 +179,6 @@ impl AppState {
         // keyring に保存済みトークンがあるかでログイン状態を判定する。
         // プロフィール（email 等）の取得に失敗してもログイン状態は維持する。
         let google_logged_in = google.as_ref().is_some_and(|c| c.has_tokens());
-        log::info!(
-            "owner-model(login): google_logged_in={} profile_sub={:?}",
-            google_logged_in,
-            google_profile.as_ref().map(|p| p.sub.clone())
-        );
 
         // BOOTH セッションを DB（app_settings）から復元する。
         // セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を
