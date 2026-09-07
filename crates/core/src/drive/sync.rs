@@ -183,6 +183,11 @@ pub fn sync(
             .unwrap_or_default(),
         None => std::collections::HashSet::new(),
     };
+    log::info!(
+        "owner-model(sync): アップロード対象={} 件 (sub={:?})",
+        upload_ids.len(),
+        identity_sub
+    );
 
     let mut drive_pack_by_id: HashMap<&str, &DriveFile> = HashMap::new();
     for file in &files {
@@ -240,6 +245,7 @@ pub fn sync(
         // ダウンロードした pack は現在 sub の所有として記録する（フォルダ分離前提で帰属を信頼）。
         if let (Some(sub), Some(key)) = (identity_sub, owner_key) {
             books::set_owner_sub(pool, pack_id, Some(crate::owner::encrypt(key, sub)))?;
+            log::info!("owner-model(sync): download で owner_sub セット pack={pack_id}");
         }
         sync_state::upsert(
             pool,
@@ -268,6 +274,7 @@ pub fn sync(
         }
         // 所有者フィルタ：現在 sub の本だけアップロード（未所属・他アカウントは上げない）。
         if !upload_ids.contains(&book.id) {
+            log::debug!("owner-model(sync): 非所有スキップ upload book={}", book.id);
             continue;
         }
         let local_path: PathBuf = packs_dir.join(format!("{pack_id}.{PACK_EXTENSION}"));

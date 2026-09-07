@@ -417,10 +417,10 @@ impl BookshelfView {
             let packs_dir = state.packs_dir.clone();
             let thumbnails_dir = state.data_dir.join("thumbnails");
             // 所有者フィルタ：ログイン中は現在 sub の本、未ログインは未所属(NULL)の本だけ表示。
+            let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
             let owned = {
-                let sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
                 let key = state.secrets.db_key().ok();
-                match (sub, key) {
+                match (google_sub.clone(), key) {
                     (Some(sub), Some(key)) => {
                         db::books::owned_book_ids(db, &key, Some(&sub)).unwrap_or_default()
                     }
@@ -435,6 +435,13 @@ impl BookshelfView {
                     .unwrap_or_default(),
                 }
             };
+            let total_books = books::list(db).unwrap_or_default().len();
+            log::info!(
+                "owner-model(本棚): sub={:?} 表示対象={} (全本={})",
+                google_sub,
+                owned.len(),
+                total_books
+            );
             let mut entries = Vec::new();
             for book in books::list(db)
                 .unwrap_or_default()
@@ -1463,7 +1470,7 @@ impl BookshelfView {
                 let identity = google_sub.as_deref().and_then(|sub| {
                     let key = db_key.as_ref()?;
                     // (source, owner) で既存の所属行を再利用（P5）。無ければ新規 UUID。
-                    let pack_id = books::resolve_reuse_id(
+                    let reuse_id = books::resolve_reuse_id(
                         &db,
                         key,
                         &site_id,
@@ -1471,8 +1478,14 @@ impl BookshelfView {
                         Some(sub),
                     )
                     .ok()
-                    .flatten()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    .flatten();
+                    let pack_id = reuse_id
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    log::info!(
+                        "owner-model(DL): sub={sub} site={site_id} product={product_id} reuse={:?} pack_id={pack_id}",
+                        reuse_id
+                    );
                     Some(opfspack::Identity {
                         sub: sub.to_string(),
                         pack_id,
@@ -1528,6 +1541,7 @@ impl BookshelfView {
                             &imported.book.id,
                             Some(thundoku_core::owner::encrypt(key, sub)),
                         );
+                        log::info!("owner-model(DL): owner_sub セット book={}", imported.book.id);
                     }
                     Ok::<_, String>(imported)
                 } else {
@@ -1581,6 +1595,10 @@ impl BookshelfView {
                                 &db,
                                 &imported.book.id,
                                 Some(thundoku_core::owner::encrypt(key, sub)),
+                            );
+                            log::info!(
+                                "owner-model(DL): owner_sub セット book={}",
+                                imported.book.id
                             );
                         }
                     }
