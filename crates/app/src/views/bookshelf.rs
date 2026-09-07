@@ -1344,6 +1344,10 @@ impl BookshelfView {
         let title = item.title.clone();
         let product_id = item.database_id.clone();
         let tag_fetch_enabled = self.tag_fetch_enabled;
+        // 所有者（owner_sub）の付け方: ログイン中なら現在 sub で暗号化した pack にして
+        // owner_sub を記録する。未ログインなら未暗号化（owner_sub = NULL）。
+        let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+        let db_key = state.secrets.db_key().ok();
         // Progress is reported from the background task through a channel and
         // applied on the UI thread (the task itself must stay Send).
         // NOTE: sync_channel(64) はバッファが満杯になると send がブロックする。
@@ -1433,6 +1437,24 @@ impl BookshelfView {
                         ));
                     }
                 };
+                let identity = google_sub.as_deref().and_then(|sub| {
+                    let key = db_key.as_ref()?;
+                    // (source, owner) で既存の所属行を再利用（P5）。無ければ新規 UUID。
+                    let pack_id = books::resolve_reuse_id(
+                        &db,
+                        key,
+                        &site_id,
+                        &product_id,
+                        Some(sub),
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    Some(opfspack::Identity {
+                        sub: sub.to_string(),
+                        pack_id,
+                    })
+                });
                 let imported = if extension == "pdf" {
                     // PDF レンダリング（重い）は DB ロック外で行い、UI スレッドの
                     // DB 操作をブロックしないようにする。
@@ -1446,7 +1468,7 @@ impl BookshelfView {
                         bytes.len() as i64,
                         pages,
                         &packs_dir,
-                        None,
+                        identity.as_ref(),
                     )
                     .map_err(|e| e.to_string())?;
                     // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
@@ -1476,24 +1498,32 @@ impl BookshelfView {
                     if !tag_fetch_enabled {
                         let _ = db::tags::delete_generated(&db, &imported.book.id);
                     }
+                    // 所有者（owner_sub）を記録（ログイン中のみ）。
+                    if let (Some(sub), Some(key)) = (&google_sub, &db_key) {
+                        let _ = books::set_owner_sub(
+                            &db,
+                            &imported.book.id,
+                            Some(thundoku_core::owner::encrypt(key, sub)),
+                        );
+                    }
                     Ok::<_, String>(imported)
                 } else {
                     let imported = match extension.as_str() {
                         "epub" => thundoku_core::import::import_epub_bytes(
-                            &db, &file_name, &bytes, &packs_dir, None,
+                            &db, &file_name, &bytes, &packs_dir, identity.as_ref(),
                         ),
                         "zip" => thundoku_core::import::import_zip_bytes(
                             &db,
                             &file_name,
                             &bytes,
                             &packs_dir,
-                            None,
+                            identity.as_ref(),
                             &mut on_import,
                         ),
                         // BOOTH は PDF だけでなく画像ファイル（イラスト等）もある
                         "jpg" | "jpeg" | "png" | "webp" | "gif" => {
                             thundoku_core::import::import_image_bytes(
-                                &db, &file_name, &bytes, &packs_dir, None,
+                                &db, &file_name, &bytes, &packs_dir, identity.as_ref(),
                             )
                         }
                         other => Err(thundoku_core::import::ImportError::UnsupportedType(
@@ -1521,6 +1551,14 @@ impl BookshelfView {
                         }
                         if !tag_fetch_enabled {
                             let _ = db::tags::delete_generated(&db, &imported.book.id);
+                        }
+                        // 所有者（owner_sub）を記録（ログイン中のみ）。
+                        if let (Some(sub), Some(key)) = (&google_sub, &db_key) {
+                            let _ = books::set_owner_sub(
+                                &db,
+                                &imported.book.id,
+                                Some(thundoku_core::owner::encrypt(key, sub)),
+                            );
                         }
                     }
                     imported.map_err(|e| e.to_string())
