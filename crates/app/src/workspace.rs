@@ -182,10 +182,10 @@ impl Workspace {
                 if flag.load(std::sync::atomic::Ordering::SeqCst) {
                     flag.store(false, std::sync::atomic::Ordering::SeqCst);
                     // Drive 設定をバックグラウンドで照会（RefCell 借用中のブロッキング SQL を避ける）
-                    let enabled = db::settings::get(&db, "drive.sync.enabled")
+                    // 「最終同期が無い（一度も同期していない）」なら同期確認を出す。
+                    let last_sync = db::settings::get(&db, "drive.last_sync_at")
                         .ok()
-                        .flatten()
-                        .is_some_and(|v| v == "true" || v == "1");
+                        .flatten();
                     let _ = handle.update(cx, |this, cx| {
                         this.show_auth = false;
                         this.auth_dialog = None;
@@ -193,7 +193,7 @@ impl Workspace {
                         this.auth_loading = false;
                         this.active = NavTarget::Settings;
                         this.sidebar_open = true;
-                        if !enabled {
+                        if last_sync.is_none() {
                             this.show_drive_prompt = true;
                         }
                         // ログイン状態が変わったので本棚を再フィルタ（owner モデル）。、
