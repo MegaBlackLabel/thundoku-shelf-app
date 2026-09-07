@@ -176,6 +176,33 @@ pub fn list_owner_subs(pool: &SqlitePool) -> Result<Vec<(String, Option<String>)
     })
 }
 
+/// 現在の表示/同期/バックアップ対象の book id 集合（P2）。
+/// - `current_sub = Some(s)`：`s` に帰属する本。
+/// - `current_sub = None`（未ログイン）：未所属（owner_sub IS NULL）の本。
+/// 他アカウント・復号不能（未知）の本は除外する。
+pub fn owned_book_ids(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    current_sub: Option<&str>,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rows = list_owner_subs(pool)?;
+    let mut out = std::collections::HashSet::new();
+    for (id, owner_sub) in rows {
+        let owned = match current_sub {
+            Some(s) => {
+                owner_sub
+                    .as_deref()
+                    .is_some_and(|b| crate::owner::decrypt(key, b).as_deref() == Some(s))
+            }
+            None => owner_sub.is_none(),
+        };
+        if owned {
+            out.insert(id);
+        }
+    }
+    Ok(out)
+}
+
 /// `(book_id, owner_sub)` で source（`site_id + tbf_product_id`）に一致する本（重複抑止用）。
 pub fn find_by_source(
     pool: &SqlitePool,

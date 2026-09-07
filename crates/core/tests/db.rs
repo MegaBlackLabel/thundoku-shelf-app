@@ -250,6 +250,91 @@ fn resolve_reuse_id_returns_owned_match_only() {
 }
 
 #[test]
+fn owned_book_ids_filters_by_owner() {
+    let pool = memory_db();
+    let key = [3u8; 32];
+    let mk = |id: &str| books::Book {
+        id: id.into(),
+        title: "本".into(),
+        author: String::new(),
+        circle_name: String::new(),
+        purchase_date: None,
+        file_name: "f.pdf".into(),
+        file_size: 1,
+        opfs_path: format!("{id}.opfspack"),
+        cover_thumbnail: None,
+        tbf_product_id: None,
+        site_id: None,
+        tags_fetched: 1,
+        pack_id: Some(id.into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: "2026-01-01 00:00:00".into(),
+        updated_at: "2026-01-01 00:00:00".into(),
+    };
+    // book-1: A 所属 / book-2: 未所属(NULL) / book-3: B 所属
+    books::insert(&pool, &mk("book-1")).unwrap();
+    books::insert(&pool, &mk("book-2")).unwrap();
+    books::insert(&pool, &mk("book-3")).unwrap();
+    books::set_owner_sub(&pool, "book-1", Some(thundoku_core::owner::encrypt(&key, "A"))).unwrap();
+    books::set_owner_sub(&pool, "book-3", Some(thundoku_core::owner::encrypt(&key, "B"))).unwrap();
+
+    // A ログイン中 → A の本だけ
+    let as_a = books::owned_book_ids(&pool, &key, Some("A")).unwrap();
+    assert!(as_a.contains("book-1"));
+    assert!(!as_a.contains("book-2"));
+    assert!(!as_a.contains("book-3"));
+    // B ログイン中 → B の本だけ
+    let as_b = books::owned_book_ids(&pool, &key, Some("B")).unwrap();
+    assert!(as_b.contains("book-3") && !as_b.contains("book-1") && !as_b.contains("book-2"));
+    // 未ログイン → 未所属(NULL)だけ
+    let logged_out = books::owned_book_ids(&pool, &key, None).unwrap();
+    assert_eq!(logged_out, std::collections::HashSet::from(["book-2".to_string()]));
+}
+
+#[test]
+fn clear_owner_model_first_run_wipes_and_sets_flag() {
+    let pool = memory_db();
+    let packs = std::env::temp_dir().join("thundoku-owner-packs");
+    let thumbs = std::env::temp_dir().join("thundoku-owner-thumbs");
+    let _ = std::fs::remove_dir_all(&packs);
+    let _ = std::fs::remove_dir_all(&thumbs);
+    std::fs::create_dir_all(&packs).unwrap();
+    std::fs::create_dir_all(&thumbs).unwrap();
+    std::fs::write(packs.join("b1.opfspack"), b"data").unwrap();
+    let book = books::Book {
+        id: "book-1".into(),
+        title: "t".into(),
+        author: String::new(),
+        circle_name: String::new(),
+        purchase_date: None,
+        file_name: "f.pdf".into(),
+        file_size: 1,
+        opfs_path: "book-1.opfspack".into(),
+        cover_thumbnail: None,
+        tbf_product_id: None,
+        site_id: None,
+        tags_fetched: 1,
+        pack_id: Some("book-1".into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: "2026-01-01 00:00:00".into(),
+        updated_at: "2026-01-01 00:00:00".into(),
+    };
+    books::insert(&pool, &book).unwrap();
+    // 初回 → クリア & フラグセット
+    assert!(thundoku_core::db::clear_owner_model_if_first_run(&pool, &packs, &thumbs).unwrap());
+    assert_eq!(books::list(&pool).unwrap().len(), 0);
+    assert!(!packs.join("b1.opfspack").exists());
+    assert_eq!(
+        settings::get(&pool, "owner_sub_model.initialized").unwrap(),
+        Some("1".into())
+    );
+    // 2 回目 → no-op（クリアしない）
+    assert!(!thundoku_core::db::clear_owner_model_if_first_run(&pool, &packs, &thumbs).unwrap());
+}
+
+#[test]
 fn bookshelf_upsert_replaces_existing_row() {
     let pool = memory_db();
     let item = |title: &str| bookshelf::BookshelfItem {

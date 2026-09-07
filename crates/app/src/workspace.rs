@@ -478,6 +478,15 @@ impl Workspace {
         let state = AppState::global(cx);
         let google = state.google.clone();
         let db = state.db_pool.clone();
+        // 復元確認の差分判定も所有者ベースに揃える（P3）。
+        let book_ids = {
+            let sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+            let key = state.secrets.db_key().ok();
+            match (sub, key) {
+                (Some(sub), Some(key)) => db::books::owned_book_ids(&db, &key, Some(&sub)).ok(),
+                _ => None,
+            }
+        };
         let folder_id = {
             let current = db::settings::get(&db, "drive.sync.folder_id")
                 .ok()
@@ -508,8 +517,13 @@ impl Workspace {
                 token,
             );
             // ローカルと Drive のバックアップに差分があるときだけ復元候補にする
-            let has_diff =
-                thundoku_core::drive::sync::backup_has_diff(&db, &mut drive, &folder_id).ok()?;
+            let has_diff = thundoku_core::drive::sync::backup_has_diff(
+                &db,
+                &mut drive,
+                &folder_id,
+                book_ids.as_ref(),
+            )
+            .ok()?;
             if !has_diff {
                 return None;
             }
@@ -709,6 +723,7 @@ impl Workspace {
         let downloads_dir = state.downloads_dir.clone();
         let db_path = state.data_dir.join("thundoku-shelf.db");
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+        let db_key = state.secrets.db_key().ok();
         let task: gpui_kit::Task<Result<(), String>> = cx.background_executor().spawn(async move {
             let folder_id = db::settings::get(&db, "drive.sync.folder_id")
                 .ok()
@@ -729,6 +744,7 @@ impl Workspace {
                 &packs_dir,
                 &downloads_dir,
                 google_sub.as_deref(),
+                db_key.as_ref(),
                 &folder_id,
                 Some(&db_path),
             )

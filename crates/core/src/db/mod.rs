@@ -156,6 +156,56 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     })
 }
 
+/// P4: 初回起動（`owner_sub_model.initialized` フラグが無い）で既存データをクリアして
+/// 新モデル（ownersub）で開始する。2 回目以降は何もしない。
+/// 既存データは「開発版・旧フォーマット」のため削除して作り直す。
+/// 戻り値: 初回でクリアしたら `true`。
+pub fn clear_owner_model_if_first_run(
+    pool: &SqlitePool,
+    packs_dir: &Path,
+    thumbnails_dir: &Path,
+) -> Result<bool, sqlx::Error> {
+    let initialized: i64 = block_on(async {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM app_settings WHERE key = 'owner_sub_model.initialized'",
+        )
+        .fetch_one(pool)
+        .await
+    })?;
+    if initialized > 0 {
+        return Ok(false);
+    }
+    // FK 安全の順（参照子 → 親）でクリアする。sites / tbf_events 等の参照テーブルは残す。
+    for table in [
+        "product_sample_pages",
+        "token_analysis",
+        "document_text",
+        "document_images",
+        "imported_documents",
+        "book_tags",
+        "reading_progress",
+        "view_history",
+        "page_views",
+        "book_first_events",
+        "checked_items",
+        "bookshelf_items",
+        "books",
+        "drive_sync_state",
+    ] {
+        let _ = block_on(async {
+            sqlx::query(&format!("DELETE FROM {table}"))
+                .execute(pool)
+                .await
+        });
+    }
+    let _ = std::fs::remove_dir_all(packs_dir);
+    let _ = std::fs::create_dir_all(packs_dir);
+    let _ = std::fs::remove_dir_all(thumbnails_dir);
+    let _ = std::fs::create_dir_all(thumbnails_dir);
+    settings::set(pool, "owner_sub_model.initialized", "1")?;
+    Ok(true)
+}
+
 /// テスト用のインメモリプール（1 接続固定で同一メモリを共有）＋マイグレーション適用。
 pub fn test_pool() -> SqlitePool {
     let pool = block_on(async {

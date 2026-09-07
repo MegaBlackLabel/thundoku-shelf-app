@@ -569,6 +569,7 @@ impl SettingsView {
         let downloads_dir = state.downloads_dir.clone();
         let db_path = state.data_dir.join("thundoku-shelf.db");
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+        let db_key = state.secrets.db_key().ok();
         log::info!("sync_drive_now: start");
         let task: gpui_kit::Task<Result<sync::SyncOutcome, String>> =
             cx.background_executor().spawn(async move {
@@ -604,6 +605,7 @@ impl SettingsView {
                     &packs_dir,
                     &downloads_dir,
                     google_sub.as_deref(),
+                    db_key.as_ref(),
                     &folder_id,
                     Some(&db_path),
                 )

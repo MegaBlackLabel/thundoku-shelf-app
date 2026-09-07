@@ -416,8 +416,31 @@ impl BookshelfView {
             let db = &state.db_pool;
             let packs_dir = state.packs_dir.clone();
             let thumbnails_dir = state.data_dir.join("thumbnails");
+            // 所有者フィルタ：ログイン中は現在 sub の本、未ログインは未所属(NULL)の本だけ表示。
+            let owned = {
+                let sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+                let key = state.secrets.db_key().ok();
+                match (sub, key) {
+                    (Some(sub), Some(key)) => {
+                        db::books::owned_book_ids(db, &key, Some(&sub)).unwrap_or_default()
+                    }
+                    // ログイン中だが key が無い → 復号不能なので表示しない。
+                    (Some(_), None) => std::collections::HashSet::new(),
+                    // 未ログイン → 未所属(NULL)。NULL 判定は key を使わないのでダミーで良い。
+                    (None, key) => db::books::owned_book_ids(
+                        db,
+                        key.as_ref().unwrap_or(&[0u8; 32]),
+                        None,
+                    )
+                    .unwrap_or_default(),
+                }
+            };
             let mut entries = Vec::new();
-            for book in books::list(db).unwrap_or_default() {
+            for book in books::list(db)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|b| owned.contains(&b.id))
+            {
                 let tags: Vec<String> = db::tags::list_for_book(db, &book.id)
                     .unwrap_or_default()
                     .into_iter()

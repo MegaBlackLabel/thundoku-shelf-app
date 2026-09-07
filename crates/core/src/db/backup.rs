@@ -31,13 +31,18 @@ const TABLES: &[&str] = &[
 const EXCLUDED_COLUMNS: &[&str] = &["thumbnail_data", "image_data"];
 
 /// 主要テーブルを JSON 文字列にエクスポートする。
+/// `book_ids` が `Some(ids)` のとき、所有者（本の id 集合）に連動して
+/// `books` とその下位テーブルだけをエクスポートする（P3）。`None` は全件。
 #[allow(clippy::explicit_auto_deref)]
-pub fn export_json(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+pub fn export_json(
+    pool: &SqlitePool,
+    book_ids: Option<&std::collections::HashSet<String>>,
+) -> Result<String, sqlx::Error> {
     crate::db::block_on(async {
         let mut conn = pool.acquire().await?;
         let mut payload = Map::new();
         for table in TABLES {
-            let rows = table_rows(&mut *conn, table).await?;
+            let rows = table_rows(&mut *conn, table, book_ids).await?;
             payload.insert((*table).to_string(), Value::Array(rows));
         }
         Ok(serde_json::to_string(&Value::Object(payload)).unwrap_or_default())
@@ -93,6 +98,7 @@ fn pk_columns(table: &str) -> Option<&'static [&'static str]> {
 async fn table_rows(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
+    book_ids: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<Value>, sqlx::Error> {
     // 画像（blob）カラムは SELECT から除外して読み込みコストを削る
     let cols: Vec<String> = {
@@ -109,9 +115,35 @@ async fn table_rows(
         names
     };
     let col_list = cols.join(", ");
-    let rows = sqlx::query(&format!("SELECT {col_list} FROM {table}"))
-        .fetch_all(&mut *conn)
-        .await?;
+    // 所有者（本の id 集合）に連動して下位テーブルを絞る（P3）。json_each で IN を組む。
+    let mut where_sql = String::new();
+    let mut bind_json: Option<String> = None;
+    if let Some(ids) = book_ids {
+        let json = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
+        match table {
+            "document_images" => {
+                where_sql = " WHERE document_id IN (SELECT id FROM imported_documents \
+                             WHERE book_id IN (SELECT value FROM json_each(?)))"
+                    .into();
+                bind_json = Some(json);
+            }
+            "books" => {
+                where_sql = " WHERE id IN (SELECT value FROM json_each(?))".into();
+                bind_json = Some(json);
+            }
+            "reading_progress" | "page_views" | "book_tags" | "view_history" | "imported_documents" => {
+                where_sql = " WHERE book_id IN (SELECT value FROM json_each(?))".into();
+                bind_json = Some(json);
+            }
+            _ => {}
+        }
+    }
+    let sql = format!("SELECT {col_list} FROM {table}{where_sql}");
+    let mut query = sqlx::query(&sql);
+    if let Some(json) = &bind_json {
+        query = query.bind(json);
+    }
+    let rows = query.fetch_all(&mut *conn).await?;
     let mut out = Vec::new();
     for row in rows {
         let mut obj = Map::new();
@@ -292,7 +324,7 @@ mod tests {
         )
         .unwrap();
 
-        let json = export_json(&pool).unwrap();
+        let json = export_json(&pool, None).unwrap();
         let payload: Value = serde_json::from_str(&json).unwrap();
         // books テーブルに 1 件
         let books = payload["books"].as_array().unwrap();
@@ -357,7 +389,7 @@ mod tests {
         crate::db::page_views::add_dwell(&src, "book-1", 1, 3.5).unwrap();
         crate::db::page_views::add_dwell(&src, "book-1", 2, 1.25).unwrap();
 
-        let json = export_json(&src).unwrap();
+        let json = export_json(&src, None).unwrap();
         // view_history がバックアップに含まれる
         let payload: Value = serde_json::from_str(&json).unwrap();
         let vh = payload["view_history"].as_array().unwrap();
@@ -387,5 +419,78 @@ mod tests {
         assert_eq!(rows[0].view_count, 1);
         assert!((rows[0].total_seconds - 3.5).abs() < 1e-9);
         assert!((rows[1].total_seconds - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn export_json_filters_by_owner() {
+        let pool = crate::db::test_pool();
+        crate::db::migrate(&pool).unwrap();
+        let key = [17u8; 32];
+        let mk = |id: &str| crate::db::books::Book {
+            id: id.into(),
+            title: "本".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "f.pdf".into(),
+            file_size: 1,
+            opfs_path: format!("{id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some(id.into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+        };
+        crate::db::books::insert(&pool, &mk("book-A")).unwrap();
+        crate::db::books::insert(&pool, &mk("book-B")).unwrap();
+        crate::db::books::set_owner_sub(
+            &pool,
+            "book-A",
+            Some(crate::owner::encrypt(&key, "A")),
+        )
+        .unwrap();
+        crate::db::books::set_owner_sub(
+            &pool,
+            "book-B",
+            Some(crate::owner::encrypt(&key, "B")),
+        )
+        .unwrap();
+        // 進捗も入れる
+        use crate::db::progress::ReadingProgress;
+        for (id, page) in [("book-A", 5), ("book-B", 9)] {
+            crate::db::progress::upsert(
+                &pool,
+                &ReadingProgress {
+                    book_id: id.into(),
+                    current_page: page,
+                    total_pages: Some(10),
+                    finished_at: None,
+                    last_read_at: "2026-01-01 00:00:00".into(),
+                    scroll_position: 0.0,
+                },
+            )
+            .unwrap();
+        }
+
+        // A の所有のみ → book-A とその進捗だけ
+        let owned_a: std::collections::HashSet<String> = ["book-A".into()].into();
+        let json = export_json(&pool, Some(&owned_a)).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let books = v["books"].as_array().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0]["id"], "book-A");
+        let prog = v["reading_progress"].as_array().unwrap();
+        assert_eq!(prog.len(), 1);
+        assert_eq!(prog[0]["book_id"], "book-A");
+
+        // 全件（None）→ 両方
+        let json_full = export_json(&pool, None).unwrap();
+        let vf: Value = serde_json::from_str(&json_full).unwrap();
+        assert_eq!(vf["books"].as_array().unwrap().len(), 2);
+        assert_eq!(vf["reading_progress"].as_array().unwrap().len(), 2);
     }
 }

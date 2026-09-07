@@ -131,6 +131,12 @@ impl AppState {
 
         // sqlx で接続 + マイグレーション適用（migrations/ ディレクトリ管理）
         let db_pool = db::connect(&db_path).expect("open database");
+        // P4: 初回起動（新旧モデル移行）で既存データをクリアして新モデルで開始する。
+        let _ = db::clear_owner_model_if_first_run(
+            &db_pool,
+            &packs_dir,
+            &data_dir.join("thumbnails"),
+        );
 
         let secrets = SecretStore::new();
         let mut tbf = TbfClient::new();

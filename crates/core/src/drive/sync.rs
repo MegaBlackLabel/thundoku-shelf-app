@@ -166,6 +166,7 @@ pub fn sync(
     packs_dir: &Path,
     downloads_dir: &Path,
     identity_sub: Option<&str>,
+    owner_key: Option<&[u8; 32]>,
     folder_id: &str,
     db_path: Option<&Path>,
 ) -> Result<SyncOutcome, SyncError> {
@@ -173,6 +174,15 @@ pub fn sync(
     let files = drive.list_files(folder_id)?;
     log::info!("drive sync: list_files -> {} files", files.len());
     let mut outcome = SyncOutcome::default();
+    // アップロード / バックアップ対象の所有者フィルタ（P2/P3）。
+    // ログイン中は現在 sub の本のみ、未ログインは何も上げない（未所属はアップロードしない）。
+    let upload_ids: std::collections::HashSet<String> = match identity_sub {
+        Some(sub) => owner_key
+            .map(|k| books::owned_book_ids(pool, k, Some(sub)))
+            .transpose()?
+            .unwrap_or_default(),
+        None => std::collections::HashSet::new(),
+    };
 
     let mut drive_pack_by_id: HashMap<&str, &DriveFile> = HashMap::new();
     for file in &files {
@@ -227,6 +237,10 @@ pub fn sync(
         std::fs::write(&temp, &bytes)?;
         std::fs::write(&local_path, &bytes)?;
         import_book(pool, &reader, pack_id, identity_sub, bytes.len() as i64)?;
+        // ダウンロードした pack は現在 sub の所有として記録する（フォルダ分離前提で帰属を信頼）。
+        if let (Some(sub), Some(key)) = (identity_sub, owner_key) {
+            books::set_owner_sub(pool, pack_id, Some(crate::owner::encrypt(key, sub)))?;
+        }
         sync_state::upsert(
             pool,
             &sync_state::DriveSyncState {
@@ -250,6 +264,10 @@ pub fn sync(
             .or_else(|| Some(book.id.clone()))
             .unwrap_or_default();
         if pack_id.is_empty() {
+            continue;
+        }
+        // 所有者フィルタ：現在 sub の本だけアップロード（未所属・他アカウントは上げない）。
+        if !upload_ids.contains(&book.id) {
             continue;
         }
         let local_path: PathBuf = packs_dir.join(format!("{pack_id}.{PACK_EXTENSION}"));
@@ -293,7 +311,7 @@ pub fn sync(
     // Drive にバックアップする。画像 base64 は含めず、md5 が変わったとき
     // だけアップロードする（200MB 級の DB ファイル全体は上げない）。
     if db_path.is_some() {
-        let json = crate::db::backup::export_json(pool)?;
+        let json = crate::db::backup::export_json(pool, Some(&upload_ids))?;
         let bytes = json.into_bytes();
         let local_md5 = format!("{:x}", md5::compute(&bytes));
         let existing = files.iter().find(|f| f.name == DB_BACKUP_NAME);
@@ -382,6 +400,7 @@ pub fn backup_has_diff(
     pool: &SqlitePool,
     drive: &mut dyn DriveApi,
     folder_id: &str,
+    book_ids: Option<&std::collections::HashSet<String>>,
 ) -> Result<bool, SyncError> {
     let Some(info) = check_drive_backup(drive, folder_id)? else {
         return Ok(false);
@@ -393,7 +412,7 @@ pub fn backup_has_diff(
     let drive_json: serde_json::Value = serde_json::from_slice(&drive_bytes)
         .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
     let local_json: serde_json::Value =
-        serde_json::from_str(&crate::db::backup::export_json(pool)?)
+        serde_json::from_str(&crate::db::backup::export_json(pool, book_ids)?)
             .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
     // 両方を「Drive に存在するテーブルだけ」に絞って正規化し、決定的な順序で比較する。
     let drive_obj = drive_json.as_object();
@@ -570,7 +589,7 @@ mod tests {
             },
         )
         .unwrap();
-        let json = crate::db::backup::export_json(&src).unwrap();
+        let json = crate::db::backup::export_json(&src, None).unwrap();
 
         let mut drive = MockDrive {
             files: vec![crate::drive::DriveFile {
@@ -643,7 +662,7 @@ mod tests {
             },
         )
         .unwrap();
-        let json = crate::db::backup::export_json(&src).unwrap();
+        let json = crate::db::backup::export_json(&src, None).unwrap();
         let json_md5 = format!("{:x}", md5::compute(json.as_bytes()));
 
         // 同一データの DB: md5 一致 -> 差分なし
@@ -702,7 +721,7 @@ mod tests {
             .borrow_mut()
             .insert("backup-id".into(), json.as_bytes().to_vec());
         assert!(
-            !super::backup_has_diff(&same, &mut drive, "folder").unwrap(),
+            !super::backup_has_diff(&same, &mut drive, "folder", None).unwrap(),
             "identical data must not report a diff"
         );
 
@@ -716,7 +735,7 @@ mod tests {
         };
         let mut empty = empty;
         assert!(
-            !super::backup_has_diff(&same, &mut empty, "folder").unwrap(),
+            !super::backup_has_diff(&same, &mut empty, "folder", None).unwrap(),
             "no backup must not report a diff"
         );
 
@@ -734,7 +753,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            super::backup_has_diff(&same, &mut drive, "folder").unwrap(),
+            super::backup_has_diff(&same, &mut drive, "folder", None).unwrap(),
             "changed data must report a diff"
         );
     }
@@ -785,7 +804,7 @@ mod tests {
 
         // Drive のバックアップは古い形式: view_history キーを含まない
         let local_json: serde_json::Value =
-            serde_json::from_str(&crate::db::backup::export_json(&local).unwrap()).unwrap();
+            serde_json::from_str(&crate::db::backup::export_json(&local, None).unwrap()).unwrap();
         let mut drive_obj = local_json.as_object().cloned().unwrap();
         drive_obj.remove("view_history");
         let drive_bytes = serde_json::to_vec(&serde_json::Value::Object(drive_obj)).unwrap();
@@ -810,7 +829,7 @@ mod tests {
 
         // view_history は Drive 側に無いため比較対象から外れ、データが一致していれば差分なし
         assert!(
-            !super::backup_has_diff(&local, &mut drive, "folder").unwrap(),
+            !super::backup_has_diff(&local, &mut drive, "folder", None).unwrap(),
             "tables missing in drive must be ignored when other data matches"
         );
     }
@@ -874,6 +893,7 @@ mod tests {
     fn sync_backs_up_database_json_when_changed() {
         let pool = crate::db::test_pool();
         migrate(&pool).unwrap();
+        let key = [13u8; 32];
         // データを入れるとエクスポート内容が変わる
         crate::db::books::insert(
             &pool,
@@ -898,6 +918,13 @@ mod tests {
             },
         )
         .unwrap();
+        // 所有者ベースのバックアップ（P3）で、test-sub の本だけを出す。
+        crate::db::books::set_owner_sub(
+            &pool,
+            "book-1",
+            Some(crate::owner::encrypt(&key, "test-sub")),
+        )
+        .unwrap();
         let packs = std::env::temp_dir().join("thundoku-sync-test-packs");
         std::fs::create_dir_all(&packs).unwrap();
         let dl = std::env::temp_dir().join("thundoku-sync-test-dl");
@@ -916,7 +943,8 @@ mod tests {
             &mut drive,
             &packs,
             &dl,
-            None,
+            Some("test-sub"),
+            Some(&key),
             "folder",
             Some(&db_path),
         )
@@ -934,7 +962,8 @@ mod tests {
             &mut drive,
             &packs,
             &dl,
-            None,
+            Some("test-sub"),
+            Some(&key),
             "folder",
             Some(&db_path),
         )
@@ -972,12 +1001,20 @@ mod tests {
             },
         )
         .unwrap();
+        // book-2 も test-sub の所有にして、バックアップ内容を変える（再アップロード判定）。
+        crate::db::books::set_owner_sub(
+            &pool,
+            "book-2",
+            Some(crate::owner::encrypt(&key, "test-sub")),
+        )
+        .unwrap();
         let outcome = super::sync(
             &pool,
             &mut drive,
             &packs,
             &dl,
-            None,
+            Some("test-sub"),
+            Some(&key),
             "folder",
             Some(&db_path),
         )

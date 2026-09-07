@@ -199,6 +199,7 @@ fn sync_env(
         &env.packs(),
         &env.downloads(),
         None,
+        None,
         "folder-1",
         None,
     )
@@ -336,8 +337,26 @@ fn uploads_local_pack_without_state_row() {
         },
     )
     .unwrap();
+    // 新仕様: 未所属(NULL) pack はアップロードされない。所有本としてテストする。
+    let key = [11u8; 32];
+    db::books::set_owner_sub(
+        &env.pool,
+        "pack-9",
+        Some(thundoku_core::owner::encrypt(&key, "test-sub")),
+    )
+    .unwrap();
 
-    let outcome = sync_env(&mut env, &mut drive).unwrap();
+    let outcome = sync(
+        &env.pool,
+        &mut drive,
+        &env.packs(),
+        &env.downloads(),
+        Some("test-sub"),
+        Some(&key),
+        "folder-1",
+        None,
+    )
+    .unwrap();
     assert_eq!(outcome.uploaded, vec!["pack-9"]);
     assert_eq!(drive.upload_count(), 1);
     assert!(drive.files.contains_key("id-pack-9.opfspack"));
@@ -350,6 +369,14 @@ fn reuploads_locally_modified_pack() {
     let bytes = plain_pack("pages/page_0001.webp", b"OLD");
     drive.seed("pack-2.opfspack", &bytes);
     sync_env(&mut env, &mut drive).unwrap();
+    let key = [11u8; 32];
+    // 新仕様: ダウンロードした本を「test-sub の所有」として扱い、再アップロードを確認する。
+    db::books::set_owner_sub(
+        &env.pool,
+        "pack-2",
+        Some(thundoku_core::owner::encrypt(&key, "test-sub")),
+    )
+    .unwrap();
     assert_eq!(drive.upload_count(), 0); // downloaded, not uploaded
 
     // modify local pack after sync
@@ -368,7 +395,17 @@ fn reuploads_locally_modified_pack() {
     )
     .unwrap();
     // last_synced_at in the past → mtime newer → re-upload
-    let outcome = sync_env(&mut env, &mut drive).unwrap();
+    let outcome = sync(
+        &env.pool,
+        &mut drive,
+        &env.packs(),
+        &env.downloads(),
+        Some("test-sub"),
+        Some(&key),
+        "folder-1",
+        None,
+    )
+    .unwrap();
     assert_eq!(outcome.uploaded, vec!["pack-2"]);
     assert_eq!(drive.upload_count(), 1);
     // drive file replaced
@@ -459,6 +496,7 @@ fn encrypted_pack_imports_with_matching_identity() {
         &env.packs(),
         &env.downloads(),
         Some("test-sub"),
+        None,
         "folder-1",
         None,
     )
