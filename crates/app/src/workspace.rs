@@ -148,7 +148,7 @@ impl Workspace {
     /// `AuthDialog` から `Workspace` を直接 update すると RefCell 再入問題で固まるため、
     /// AppState のフラグを追ってここで状態をリセットする。
     fn start_login_done_watcher(&mut self, cx: &mut Context<Self>) {
-        let handle = cx.entity();
+        let handle = cx.weak_entity();
         let flag = AppState::global(cx).google_login_done.clone();
         let logout_flag = AppState::global(cx).google_logout_done.clone();
         let auth_open = AppState::global(cx).auth_open_requested.clone();
@@ -163,7 +163,7 @@ impl Workspace {
                 if auth_open.load(std::sync::atomic::Ordering::SeqCst) {
                     auth_open.store(false, std::sync::atomic::Ordering::SeqCst);
                     let provider = auth_provider.lock().take();
-                    handle.update(cx, |this, cx| {
+                    let _ = handle.update(cx, |this, cx| {
                         this.show_auth = true;
                         let dialog = this
                             .auth_dialog
@@ -186,7 +186,7 @@ impl Workspace {
                         .ok()
                         .flatten()
                         .is_some_and(|v| v == "true" || v == "1");
-                    handle.update(cx, |this, cx| {
+                    let _ = handle.update(cx, |this, cx| {
                         this.show_auth = false;
                         this.auth_dialog = None;
                         // ログイン完了後は設定画面に戻す
@@ -207,7 +207,7 @@ impl Workspace {
                 // ログアウトで未ログインに戻ったら本棚を再フィルタ（未所属のみ表示）。
                 if logout_flag.load(std::sync::atomic::Ordering::SeqCst) {
                     logout_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                    handle.update(cx, |this, cx| {
+                    let _ = handle.update(cx, |this, cx| {
                         this.bookshelf.update(cx, |b, bx| b.reload(bx));
                         log::info!("owner-model: ログアウト→本棚 reload");
                     });
@@ -1600,7 +1600,7 @@ impl Workspace {
             .on_click({
                 let handle = handle.clone();
                 move |_event, window, cx| {
-                    handle.update(cx, |this, cx| {
+                    let _ = handle.update(cx, |this, cx| {
                         if !this.sidebar_open {
                             this.sidebar_open = true;
                         }
@@ -1802,7 +1802,7 @@ impl Workspace {
                 let handle = handle.clone();
                 move |_, _window, cx| {
                     cx.stop_propagation();
-                    handle.update(cx, |this, cx| {
+                    let _ = handle.update(cx, |this, cx| {
                         this.switch_to(NavTarget::About, cx);
                     });
                 }
@@ -1873,7 +1873,7 @@ impl Workspace {
                 let handle = handle.clone();
                 move |event, window, cx| {
                     cx.stop_propagation();
-                    handle.update(cx, |this, cx| {
+                    let _ = handle.update(cx, |this, cx| {
                         let is_bookshelf = target == NavTarget::Bookshelf;
                         if is_bookshelf && event.click_count() >= 2 {
                             if !this.sidebar_open {
@@ -1958,7 +1958,7 @@ impl Workspace {
                 let handle = handle.clone();
                 move |_, _window, cx| {
                     cx.stop_propagation();
-                    handle.update(cx, |this, cx| {
+                    let _ = handle.update(cx, |this, cx| {
                         on_click(this, cx);
                     });
                 }
