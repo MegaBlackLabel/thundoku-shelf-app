@@ -201,6 +201,55 @@ fn owner_sub_roundtrip() {
 }
 
 #[test]
+fn resolve_reuse_id_returns_owned_match_only() {
+    let pool = memory_db();
+    let key = [5u8; 32];
+    let mk = |id: &str| books::Book {
+        id: id.into(),
+        title: "本".into(),
+        author: String::new(),
+        circle_name: String::new(),
+        purchase_date: None,
+        file_name: "f.pdf".into(),
+        file_size: 1,
+        opfs_path: format!("{id}.opfspack"),
+        cover_thumbnail: None,
+        tbf_product_id: Some("db-1".into()),
+        site_id: Some("techbookfest".into()),
+        tags_fetched: 1,
+        pack_id: Some(id.into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: "2026-01-01 00:00:00".into(),
+        updated_at: "2026-01-01 00:00:00".into(),
+    };
+    // book-1: sub-A に所属(暗号化済み) / book-2: 未所属(NULL)
+    books::insert(&pool, &mk("book-1")).unwrap();
+    books::insert(&pool, &mk("book-2")).unwrap();
+    books::set_owner_sub(&pool, "book-1", Some(thundoku_core::owner::encrypt(&key, "sub-A"))).unwrap();
+    // 同一 source + sub-A → book-1 を再利用
+    assert_eq!(
+        books::resolve_reuse_id(&pool, &key, "techbookfest", "db-1", Some("sub-A")).unwrap(),
+        Some("book-1".into())
+    );
+    // 別の sub → 一致なし（Aの行は再利用せず、NULL行も再利用しない）
+    assert_eq!(
+        books::resolve_reuse_id(&pool, &key, "techbookfest", "db-1", Some("sub-B")).unwrap(),
+        None
+    );
+    // source 不一致 → None
+    assert_eq!(
+        books::resolve_reuse_id(&pool, &key, "techbookfest", "db-9", Some("sub-A")).unwrap(),
+        None
+    );
+    // 未ログイン（None）→ 未所属（NULL）の book-2 を再利用
+    assert_eq!(
+        books::resolve_reuse_id(&pool, &key, "techbookfest", "db-1", None).unwrap(),
+        Some("book-2".into())
+    );
+}
+
+#[test]
 fn bookshelf_upsert_replaces_existing_row() {
     let pool = memory_db();
     let item = |title: &str| bookshelf::BookshelfItem {

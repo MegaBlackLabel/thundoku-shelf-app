@@ -113,6 +113,12 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                     .await?;
             }
         }
+        // 複数アカウント対応: 同一 source を owner ごとに複数行持てるようにするため、
+        // `(site_id, tbf_product_id)` の UNIQUE 制約を外す（乙案）。
+        // 既存 DB / 新規 DB とも、ここで冪等に DROP する。
+        sqlx::query("DROP INDEX IF EXISTS books_site_tbf_product_id_unique")
+            .execute(&mut *conn)
+            .await?;
         // チェックリストのポーリング有効フラグ（プログラム的マイグレーション。
         // hidden_at と同様に PRAGMA で存在確認してから ALTER TABLE する。
         // 既存の migration ファイルは checksum 管理されるため変更しない）

@@ -176,6 +176,49 @@ pub fn list_owner_subs(pool: &SqlitePool) -> Result<Vec<(String, Option<String>)
     })
 }
 
+/// `(book_id, owner_sub)` で source（`site_id + tbf_product_id`）に一致する本（重複抑止用）。
+pub fn find_by_source(
+    pool: &SqlitePool,
+    site_id: &str,
+    tbf_product_id: &str,
+) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT id, owner_sub FROM books WHERE site_id = ?1 AND tbf_product_id = ?2",
+        )
+        .bind(site_id)
+        .bind(tbf_product_id)
+        .fetch_all(pool)
+        .await
+    })
+}
+
+/// 再DL時に使い回す既存 book id（P5）。
+/// - `sub = Some(s)`：同一 source で `s` に帰属する行の id。
+/// - `sub = None`（未ログイン）：同一 source で未所属（owner_sub IS NULL）の行の id。
+/// **他の owner の行は更新対象にしない**（別途追加。自動変換はしない）。
+pub fn resolve_reuse_id(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    site_id: &str,
+    tbf_product_id: &str,
+    sub: Option<&str>,
+) -> Result<Option<String>, sqlx::Error> {
+    let rows = find_by_source(pool, site_id, tbf_product_id)?;
+    for (id, owner_sub) in rows {
+        let matched = match sub {
+            Some(s) => owner_sub
+                .as_deref()
+                .is_some_and(|b| crate::owner::decrypt(key, b).as_deref() == Some(s)),
+            None => owner_sub.is_none(),
+        };
+        if matched {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 pub fn delete(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query("DELETE FROM books WHERE id = ?1")

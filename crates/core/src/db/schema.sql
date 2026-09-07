@@ -51,9 +51,6 @@ CREATE TABLE IF NOT EXISTS books (
 );
 
 CREATE INDEX IF NOT EXISTS books_site_id_idx ON books(site_id);
-CREATE UNIQUE INDEX IF NOT EXISTS books_site_tbf_product_id_unique
-  ON books(site_id, tbf_product_id)
-  WHERE site_id IS NOT NULL AND tbf_product_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS tbf_events (
   id TEXT PRIMARY KEY,
