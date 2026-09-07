@@ -228,7 +228,7 @@ impl Workspace {
         let db = AppState::global(cx).db_pool.clone();
         let tbf_client = AppState::global(cx).tbf.clone();
         let tbf_logged_in = AppState::global(cx).tbf_logged_in.clone();
-        let settings_entity = self.settings.clone();
+        let settings_entity = self.settings.downgrade();
         cx.spawn(async move |_window, cx| {
             // セッション切れの OpenAuth は 1 回だけ出す（連続で出さない）
             let mut auth_dispatched = false;
@@ -283,7 +283,7 @@ impl Workspace {
                     });
                 }
                 if any_changed {
-                    settings_entity.update(cx, |settings, cx| settings.sync_drive_now(cx));
+                    let _ = settings_entity.update(cx, |settings, cx| settings.sync_drive_now(cx));
                 }
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(interval_min as u64 * 60))
