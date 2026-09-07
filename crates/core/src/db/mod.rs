@@ -202,6 +202,15 @@ pub fn clear_owner_model_if_first_run(
     let _ = std::fs::create_dir_all(packs_dir);
     let _ = std::fs::remove_dir_all(thumbnails_dir);
     let _ = std::fs::create_dir_all(thumbnails_dir);
+    // 同期状態も「未同期」に戻す（新モデル開始時に最初のログインで
+    // 「Google Drive と同期しますか？」を促すため）。
+    for key in [
+        "drive.last_sync_at",
+        "drive.sync.enabled",
+        "drive.sync.folder_id",
+    ] {
+        let _ = settings::delete(pool, key);
+    }
     settings::set(pool, "owner_sub_model.initialized", "1")?;
     Ok(true)
 }
