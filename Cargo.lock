@@ -9250,6 +9250,7 @@ dependencies = [
 name = "thundoku-core"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm",
  "base64 0.22.1",
  "chrono",
  "image",
