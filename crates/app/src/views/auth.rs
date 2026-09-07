@@ -110,108 +110,117 @@ impl AuthDialog {
     /// WebView（wry）は実ウィンドウが必要なため、ログインモーダルを
     /// 開いたときだけ作成する（テスト環境で WebView を作らない）。
     fn ensure_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // WebView 生成はウィンドウ借用中の RefCell 再入で固まるため render 後に defer する。
         if self.show_booth_login && self.booth_login.is_none() {
-            let booth_login = cx.new(|cx| BoothLoginView::new(window, cx));
-            // ログイン成功: WebView を閉じてモーダル全体も閉じる
-            let _done = cx.subscribe(
-                &booth_login,
-                |this: &mut Self, _: Entity<BoothLoginView>, _: &BoothLoginDone, cx| {
-                    this.show_booth_login = false;
-                    // 次回は新しい WebView + 監視を開始する
-                    this.booth_login = None;
-                    this.booth_subscription = None;
-                    cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
-                },
-            );
-            // キャンセル: WebView を破棄してログイン画面に戻る（次回は新規フロー）
-            let _cancelled = cx.subscribe(
-                &booth_login,
-                |this: &mut Self, _: Entity<BoothLoginView>, _: &BoothLoginCancelled, _| {
-                    this.show_booth_login = false;
-                    this.booth_login = None;
-                    this.booth_subscription = None;
-                },
-            );
-            self.booth_subscription = Some(_done);
-            self.booth_login = Some(booth_login);
+            cx.defer_in(window, |this, window, cx| {
+                let booth_login = cx.new(|cx| BoothLoginView::new(window, cx));
+                // ログイン成功: WebView を閉じてモーダル全体も閉じる
+                let _done = cx.subscribe(
+                    &booth_login,
+                    |this: &mut Self, _: Entity<BoothLoginView>, _: &BoothLoginDone, cx| {
+                        this.show_booth_login = false;
+                        // 次回は新しい WebView + 監視を開始する
+                        this.booth_login = None;
+                        this.booth_subscription = None;
+                        cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
+                    },
+                );
+                // キャンセル: WebView を破棄してログイン画面に戻る（次回は新規フロー）
+                let _cancelled = cx.subscribe(
+                    &booth_login,
+                    |this: &mut Self, _: Entity<BoothLoginView>, _: &BoothLoginCancelled, _| {
+                        this.show_booth_login = false;
+                        this.booth_login = None;
+                        this.booth_subscription = None;
+                    },
+                );
+                this.booth_subscription = Some(_done);
+                this.booth_login = Some(booth_login);
+            });
         }
         // Google: WebView（wry）は実ウィンドウが必要なため、ログインモーダルを
         // 開いたときだけ作成する（テスト環境で WebView を作らない）。
+        // ウィンドウ借用中の WebView 生成は RefCell 再入でウィンドウ描画が固まるため、
+        // render 後に defer_in で生成する。
         if self.show_google_login && self.google_login.is_none() {
-            let google_login = cx.new(|cx| GoogleLoginView::new(window, cx));
-            // 成功: プロフィールを保存してモーダル全体を閉じる
-            let _done = cx.subscribe(
-                &google_login,
-                |this: &mut Self, _: Entity<GoogleLoginView>, event: &GoogleLoginDone, cx| {
-                    let profile = event.0.clone();
-                    this.google_profile = Some(profile.clone());
-                    let state = AppState::global(cx);
-                    *state.google_profile.lock() = Some(profile);
-                    *state.google_logged_in.lock() = true;
-                    *state.google_login_error.lock() = None;
-                    // WebView は完了処理で隠される。次回は新しい認可フローを開始する
-                    this.google_login = None;
-                    this.google_subscription = None;
-                    // Workspace の状態更新は、RefCell already borrowed でアプリが固まるため
-                    // ここでは行わない。グローバルフラグを立て、Workspace の監視タスクが
-                    // show_auth をリセットする（Workspace::new で開始）。
-                    AppState::global(cx)
-                        .google_login_done
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                },
-            );
-            // 失敗: エラーを保持してモーダル全体を閉じる（成功時と同じ挙動）
-            let _failed = cx.subscribe(
-                &google_login,
-                |this: &mut Self, _: Entity<GoogleLoginView>, event: &GoogleLoginFailed, cx| {
-                    this.show_google_login = false;
-                    this.google_login = None;
-                    this.google_subscription = None;
-                    let state = AppState::global(cx);
-                    *state.google_login_error.lock() = Some(event.0.clone());
-                    AppState::global(cx)
-                        .google_login_done
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                },
-            );
-            // キャンセル: WebView を破棄してログイン画面に戻る（次回は新規フロー）
-            let _cancelled = cx.subscribe(
-                &google_login,
-                |this: &mut Self, _: Entity<GoogleLoginView>, _: &GoogleLoginCancelled, _| {
-                    this.show_google_login = false;
-                    this.google_login = None;
-                    this.google_subscription = None;
-                },
-            );
-            self.google_subscription = Some(_done);
-            self.google_login = Some(google_login);
+            cx.defer_in(window, |this, window, cx| {
+                let google_login = cx.new(|cx| GoogleLoginView::new(window, cx));
+                // 成功: プロフィールを保存してモーダル全体を閉じる
+                let _done = cx.subscribe(
+                    &google_login,
+                    |this: &mut Self, _: Entity<GoogleLoginView>, event: &GoogleLoginDone, cx| {
+                        let profile = event.0.clone();
+                        this.google_profile = Some(profile.clone());
+                        let state = AppState::global(cx);
+                        *state.google_profile.lock() = Some(profile);
+                        *state.google_logged_in.lock() = true;
+                        *state.google_login_error.lock() = None;
+                        // WebView は完了処理で隠される。次回は新しい認可フローを開始する
+                        this.google_login = None;
+                        this.google_subscription = None;
+                        // Workspace の状態更新は、RefCell already borrowed でアプリが固まるため
+                        // ここでは行わない。グローバルフラグを立て、Workspace の監視タスクが
+                        // show_auth をリセットする（Workspace::new で開始）。
+                        AppState::global(cx)
+                            .google_login_done
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    },
+                );
+                // 失敗: エラーを保持してモーダル全体を閉じる（成功時と同じ挙動）
+                let _failed = cx.subscribe(
+                    &google_login,
+                    |this: &mut Self, _: Entity<GoogleLoginView>, event: &GoogleLoginFailed, cx| {
+                        this.show_google_login = false;
+                        this.google_login = None;
+                        this.google_subscription = None;
+                        let state = AppState::global(cx);
+                        *state.google_login_error.lock() = Some(event.0.clone());
+                        AppState::global(cx)
+                            .google_login_done
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    },
+                );
+                // キャンセル: WebView を破棄してログイン画面に戻る（次回は新規フロー）
+                let _cancelled = cx.subscribe(
+                    &google_login,
+                    |this: &mut Self, _: Entity<GoogleLoginView>, _: &GoogleLoginCancelled, _| {
+                        this.show_google_login = false;
+                        this.google_login = None;
+                        this.google_subscription = None;
+                    },
+                );
+                this.google_subscription = Some(_done);
+                this.google_login = Some(google_login);
+            });
         }
         // 技術書典: WebView ログイン（テスト環境では WebView を作らない）
         if self.show_tbf_login && self.tbf_login.is_none() {
-            let tbf_login = cx.new(|cx| TbfLoginView::new(window, cx));
-            // 成功: モーダル全体を閉じる
-            let _done = cx.subscribe(
-                &tbf_login,
-                |this: &mut Self, _: Entity<TbfLoginView>, _: &TbfLoginDone, cx| {
-                    this.tbf_logged_in = true;
-                    this.show_tbf_login = false;
-                    // 次回は新しい WebView + 監視を開始する
-                    this.tbf_login = None;
-                    this.tbf_subscription = None;
-                    cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
-                },
-            );
-            // キャンセル: WebView を破棄してログイン画面に戻る（次回は新規フロー）
-            let _cancelled = cx.subscribe(
-                &tbf_login,
-                |this: &mut Self, _: Entity<TbfLoginView>, _: &TbfLoginCancelled, _| {
-                    this.show_tbf_login = false;
-                    this.tbf_login = None;
-                    this.tbf_subscription = None;
-                },
-            );
-            self.tbf_subscription = Some(_done);
-            self.tbf_login = Some(tbf_login);
+            cx.defer_in(window, |this, window, cx| {
+                let tbf_login = cx.new(|cx| TbfLoginView::new(window, cx));
+                // 成功: モーダル全体を閉じる
+                let _done = cx.subscribe(
+                    &tbf_login,
+                    |this: &mut Self, _: Entity<TbfLoginView>, _: &TbfLoginDone, cx| {
+                        this.tbf_logged_in = true;
+                        this.show_tbf_login = false;
+                        // 次回は新しい WebView + 監視を開始する
+                        this.tbf_login = None;
+                        this.tbf_subscription = None;
+                        cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
+                    },
+                );
+                // キャンセル: WebView を破棄してログイン画面に戻る（次回は新規フロー）
+                let _cancelled = cx.subscribe(
+                    &tbf_login,
+                    |this: &mut Self, _: Entity<TbfLoginView>, _: &TbfLoginCancelled, _| {
+                        this.show_tbf_login = false;
+                        this.tbf_login = None;
+                        this.tbf_subscription = None;
+                    },
+                );
+                this.tbf_subscription = Some(_done);
+                this.tbf_login = Some(tbf_login);
+            });
         }
     }
 
