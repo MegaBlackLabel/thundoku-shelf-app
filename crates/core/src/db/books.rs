@@ -136,6 +136,46 @@ pub fn set_tbf_product_id(
     })
 }
 
+/// Set the (encrypted) owner sub for a book. `Some` = その sub で暗号化された pack、
+/// `None` = 未所属（未暗号化）。呼び出し側で暗号化済み blob を渡す（不透明な文字列）。
+pub fn set_owner_sub(
+    pool: &SqlitePool,
+    id: &str,
+    owner_sub: Option<String>,
+) -> Result<(), sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query(
+            "UPDATE books SET owner_sub = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(&owner_sub)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+}
+
+/// Read the (encrypted) owner sub of a book. `None` = 未所属 or 行なし。
+pub fn get_owner_sub(pool: &SqlitePool, id: &str) -> Result<Option<String>, sqlx::Error> {
+    crate::db::block_on(async {
+        let row: Option<Option<String>> =
+            sqlx::query_scalar("SELECT owner_sub FROM books WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(row.flatten())
+    })
+}
+
+/// `(book_id, owner_sub)` の一覧。表示・アップロード・バックアップの所有者フィルタに使う。
+pub fn list_owner_subs(pool: &SqlitePool) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query_as::<_, (String, Option<String>)>("SELECT id, owner_sub FROM books")
+            .fetch_all(pool)
+            .await
+    })
+}
+
 pub fn delete(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query("DELETE FROM books WHERE id = ?1")

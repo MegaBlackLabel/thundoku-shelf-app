@@ -160,6 +160,47 @@ fn set_tbf_product_id_links_downloaded_book_to_shelf() {
 }
 
 #[test]
+fn owner_sub_roundtrip() {
+    let pool = memory_db();
+    let book = books::Book {
+        id: "book-1".into(),
+        title: "テスト本".into(),
+        author: "著者A".into(),
+        circle_name: "サークルA".into(),
+        purchase_date: None,
+        file_name: "book.pdf".into(),
+        file_size: 12345,
+        opfs_path: "book-1.opfspack".into(),
+        cover_thumbnail: None,
+        tbf_product_id: None,
+        site_id: None,
+        tags_fetched: 1,
+        pack_id: Some("book-1".into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: "2026-08-21 00:00:00".into(),
+        updated_at: "2026-08-21 00:00:00".into(),
+    };
+    books::insert(&pool, &book).unwrap();
+    // 初期状態は NULL（未所属）
+    assert_eq!(books::get_owner_sub(&pool, "book-1").unwrap(), None);
+    // 暗号化済み blob（不透明な文字列）で所属をセット
+    books::set_owner_sub(&pool, "book-1", Some("enc-blob".into())).unwrap();
+    assert_eq!(
+        books::get_owner_sub(&pool, "book-1").unwrap(),
+        Some("enc-blob".into())
+    );
+    // list でも返る
+    assert_eq!(
+        books::list_owner_subs(&pool).unwrap(),
+        vec![("book-1".to_string(), Some("enc-blob".into()))]
+    );
+    // NULL に戻す（未所属へ）
+    books::set_owner_sub(&pool, "book-1", None).unwrap();
+    assert_eq!(books::get_owner_sub(&pool, "book-1").unwrap(), None);
+}
+
+#[test]
 fn bookshelf_upsert_replaces_existing_row() {
     let pool = memory_db();
     let item = |title: &str| bookshelf::BookshelfItem {

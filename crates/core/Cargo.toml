@@ -24,6 +24,7 @@ percent-encoding = "2"
 md5 = "0.7"
 rand = "0.8"
 sha2.workspace = true
+aes-gcm = "0.10"
 socket2 = "0.6"
 opfspack = { path = "../opfspack" }
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }

@@ -98,6 +98,21 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 .await?;
             }
         }
+        // 所有者 sub（暗号化済み / NULL = 未所属）。アカウント切替・複数アカウント対応
+        // （改訂版）。既存の migration ファイルは checksum 管理されるため変更せず、
+        // PRAGMA で存在確認してから ALTER TABLE する。
+        {
+            let has_owner_sub: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('books') WHERE name = 'owner_sub'",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if !has_owner_sub {
+                sqlx::query("ALTER TABLE books ADD COLUMN owner_sub TEXT")
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
         // チェックリストのポーリング有効フラグ（プログラム的マイグレーション。
         // hidden_at と同様に PRAGMA で存在確認してから ALTER TABLE する。
         // 既存の migration ファイルは checksum 管理されるため変更しない）
