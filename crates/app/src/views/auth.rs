@@ -136,6 +136,7 @@ impl AuthDialog {
                 );
                 this.booth_subscription = Some(_done);
                 this.booth_login = Some(booth_login);
+                cx.notify();
             });
         }
         // Google: WebView（wry）は実ウィンドウが必要なため、ログインモーダルを
@@ -191,6 +192,7 @@ impl AuthDialog {
                 );
                 this.google_subscription = Some(_done);
                 this.google_login = Some(google_login);
+                cx.notify();
             });
         }
         // 技術書典: WebView ログイン（テスト環境では WebView を作らない）
@@ -220,6 +222,7 @@ impl AuthDialog {
                 );
                 this.tbf_subscription = Some(_done);
                 this.tbf_login = Some(tbf_login);
+                cx.notify();
             });
         }
     }
@@ -272,15 +275,22 @@ impl Render for AuthDialog {
             .items_center()
             .justify_center()
             // 各プロバイダの WebView ログインモーダル（deferred で最前面表示）
+            // ログインビューは defer_in で render 後に生成されるため、まだ無いフレームは空を出す。
             .child(if self.show_booth_login {
-                let booth = self.booth_login.clone().expect("initialized in render");
-                deferred(booth).into_any_element()
+                match &self.booth_login {
+                    Some(booth) => deferred(booth.clone()).into_any_element(),
+                    None => div().into_any_element(),
+                }
             } else if self.show_google_login {
-                let google = self.google_login.clone().expect("initialized in render");
-                deferred(google).into_any_element()
+                match &self.google_login {
+                    Some(google) => deferred(google.clone()).into_any_element(),
+                    None => div().into_any_element(),
+                }
             } else if self.show_tbf_login {
-                let tbf = self.tbf_login.clone().expect("initialized in render");
-                deferred(tbf).into_any_element()
+                match &self.tbf_login {
+                    Some(tbf) => deferred(tbf.clone()).into_any_element(),
+                    None => div().into_any_element(),
+                }
             } else {
                 div().into_any_element()
             })
