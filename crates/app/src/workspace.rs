@@ -1353,10 +1353,10 @@ impl Render for Workspace {
                 let handle = cx.entity();
                 gpui_kit::deferred(
                     Dialog::new(cx)
-                        .title(div().child("Googleドライブでバックアップを有効にしますか？"))
+                        .title(div().child("Google Drive と同期しますか？"))
                         .content(move |content, _window, _cx| {
                             content.child(div().text_sm().child(
-                                "Google ログインできました。Google Drive にバックアップを自動保存して、複数の端末で本棚を同期できます。有効にしますか？"
+                                "Google ログインできました。本棚を Google Drive に保存して、複数の端末で同期できます。今すぐ同期しますか？"
                             ))
                         })
                         .footer(
@@ -1382,7 +1382,7 @@ impl Render for Workspace {
                                     Button::new("drive-confirm")
                                         .cursor_pointer()
                                         .primary()
-                                        .label("有効にする")
+                                        .label("同期する")
                                         .on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
@@ -1390,7 +1390,9 @@ impl Render for Workspace {
                                                     this.show_drive_prompt = false;
                                                     let db = &AppState::global(cx).db_pool;
                                                     let _ = db::settings::set(db, "drive.sync.enabled", "true");
-                                                    crate::app_state::set_toast(cx, "Google Drive バックアップを有効にしました");
+                                                    // 有効化だけでなく、実際に今すぐ同期を実行する。
+                                                    this.sync_drive(cx);
+                                                    crate::app_state::set_toast(cx, "Google Drive と同期しました");
                                                     cx.notify();
                                                 });
                                             }
