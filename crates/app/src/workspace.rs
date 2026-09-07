@@ -185,7 +185,7 @@ impl Workspace {
                         .ok()
                         .flatten()
                         .is_some_and(|v| v == "true" || v == "1");
-                    handle.update(cx, |this, _cx| {
+                    handle.update(cx, |this, cx| {
                         this.show_auth = false;
                         this.auth_dialog = None;
                         // ログイン完了後は設定画面に戻す
@@ -195,6 +195,9 @@ impl Workspace {
                         if !enabled {
                             this.show_drive_prompt = true;
                         }
+                        // ログイン状態が変わったので本棚を再フィルタ（owner モデル）。、
+                        this.bookshelf.update(cx, |b, bx| b.reload(bx));
+                        log::info!("owner-model: ログイン完了→本棚 reload");
                     });
                     // cx.notify() は RefCell already borrowed を起こすため、
                     // AsyncApp::refresh()（&self）で再描画を要求する。
