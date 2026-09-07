@@ -66,6 +66,9 @@ pub struct AppState {
     /// Google ログイン（成功・失敗）が完了したことを Workspace 監視タスクへ通知する。
     /// Workspace 側で show_auth をリセットする（RefCell 再入問題を回避するため）。
     pub google_login_done: Arc<AtomicBool>,
+    /// Google ログアウトが完了したことを Workspace 監視タスクへ通知する。
+    /// 本棚を未ログイン（未所属のみ表示）に再フィルタするため。
+    pub google_logout_done: Arc<AtomicBool>,
     /// 認証モーダルを開く要求。Workspace 監視タスクが検知して show_auth を
     /// 設定する（SettingsView → Workspace の直接 update による RefCell 再入を回避）。
     pub auth_open_requested: Arc<AtomicBool>,
@@ -225,6 +228,7 @@ impl AppState {
             exit_checked: Arc::new(AtomicBool::new(false)),
             exit_uploading: Arc::new(AtomicBool::new(false)),
             google_login_done: Arc::new(AtomicBool::new(false)),
+            google_logout_done: Arc::new(AtomicBool::new(false)),
             auth_open_requested: Arc::new(AtomicBool::new(false)),
             auth_open_provider: Arc::new(Mutex::new(None)),
         });
@@ -278,6 +282,7 @@ impl AppState {
             exit_checked: Arc::new(AtomicBool::new(false)),
             exit_uploading: Arc::new(AtomicBool::new(false)),
             google_login_done: Arc::new(AtomicBool::new(false)),
+            google_logout_done: Arc::new(AtomicBool::new(false)),
             auth_open_requested: Arc::new(AtomicBool::new(false)),
             auth_open_provider: Arc::new(Mutex::new(None)),
         });

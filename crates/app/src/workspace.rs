@@ -150,6 +150,7 @@ impl Workspace {
     fn start_login_done_watcher(&mut self, cx: &mut Context<Self>) {
         let handle = cx.entity();
         let flag = AppState::global(cx).google_login_done.clone();
+        let logout_flag = AppState::global(cx).google_logout_done.clone();
         let auth_open = AppState::global(cx).auth_open_requested.clone();
         let auth_provider = AppState::global(cx).auth_open_provider.clone();
         let db = AppState::global(cx).db_pool.clone();
@@ -201,6 +202,15 @@ impl Workspace {
                     });
                     // cx.notify() は RefCell already borrowed を起こすため、
                     // AsyncApp::refresh()（&self）で再描画を要求する。
+                    cx.refresh();
+                }
+                // ログアウトで未ログインに戻ったら本棚を再フィルタ（未所属のみ表示）。
+                if logout_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    logout_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                    handle.update(cx, |this, cx| {
+                        this.bookshelf.update(cx, |b, bx| b.reload(bx));
+                        log::info!("owner-model: ログアウト→本棚 reload");
+                    });
                     cx.refresh();
                 }
             }

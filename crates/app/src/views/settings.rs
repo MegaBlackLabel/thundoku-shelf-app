@@ -487,6 +487,10 @@ impl SettingsView {
                 log::info!("logout_google: client logout ({:?})", t.elapsed());
                 *state.google_profile.lock() = None;
                 *state.google_logged_in.lock() = false;
+                // ログアウトで未ログインに戻るため、本棚を再フィルタするフラグを立てる。
+                AppState::global(cx)
+                    .google_logout_done
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 // keyring の削除はバックグラウンドで行う
                 let store = state.secrets.clone();
                 cx.background_spawn(async move {
