@@ -276,6 +276,16 @@ mod tests {
                 is_hidden: 0,
                 created_at: "2026-08-23 00:00:00".into(),
                 updated_at: "2026-08-23 00:00:00".into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
             },
         )
         .unwrap();
@@ -363,6 +373,16 @@ mod tests {
                 is_hidden: 0,
                 created_at: "2026-08-23 00:00:00".into(),
                 updated_at: "2026-08-23 00:00:00".into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
             },
         )
         .unwrap();
@@ -444,6 +464,16 @@ mod tests {
             is_hidden: 0,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
         };
         crate::db::books::insert(&pool, &mk("book-A")).unwrap();
         crate::db::books::insert(&pool, &mk("book-B")).unwrap();

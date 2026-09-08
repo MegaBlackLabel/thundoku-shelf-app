@@ -181,6 +181,16 @@ fn finish_import(
         is_hidden: 0,
         created_at: timestamp.clone(),
         updated_at: timestamp.clone(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     books::insert(pool, &book)?;
     log::info!("finish_import: books 挿入完了");

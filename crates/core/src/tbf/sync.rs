@@ -110,6 +110,16 @@ pub fn save_bookshelf(pool: &SqlitePool, items: &[TbfShelfItem]) -> Result<usize
                 synced_at: timestamp.clone(),
                 created_at: timestamp.clone(),
                 updated_at: timestamp.clone(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
             },
         )?;
     }

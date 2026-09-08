@@ -104,6 +104,16 @@ mod tests {
                 is_hidden: 0,
                 created_at: "2026-08-21 00:00:00".into(),
                 updated_at: "2026-08-21 00:00:00".into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
             },
         )
         .unwrap();

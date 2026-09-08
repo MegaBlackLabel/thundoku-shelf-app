@@ -21,17 +21,29 @@ pub struct Book {
     pub is_hidden: i64,
     pub created_at: String,
     pub updated_at: String,
+    // 共有ソースメタ列（FANZA同人 / DLsite）
+    pub media_category: Option<String>,
+    pub ai_type: Option<String>,
+    pub is_drm: i64,
+    pub release_date: Option<String>,
+    pub description: Option<String>,
+    pub theme: Option<String>,
+    pub maker_id: Option<String>,
+    pub page_count: Option<i64>,
+    pub age_rating: Option<String>,
+    pub series_name: Option<String>,
 }
 
 const COLUMNS: &str = "id, title, author, circle_name, purchase_date, file_name, file_size, \
      opfs_path, cover_thumbnail, tbf_product_id, site_id, tags_fetched, pack_id, \
-     is_favorite, is_hidden, created_at, updated_at";
+     is_favorite, is_hidden, created_at, updated_at, media_category, ai_type, is_drm, \
+     release_date, description, theme, maker_id, page_count, age_rating, series_name";
 
 pub fn insert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query(&format!(
             "INSERT INTO books ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-             ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"
         ))
         .bind(&book.id)
         .bind(&book.title)
@@ -50,6 +62,16 @@ pub fn insert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
         .bind(book.is_hidden)
         .bind(&book.created_at)
         .bind(&book.updated_at)
+        .bind(&book.media_category)
+        .bind(&book.ai_type)
+        .bind(book.is_drm)
+        .bind(&book.release_date)
+        .bind(&book.description)
+        .bind(&book.theme)
+        .bind(&book.maker_id)
+        .bind(book.page_count)
+        .bind(&book.age_rating)
+        .bind(&book.series_name)
         .execute(pool)
         .await?;
         Ok(())
@@ -61,7 +83,7 @@ pub fn upsert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query(&format!(
             "INSERT INTO books ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-             ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                author = excluded.author,
@@ -75,7 +97,17 @@ pub fn upsert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
                site_id = excluded.site_id,
                tags_fetched = excluded.tags_fetched,
                pack_id = excluded.pack_id,
-               updated_at = excluded.updated_at"
+               updated_at = excluded.updated_at,
+               media_category = excluded.media_category,
+               ai_type = excluded.ai_type,
+               is_drm = excluded.is_drm,
+               release_date = excluded.release_date,
+               description = excluded.description,
+               theme = excluded.theme,
+               maker_id = excluded.maker_id,
+               page_count = excluded.page_count,
+               age_rating = excluded.age_rating,
+               series_name = excluded.series_name"
         ))
         .bind(&book.id)
         .bind(&book.title)
@@ -94,6 +126,16 @@ pub fn upsert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
         .bind(book.is_hidden)
         .bind(&book.created_at)
         .bind(&book.updated_at)
+        .bind(&book.media_category)
+        .bind(&book.ai_type)
+        .bind(book.is_drm)
+        .bind(&book.release_date)
+        .bind(&book.description)
+        .bind(&book.theme)
+        .bind(&book.maker_id)
+        .bind(book.page_count)
+        .bind(&book.age_rating)
+        .bind(&book.series_name)
         .execute(pool)
         .await?;
         Ok(())
