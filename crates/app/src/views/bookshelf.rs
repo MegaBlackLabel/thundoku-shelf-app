@@ -1686,6 +1686,18 @@ impl BookshelfView {
                             let _ = books::set_site_id(&db, &imported.book.id, &site_id);
                         }
                         let _ = books::set_tbf_product_id(&db, &imported.book.id, &product_id);
+                        // FANZA: インポート後にリモートメタ（タイトル/サークル/購入日）を補完する
+                        //（インポートはファイル名由来で作るため空になる）
+                        if site_id == "fanza" {
+                            let _ = books::set_metadata(
+                                &db,
+                                &imported.book.id,
+                                &item.title,
+                                "",
+                                &item.circle_name,
+                                item.caused_at.clone(),
+                            );
+                        }
                         if imported.document.total_pages > 0 {
                             let _ = progress::upsert(
                                 &db,
