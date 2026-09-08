@@ -2151,7 +2151,15 @@ impl BookshelfView {
                 // FANZA: reload の owned フィルタで local が外れるとカードは
                 // shelf.tags_json を読むため、book_tags に加えて本棚アイテムにも書く。
                 if self.editing_site_id.as_deref() == Some("fanza") {
-                    let _ = bookshelf::update_tags(db, "fanza", &book_id, &tags);
+                    let shelf_res = bookshelf::update_tags(db, "fanza", &book_id, &tags);
+                    log::info!(
+                        "save_tag_edit: fanza shelf update_tags book_id={book_id} -> {shelf_res:?}"
+                    );
+                } else {
+                    log::info!(
+                        "save_tag_edit: editing_site_id={:?} (not fanza, no shelf write)",
+                        self.editing_site_id
+                    );
                 }
             } else {
                 log::warn!(
