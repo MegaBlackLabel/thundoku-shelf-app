@@ -108,6 +108,8 @@ pub struct BookshelfView {
     site_filter: Option<String>,
     /// インラインタグ編集中の本（Web の TagList 編集モード相当）
     editing_book_id: Option<String>,
+    /// 編集中の本のサイト id（FANZA ジャンル再取得ボタン/保存先の判定用）
+    editing_site_id: Option<String>,
     /// 編集中のタグ一覧
     editing_tags: Vec<String>,
     /// タグ編集のサジェスチョン（後で読む + お気に入りタグ）
@@ -219,6 +221,7 @@ impl BookshelfView {
             site_filter: Self::read_site_filter(cx),
             available_events: Vec::new(),
             editing_book_id: None,
+            editing_site_id: None,
             editing_tags: Vec::new(),
             editing_suggestions: Vec::new(),
             editing_input: None,
@@ -589,10 +592,18 @@ impl BookshelfView {
                 let local = entries.iter().find(|entry| {
                     entry.book.tbf_product_id.as_deref() == Some(shelf.database_id.as_str())
                 });
-                let cover = local
-                    .and_then(|entry| entry.cover.clone())
-                    .or_else(|| load_cached_cover(&thumbnails_dir, shelf))
-                    .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name));
+                let cover = if shelf.site_id == "fanza" {
+                    // FANZA はダウンロード後のパック表紙に差し替えず、同期時の
+                    // サムネイル（thumbnail_url 由来のキャッシュ）を維持する。
+                    load_cached_cover(&thumbnails_dir, shelf)
+                        .or_else(|| local.and_then(|entry| entry.cover.clone()))
+                        .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
+                } else {
+                    local
+                        .and_then(|entry| entry.cover.clone())
+                        .or_else(|| load_cached_cover(&thumbnails_dir, shelf))
+                        .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
+                };
                 let tags = local
                     .map(|entry| entry.tags.clone())
                     .unwrap_or_else(|| bookshelf::tags_of(shelf));
@@ -2028,7 +2039,7 @@ impl BookshelfView {
                 db::tags::list_for_book(db, &local_id)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|tag| tag.source == "manual")
+                    .filter(|tag| tag.source == "manual" || tag.source == "fanza_genre")
                     .map(|tag| tag.tag_name)
                     .collect::<Vec<_>>()
             } else {
@@ -2049,6 +2060,23 @@ impl BookshelfView {
             (tags, suggestions)
         };
         self.editing_book_id = Some(book_id.to_string());
+        self.editing_site_id = {
+            let state = Self::app_state(cx);
+            let db = &state.db_pool;
+            if let Some(local_id) = Self::resolve_local_book_id(db, book_id) {
+                books::get(db, &local_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| b.site_id)
+            } else {
+                bookshelf::list_all(db)
+                    .ok()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|item| item.database_id == book_id)
+                    .map(|item| item.site_id.clone())
+            }
+        };
         self.editing_tags = tags.clone();
         self.editing_suggestions = suggestions;
         self.editing_input =
@@ -2110,12 +2138,77 @@ impl BookshelfView {
                     tags.iter().map(|tag| (tag.as_str(), "manual")).collect();
                 let _ = db::tags::set_for_book(db, &local_id, &tag_pairs);
             } else {
-                let _ = bookshelf::update_tags(db, tbf::SITE_ID_TECHBOOKFEST, &book_id, &tags);
+                let site = self
+                    .editing_site_id
+                    .as_deref()
+                    .unwrap_or(tbf::SITE_ID_TECHBOOKFEST);
+                let _ = bookshelf::update_tags(db, site, &book_id, &tags);
             }
         }
         self.editing_book_id = None;
         self.editing_tags.clear();
         self.reload(cx);
+    }
+
+    /// FANZA のジャンルタグを作品ページから再取得し、未取得のものを編集中タグに追加する。
+    fn refetch_genre_tags(&mut self, cx: &mut Context<Self>) {
+        let Some(book_id) = self.editing_book_id.clone() else {
+            return;
+        };
+        if self.editing_site_id.as_deref() != Some("fanza") {
+            return;
+        }
+        let (cid, session) = {
+            let state = Self::app_state(cx);
+            let db = &state.db_pool;
+            let cid = if let Some(local_id) = Self::resolve_local_book_id(db, &book_id) {
+                books::get(db, &local_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| b.tbf_product_id)
+            } else {
+                Some(book_id.clone())
+            };
+            (cid, state.fanza_session.lock().clone())
+        };
+        let Some(cid) = cid else {
+            return;
+        };
+        let Some(session) = session else {
+            self.toast = Some("FANZA にログインしてください".into());
+            cx.notify();
+            return;
+        };
+        let current = self.editing_tags.clone();
+        let handle = cx.entity();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+        std::thread::spawn(move || {
+            let mut client = FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+            let genre_tags = client
+                .product_page(&cid)
+                .map(|p| p.genre_tags)
+                .unwrap_or_default();
+            let _ = tx.send(genre_tags);
+        });
+        cx.spawn(async move |_window, cx| {
+            let genre_tags = rx.recv().unwrap_or_default();
+            handle
+                .update(cx, |this, cx| {
+                    let mut added = 0;
+                    for tag in genre_tags {
+                        if !tag.is_empty()
+                            && !current.contains(&tag)
+                            && !this.editing_tags.contains(&tag)
+                        {
+                            this.editing_tags.push(tag);
+                            added += 1;
+                        }
+                    }
+                    this.toast = Some(format!("ジャンルを再取得しました（{added} 件追加）"));
+                    cx.notify();
+                });
+        })
+        .detach();
     }
 
     /// タグ編集をキャンセル（Web の handleCancel 相当）。
@@ -2526,6 +2619,7 @@ impl BookshelfView {
                 editing_tags,
                 editing_suggestions,
                 editing_input.expect("editing input"),
+                card.shelf.site_id == "fanza",
             )
             .into_any_element()
         } else {
@@ -2679,6 +2773,7 @@ impl BookshelfView {
         editing_tags: &[String],
         editing_suggestions: &[String],
         editing_input: &gpui_kit::Entity<InputState>,
+        show_refetch: bool,
     ) -> impl IntoElement {
         let handle = handle.clone();
         let tags = editing_tags.to_vec();
@@ -2817,7 +2912,28 @@ impl BookshelfView {
                                             }
                                         }),
                                 ),
-                            ),
+                            )
+                            // FANZA: ジャンルタグをサイトから再取得（未取得分を追加）
+                            .when(show_refetch, |this| {
+                                this.child(
+                                    div().debug_selector(|| "tag-edit-refetch-btn".into()).child(
+                                        Button::new("tag-edit-refetch")
+                                            .cursor_pointer()
+                                            .outline()
+                                            .label("再取得")
+                                            .cursor_pointer()
+                                            .on_click({
+                                                let handle = handle.clone();
+                                                move |_, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    handle.update(cx, |this, cx| {
+                                                        this.refetch_genre_tags(cx);
+                                                    });
+                                                }
+                                            }),
+                                    ),
+                                )
+                            }),
                     )
             )
             // サジェスチョン（Web の suggestions 相当: 後で読む + お気に入りタグ）
@@ -3167,6 +3283,7 @@ impl BookshelfView {
                             &self.editing_tags,
                             &self.editing_suggestions,
                             &self.editing_input.clone().expect("editing input"),
+                            self.editing_site_id.as_deref() == Some("fanza"),
                         )
                         .into_any_element()
                     } else {
