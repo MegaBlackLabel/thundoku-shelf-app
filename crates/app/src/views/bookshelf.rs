@@ -604,9 +604,15 @@ impl BookshelfView {
                         .or_else(|| load_cached_cover(&thumbnails_dir, shelf))
                         .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
                 };
-                let tags = local
-                    .map(|entry| entry.tags.clone())
-                    .unwrap_or_else(|| bookshelf::tags_of(shelf));
+                let tags = if shelf.site_id == "fanza" {
+                    // FANZA: タグは shelf.tags_json を正とする（book_tags は重複本で
+                    // 分かれるため）。保存/ジャンル取得で両方に書くが、表示は安定。
+                    bookshelf::tags_of(shelf)
+                } else {
+                    local
+                        .map(|entry| entry.tags.clone())
+                        .unwrap_or_else(|| bookshelf::tags_of(shelf))
+                };
                 shelf_cards.push(ShelfCard {
                     shelf: shelf.clone(),
                     cover_fetch_failed: false,
