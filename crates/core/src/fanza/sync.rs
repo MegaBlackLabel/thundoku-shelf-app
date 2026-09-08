@@ -16,6 +16,12 @@ fn now() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// 一覧の `imageSrc` は 100x75 と小さいため、高解像度サムネイル
+/// （`pl-200x150`、詳細 API の `imagePath` で確認済み）に差し替える。
+fn widen_thumb(url: &str) -> String {
+    url.replace("pl-100x75", "pl-200x150")
+}
+
 /// 購入済み作品のうち画像系（comic / cg）だけを `bookshelf_items(site_id='fanza')` に
 /// 保存し、保存件数を返す。除外カテゴリ（voice / game / video）は upsert しない。
 pub fn save_purchases(pool: &SqlitePool, client: &mut FanzaClient) -> Result<usize, FanzaError> {
@@ -33,7 +39,7 @@ pub fn save_purchases(pool: &SqlitePool, client: &mut FanzaClient) -> Result<usi
             title: p.title,
             circle_name: p.maker_name,
             author: String::new(),
-            thumbnail_url: Some(p.image_src),
+            thumbnail_url: Some(widen_thumb(&p.image_src)),
             format: "ZIP".into(),
             caused_at: p.purchase_date,
             event_name: None,

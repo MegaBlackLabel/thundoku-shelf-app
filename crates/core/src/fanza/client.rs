@@ -17,6 +17,10 @@ pub const LIBRARY_BASE: &str =
 /// jar 等の参照メタ列は一覧 API では返さない（`details` / 商品ページで取得）。
 pub const PAGE_LIMIT: usize = 20;
 
+/// DMM/FANZA は非ブラウザの User-Agent を 403 で弾くため、ブラウザ UA + Referer を送る
+///（BoothClient と同じ流儀）。
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
 #[derive(Debug, thiserror::Error)]
 pub enum FanzaError {
     #[error("セッション切れ・未ログイン")]
@@ -118,6 +122,7 @@ impl FanzaClient {
         vec![
             ("Cookie".to_string(), self.session.cookie_header()),
             ("Accept".to_string(), "application/json".to_string()),
+            ("User-Agent".to_string(), USER_AGENT.to_string()),
         ]
     }
 
@@ -224,10 +229,26 @@ impl FanzaClient {
         download_url: &str,
         on_progress: &mut dyn FnMut(u64, u64),
     ) -> Result<Vec<u8>, FanzaError> {
+        // CDN（contents.doujin.dmm.co.jp）は Cloudflare 系で、ブラウザ相当の
+        // Sec-Fetch-* / Accept ヘッダを要求する（無いと 403）。UA/Referer だけでは足りない。
+        let headers = vec![
+            ("Cookie".to_string(), self.session.cookie_header()),
+            ("User-Agent".to_string(), USER_AGENT.to_string()),
+            ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
+            (
+                "Accept".to_string(),
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8".to_string(),
+            ),
+            ("Accept-Language".to_string(), "ja,en;q=0.9".to_string()),
+            ("Sec-Fetch-Dest".to_string(), "document".to_string()),
+            ("Sec-Fetch-Mode".to_string(), "navigate".to_string()),
+            ("Sec-Fetch-Site".to_string(), "cross-site".to_string()),
+            ("Upgrade-Insecure-Requests".to_string(), "1".to_string()),
+        ];
         let spec = RequestSpec {
             method: "GET".into(),
             url: download_url.into(),
-            headers: self.cookie_headers(),
+            headers,
             body: None,
             redirects: 5,
         };
