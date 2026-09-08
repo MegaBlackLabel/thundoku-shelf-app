@@ -2179,36 +2179,21 @@ impl BookshelfView {
             cx.notify();
             return;
         };
-        let current = self.editing_tags.clone();
-        let handle = cx.entity();
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
-        std::thread::spawn(move || {
-            let mut client = FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
-            let genre_tags = client
-                .product_page(&cid)
-                .map(|p| p.genre_tags)
-                .unwrap_or_default();
-            let _ = tx.send(genre_tags);
-        });
-        cx.spawn(async move |_window, cx| {
-            let genre_tags = rx.recv().unwrap_or_default();
-            handle
-                .update(cx, |this, cx| {
-                    let mut added = 0;
-                    for tag in genre_tags {
-                        if !tag.is_empty()
-                            && !current.contains(&tag)
-                            && !this.editing_tags.contains(&tag)
-                        {
-                            this.editing_tags.push(tag);
-                            added += 1;
-                        }
-                    }
-                    this.toast = Some(format!("ジャンルを再取得しました（{added} 件追加）"));
-                    cx.notify();
-                });
-        })
-        .detach();
+        // 1 リクエストなので同期で取得する（非同期にすると保存との競合が起きる）
+        let mut client = FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+        let genre_tags = client
+            .product_page(&cid)
+            .map(|p| p.genre_tags)
+            .unwrap_or_default();
+        let mut added = 0;
+        for tag in genre_tags {
+            if !tag.is_empty() && !self.editing_tags.contains(&tag) {
+                self.editing_tags.push(tag);
+                added += 1;
+            }
+        }
+        self.toast = Some(format!("ジャンルを再取得しました（{added} 件追加）"));
+        cx.notify();
     }
 
     /// タグ編集をキャンセル（Web の handleCancel 相当）。
@@ -2895,25 +2880,8 @@ impl BookshelfView {
                                         }),
                                 ),
                             )
-                            .child(
-                                div().debug_selector(|| "tag-edit-cancel-btn".into()).child(
-                                    Button::new("tag-edit-cancel")
-                                        .cursor_pointer()
-                                        .outline()
-                                        .label("キャンセル")
-                                        .cursor_pointer()
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                cx.stop_propagation();
-                                                handle.update(cx, |this, cx| {
-                                                    this.cancel_tag_edit(cx)
-                                                });
-                                            }
-                                        }),
-                                ),
-                            )
-                            // FANZA: ジャンルタグをサイトから再取得（未取得分を追加）
+                            // FANZA: ジャンルタグをサイトから再取得（未取得分を追加）。
+                            // 保存ボタンの右に配置する。
                             .when(show_refetch, |this| {
                                 this.child(
                                     div().debug_selector(|| "tag-edit-refetch-btn".into()).child(
@@ -2933,7 +2901,25 @@ impl BookshelfView {
                                             }),
                                     ),
                                 )
-                            }),
+                            })
+                            .child(
+                                div().debug_selector(|| "tag-edit-cancel-btn".into()).child(
+                                    Button::new("tag-edit-cancel")
+                                        .cursor_pointer()
+                                        .outline()
+                                        .label("キャンセル")
+                                        .cursor_pointer()
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                cx.stop_propagation();
+                                                handle.update(cx, |this, cx| {
+                                                    this.cancel_tag_edit(cx)
+                                                });
+                                            }
+                                        }),
+                                ),
+                            ),
                     )
             )
             // サジェスチョン（Web の suggestions 相当: 後で読む + お気に入りタグ）
