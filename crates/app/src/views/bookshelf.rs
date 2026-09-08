@@ -2411,7 +2411,7 @@ impl BookshelfView {
                     img(render.clone())
                         .w_full()
                         .h_full()
-                        .object_fit(gpui_kit::ObjectFit::Contain),
+                        .object_fit(gpui_kit::ObjectFit::Cover),
                 )
                 .into_any_element(),
             None => div()
@@ -3163,7 +3163,7 @@ impl BookshelfView {
                     img(render.clone())
                         .w_full()
                         .h_full()
-                        .object_fit(gpui_kit::ObjectFit::Contain),
+                        .object_fit(gpui_kit::ObjectFit::Cover),
                 )
                 .into_any_element(),
             None => div()
