@@ -2400,12 +2400,21 @@ impl BookshelfView {
         let _ = window;
 
         // -- 表紙: 画像 + 未読/既読バッジ + ダウンロード状態アイコン + 進捗リング --
-        // 画像は枠（144x192）に必ず収まるよう overflow-hidden のラッパーで包む
-        // （オーバーレイ・アイコンは枠基準で配置されるため、はみ出しによるズレを防ぐ）。
+        // 枠の高さを画像のアスペクト比に合わせる（自然比率を保つ＝クロップ/レターボックスなし）。
+        // バッジ（未読/♡/↓）は枠=画像に乗る。FANZA は横長（4:3）サムネ等のため枠高さが変わる。
+        let cover_h: f32 = match &cover {
+            Some(render) => {
+                let size = render.size(0);
+                let w = size.width.0 as f32;
+                let h = size.height.0 as f32;
+                (144.0 * (h / w.max(1.0))).clamp(80.0, 420.0)
+            }
+            None => 192.0,
+        };
         let image: gpui_kit::AnyElement = match &cover {
             Some(render) => div()
                 .w(px(144.0))
-                .h(px(192.0))
+                .h(px(cover_h))
                 .overflow_hidden()
                 .child(
                     img(render.clone())
@@ -2416,7 +2425,7 @@ impl BookshelfView {
                 .into_any_element(),
             None => div()
                 .w(px(144.0))
-                .h(px(192.0))
+                .h(px(cover_h))
                 .bg(theme.muted)
                 .into_any_element(),
         };
@@ -2424,7 +2433,7 @@ impl BookshelfView {
         let mut cover_el = div()
             .relative()
             .w(px(144.0))
-            .h(px(192.0))
+            .h(px(cover_h))
             .child(image)
             // 左上: 未読/既読バッジ（Web の statusText と同じ）
             .child(if is_read {
