@@ -107,6 +107,26 @@ impl FanzaDetail {
     }
 }
 
+/// 作品ページ（SSR HTML、一般公開）から抽出する情報。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanzaProductPage {
+    /// ジャンルタグ（`拘束`、`触手` などの複数）。
+    pub genre_tags: Vec<String>,
+}
+
+/// 作品ページ HTML からジャンルタグ（`genreTag__txt`）を抽出する。
+pub fn parse_product_page(html: &str) -> FanzaProductPage {
+    let mut genre_tags = Vec::new();
+    let re = regex::Regex::new(r#"class="genreTag__txt"[^>]*>([^<]+)</a>"#).unwrap();
+    for cap in re.captures_iter(html) {
+        let tag = cap[1].trim().to_string();
+        if !tag.is_empty() {
+            genre_tags.push(tag);
+        }
+    }
+    FanzaProductPage { genre_tags }
+}
+
 /// FANZA 同人クライアント（`tbf::transport` を再利用、`Transport` でモック可能）。
 pub struct FanzaClient {
     transport: Box<dyn Transport>,
@@ -221,6 +241,25 @@ impl FanzaClient {
             is_drm,
             file_size: s_opt(d, "fileSize"),
         })
+    }
+
+    /// 作品ページ（SSR HTML、一般公開）からジャンルタグ等を取得する。
+    pub fn product_page(&mut self, cid: &str) -> Result<FanzaProductPage, FanzaError> {
+        let url = format!("https://www.dmm.co.jp/dc/doujin/-/detail/=/cid={cid}/");
+        let spec = RequestSpec {
+            method: "GET".into(),
+            url,
+            headers: self.cookie_headers(),
+            body: None,
+            redirects: 3,
+        };
+        let resp = self
+            .transport
+            .send(spec)
+            .map_err(FanzaError::Transport)?;
+        self.check_status(&resp)?;
+        let html = String::from_utf8_lossy(&resp.body).to_string();
+        Ok(parse_product_page(&html))
     }
 
     /// ダウンロード proxy URL を 302 追跡して ZIP 本体を取得する。HTML レスポンスは拒否。
@@ -551,6 +590,17 @@ mod tests {
         assert!(cf.contains("CloudFront-Signature=abc"), "CloudFront signature cookie missing: {cf}");
         assert!(cf.contains("CloudFront-Key-Pair-Id=K123"));
         assert!(spec.redirects == 3);
+    }
+
+    /// 作品ページ HTML からジャンルタグ（genreTag__txt）を抽出する。
+    #[test]
+    fn parse_product_page_extracts_genre_tags() {
+        let html = r#"<ul class="genreTagList"><li><a href="/x" class="genreTag__txt">拘束</a></li><li><a href="/y" class="genreTag__txt">触手</a></li><li><a href="/z" class="genreTag__txt">ファンタジー</a></li></ul>"#;
+        let page = parse_product_page(html);
+        assert_eq!(
+            page.genre_tags,
+            vec!["拘束".to_string(), "触手".to_string(), "ファンタジー".to_string()]
+        );
     }
 
     /// 実機プローブ: `UreqTransport` 経由で CDN ダウンロードが 200 になるか確認する。

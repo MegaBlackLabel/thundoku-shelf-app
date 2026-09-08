@@ -1483,6 +1483,7 @@ impl BookshelfView {
                 // - BOOTH: セッション Cookie で downloadables/{id} を GET → 302 の
                 //   Location（署名付き S3 URL）を自動追跡してファイル本体を取得
                 // - 技術書典: GraphQL の downloadURL を resolve して取得
+                let mut genre_tags: Vec<String> = Vec::new();
                 let bytes = if site_id == "booth" {
                     let session =
                         booth_session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
@@ -1518,6 +1519,11 @@ impl BookshelfView {
                     let url = detail
                         .download_link
                         .ok_or_else(|| "FANZA ダウンロード URL がありません".to_string())?;
+                    // ジャンルタグ（作品ページから。取得失敗してもダウンロードは続行）
+                    genre_tags = client
+                        .product_page(&product_id)
+                        .map(|p| p.genre_tags)
+                        .unwrap_or_default();
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
@@ -1710,6 +1716,14 @@ impl BookshelfView {
                                 &item.circle_name,
                                 item.caused_at.clone(),
                             );
+                            // サイトから取得したジャンルタグを book_tags に保存する
+                            if !genre_tags.is_empty() {
+                                let pairs: Vec<(&str, &str)> = genre_tags
+                                    .iter()
+                                    .map(|t| (t.as_str(), "fanza_genre"))
+                                    .collect();
+                                let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
+                            }
                         }
                         if imported.document.total_pages > 0 {
                             let _ = progress::upsert(
