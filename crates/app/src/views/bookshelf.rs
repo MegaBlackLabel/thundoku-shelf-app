@@ -1641,6 +1641,27 @@ impl BookshelfView {
                         pack_id,
                     })
                 });
+                // 再ダウンロード防止: 同一 (site, product) の既存本（ログイン有無どちらも）
+                // の book_id を再利用する（identity が None＝未ログインでも重複を作らない）。
+                let reuse_book_id: Option<String> = {
+                    let key = db_key.as_ref();
+                    match (google_sub.as_deref(), key) {
+                        (Some(sub), Some(key)) => {
+                            books::resolve_reuse_id(&db, key, &site_id, &product_id, Some(sub))
+                                .ok()
+                                .flatten()
+                        }
+                        _ => books::resolve_reuse_id(
+                            &db,
+                            &[0u8; 32],
+                            &site_id,
+                            &product_id,
+                            None,
+                        )
+                        .ok()
+                        .flatten(),
+                    }
+                };
                 let imported = if extension == "pdf" {
                     // PDF レンダリング（重い）は DB ロック外で行い、UI スレッドの
                     // DB 操作をブロックしないようにする。
@@ -1705,6 +1726,7 @@ impl BookshelfView {
                             &packs_dir,
                             identity.as_ref(),
                             &mut on_import,
+                            reuse_book_id.as_deref(),
                         ),
                         // BOOTH は PDF だけでなく画像ファイル（イラスト等）もある
                         "jpg" | "jpeg" | "png" | "webp" | "gif" => {

@@ -90,7 +90,11 @@ fn thumbnail_of(page: &[u8]) -> Result<(Vec<u8>, u32, u32), ImportError> {
     Ok((data, thumb_width, thumb_height))
 }
 
-fn book_id_for(identity: Option<&Identity>) -> String {
+fn book_id_for(identity: Option<&Identity>, reuse_book_id: Option<&str>) -> String {
+    // 再ダウンロード時は既存本を再利用して重複を防ぐ（未ログイン＝identity None でも）。
+    if let Some(reuse) = reuse_book_id {
+        return reuse.to_string();
+    }
     identity
         .map(|i| i.pack_id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
@@ -143,8 +147,9 @@ fn finish_import(
     file_name: &str,
     source_bytes_len: i64,
     spec: PackSpec,
+    reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
-    let book_id = book_id_for(identity);
+    let book_id = book_id_for(identity, reuse_book_id);
     let title = base_title(file_name);
     let timestamp = now();
     log::info!("finish_import: 開始（{} ページ）", spec.total_pages);
@@ -331,7 +336,7 @@ pub fn import_file(
     match extension.as_str() {
         "pdf" => import_pdf_bytes(pool, &file_name, &bytes, packs_dir, identity, progress),
         "epub" => import_epub_bytes(pool, &file_name, &bytes, packs_dir, identity),
-        "zip" => import_zip_bytes(pool, &file_name, &bytes, packs_dir, identity, progress),
+        "zip" => import_zip_bytes(pool, &file_name, &bytes, packs_dir, identity, progress, None),
         _ => Err(ImportError::UnsupportedType(extension)),
     }
 }
@@ -420,6 +425,7 @@ pub fn import_rendered_pdf_pages(
             source_type: "pdf".to_string(),
             total_pages,
         },
+        None,
     )
 }
 
@@ -450,6 +456,7 @@ pub fn import_epub_bytes(
             source_type: "epub".to_string(),
             total_pages: 0,
         },
+        None,
     )
 }
 
@@ -529,6 +536,7 @@ pub fn import_zip_bytes(
     packs_dir: &Path,
     identity: Option<&Identity>,
     progress: &mut (dyn FnMut(f32) + Send),
+    reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| ImportError::Zip(e.to_string()))?;
@@ -624,6 +632,7 @@ pub fn import_zip_bytes(
             source_type: "image-set".to_string(),
             total_pages,
         },
+        reuse_book_id,
     )
 }
 
@@ -675,5 +684,6 @@ pub fn import_image_bytes(
             source_type: "image".to_string(),
             total_pages: 1,
         },
+        None,
     )
 }
