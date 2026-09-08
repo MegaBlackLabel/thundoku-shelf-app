@@ -2136,8 +2136,15 @@ impl BookshelfView {
             if let Some(local_id) = Self::resolve_local_book_id(db, &book_id) {
                 let tag_pairs: Vec<(&str, &str)> =
                     tags.iter().map(|tag| (tag.as_str(), "manual")).collect();
-                let _ = db::tags::set_for_book(db, &local_id, &tag_pairs);
+                let res = db::tags::set_for_book(db, &local_id, &tag_pairs);
+                log::info!(
+                    "save_tag_edit: book_id={book_id} -> local_id={local_id} tags={tags:?} -> set_for_book={res:?}"
+                );
             } else {
+                log::warn!(
+                    "save_tag_edit: resolve_local_book_id=None book_id={book_id} site={:?} -> shelf update",
+                    self.editing_site_id
+                );
                 let site = self
                     .editing_site_id
                     .as_deref()
