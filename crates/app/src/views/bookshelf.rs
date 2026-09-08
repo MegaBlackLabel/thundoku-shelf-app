@@ -1570,7 +1570,19 @@ impl BookshelfView {
                     drop(client);
                     bytes
                 };
-                let file_name = item_file_name(&title, &item);
+                let mut file_name = item_file_name(&title, &item);
+                // FANZA は ZIP（画像セット）または PDF。ファイル名由来の拡張子
+                // （既定 .pdf）で誤判定して PDF レンダリングするのを防ぐため、
+                // 実バイトのマジックナンバーから拡張子を判定する。
+                if site_id == "fanza" {
+                    if let Some(ext) = sniff_extension(&bytes) {
+                        let stem = file_name
+                            .rsplit_once('.')
+                            .map(|(s, _)| s)
+                            .unwrap_or(&file_name);
+                        file_name = format!("{stem}.{ext}");
+                    }
+                }
                 let extension = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
                 let import_tx = progress_tx.clone();
                 let import_progress_id = product_id.clone();
@@ -4147,6 +4159,31 @@ fn item_file_name(title: &str, item: &bookshelf::BookshelfItem) -> String {
     }
 }
 
+/// ダウンロードしたバイト列のマジックナンバーから拡張子を推定する。
+/// FANZA はファイル名由来の拡張子（既定 `.pdf`）が実際と異なることがあるため使う
+/// （画像セット ZIP が PDF として誤レンダリングされるのを防ぐ）。
+fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"PK\x03\x04") {
+        return Some("zip");
+    }
+    if bytes.starts_with(b"%PDF") {
+        return Some("pdf");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(b"\x89PNG") {
+        return Some("png");
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some("gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use gpui_kit::AppContext as _;
@@ -4155,6 +4192,16 @@ mod tests {
     use thundoku_core::db::{books, progress};
 
     use super::*;
+
+    #[test]
+    fn sniff_extension_detects_zip_and_pdf() {
+        assert_eq!(sniff_extension(b"PK\x03\x04zipdata"), Some("zip"));
+        assert_eq!(sniff_extension(b"%PDF-1.7"), Some("pdf"));
+        assert_eq!(sniff_extension(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(sniff_extension(b"\x89PNG\r\n\x1a\n"), Some("png"));
+        assert_eq!(sniff_extension(b"RIFFxxxxWEBP"), Some("webp"));
+        assert_eq!(sniff_extension(b"not a file"), None);
+    }
 
     fn seed_book(cx: &mut TestAppContext, id: &str, title: &str, circle: &str) {
         cx.update(|cx| {
