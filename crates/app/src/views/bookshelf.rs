@@ -3501,7 +3501,35 @@ impl Render for BookshelfView {
         let tag_fetch_enabled = self.tag_fetch_enabled;
         let available_events = self.available_events.clone();
         let selected_events = self.selected_events.clone();
-        let favorite_tags = self.favorite_tags.clone();
+        let favorite_tags = {
+            let favs = self.favorite_tags.clone();
+            match self.site_filter.as_deref() {
+                // サイト選択中はそのサイトのタグでお気に入りタグフィルタを絞る
+                Some(site) => {
+                    let state = Self::app_state(cx);
+                    let db = &state.db_pool;
+                    let mut site_tags = std::collections::HashSet::new();
+                    for item in bookshelf::list_all(db).ok().unwrap_or_default() {
+                        if item.site_id == site {
+                            for t in bookshelf::tags_of(&item) {
+                                site_tags.insert(t);
+                            }
+                        }
+                    }
+                    for b in books::list(db).ok().unwrap_or_default() {
+                        if b.site_id.as_deref() == Some(site) {
+                            for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
+                                site_tags.insert(t.tag_name);
+                            }
+                        }
+                    }
+                    favs.into_iter()
+                        .filter(|t| site_tags.contains(t))
+                        .collect::<Vec<_>>()
+                }
+                None => favs,
+            }
+        };
         let search_state = self.search_state.clone().expect("search state");
         // Popover の content クロージャは 'static なのでテーマ色を先にコピーする
         let theme_border = cx.theme().border;
