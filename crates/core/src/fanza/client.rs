@@ -265,9 +265,21 @@ impl FanzaClient {
         } else {
             return Err(FanzaError::Http(proxy_resp.status));
         };
-        // 2) CDN へ直接（署名 Cookie を含むフルブラウザヘッダ付き）
+        // 2) CDN へ直接（署名 Cookie 込みのフルブラウザヘッダ付き）
+        //    署名 Cookie（CloudFront-*）はログイン時ではなく、このダウンロード proxy の
+        //    応答（Set-Cookie）で lazy に発行されるため、ここで取って CDN へ送る。
+        //    （ureq をリダイレクトに任せるとクロスホストで Cookie が落ちるので手動追跡）
+        let mut cookie = self.session.cookie_header();
+        for (k, v) in proxy_resp.set_cookies() {
+            if k.starts_with("CloudFront-") && !cookie.contains(&format!("{k}=")) {
+                if !cookie.is_empty() {
+                    cookie.push_str("; ");
+                }
+                cookie.push_str(&format!("{k}={v}"));
+            }
+        }
         let headers = vec![
-            ("Cookie".to_string(), self.session.cookie_header()),
+            ("Cookie".to_string(), cookie),
             ("User-Agent".to_string(), USER_AGENT.to_string()),
             ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
             (
@@ -487,10 +499,20 @@ mod tests {
                 if spec.url.contains("/dc/-/proxy/") {
                     Ok(ResponseSpec {
                         status: 302,
-                        headers: vec![(
-                            "location".into(),
-                            "https://doujin.contents.doujin.dmm.co.jp/bb/dm_comic/x.zip".into(),
-                        )],
+                        headers: vec![
+                            (
+                                "location".into(),
+                                "https://doujin.contents.doujin.dmm.co.jp/bb/dm_comic/x.zip".into(),
+                            ),
+                            (
+                                "set-cookie".into(),
+                                "CloudFront-Signature=abc; path=/; domain=dmm.co.jp; secure; httponly".into(),
+                            ),
+                            (
+                                "set-cookie".into(),
+                                "CloudFront-Key-Pair-Id=K123; path=/; domain=dmm.co.jp; secure; httponly".into(),
+                            ),
+                        ],
                         body: vec![],
                     })
                 } else {
@@ -519,7 +541,15 @@ mod tests {
         let spec = cdn_spec.lock().clone().expect("CDN request made");
         assert!(spec.url.starts_with("https://doujin.contents.doujin.dmm.co.jp/"));
         assert!(spec.headers.iter().any(|(k, v)| k == "Cookie" && v.contains("login_id=abc")));
-        // proxy は redirects=0（手動追跡）
+        // proxy 応答で発行された署名 Cookie（CloudFront-*）が CDN へ届く
+        let cf = spec
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Cookie")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert!(cf.contains("CloudFront-Signature=abc"), "CloudFront signature cookie missing: {cf}");
+        assert!(cf.contains("CloudFront-Key-Pair-Id=K123"));
         assert!(spec.redirects == 3);
     }
 
