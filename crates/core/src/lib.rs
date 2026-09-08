@@ -2,6 +2,7 @@
 pub mod booth;
 pub mod db;
 pub mod drive;
+pub mod fanza;
 pub mod google;
 pub mod import;
 pub mod owner;
