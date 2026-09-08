@@ -2087,9 +2087,33 @@ impl BookshelfView {
                     .unwrap_or_default()
             };
             // Web の tagSuggestions 相当: 後で読む + お気に入りタグ
+            // サイトフィルタ中は選択サイトのタグで絞る（技術書典選択中に FANZA の
+            // お気に入りタグが出ないように。すべての本では全表示）。
             let mut suggestions = vec!["後で読む".to_string()];
-            for tag in db::tags::list_favorites(db).unwrap_or_default() {
-                if !suggestions.contains(&tag) {
+            let favorites = db::tags::list_favorites(db).unwrap_or_default();
+            let allowed: Option<std::collections::HashSet<String>> =
+                self.site_filter.as_deref().map(|site| {
+                    let mut set = std::collections::HashSet::new();
+                    for item in bookshelf::list_all(db).ok().unwrap_or_default() {
+                        if item.site_id == site {
+                            for t in bookshelf::tags_of(&item) {
+                                set.insert(t);
+                            }
+                        }
+                    }
+                    for b in books::list(db).ok().unwrap_or_default() {
+                        if b.site_id.as_deref() == Some(site) {
+                            for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
+                                set.insert(t.tag_name);
+                            }
+                        }
+                    }
+                    set
+                });
+            for tag in favorites {
+                if allowed.as_ref().map_or(true, |s| s.contains(&tag))
+                    && !suggestions.contains(&tag)
+                {
                     suggestions.push(tag);
                 }
             }
@@ -2618,7 +2642,7 @@ impl BookshelfView {
                     // Web の formatEventLabel と同じ: イベント不明のときは
                     // 「イベント不明」を表示
                     .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
-                        ("booth", Some(date)) => format!("購入日: {date}"),
+                        ("booth", Some(date)) | ("fanza", Some(date)) => format!("購入日: {date}"),
                         _ => event_text.clone(),
                     }),
             )
@@ -3090,6 +3114,10 @@ impl BookshelfView {
             .clone()
             .map(|name| format_event_label(&name));
         let event_text = event.unwrap_or_else(|| "イベント不明".to_string());
+        let purchase_date = shelf
+            .caused_at
+            .as_deref()
+            .map(|d| d.split_whitespace().next().unwrap_or(d).replace('/', "-"));
         let database_id = shelf.database_id.clone();
         let cover = card.cover.clone().or_else(|| {
             if card.cover_fetch_failed {
@@ -3286,7 +3314,12 @@ impl BookshelfView {
                         .text_color(cx.theme().muted_foreground)
                         // Web の formatEventLabel と同じ: イベント不明のときは
                         // 「イベント不明」を表示
-                        .child(event_text.clone()),
+                        .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
+                            ("booth", Some(date)) | ("fanza", Some(date)) => {
+                                format!("購入日: {date}")
+                            }
+                            _ => event_text.clone(),
+                        }),
                 )
                 // サークル名（非空のときだけ表示）
                 .child(if !circle_name.is_empty() {
