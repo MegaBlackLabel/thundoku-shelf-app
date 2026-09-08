@@ -23,7 +23,8 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::booth::BoothClient;
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, documents, progress};
-use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE};
+use thundoku_core::fanza::client::FanzaClient;
+use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE, UreqTransport};
 
 use crate::actions::{
     DeleteBook, EditBookTags, HideBook, OpenAuth, OpenAuthProvider, OpenReader, SyncDrive,
@@ -1382,6 +1383,7 @@ impl BookshelfView {
         let site_id = item.site_id.clone();
         let tbf_client = state.tbf.clone();
         let booth_session = state.booth_session.lock().clone();
+        let fanza_session = state.fanza_session.lock().clone();
         let db = state.db_pool.clone();
         let packs_dir = state.packs_dir.clone();
         let title = item.title.clone();
@@ -1412,6 +1414,36 @@ impl BookshelfView {
                         booth_session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
                     let client = BoothClient::new(&session);
                     let url = item.download_url.as_deref().unwrap_or_default().to_string();
+                    let download_tx = progress_tx.clone();
+                    let download_progress_id = product_id.clone();
+                    let mut on_download = move |downloaded: u64, total: u64| {
+                        let fraction = if total > 0 {
+                            downloaded as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let _ = download_tx.send((
+                            download_progress_id.clone(),
+                            DownloadState::Downloading(fraction),
+                        ));
+                    };
+                    client
+                        .download_with_progress(&url, &mut on_download)
+                        .map_err(|e| e.to_string())?
+                } else if site_id == "fanza" {
+                    // FANZA: 一覧では download_url を持たないため、details API で
+                    // download_link を取得してから ZIP をダウンロードする。
+                    let session =
+                        fanza_session.ok_or_else(|| "FANZA セッションがありません".to_string())?;
+                    let mut client =
+                        FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+                    let detail = client.detail(&product_id).map_err(|e| e.to_string())?;
+                    if detail.is_drm {
+                        return Err("DRM 付き作品は取り込めません".to_string());
+                    }
+                    let url = detail
+                        .download_link
+                        .ok_or_else(|| "FANZA ダウンロード URL がありません".to_string())?;
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
