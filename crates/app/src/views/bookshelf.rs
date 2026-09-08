@@ -1734,6 +1734,14 @@ impl BookshelfView {
                                     .map(|t| (t.as_str(), "fanza_genre"))
                                     .collect();
                                 let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
+                                // 本棚アイテムの tags_json にも書く（owned フィルタで
+                                // local が外れてもカードに表示できるように）
+                                let _ = bookshelf::update_tags(
+                                    &db,
+                                    "fanza",
+                                    &product_id,
+                                    &genre_tags,
+                                );
                             }
                         }
                         if imported.document.total_pages > 0 {
@@ -2140,6 +2148,11 @@ impl BookshelfView {
                 log::info!(
                     "save_tag_edit: book_id={book_id} -> local_id={local_id} tags={tags:?} -> set_for_book={res:?}"
                 );
+                // FANZA: reload の owned フィルタで local が外れるとカードは
+                // shelf.tags_json を読むため、book_tags に加えて本棚アイテムにも書く。
+                if self.editing_site_id.as_deref() == Some("fanza") {
+                    let _ = bookshelf::update_tags(db, "fanza", &book_id, &tags);
+                }
             } else {
                 log::warn!(
                     "save_tag_edit: resolve_local_book_id=None book_id={book_id} site={:?} -> shelf update",
