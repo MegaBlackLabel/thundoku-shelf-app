@@ -224,13 +224,48 @@ impl FanzaClient {
     }
 
     /// ダウンロード proxy URL を 302 追跡して ZIP 本体を取得する。HTML レスポンスは拒否。
+    ///
+    /// CDN（`contents.doujin.dmm.co.jp`）は CloudFront プライベート配布で、署名 Cookie
+    /// （`CloudFront-Policy`/`CloudFront-Signature`/`CloudFront-Key-Pair-Id`）が要る。
+    /// ureq はクロスホスト（proxy → CDN）リダイレクトで `Cookie` ヘッダを落とすため、
+    /// proxy の 302 `Location` を手動で取得し、CDN へ直接（署名 Cookie 付き）取得する。
     pub fn download_with_progress(
         &mut self,
         download_url: &str,
         on_progress: &mut dyn FnMut(u64, u64),
     ) -> Result<Vec<u8>, FanzaError> {
-        // CDN（contents.doujin.dmm.co.jp）は Cloudflare 系で、ブラウザ相当の
-        // Sec-Fetch-* / Accept ヘッダを要求する（無いと 403）。UA/Referer だけでは足りない。
+        // 1) proxy を manual（redirects=0）で叩いて 302 Location を取得
+        let proxy_headers = vec![
+            ("Cookie".to_string(), self.session.cookie_header()),
+            ("User-Agent".to_string(), USER_AGENT.to_string()),
+            ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
+        ];
+        let proxy_spec = RequestSpec {
+            method: "GET".into(),
+            url: download_url.into(),
+            headers: proxy_headers,
+            body: None,
+            redirects: 0,
+        };
+        let proxy_resp = self
+            .transport
+            .send(proxy_spec)
+            .map_err(FanzaError::Transport)?;
+        let cd_url = if proxy_resp.status == 302 {
+            let loc = proxy_resp
+                .header("location")
+                .ok_or_else(|| FanzaError::Parse("プロキシ応答に location がありません".into()))?;
+            if loc.starts_with('/') {
+                format!("https://www.dmm.co.jp{loc}")
+            } else {
+                loc.to_string()
+            }
+        } else if proxy_resp.status == 401 || proxy_resp.status == 403 {
+            return Err(FanzaError::Unauthorized(proxy_resp.status));
+        } else {
+            return Err(FanzaError::Http(proxy_resp.status));
+        };
+        // 2) CDN へ直接（署名 Cookie を含むフルブラウザヘッダ付き）
         let headers = vec![
             ("Cookie".to_string(), self.session.cookie_header()),
             ("User-Agent".to_string(), USER_AGENT.to_string()),
@@ -247,10 +282,10 @@ impl FanzaClient {
         ];
         let spec = RequestSpec {
             method: "GET".into(),
-            url: download_url.into(),
+            url: cd_url,
             headers,
             body: None,
-            redirects: 5,
+            redirects: 3,
         };
         let resp = self
             .transport
@@ -437,5 +472,96 @@ mod tests {
         };
         let mut c2 = FanzaClient::with_transport(Box::new(transport2), session());
         assert!(c2.detail("d_1").unwrap().is_drm);
+    }
+
+    /// ダウンロード: proxy の 302 Location を手動で取得し、CDN へ直接（署名 Cookie 付き）
+    /// 取得すること。ureq がクロスホストリダイレクトで Cookie を落とす問題の回帰テスト。
+    #[test]
+    fn download_manually_follows_proxy_302_to_cdn_with_cookie() {
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+        let cdn_spec = Arc::new(Mutex::new(None::<RequestSpec>));
+        let cdn_spec2 = cdn_spec.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                if spec.url.contains("/dc/-/proxy/") {
+                    Ok(ResponseSpec {
+                        status: 302,
+                        headers: vec![(
+                            "location".into(),
+                            "https://doujin.contents.doujin.dmm.co.jp/bb/dm_comic/x.zip".into(),
+                        )],
+                        body: vec![],
+                    })
+                } else {
+                    *cdn_spec2.lock() = Some(spec);
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/zip".into())],
+                        body: b"PK\x03\x04zipdata".to_vec(),
+                    })
+                }
+            }),
+        };
+        let mut client = FanzaClient::with_transport(
+            Box::new(transport),
+            FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())])),
+        );
+        let mut on = |_: u64, _: u64| {};
+        let bytes = client
+            .download_with_progress(
+                "https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=x/",
+                &mut on,
+            )
+            .unwrap();
+        assert_eq!(bytes, b"PK\x03\x04zipdata");
+        // CDN リクエストには Cookie（CloudFront 署名含む）が送られ、proxy URL ではなく CDN URL 宛。
+        let spec = cdn_spec.lock().clone().expect("CDN request made");
+        assert!(spec.url.starts_with("https://doujin.contents.doujin.dmm.co.jp/"));
+        assert!(spec.headers.iter().any(|(k, v)| k == "Cookie" && v.contains("login_id=abc")));
+        // proxy は redirects=0（手動追跡）
+        assert!(spec.redirects == 3);
+    }
+
+    /// 実機プローブ: `UreqTransport` 経由で CDN ダウンロードが 200 になるか確認する。
+    /// `FANZA_TEST_COOKIE` に Cookie（`name=value; ...`）を設定して実行する。
+    #[test]
+    #[ignore]
+    fn live_download_probe() {
+        let cookie = std::env::var("FANZA_TEST_COOKIE").expect("FANZA_TEST_COOKIE not set");
+        let mut t = crate::tbf::UreqTransport::new();
+        let base = vec![
+            ("Cookie".into(), cookie),
+            ("User-Agent".into(), USER_AGENT.into()),
+            ("Referer".into(), "https://www.dmm.co.jp/".into()),
+        ];
+        // 1) proxy を manual (redirects=0) で叩いて 302 Location を取得
+        let p_spec = RequestSpec {
+            method: "GET".into(),
+            url: "https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=d_815503/".into(),
+            headers: base.clone(),
+            body: None,
+            redirects: 0,
+        };
+        let p = t.send(p_spec).unwrap();
+        eprintln!("PROXY status={}", p.status);
+        let loc = p.header("location").unwrap_or("").to_string();
+        eprintln!("LOC={loc}");
+        // 2) CDN へ直接（Cookie 含む Sec-Fetch ヘッダ付き）
+        let mut c_headers = base;
+        c_headers.push(("Sec-Fetch-Dest".into(), "document".into()));
+        c_headers.push(("Sec-Fetch-Mode".into(), "navigate".into()));
+        c_headers.push(("Sec-Fetch-Site".into(), "cross-site".into()));
+        c_headers.push(("Accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into()));
+        let c_spec = RequestSpec {
+            method: "GET".into(),
+            url: loc,
+            headers: c_headers,
+            body: None,
+            redirects: 3,
+        };
+        let mut on = |_: u64, _: u64| {};
+        let r = t.send_download(c_spec, &mut on).unwrap();
+        eprintln!("CDN status={} len={} ct={:?}", r.status, r.body.len(), r.header("content-type"));
     }
 }
