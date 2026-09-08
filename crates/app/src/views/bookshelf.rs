@@ -2087,29 +2087,40 @@ impl BookshelfView {
                     .unwrap_or_default()
             };
             // Web の tagSuggestions 相当: 後で読む + お気に入りタグ
-            // サイトフィルタ中は選択サイトのタグで絞る（技術書典選択中に FANZA の
-            // お気に入りタグが出ないように。すべての本では全表示）。
+            // 編集中の本のサイトでお気に入りタグを絞る（技術書典の本を編集するときに
+            // FANZA のお気に入りタグが出ないように。サイト不明なら全表示）。
             let mut suggestions = vec!["後で読む".to_string()];
             let favorites = db::tags::list_favorites(db).unwrap_or_default();
-            let allowed: Option<std::collections::HashSet<String>> =
-                self.site_filter.as_deref().map(|site| {
-                    let mut set = std::collections::HashSet::new();
-                    for item in bookshelf::list_all(db).ok().unwrap_or_default() {
-                        if item.site_id == site {
-                            for t in bookshelf::tags_of(&item) {
-                                set.insert(t);
-                            }
+            let book_site: Option<String> = if let Some(local_id) =
+                Self::resolve_local_book_id(db, book_id)
+            {
+                books::get(db, &local_id).ok().flatten().and_then(|b| b.site_id)
+            } else {
+                bookshelf::list_all(db)
+                    .ok()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|i| i.database_id == book_id)
+                    .map(|i| i.site_id)
+            };
+            let allowed: Option<std::collections::HashSet<String>> = book_site.as_deref().map(|site| {
+                let mut set = std::collections::HashSet::new();
+                for item in bookshelf::list_all(db).ok().unwrap_or_default() {
+                    if item.site_id == site {
+                        for t in bookshelf::tags_of(&item) {
+                            set.insert(t);
                         }
                     }
-                    for b in books::list(db).ok().unwrap_or_default() {
-                        if b.site_id.as_deref() == Some(site) {
-                            for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
-                                set.insert(t.tag_name);
-                            }
+                }
+                for b in books::list(db).ok().unwrap_or_default() {
+                    if b.site_id.as_deref() == Some(site) {
+                        for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
+                            set.insert(t.tag_name);
                         }
                     }
-                    set
-                });
+                }
+                set
+            });
             for tag in favorites {
                 if allowed.as_ref().map_or(true, |s| s.contains(&tag))
                     && !suggestions.contains(&tag)
@@ -2364,7 +2375,7 @@ impl BookshelfView {
         let purchase_date = shelf
             .caused_at
             .as_deref()
-            .map(|d| d.split_whitespace().next().unwrap_or(d).replace('/', "-"));
+            .map(format_purchase_date);
         let database_id = shelf.database_id.clone();
         let cover = card.cover.clone().or_else(|| {
             if card.cover_fetch_failed {
@@ -3117,7 +3128,7 @@ impl BookshelfView {
         let purchase_date = shelf
             .caused_at
             .as_deref()
-            .map(|d| d.split_whitespace().next().unwrap_or(d).replace('/', "-"));
+            .map(format_purchase_date);
         let database_id = shelf.database_id.clone();
         let cover = card.cover.clone().or_else(|| {
             if card.cover_fetch_failed {
@@ -4348,6 +4359,27 @@ fn item_file_name(title: &str, item: &bookshelf::BookshelfItem) -> String {
         Some(name) if !name.is_empty() => name.clone(),
         _ => format!("{title}.pdf"),
     }
+}
+
+/// 購入日を `YYYY/MM/DD` に正規化する（"2026年09月03日" / "2026-08-25 00:00:00" 対応）。
+fn format_purchase_date(raw: &str) -> String {
+    let s = raw.trim();
+    if s.contains('年') {
+        let y = s.split('年').next().unwrap_or("");
+        let m = s.split('年').nth(1).and_then(|p| p.split('月').next()).unwrap_or("");
+        let d = s
+            .split('月')
+            .nth(1)
+            .and_then(|p| p.split('日').next())
+            .unwrap_or("");
+        let m = m.trim();
+        let d = d.trim();
+        if !y.is_empty() && !m.is_empty() && !d.is_empty() {
+            return format!("{y}/{m:0>2}/{d:0>2}");
+        }
+    }
+    let date_part = s.split_whitespace().next().unwrap_or(s);
+    date_part.replace('-', "/")
 }
 
 /// ダウンロードしたバイト列のマジックナンバーから拡張子を推定する。
