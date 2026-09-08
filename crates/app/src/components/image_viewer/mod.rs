@@ -336,7 +336,10 @@ impl ImageViewer {
             match mode.as_deref() {
                 Some("spread") => ViewMode::Spread,
                 Some("scroll") => ViewMode::Scroll,
-                _ => ViewMode::Single,
+                Some(_) => ViewMode::Single,
+                // 未設定のときのデフォルト: FANZA は見開き。
+                None if site_id.as_deref() == Some("fanza") => ViewMode::Spread,
+                None => ViewMode::Single,
             }
         };
         // ページめくり方向（設定ページの「ページめくり」から復元）
@@ -349,7 +352,12 @@ impl ImageViewer {
                 .ok()
                 .flatten()
                 .or_else(|| db::settings::get(db, "viewer.page_turn").ok().flatten());
-            direction.as_deref() == Some("right-to-left")
+            match direction.as_deref() {
+                Some("right-to-left") => true,
+                Some("left-to-right") => false,
+                // 未設定のときのデフォルト: FANZA は右綴じ。
+                _ => site_id.as_deref() == Some("fanza"),
+            }
         };
         // 自動再生の間隔（サイト別キー → グローバル → デフォルト）
         let saved_autoplay_interval = {

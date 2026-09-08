@@ -57,6 +57,10 @@ pub struct SettingsView {
     booth_viewer_mode: String,
     /// BOOTH サイトのページめくり方向
     booth_page_turn: String,
+    /// FANZA同人サイトのビューアー表示モード（viewer.mode.fanza と同期）
+    fanza_viewer_mode: String,
+    /// FANZA同人サイトのページめくり方向
+    fanza_page_turn: String,
     /// データベース情報: 未読/読書中/読了 の冊数
     status_counts: (usize, usize, usize),
     /// プロフィール再取得中フラグ（設定画面表示時のログイン状態チェック）
@@ -99,6 +103,13 @@ impl SettingsView {
                 .unwrap_or_else(|| "single".into()),
             booth_page_turn: Self::read_setting(cx, "viewer.page_turn.booth")
                 .unwrap_or_else(|| "left-to-right".into()),
+            // FANZA は既定で見開き + 右綴じ（サイト設定が無ければ）。
+            fanza_viewer_mode: Self::read_setting(cx, "viewer.mode.fanza")
+                .or_else(|| Self::read_setting(cx, "viewer.mode"))
+                .unwrap_or_else(|| "spread".into()),
+            fanza_page_turn: Self::read_setting(cx, "viewer.page_turn.fanza")
+                .or_else(|| Self::read_setting(cx, "viewer.page_turn"))
+                .unwrap_or_else(|| "right-to-left".into()),
             status_counts: (0, 0, 0),
             profile_fetching: false,
             book_count: 0,
@@ -184,6 +195,20 @@ impl SettingsView {
     pub fn set_booth_page_turn(&mut self, cx: &mut Context<Self>, direction: &str) {
         self.booth_page_turn = direction.to_string();
         Self::write_setting(cx, "viewer.page_turn.booth", direction);
+        cx.notify();
+    }
+
+    /// FANZA同人サイトの表示モードを保存。
+    pub fn set_fanza_viewer_mode(&mut self, cx: &mut Context<Self>, mode: &str) {
+        self.fanza_viewer_mode = mode.to_string();
+        Self::write_setting(cx, "viewer.mode.fanza", mode);
+        cx.notify();
+    }
+
+    /// FANZA同人サイトのページめくり方向を保存。
+    pub fn set_fanza_page_turn(&mut self, cx: &mut Context<Self>, direction: &str) {
+        self.fanza_page_turn = direction.to_string();
+        Self::write_setting(cx, "viewer.page_turn.fanza", direction);
         cx.notify();
     }
 
@@ -936,6 +961,8 @@ impl SettingsView {
                                                 .update(cx, |this, cx| {
                                                     if site_id == "booth" {
                                                         this.set_booth_viewer_mode(cx, &value);
+                                                    } else if site_id == "fanza" {
+                                                        this.set_fanza_viewer_mode(cx, &value);
                                                     } else {
                                                         this.set_viewer_mode(cx, &value);
                                                     }
@@ -1003,6 +1030,8 @@ impl SettingsView {
                                                     .update(cx, |this, cx| {
                                                         if site_id == "booth" {
                                                             this.set_booth_page_turn(cx, &value);
+                                                        } else if site_id == "fanza" {
+                                                            this.set_fanza_page_turn(cx, &value);
                                                         } else {
                                                             this.set_page_turn(cx, &value);
                                                         }
@@ -1126,6 +1155,8 @@ impl Render for SettingsView {
         let tbf_page_turn = self.tbf_page_turn.clone();
         let booth_viewer_mode = self.booth_viewer_mode.clone();
         let booth_page_turn = self.booth_page_turn.clone();
+        let fanza_viewer_mode = self.fanza_viewer_mode.clone();
+        let fanza_page_turn = self.fanza_page_turn.clone();
         let status_counts = self.status_counts;
         let last_synced_at = Self::read_setting(cx, "api.last_sync_at");
         let handle = cx.entity();
@@ -1148,6 +1179,14 @@ impl Render for SettingsView {
             "BOOTH サイトの設定",
             booth_viewer_mode,
             booth_page_turn,
+        );
+        let fanza_viewer_settings = self.site_viewer_settings_card(
+            cx,
+            "fanza",
+            "FANZA同人サイト設定",
+            "FANZA同人サイトの設定",
+            fanza_viewer_mode,
+            fanza_page_turn,
         );
 
         let storage_settings = self.settings_card(
@@ -1763,6 +1802,7 @@ impl Render for SettingsView {
                     .child(account_settings)
                     .child(viewer_settings)
                     .child(booth_viewer_settings)
+                    .child(fanza_viewer_settings)
                     // データ設定（Web のセクション見出し）
                     .child(
                         div()

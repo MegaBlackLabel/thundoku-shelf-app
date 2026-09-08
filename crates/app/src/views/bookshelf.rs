@@ -225,7 +225,7 @@ impl BookshelfView {
             pending_tag_edit: None,
             read_filter: ReadFilter::All,
             view_mode: ViewMode::Card,
-            tag_fetch_enabled: false,
+            tag_fetch_enabled: true,
             sync_busy: 0,
             fetching_covers: false,
             cover_fetch_retried: false,
@@ -695,7 +695,8 @@ impl BookshelfView {
             db::settings::get(db, "tag.fetch.enabled")
                 .ok()
                 .flatten()
-                .is_some_and(|v| v == "true")
+                .map(|v| v == "true")
+                .unwrap_or(true)
         };
         log::info!(
             "reload: fetch_remote_covers 呼び出し（{:?}）",
@@ -2227,7 +2228,7 @@ impl BookshelfView {
                     img(render.clone())
                         .w_full()
                         .h_full()
-                        .object_fit(gpui_kit::ObjectFit::Cover),
+                        .object_fit(gpui_kit::ObjectFit::Contain),
                 )
                 .into_any_element(),
             None => div()
@@ -2951,7 +2952,7 @@ impl BookshelfView {
                     img(render.clone())
                         .w_full()
                         .h_full()
-                        .object_fit(gpui_kit::ObjectFit::Cover),
+                        .object_fit(gpui_kit::ObjectFit::Contain),
                 )
                 .into_any_element(),
             None => div()
@@ -3967,8 +3968,8 @@ fn resize_for_cache(data: &[u8], max_width: u32) -> Option<Vec<u8>> {
 }
 
 /// 画像を縮小（最大幅 max_width px）して BGRA の RenderImage に変換する。
-/// カード枠（144x192 = 0.75）に合わせて中央クロップするので、UI 側で
-/// ストレッチしても縦長・横長にならない。
+/// 元画像のアスペクト比を保つ（クロップしない）。カード側で object_fit(Contain) により
+/// はみ出さず比率のまま表示する（FANZA 等はサムネの比率がバラバラのため）。
 fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
     let decoded = image::load_from_memory(data).ok()?;
     let (w, h) = (decoded.width(), decoded.height());
@@ -3980,23 +3981,7 @@ fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
     } else {
         decoded
     };
-    // カード枠（144x192 = 0.75）に合わせて中央クロップする
-    let (cw, ch) = (resized.width(), resized.height());
-    let target_ratio = 144.0f32 / 192.0f32; // 0.75
-    let current_ratio = cw as f32 / ch as f32;
-    let (crop_x, crop_y, crop_w, crop_h) = if current_ratio > target_ratio {
-        // 横長 → 縦を切り取る
-        let new_h = (cw as f32 / target_ratio).round() as u32;
-        let new_h = new_h.min(ch);
-        (0, (ch - new_h) / 2, cw, new_h)
-    } else {
-        // 縦長 → 横を切り取る
-        let new_w = (ch as f32 * target_ratio).round() as u32;
-        let new_w = new_w.min(cw);
-        ((cw - new_w) / 2, 0, new_w, ch)
-    };
-    let cropped = image::imageops::crop_imm(&resized, crop_x, crop_y, crop_w, crop_h).to_image();
-    let mut rgba = cropped;
+    let mut rgba = resized.into_rgba8();
     // RenderImage は BGRA を期待するため R/B を入れ替える
     for pixel in rgba.pixels_mut() {
         pixel.0.swap(0, 2);
@@ -5553,20 +5538,10 @@ mod tests {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let view = cx.new(BookshelfView::new);
-        // デフォルトは OFF
-        assert!(!view.read_with(cx, |this, _| this.tag_fetch_enabled));
-
-        // ON にすると app_settings に永続化される
-        cx.update(|cx| view.update(cx, |this, cx| this.toggle_tag_fetch(cx)));
+        // デフォルトは ON（FANZA 対応で変更）
         assert!(view.read_with(cx, |this, _| this.tag_fetch_enabled));
-        let stored = cx.update(|cx| {
-            let state = AppState::global(cx);
-            let db = &state.db_pool;
-            db::settings::get(db, "tag.fetch.enabled").ok().flatten()
-        });
-        assert_eq!(stored.as_deref(), Some("true"));
 
-        // 再トグルで OFF に戻り設定も更新される
+        // トグルで OFF になり app_settings に永続化される
         cx.update(|cx| view.update(cx, |this, cx| this.toggle_tag_fetch(cx)));
         assert!(!view.read_with(cx, |this, _| this.tag_fetch_enabled));
         let stored = cx.update(|cx| {
@@ -5575,6 +5550,16 @@ mod tests {
             db::settings::get(db, "tag.fetch.enabled").ok().flatten()
         });
         assert_eq!(stored.as_deref(), Some("false"));
+
+        // 再トグルで ON に戻り設定も更新される
+        cx.update(|cx| view.update(cx, |this, cx| this.toggle_tag_fetch(cx)));
+        assert!(view.read_with(cx, |this, _| this.tag_fetch_enabled));
+        let stored = cx.update(|cx| {
+            let state = AppState::global(cx);
+            let db = &state.db_pool;
+            db::settings::get(db, "tag.fetch.enabled").ok().flatten()
+        });
+        assert_eq!(stored.as_deref(), Some("true"));
     }
 
     #[gpui_kit::test]
