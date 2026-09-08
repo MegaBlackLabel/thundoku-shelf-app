@@ -809,6 +809,7 @@ impl Workspace {
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
+        let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
 
         let google_email = AppState::global(cx)
             .google_profile
@@ -958,6 +959,12 @@ impl Workspace {
                 booth_logged_in,
                 Some(AuthProvider::Booth),
                 Some(crate::views::settings::SettingsView::logout_booth),
+            ))
+            .child(site_row(
+                "FANZA同人",
+                fanza_logged_in,
+                Some(AuthProvider::Fanza),
+                Some(crate::views::settings::SettingsView::logout_fanza),
             ))
     }
 
@@ -1982,6 +1989,7 @@ impl Workspace {
         let site_filter = self.bookshelf.update(cx, |b, _| b.site_filter());
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
+        let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
 
         div()
             .id("bookshelf-submenu-wrap")
@@ -2090,6 +2098,38 @@ impl Workspace {
                                     }
                                 })
                                 .child("BOOTH"),
+                        )
+                    })
+                    .when(fanza_logged_in, |this| {
+                        this.child(
+                            div()
+                                .id("bookshelf-site-fanza")
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded_lg()
+                                .px_2()
+                                .py_1p5()
+                                .text_xs()
+                                .when(site_filter.as_deref() == Some("fanza"), |this| {
+                                    this.bg(theme.secondary)
+                                })
+                                .hover(|style| style.bg(theme.secondary))
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        cx.stop_propagation();
+                                        handle.update(cx, |this, cx| {
+                                            this.bookshelf.update(cx, |b, cx| {
+                                                b.set_site_filter(cx, Some("fanza"));
+                                            });
+                                            this.switch_to(NavTarget::Bookshelf, cx);
+                                            this.refresh_unread_count(cx);
+                                        });
+                                    }
+                                })
+                                .child("FANZA同人"),
                         )
                     })
                     .with_animation(

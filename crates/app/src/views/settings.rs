@@ -545,6 +545,23 @@ impl SettingsView {
         cx.notify();
     }
 
+    pub fn logout_fanza(&mut self, cx: &mut Context<Self>) {
+        let t = std::time::Instant::now();
+        {
+            let state = AppState::global(cx);
+            *state.fanza_session.lock() = None;
+            *state.fanza_logged_in.lock() = false;
+            let db = state.db_pool.clone();
+            cx.background_spawn(async move {
+                let _ = db::settings::delete(&db, "fanza.session");
+            })
+            .detach();
+        }
+        log::info!("logout_fanza: cleared ({:?})", t.elapsed());
+        self.show_toast("FANZA からログアウトしました", cx);
+        cx.notify();
+    }
+
     pub fn toggle_drive_sync(&mut self, cx: &mut Context<Self>, enabled: bool) {
         {
             let state = AppState::global(cx);

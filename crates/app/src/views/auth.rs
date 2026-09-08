@@ -13,6 +13,7 @@ use thundoku_core::google::GoogleProfile;
 
 use crate::app_state::AppState;
 use crate::views::booth_login::{BoothLoginCancelled, BoothLoginDone, BoothLoginView};
+use crate::views::fanza_login::{FanzaLoginCancelled, FanzaLoginDone, FanzaLoginView};
 use crate::views::google_login::{
     GoogleLoginCancelled, GoogleLoginDone, GoogleLoginFailed, GoogleLoginView,
 };
@@ -24,6 +25,7 @@ pub enum AuthProvider {
     TechBookFest,
     Google,
     Booth,
+    Fanza,
 }
 
 pub struct AuthDialog {
@@ -37,6 +39,11 @@ pub struct AuthDialog {
     booth_login: Option<Entity<BoothLoginView>>,
     /// BoothLoginView の完了イベント購読（保持して drop を防ぐ）
     booth_subscription: Option<gpui_kit::Subscription>,
+    /// FANZA の WebView ログインモーダルを表示中か
+    show_fanza_login: bool,
+    fanza_login: Option<Entity<FanzaLoginView>>,
+    /// FanzaLoginView の完了イベント購読（保持して drop を防ぐ）
+    fanza_subscription: Option<gpui_kit::Subscription>,
     /// Google の WebView ログインモーダルを表示中か
     show_google_login: bool,
     google_login: Option<Entity<GoogleLoginView>>,
@@ -57,6 +64,9 @@ impl AuthDialog {
             show_booth_login: false,
             booth_login: None,
             booth_subscription: None,
+            show_fanza_login: false,
+            fanza_login: None,
+            fanza_subscription: None,
             show_google_login: false,
             google_login: None,
             google_subscription: None,
@@ -80,6 +90,7 @@ impl AuthDialog {
             AuthProvider::TechBookFest => self.show_tbf_login = true,
             AuthProvider::Google => self.show_google_login = true,
             AuthProvider::Booth => self.show_booth_login = true,
+            AuthProvider::Fanza => self.show_fanza_login = true,
         }
     }
 
@@ -136,6 +147,34 @@ impl AuthDialog {
                 );
                 this.booth_subscription = Some(_done);
                 this.booth_login = Some(booth_login);
+                cx.notify();
+            });
+        }
+        // FANZA: WebView ログイン（テスト環境では WebView を作らない）
+        if self.show_fanza_login && self.fanza_login.is_none() {
+            cx.defer_in(window, |this, window, cx| {
+                let fanza_login = cx.new(|cx| FanzaLoginView::new(window, cx));
+                // 成功: WebView を閉じてモーダル全体も閉じる
+                let _done = cx.subscribe(
+                    &fanza_login,
+                    |this: &mut Self, _: Entity<FanzaLoginView>, _: &FanzaLoginDone, cx| {
+                        this.show_fanza_login = false;
+                        this.fanza_login = None;
+                        this.fanza_subscription = None;
+                        cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
+                    },
+                );
+                // キャンセル: WebView を破棄してログイン画面に戻る
+                let _cancelled = cx.subscribe(
+                    &fanza_login,
+                    |this: &mut Self, _: Entity<FanzaLoginView>, _: &FanzaLoginCancelled, _| {
+                        this.show_fanza_login = false;
+                        this.fanza_login = None;
+                        this.fanza_subscription = None;
+                    },
+                );
+                this.fanza_subscription = Some(_done);
+                this.fanza_login = Some(fanza_login);
                 cx.notify();
             });
         }
@@ -259,6 +298,11 @@ impl Render for AuthDialog {
         {
             tbf.update(cx, |view, cx| view.show(cx));
         }
+        if self.show_fanza_login
+            && let Some(fanza) = &self.fanza_login
+        {
+            fanza.update(cx, |view, cx| view.show(cx));
+        }
         let error = self.error.clone();
         let tbf_logged_in = self.tbf_logged_in;
         let google_profile = self.google_profile.clone();
@@ -291,10 +335,15 @@ impl Render for AuthDialog {
                     Some(tbf) => deferred(tbf.clone()).into_any_element(),
                     None => div().into_any_element(),
                 }
+            } else if self.show_fanza_login {
+                match &self.fanza_login {
+                    Some(fanza) => deferred(fanza.clone()).into_any_element(),
+                    None => div().into_any_element(),
+                }
             } else {
                 div().into_any_element()
             })
-            .child(if self.show_booth_login || self.show_google_login || self.show_tbf_login {
+            .child(if self.show_booth_login || self.show_google_login || self.show_tbf_login || self.show_fanza_login {
                 // WebView ログインモーダル表示中は auth-modal（中央モーダル）を
                 // 重ねない。deferred の WebView が最前面に出るため不要な見た目になる。
                 div().into_any_element()
@@ -328,6 +377,7 @@ impl Render for AuthDialog {
                                     Some(AuthProvider::Google) => "Googleでログイン",
                                     Some(AuthProvider::TechBookFest) => "技術書典でログイン",
                                     Some(AuthProvider::Booth) => "BOOTHでログイン",
+                                    Some(AuthProvider::Fanza) => "FANZAでログイン",
                                     None => "ログイン",
                                 },
                             ))
@@ -415,6 +465,35 @@ impl Render for AuthDialog {
                                         move |_, _window, cx| {
                                             handle.update(cx, |this, cx| {
                                                 this.show_google_login = true;
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            )
+                            .into_any_element(),
+                        // FANZA同人: WebView でログイン（モーダル内で完結）
+                        Some(AuthProvider::Fanza) => div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "FANZA のログインはアプリ内ブラウザ（WebView）で行います。\nログイン画面でメールアドレスとパスワードを入力すると、セッションが自動で保存されます。",
+                                    ),
+                            )
+                            .child(
+                                Button::new("auth-fanza-open")
+                                    .cursor_pointer()
+                                    .primary()
+                                    .label("FANZAログイン画面を開く")
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.show_fanza_login = true;
                                                 cx.notify();
                                             });
                                         }

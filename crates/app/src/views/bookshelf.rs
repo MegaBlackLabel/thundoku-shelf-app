@@ -1069,9 +1069,11 @@ impl BookshelfView {
         match self.site_filter.as_deref() {
             Some("techbookfest") => self.sync_tbf(cx),
             Some("booth") => self.sync_booth(cx),
+            Some("fanza") => self.sync_fanza(cx),
             _ => {
                 self.sync_tbf(cx);
                 self.sync_booth(cx);
+                self.sync_fanza(cx);
             }
         }
         let drive_ready = *AppState::global(cx).google_logged_in.lock();
@@ -1288,6 +1290,77 @@ impl BookshelfView {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&OpenAuthProvider {
                                     provider: crate::views::auth::AuthProvider::Booth,
+                                })
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// FANZA同人から本棚を同期する（購入済み一覧 → 画像系のみ bookshelf_items へ保存）。
+    pub fn sync_fanza(&mut self, cx: &mut Context<Self>) {
+        let logged_in = *AppState::global(cx).fanza_logged_in.lock();
+        if !logged_in {
+            self.toast = Some("FANZA にログインしてから同期してください".into());
+            cx.defer(move |cx| {
+                cx.dispatch_action(&OpenAuthProvider {
+                    provider: crate::views::auth::AuthProvider::Fanza,
+                })
+            });
+            cx.notify();
+            return;
+        }
+        log::info!("sync_fanza: 開始");
+        self.sync_busy += 1;
+        self.error = None;
+        self.toast = Some("FANZA サイトのデータを取得中です".into());
+        let handle = cx.entity();
+        let state = Self::app_state(cx);
+        let session = state.fanza_session.lock().clone();
+        let db = state.db_pool.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<usize, String> {
+                let session =
+                    session.ok_or_else(|| "FANZA セッションがありません".to_string())?;
+                let mut client =
+                    FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+                thundoku_core::fanza::sync::save_purchases(&db, &mut client)
+                    .map_err(|e| e.to_string())
+            })();
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_window, cx| {
+            let result = loop {
+                match rx.try_recv() {
+                    Ok(result) => break result,
+                    Err(_) => {
+                        handle.update(cx, |_, cx| cx.notify());
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(120))
+                            .await;
+                    }
+                }
+            };
+            handle.update(cx, |this, cx| {
+                this.sync_busy = this.sync_busy.saturating_sub(1);
+                match result {
+                    Ok(count) => {
+                        log::info!("sync_fanza: 完了（{count} 件）");
+                        this.toast = Some(format!("FANZA サイトから {count} 件取得しました"));
+                        this.reload(cx);
+                    }
+                    Err(message) => {
+                        log::error!("sync_fanza failed: {message}");
+                        this.error = Some(message.clone());
+                        if message.contains("not logged in") || message.contains("セッション") {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&OpenAuthProvider {
+                                    provider: crate::views::auth::AuthProvider::Fanza,
                                 })
                             });
                         }
@@ -3224,6 +3297,7 @@ impl Render for BookshelfView {
                 let (site_title, site_subtitle) = match self.site_filter.as_deref() {
                     Some("booth") => ("BOOTH", "BOOTH の本棚"),
                     Some("techbookfest") => ("技術書典", "TechBookFest の本棚"),
+                    Some("fanza") => ("FANZA同人", "FANZA同人の本棚"),
                     _ => ("すべての本", "すべてのサイトの本棚"),
         };
                 div()

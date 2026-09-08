@@ -63,6 +63,10 @@ impl FanzaSession {
             .collect::<Vec<_>>()
             .join("; ")
     }
+
+    pub fn cookies_count(&self) -> usize {
+        self.cookies.len()
+    }
 }
 
 /// 一覧 API の 1 購入作品（`data.items` の各要素 + 購入日はグループ key から）。
