@@ -23,7 +23,9 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::booth::BoothClient;
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, documents, progress};
-use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE};
+use thundoku_core::dlsite::client::DlsiteClient;
+use thundoku_core::fanza::client::FanzaClient;
+use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE, UreqTransport};
 
 use crate::actions::{
     DeleteBook, EditBookTags, HideBook, OpenAuth, OpenAuthProvider, OpenReader, SyncDrive,
@@ -107,6 +109,8 @@ pub struct BookshelfView {
     site_filter: Option<String>,
     /// インラインタグ編集中の本（Web の TagList 編集モード相当）
     editing_book_id: Option<String>,
+    /// 編集中の本のサイト id（FANZA ジャンル再取得ボタン/保存先の判定用）
+    editing_site_id: Option<String>,
     /// 編集中のタグ一覧
     editing_tags: Vec<String>,
     /// タグ編集のサジェスチョン（後で読む + お気に入りタグ）
@@ -218,13 +222,14 @@ impl BookshelfView {
             site_filter: Self::read_site_filter(cx),
             available_events: Vec::new(),
             editing_book_id: None,
+            editing_site_id: None,
             editing_tags: Vec::new(),
             editing_suggestions: Vec::new(),
             editing_input: None,
             pending_tag_edit: None,
             read_filter: ReadFilter::All,
             view_mode: ViewMode::Card,
-            tag_fetch_enabled: false,
+            tag_fetch_enabled: true,
             sync_busy: 0,
             fetching_covers: false,
             cover_fetch_retried: false,
@@ -588,13 +593,27 @@ impl BookshelfView {
                 let local = entries.iter().find(|entry| {
                     entry.book.tbf_product_id.as_deref() == Some(shelf.database_id.as_str())
                 });
-                let cover = local
-                    .and_then(|entry| entry.cover.clone())
-                    .or_else(|| load_cached_cover(&thumbnails_dir, shelf))
-                    .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name));
-                let tags = local
-                    .map(|entry| entry.tags.clone())
-                    .unwrap_or_else(|| bookshelf::tags_of(shelf));
+                let cover = if shelf.site_id == "fanza" || shelf.site_id == "dlsite" {
+                    // FANZA / DLsite はダウンロード後のパック表紙に差し替えず、同期時の
+                    // サムネイル（thumbnail_url 由来のキャッシュ）を維持する。
+                    load_cached_cover(&thumbnails_dir, shelf)
+                        .or_else(|| local.and_then(|entry| entry.cover.clone()))
+                        .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
+                } else {
+                    local
+                        .and_then(|entry| entry.cover.clone())
+                        .or_else(|| load_cached_cover(&thumbnails_dir, shelf))
+                        .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
+                };
+                let tags = if shelf.site_id == "fanza" || shelf.site_id == "dlsite" {
+                    // FANZA / DLsite: タグは shelf.tags_json を正とする（book_tags は重複本で
+                    // 分かれるため）。保存/ジャンル取得で両方に書くが、表示は安定。
+                    bookshelf::tags_of(shelf)
+                } else {
+                    local
+                        .map(|entry| entry.tags.clone())
+                        .unwrap_or_else(|| bookshelf::tags_of(shelf))
+                };
                 shelf_cards.push(ShelfCard {
                     shelf: shelf.clone(),
                     cover_fetch_failed: false,
@@ -647,6 +666,16 @@ impl BookshelfView {
                             synced_at: String::new(),
                             created_at: entry.book.created_at.clone(),
                             updated_at: entry.book.updated_at.clone(),
+                            media_category: None,
+                            ai_type: None,
+                            is_drm: 0,
+                            release_date: None,
+                            description: None,
+                            theme: None,
+                            maker_id: None,
+                            page_count: None,
+                            age_rating: None,
+                            series_name: None,
                         },
                         local: Some(Box::new(entry.clone())),
                         tags: entry.tags.clone(),
@@ -684,7 +713,8 @@ impl BookshelfView {
             db::settings::get(db, "tag.fetch.enabled")
                 .ok()
                 .flatten()
-                .is_some_and(|v| v == "true")
+                .map(|v| v == "true")
+                .unwrap_or(true)
         };
         log::info!(
             "reload: fetch_remote_covers 呼び出し（{:?}）",
@@ -782,7 +812,10 @@ impl BookshelfView {
                                 log::info!("cover worker: 終了 (i={i}, len={})", pending.len());
                                 break;
                             };
-                            let resolved = if url.starts_with('/') {
+                            let resolved = if url.starts_with("//") {
+                                // プロトコル相対（//img.dlsite.jp/... 等）を絶対化する
+                                format!("https:{url}")
+                            } else if url.starts_with('/') {
                                 format!("https://techbookfest.org{url}")
                             } else {
                                 url.clone()
@@ -802,6 +835,11 @@ impl BookshelfView {
                                         .or_else(|| fetch_bytes(agent, &resolved)),
                                     None => fetch_bytes(agent, &resolved),
                                 }
+                            } else if site_id == "dlsite" {
+                                // DLsite の表紙は公開 CDN（img.dlsite.jp、Cookie 不要）。
+                                // プロトコル相対 URL は上で絶対化済み。TBF クライアントには
+                                // フォールバックしない（誤った経路で失敗するため）。
+                                fetch_bytes(agent, &resolved)
                             } else {
                                 // TBF の表紙も公開 URL なら直接取得する（4 並列が機能する）。
                                 // 失敗した場合のみセッション付きクライアントにフォールバック
@@ -1058,9 +1096,13 @@ impl BookshelfView {
         match self.site_filter.as_deref() {
             Some("techbookfest") => self.sync_tbf(cx),
             Some("booth") => self.sync_booth(cx),
+            Some("fanza") => self.sync_fanza(cx),
+            Some("dlsite") => self.sync_dlsite(cx),
             _ => {
                 self.sync_tbf(cx);
                 self.sync_booth(cx);
+                self.sync_fanza(cx);
+                self.sync_dlsite(cx);
             }
         }
         let drive_ready = *AppState::global(cx).google_logged_in.lock();
@@ -1182,6 +1224,16 @@ impl BookshelfView {
                             synced_at: "2026-08-25 00:00:00".into(),
                             created_at: "2026-08-25 00:00:00".into(),
                             updated_at: "2026-08-25 00:00:00".into(),
+                            media_category: None,
+                            ai_type: None,
+                            is_drm: 0,
+                            release_date: None,
+                            description: None,
+                            theme: None,
+                            maker_id: None,
+                            page_count: None,
+                            age_rating: None,
+                            series_name: None,
                         },
                     )
                     .map_err(|e| e.to_string())?;
@@ -1278,6 +1330,148 @@ impl BookshelfView {
         .detach();
     }
 
+    /// FANZA同人から本棚を同期する（購入済み一覧 → 画像系のみ bookshelf_items へ保存）。
+    pub fn sync_fanza(&mut self, cx: &mut Context<Self>) {
+        let logged_in = *AppState::global(cx).fanza_logged_in.lock();
+        if !logged_in {
+            self.toast = Some("FANZA にログインしてから同期してください".into());
+            cx.defer(move |cx| {
+                cx.dispatch_action(&OpenAuthProvider {
+                    provider: crate::views::auth::AuthProvider::Fanza,
+                })
+            });
+            cx.notify();
+            return;
+        }
+        log::info!("sync_fanza: 開始");
+        self.sync_busy += 1;
+        self.error = None;
+        self.toast = Some("FANZA サイトのデータを取得中です".into());
+        let handle = cx.entity();
+        let state = Self::app_state(cx);
+        let session = state.fanza_session.lock().clone();
+        let db = state.db_pool.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<usize, String> {
+                let session =
+                    session.ok_or_else(|| "FANZA セッションがありません".to_string())?;
+                let mut client =
+                    FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+                thundoku_core::fanza::sync::save_purchases(&db, &mut client)
+                    .map_err(|e| e.to_string())
+            })();
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_window, cx| {
+            let result = loop {
+                match rx.try_recv() {
+                    Ok(result) => break result,
+                    Err(_) => {
+                        handle.update(cx, |_, cx| cx.notify());
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(120))
+                            .await;
+                    }
+                }
+            };
+            handle.update(cx, |this, cx| {
+                this.sync_busy = this.sync_busy.saturating_sub(1);
+                match result {
+                    Ok(count) => {
+                        log::info!("sync_fanza: 完了（{count} 件）");
+                        this.toast = Some(format!("FANZA サイトから {count} 件取得しました"));
+                        this.reload(cx);
+                    }
+                    Err(message) => {
+                        log::error!("sync_fanza failed: {message}");
+                        this.error = Some(message.clone());
+                        if message.contains("not logged in") || message.contains("セッション") {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&OpenAuthProvider {
+                                    provider: crate::views::auth::AuthProvider::Fanza,
+                                })
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// DLsite から本棚を同期する（購入済み一覧 → 画像系のみ bookshelf_items へ保存）。
+    pub fn sync_dlsite(&mut self, cx: &mut Context<Self>) {
+        let logged_in = *AppState::global(cx).dlsite_logged_in.lock();
+        if !logged_in {
+            self.toast = Some("DLsite にログインしてから同期してください".into());
+            cx.defer(move |cx| {
+                cx.dispatch_action(&OpenAuthProvider {
+                    provider: crate::views::auth::AuthProvider::Dlsite,
+                })
+            });
+            cx.notify();
+            return;
+        }
+        log::info!("sync_dlsite: 開始");
+        self.sync_busy += 1;
+        self.error = None;
+        self.toast = Some("DLsite サイトのデータを取得中です".into());
+        let handle = cx.entity();
+        let state = Self::app_state(cx);
+        let session = state.dlsite_session.lock().clone();
+        let db = state.db_pool.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<usize, String> {
+                let session =
+                    session.ok_or_else(|| "DLsite セッションがありません".to_string())?;
+                let mut client =
+                    DlsiteClient::with_transport(Box::new(UreqTransport::new()), session);
+                thundoku_core::dlsite::sync::save_purchases(&db, &mut client)
+                    .map_err(|e| e.to_string())
+            })();
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_window, cx| {
+            let result = loop {
+                match rx.try_recv() {
+                    Ok(result) => break result,
+                    Err(_) => {
+                        handle.update(cx, |_, cx| cx.notify());
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(120))
+                            .await;
+                    }
+                }
+            };
+            handle.update(cx, |this, cx| {
+                this.sync_busy = this.sync_busy.saturating_sub(1);
+                match result {
+                    Ok(count) => {
+                        log::info!("sync_dlsite: 完了（{count} 件）");
+                        this.toast = Some(format!("DLsite サイトから {count} 件取得しました"));
+                        this.reload(cx);
+                    }
+                    Err(message) => {
+                        log::error!("sync_dlsite failed: {message}");
+                        this.error = Some(message.clone());
+                        if message.contains("not logged in") || message.contains("セッション") {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&OpenAuthProvider {
+                                    provider: crate::views::auth::AuthProvider::Dlsite,
+                                })
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 技術書典から本棚を同期する（bookshelf_items upsert）。
     pub fn sync_tbf(&mut self, cx: &mut Context<Self>) {
         let logged_in = *AppState::global(cx).tbf_logged_in.lock();
@@ -1362,6 +1556,8 @@ impl BookshelfView {
         let site_id = item.site_id.clone();
         let tbf_client = state.tbf.clone();
         let booth_session = state.booth_session.lock().clone();
+        let fanza_session = state.fanza_session.lock().clone();
+        let dlsite_session = state.dlsite_session.lock().clone();
         let db = state.db_pool.clone();
         let packs_dir = state.packs_dir.clone();
         let title = item.title.clone();
@@ -1387,11 +1583,85 @@ impl BookshelfView {
                 // - BOOTH: セッション Cookie で downloadables/{id} を GET → 302 の
                 //   Location（署名付き S3 URL）を自動追跡してファイル本体を取得
                 // - 技術書典: GraphQL の downloadURL を resolve して取得
+                let mut genre_tags: Vec<String> = Vec::new();
                 let bytes = if site_id == "booth" {
                     let session =
                         booth_session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
                     let client = BoothClient::new(&session);
                     let url = item.download_url.as_deref().unwrap_or_default().to_string();
+                    let download_tx = progress_tx.clone();
+                    let download_progress_id = product_id.clone();
+                    let mut on_download = move |downloaded: u64, total: u64| {
+                        let fraction = if total > 0 {
+                            downloaded as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let _ = download_tx.send((
+                            download_progress_id.clone(),
+                            DownloadState::Downloading(fraction),
+                        ));
+                    };
+                    client
+                        .download_with_progress(&url, &mut on_download)
+                        .map_err(|e| e.to_string())?
+                } else if site_id == "fanza" {
+                    // FANZA: 一覧では download_url を持たないため、details API で
+                    // download_link を取得してから ZIP をダウンロードする。
+                    let session =
+                        fanza_session.ok_or_else(|| "FANZA セッションがありません".to_string())?;
+                    let mut client =
+                        FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+                    let detail = client.detail(&product_id).map_err(|e| e.to_string())?;
+                    if detail.is_drm {
+                        return Err("DRM 付き作品は取り込めません".to_string());
+                    }
+                    let url = detail
+                        .download_link
+                        .ok_or_else(|| "FANZA ダウンロード URL がありません".to_string())?;
+                    // ジャンルタグ（作品ページから。取得失敗してもダウンロードは続行）
+                    genre_tags = client
+                        .product_page(&product_id)
+                        .map(|p| p.genre_tags)
+                        .unwrap_or_default();
+                    let download_tx = progress_tx.clone();
+                    let download_progress_id = product_id.clone();
+                    let mut on_download = move |downloaded: u64, total: u64| {
+                        let fraction = if total > 0 {
+                            downloaded as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let _ = download_tx.send((
+                            download_progress_id.clone(),
+                            DownloadState::Downloading(fraction),
+                        ));
+                    };
+                    client
+                        .download_with_progress(&url, &mut on_download)
+                        .map_err(|e| e.to_string())?
+                } else if site_id == "dlsite" {
+                    // DLsite: 一覧 sync で保存した down_url（`.../download/=/product_id/{id}.html`）
+                    // から 302 → download.dlsite.com（jwt 署名 Cookie）で ZIP を取得する。
+                    let session = dlsite_session
+                        .ok_or_else(|| "DLsite セッションがありません".to_string())?;
+                    let mut client =
+                        DlsiteClient::with_transport(Box::new(UreqTransport::new()), session);
+                    // 一覧 sync で保存した down_url を優先。無ければ product_info で補う。
+                    let url = match item.download_url.as_deref() {
+                        Some(u) if !u.is_empty() => u.to_string(),
+                        _ => {
+                            let metas = client
+                                .product_info(&[product_id.as_str()])
+                                .map_err(|e| e.to_string())?;
+                            metas
+                                .get(&product_id)
+                                .and_then(|m| m.down_url.clone())
+                                .ok_or_else(|| {
+                                    "DLsite ダウンロード URL がありません".to_string()
+                                })?
+                        }
+                    };
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
@@ -1445,7 +1715,19 @@ impl BookshelfView {
                     drop(client);
                     bytes
                 };
-                let file_name = item_file_name(&title, &item);
+                let mut file_name = item_file_name(&title, &item);
+                // FANZA は ZIP（画像セット）または PDF。ファイル名由来の拡張子
+                // （既定 .pdf）で誤判定して PDF レンダリングするのを防ぐため、
+                // 実バイトのマジックナンバーから拡張子を判定する。
+                if site_id == "fanza" || site_id == "dlsite" {
+                    if let Some(ext) = sniff_extension(&bytes) {
+                        let stem = file_name
+                            .rsplit_once('.')
+                            .map(|(s, _)| s)
+                            .unwrap_or(&file_name);
+                        file_name = format!("{stem}.{ext}");
+                    }
+                }
                 let extension = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
                 let import_tx = progress_tx.clone();
                 let import_progress_id = product_id.clone();
@@ -1480,6 +1762,27 @@ impl BookshelfView {
                         pack_id,
                     })
                 });
+                // 再ダウンロード防止: 同一 (site, product) の既存本（ログイン有無どちらも）
+                // の book_id を再利用する（identity が None＝未ログインでも重複を作らない）。
+                let reuse_book_id: Option<String> = {
+                    let key = db_key.as_ref();
+                    match (google_sub.as_deref(), key) {
+                        (Some(sub), Some(key)) => {
+                            books::resolve_reuse_id(&db, key, &site_id, &product_id, Some(sub))
+                                .ok()
+                                .flatten()
+                        }
+                        _ => books::resolve_reuse_id(
+                            &db,
+                            &[0u8; 32],
+                            &site_id,
+                            &product_id,
+                            None,
+                        )
+                        .ok()
+                        .flatten(),
+                    }
+                };
                 let imported = if extension == "pdf" {
                     // PDF レンダリング（重い）は DB ロック外で行い、UI スレッドの
                     // DB 操作をブロックしないようにする。
@@ -1544,6 +1847,7 @@ impl BookshelfView {
                             &packs_dir,
                             identity.as_ref(),
                             &mut on_import,
+                            reuse_book_id.as_deref(),
                         ),
                         // BOOTH は PDF だけでなく画像ファイル（イラスト等）もある
                         "jpg" | "jpeg" | "png" | "webp" | "gif" => {
@@ -1561,6 +1865,76 @@ impl BookshelfView {
                             let _ = books::set_site_id(&db, &imported.book.id, &site_id);
                         }
                         let _ = books::set_tbf_product_id(&db, &imported.book.id, &product_id);
+                        // FANZA: インポート後にリモートメタ（タイトル/サークル/購入日）を補完する
+                        //（インポートはファイル名由来で作るため空になる）
+                        if site_id == "fanza" {
+                            let _ = books::set_metadata(
+                                &db,
+                                &imported.book.id,
+                                &item.title,
+                                "",
+                                &item.circle_name,
+                                item.caused_at.clone(),
+                            );
+                            // サイトから取得したジャンルタグを book_tags に保存する
+                            if !genre_tags.is_empty() {
+                                let pairs: Vec<(&str, &str)> = genre_tags
+                                    .iter()
+                                    .map(|t| (t.as_str(), "fanza_genre"))
+                                    .collect();
+                                let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
+                                // 本棚アイテムの tags_json にも書く（owned フィルタで
+                                // local が外れてもカードに表示できるように）
+                                let _ = bookshelf::update_tags(
+                                    &db,
+                                    "fanza",
+                                    &product_id,
+                                    &genre_tags,
+                                );
+                            }
+                        }
+                        // DLsite: インポート後に共有メタ列（media_category / ai_type / is_drm /
+                        // release_date / maker_id / age_rating / series_name）とカスタムジャンル
+                        // （tags_json）を books / book_tags へ反映する。
+                        if site_id == "dlsite" {
+                            let _ = books::set_metadata(
+                                &db,
+                                &imported.book.id,
+                                &item.title,
+                                "",
+                                &item.circle_name,
+                                item.caused_at.clone(),
+                            );
+                            let _ = books::set_source_metadata(
+                                &db,
+                                &imported.book.id,
+                                item.media_category.as_deref(),
+                                item.ai_type.as_deref(),
+                                item.is_drm,
+                                item.release_date.as_deref(),
+                                item.description.as_deref(),
+                                item.theme.as_deref(),
+                                item.maker_id.as_deref(),
+                                item.page_count,
+                                item.age_rating.as_deref(),
+                                item.series_name.as_deref(),
+                            );
+                            if let Some(tags_json) = &item.tags_json {
+                                if let Ok(tags) = serde_json::from_str::<Vec<String>>(tags_json) {
+                                    if !tags.is_empty() {
+                                        let pairs: Vec<(&str, &str)> = tags
+                                            .iter()
+                                            .map(|t| (t.as_str(), "dlsite_genre"))
+                                            .collect();
+                                        let _ = db::tags::set_for_book(
+                                            &db,
+                                            &imported.book.id,
+                                            &pairs,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         if imported.document.total_pages > 0 {
                             let _ = progress::upsert(
                                 &db,
@@ -1864,7 +2238,7 @@ impl BookshelfView {
                 db::tags::list_for_book(db, &local_id)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|tag| tag.source == "manual")
+                    .filter(|tag| tag.source == "manual" || tag.source == "fanza_genre" || tag.source == "dlsite_genre")
                     .map(|tag| tag.tag_name)
                     .collect::<Vec<_>>()
             } else {
@@ -1876,15 +2250,67 @@ impl BookshelfView {
                     .unwrap_or_default()
             };
             // Web の tagSuggestions 相当: 後で読む + お気に入りタグ
+            // 編集中の本のサイトでお気に入りタグを絞る（技術書典の本を編集するときに
+            // FANZA のお気に入りタグが出ないように。サイト不明なら全表示）。
             let mut suggestions = vec!["後で読む".to_string()];
-            for tag in db::tags::list_favorites(db).unwrap_or_default() {
-                if !suggestions.contains(&tag) {
+            let favorites = db::tags::list_favorites(db).unwrap_or_default();
+            let book_site: Option<String> = if let Some(local_id) =
+                Self::resolve_local_book_id(db, book_id)
+            {
+                books::get(db, &local_id).ok().flatten().and_then(|b| b.site_id)
+            } else {
+                bookshelf::list_all(db)
+                    .ok()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|i| i.database_id == book_id)
+                    .map(|i| i.site_id)
+            };
+            let allowed: Option<std::collections::HashSet<String>> = book_site.as_deref().map(|site| {
+                let mut set = std::collections::HashSet::new();
+                for item in bookshelf::list_all(db).ok().unwrap_or_default() {
+                    if item.site_id == site {
+                        for t in bookshelf::tags_of(&item) {
+                            set.insert(t);
+                        }
+                    }
+                }
+                for b in books::list(db).ok().unwrap_or_default() {
+                    if b.site_id.as_deref() == Some(site) {
+                        for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
+                            set.insert(t.tag_name);
+                        }
+                    }
+                }
+                set
+            });
+            for tag in favorites {
+                if allowed.as_ref().map_or(true, |s| s.contains(&tag))
+                    && !suggestions.contains(&tag)
+                {
                     suggestions.push(tag);
                 }
             }
             (tags, suggestions)
         };
         self.editing_book_id = Some(book_id.to_string());
+        self.editing_site_id = {
+            let state = Self::app_state(cx);
+            let db = &state.db_pool;
+            if let Some(local_id) = Self::resolve_local_book_id(db, book_id) {
+                books::get(db, &local_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| b.site_id)
+            } else {
+                bookshelf::list_all(db)
+                    .ok()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|item| item.database_id == book_id)
+                    .map(|item| item.site_id.clone())
+            }
+        };
         self.editing_tags = tags.clone();
         self.editing_suggestions = suggestions;
         self.editing_input =
@@ -1944,14 +2370,85 @@ impl BookshelfView {
             if let Some(local_id) = Self::resolve_local_book_id(db, &book_id) {
                 let tag_pairs: Vec<(&str, &str)> =
                     tags.iter().map(|tag| (tag.as_str(), "manual")).collect();
-                let _ = db::tags::set_for_book(db, &local_id, &tag_pairs);
+                let res = db::tags::set_for_book(db, &local_id, &tag_pairs);
+                log::info!(
+                    "save_tag_edit: book_id={book_id} -> local_id={local_id} tags={tags:?} -> set_for_book={res:?}"
+                );
+                // FANZA / DLsite: reload の owned フィルタで local が外れるとカードは
+                // shelf.tags_json を読むため、book_tags に加えて本棚アイテムにも書く。
+                if matches!(self.editing_site_id.as_deref(), Some("fanza") | Some("dlsite")) {
+                    let site = self.editing_site_id.as_deref().unwrap_or("fanza");
+                    let shelf_res = bookshelf::update_tags(db, site, &book_id, &tags);
+                    log::info!(
+                        "save_tag_edit: {site} shelf update_tags book_id={book_id} -> {shelf_res:?}"
+                    );
+                } else {
+                    log::info!(
+                        "save_tag_edit: editing_site_id={:?} (not fanza, no shelf write)",
+                        self.editing_site_id
+                    );
+                }
             } else {
-                let _ = bookshelf::update_tags(db, tbf::SITE_ID_TECHBOOKFEST, &book_id, &tags);
+                log::warn!(
+                    "save_tag_edit: resolve_local_book_id=None book_id={book_id} site={:?} -> shelf update",
+                    self.editing_site_id
+                );
+                let site = self
+                    .editing_site_id
+                    .as_deref()
+                    .unwrap_or(tbf::SITE_ID_TECHBOOKFEST);
+                let _ = bookshelf::update_tags(db, site, &book_id, &tags);
             }
         }
         self.editing_book_id = None;
         self.editing_tags.clear();
         self.reload(cx);
+    }
+
+    /// FANZA のジャンルタグを作品ページから再取得し、未取得のものを編集中タグに追加する。
+    fn refetch_genre_tags(&mut self, cx: &mut Context<Self>) {
+        let Some(book_id) = self.editing_book_id.clone() else {
+            return;
+        };
+        if self.editing_site_id.as_deref() != Some("fanza") {
+            return;
+        }
+        let (cid, session) = {
+            let state = Self::app_state(cx);
+            let db = &state.db_pool;
+            let cid = if let Some(local_id) = Self::resolve_local_book_id(db, &book_id) {
+                books::get(db, &local_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| b.tbf_product_id)
+            } else {
+                Some(book_id.clone())
+            };
+            (cid, state.fanza_session.lock().clone())
+        };
+        let Some(cid) = cid else {
+            return;
+        };
+        let Some(session) = session else {
+            self.toast = Some("FANZA にログインしてください".into());
+            cx.notify();
+            return;
+        };
+        // 1 リクエストなので同期で取得する（非同期にすると保存との競合が起きる）
+        let mut client = FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+        let genre_tags = client
+            .product_page(&cid)
+            .map(|p| p.genre_tags)
+            .unwrap_or_default();
+        let mut added = 0;
+        for tag in genre_tags {
+            if !tag.is_empty() && !self.editing_tags.contains(&tag) {
+                self.editing_tags.push(tag);
+                added += 1;
+            }
+        }
+        self.toast = Some(format!("ジャンルを再取得しました（{added} 件追加）"));
+        cx.notify();
     }
 
     /// タグ編集をキャンセル（Web の handleCancel 相当）。
@@ -2042,7 +2539,7 @@ impl BookshelfView {
         let purchase_date = shelf
             .caused_at
             .as_deref()
-            .map(|d| d.split_whitespace().next().unwrap_or(d).replace('/', "-"));
+            .map(format_purchase_date);
         let database_id = shelf.database_id.clone();
         let cover = card.cover.clone().or_else(|| {
             if card.cover_fetch_failed {
@@ -2067,12 +2564,21 @@ impl BookshelfView {
         let _ = window;
 
         // -- 表紙: 画像 + 未読/既読バッジ + ダウンロード状態アイコン + 進捗リング --
-        // 画像は枠（144x192）に必ず収まるよう overflow-hidden のラッパーで包む
-        // （オーバーレイ・アイコンは枠基準で配置されるため、はみ出しによるズレを防ぐ）。
+        // 枠の高さを画像のアスペクト比に合わせる（自然比率を保つ＝クロップ/レターボックスなし）。
+        // バッジ（未読/♡/↓）は枠=画像に乗る。FANZA は横長（4:3）サムネ等のため枠高さが変わる。
+        let cover_h: f32 = match &cover {
+            Some(render) => {
+                let size = render.size(0);
+                let w = size.width.0 as f32;
+                let h = size.height.0 as f32;
+                (144.0 * (h / w.max(1.0))).clamp(80.0, 420.0)
+            }
+            None => 192.0,
+        };
         let image: gpui_kit::AnyElement = match &cover {
             Some(render) => div()
                 .w(px(144.0))
-                .h(px(192.0))
+                .h(px(cover_h))
                 .overflow_hidden()
                 .child(
                     img(render.clone())
@@ -2083,7 +2589,7 @@ impl BookshelfView {
                 .into_any_element(),
             None => div()
                 .w(px(144.0))
-                .h(px(192.0))
+                .h(px(cover_h))
                 .bg(theme.muted)
                 .into_any_element(),
         };
@@ -2091,7 +2597,7 @@ impl BookshelfView {
         let mut cover_el = div()
             .relative()
             .w(px(144.0))
-            .h(px(192.0))
+            .h(px(cover_h))
             .child(image)
             // 左上: 未読/既読バッジ（Web の statusText と同じ）
             .child(if is_read {
@@ -2320,7 +2826,7 @@ impl BookshelfView {
                     // Web の formatEventLabel と同じ: イベント不明のときは
                     // 「イベント不明」を表示
                     .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
-                        ("booth", Some(date)) => format!("購入日: {date}"),
+                        ("booth", Some(date)) | ("fanza", Some(date)) | ("dlsite", Some(date)) => format!("購入日: {date}"),
                         _ => event_text.clone(),
                     }),
             )
@@ -2362,6 +2868,7 @@ impl BookshelfView {
                 editing_tags,
                 editing_suggestions,
                 editing_input.expect("editing input"),
+                card.shelf.site_id == "fanza",
             )
             .into_any_element()
         } else {
@@ -2515,6 +3022,7 @@ impl BookshelfView {
         editing_tags: &[String],
         editing_suggestions: &[String],
         editing_input: &gpui_kit::Entity<InputState>,
+        show_refetch: bool,
     ) -> impl IntoElement {
         let handle = handle.clone();
         let tags = editing_tags.to_vec();
@@ -2636,6 +3144,28 @@ impl BookshelfView {
                                         }),
                                 ),
                             )
+                            // FANZA: ジャンルタグをサイトから再取得（未取得分を追加）。
+                            // 保存ボタンの右に配置する。
+                            .when(show_refetch, |this| {
+                                this.child(
+                                    div().debug_selector(|| "tag-edit-refetch-btn".into()).child(
+                                        Button::new("tag-edit-refetch")
+                                            .cursor_pointer()
+                                            .outline()
+                                            .label("再取得")
+                                            .cursor_pointer()
+                                            .on_click({
+                                                let handle = handle.clone();
+                                                move |_, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    handle.update(cx, |this, cx| {
+                                                        this.refetch_genre_tags(cx);
+                                                    });
+                                                }
+                                            }),
+                                    ),
+                                )
+                            })
                             .child(
                                 div().debug_selector(|| "tag-edit-cancel-btn".into()).child(
                                     Button::new("tag-edit-cancel")
@@ -2768,6 +3298,10 @@ impl BookshelfView {
             .clone()
             .map(|name| format_event_label(&name));
         let event_text = event.unwrap_or_else(|| "イベント不明".to_string());
+        let purchase_date = shelf
+            .caused_at
+            .as_deref()
+            .map(format_purchase_date);
         let database_id = shelf.database_id.clone();
         let cover = card.cover.clone().or_else(|| {
             if card.cover_fetch_failed {
@@ -2964,7 +3498,12 @@ impl BookshelfView {
                         .text_color(cx.theme().muted_foreground)
                         // Web の formatEventLabel と同じ: イベント不明のときは
                         // 「イベント不明」を表示
-                        .child(event_text.clone()),
+                        .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
+                            ("booth", Some(date)) | ("fanza", Some(date)) | ("dlsite", Some(date)) => {
+                                format!("購入日: {date}")
+                            }
+                            _ => event_text.clone(),
+                        }),
                 )
                 // サークル名（非空のときだけ表示）
                 .child(if !circle_name.is_empty() {
@@ -3003,6 +3542,7 @@ impl BookshelfView {
                             &self.editing_tags,
                             &self.editing_suggestions,
                             &self.editing_input.clone().expect("editing input"),
+                            self.editing_site_id.as_deref() == Some("fanza"),
                         )
                         .into_any_element()
                     } else {
@@ -3134,7 +3674,35 @@ impl Render for BookshelfView {
         let tag_fetch_enabled = self.tag_fetch_enabled;
         let available_events = self.available_events.clone();
         let selected_events = self.selected_events.clone();
-        let favorite_tags = self.favorite_tags.clone();
+        let favorite_tags = {
+            let favs = self.favorite_tags.clone();
+            match self.site_filter.as_deref() {
+                // サイト選択中はそのサイトのタグでお気に入りタグフィルタを絞る
+                Some(site) => {
+                    let state = Self::app_state(cx);
+                    let db = &state.db_pool;
+                    let mut site_tags = std::collections::HashSet::new();
+                    for item in bookshelf::list_all(db).ok().unwrap_or_default() {
+                        if item.site_id == site {
+                            for t in bookshelf::tags_of(&item) {
+                                site_tags.insert(t);
+                            }
+                        }
+                    }
+                    for b in books::list(db).ok().unwrap_or_default() {
+                        if b.site_id.as_deref() == Some(site) {
+                            for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
+                                site_tags.insert(t.tag_name);
+                            }
+                        }
+                    }
+                    favs.into_iter()
+                        .filter(|t| site_tags.contains(t))
+                        .collect::<Vec<_>>()
+                }
+                None => favs,
+            }
+        };
         let search_state = self.search_state.clone().expect("search state");
         // Popover の content クロージャは 'static なのでテーマ色を先にコピーする
         let theme_border = cx.theme().border;
@@ -3172,6 +3740,8 @@ impl Render for BookshelfView {
                 let (site_title, site_subtitle) = match self.site_filter.as_deref() {
                     Some("booth") => ("BOOTH", "BOOTH の本棚"),
                     Some("techbookfest") => ("技術書典", "TechBookFest の本棚"),
+                    Some("fanza") => ("FANZA同人", "FANZA同人の本棚"),
+                    Some("dlsite") => ("DLsite", "DLsite の本棚"),
                     _ => ("すべての本", "すべてのサイトの本棚"),
         };
                 div()
@@ -3817,8 +4387,8 @@ fn resize_for_cache(data: &[u8], max_width: u32) -> Option<Vec<u8>> {
 }
 
 /// 画像を縮小（最大幅 max_width px）して BGRA の RenderImage に変換する。
-/// カード枠（144x192 = 0.75）に合わせて中央クロップするので、UI 側で
-/// ストレッチしても縦長・横長にならない。
+/// 元画像のアスペクト比を保つ（クロップしない）。カード側で object_fit(Contain) により
+/// はみ出さず比率のまま表示する（FANZA 等はサムネの比率がバラバラのため）。
 fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
     let decoded = image::load_from_memory(data).ok()?;
     let (w, h) = (decoded.width(), decoded.height());
@@ -3830,23 +4400,7 @@ fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
     } else {
         decoded
     };
-    // カード枠（144x192 = 0.75）に合わせて中央クロップする
-    let (cw, ch) = (resized.width(), resized.height());
-    let target_ratio = 144.0f32 / 192.0f32; // 0.75
-    let current_ratio = cw as f32 / ch as f32;
-    let (crop_x, crop_y, crop_w, crop_h) = if current_ratio > target_ratio {
-        // 横長 → 縦を切り取る
-        let new_h = (cw as f32 / target_ratio).round() as u32;
-        let new_h = new_h.min(ch);
-        (0, (ch - new_h) / 2, cw, new_h)
-    } else {
-        // 縦長 → 横を切り取る
-        let new_w = (ch as f32 * target_ratio).round() as u32;
-        let new_w = new_w.min(cw);
-        ((cw - new_w) / 2, 0, new_w, ch)
-    };
-    let cropped = image::imageops::crop_imm(&resized, crop_x, crop_y, crop_w, crop_h).to_image();
-    let mut rgba = cropped;
+    let mut rgba = resized.into_rgba8();
     // RenderImage は BGRA を期待するため R/B を入れ替える
     for pixel in rgba.pixels_mut() {
         pixel.0.swap(0, 2);
@@ -4009,6 +4563,52 @@ fn item_file_name(title: &str, item: &bookshelf::BookshelfItem) -> String {
     }
 }
 
+/// 購入日を `YYYY/MM/DD` に正規化する（"2026年09月03日" / "2026-08-25 00:00:00" 対応）。
+fn format_purchase_date(raw: &str) -> String {
+    let s = raw.trim();
+    if s.contains('年') {
+        let y = s.split('年').next().unwrap_or("");
+        let m = s.split('年').nth(1).and_then(|p| p.split('月').next()).unwrap_or("");
+        let d = s
+            .split('月')
+            .nth(1)
+            .and_then(|p| p.split('日').next())
+            .unwrap_or("");
+        let m = m.trim();
+        let d = d.trim();
+        if !y.is_empty() && !m.is_empty() && !d.is_empty() {
+            return format!("{y}/{m:0>2}/{d:0>2}");
+        }
+    }
+    let date_part = s.split_whitespace().next().unwrap_or(s);
+    date_part.replace('-', "/")
+}
+
+/// ダウンロードしたバイト列のマジックナンバーから拡張子を推定する。
+/// FANZA はファイル名由来の拡張子（既定 `.pdf`）が実際と異なることがあるため使う
+/// （画像セット ZIP が PDF として誤レンダリングされるのを防ぐ）。
+fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"PK\x03\x04") {
+        return Some("zip");
+    }
+    if bytes.starts_with(b"%PDF") {
+        return Some("pdf");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(b"\x89PNG") {
+        return Some("png");
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some("gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use gpui_kit::AppContext as _;
@@ -4017,6 +4617,16 @@ mod tests {
     use thundoku_core::db::{books, progress};
 
     use super::*;
+
+    #[test]
+    fn sniff_extension_detects_zip_and_pdf() {
+        assert_eq!(sniff_extension(b"PK\x03\x04zipdata"), Some("zip"));
+        assert_eq!(sniff_extension(b"%PDF-1.7"), Some("pdf"));
+        assert_eq!(sniff_extension(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(sniff_extension(b"\x89PNG\r\n\x1a\n"), Some("png"));
+        assert_eq!(sniff_extension(b"RIFFxxxxWEBP"), Some("webp"));
+        assert_eq!(sniff_extension(b"not a file"), None);
+    }
 
     fn seed_book(cx: &mut TestAppContext, id: &str, title: &str, circle: &str) {
         cx.update(|cx| {
@@ -4042,6 +4652,16 @@ mod tests {
                     is_hidden: 0,
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
                 },
             )
             .unwrap();
@@ -4086,6 +4706,16 @@ mod tests {
                     synced_at: "2026-08-21 00:00:00".into(),
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
                 },
             )
             .unwrap();
@@ -4130,6 +4760,16 @@ mod tests {
                     synced_at: "2026-08-21 00:00:00".into(),
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
                 },
             )
             .unwrap();
@@ -4227,6 +4867,16 @@ mod tests {
                         synced_at: "2026-08-21 00:00:00".into(),
                         created_at: "2026-08-21 00:00:00".into(),
                         updated_at: "2026-08-21 00:00:00".into(),
+                        media_category: None,
+                        ai_type: None,
+                        is_drm: 0,
+                        release_date: None,
+                        description: None,
+                        theme: None,
+                        maker_id: None,
+                        page_count: None,
+                        age_rating: None,
+                        series_name: None,
                     },
                 )
                 .unwrap();
@@ -4898,6 +5548,16 @@ mod tests {
                     synced_at: "2026-08-21 00:00:00".into(),
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
                 },
             )
             .unwrap();
@@ -5019,6 +5679,16 @@ mod tests {
                     synced_at: "2026-08-21 00:00:00".into(),
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
                 },
             )
             .unwrap();
@@ -5228,6 +5898,16 @@ mod tests {
                     is_hidden: 0,
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-23 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
                 },
             )
             .unwrap();
@@ -5298,20 +5978,10 @@ mod tests {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         let view = cx.new(BookshelfView::new);
-        // デフォルトは OFF
-        assert!(!view.read_with(cx, |this, _| this.tag_fetch_enabled));
-
-        // ON にすると app_settings に永続化される
-        cx.update(|cx| view.update(cx, |this, cx| this.toggle_tag_fetch(cx)));
+        // デフォルトは ON（FANZA 対応で変更）
         assert!(view.read_with(cx, |this, _| this.tag_fetch_enabled));
-        let stored = cx.update(|cx| {
-            let state = AppState::global(cx);
-            let db = &state.db_pool;
-            db::settings::get(db, "tag.fetch.enabled").ok().flatten()
-        });
-        assert_eq!(stored.as_deref(), Some("true"));
 
-        // 再トグルで OFF に戻り設定も更新される
+        // トグルで OFF になり app_settings に永続化される
         cx.update(|cx| view.update(cx, |this, cx| this.toggle_tag_fetch(cx)));
         assert!(!view.read_with(cx, |this, _| this.tag_fetch_enabled));
         let stored = cx.update(|cx| {
@@ -5320,6 +5990,16 @@ mod tests {
             db::settings::get(db, "tag.fetch.enabled").ok().flatten()
         });
         assert_eq!(stored.as_deref(), Some("false"));
+
+        // 再トグルで ON に戻り設定も更新される
+        cx.update(|cx| view.update(cx, |this, cx| this.toggle_tag_fetch(cx)));
+        assert!(view.read_with(cx, |this, _| this.tag_fetch_enabled));
+        let stored = cx.update(|cx| {
+            let state = AppState::global(cx);
+            let db = &state.db_pool;
+            db::settings::get(db, "tag.fetch.enabled").ok().flatten()
+        });
+        assert_eq!(stored.as_deref(), Some("true"));
     }
 
     #[gpui_kit::test]

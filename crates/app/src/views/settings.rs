@@ -57,6 +57,14 @@ pub struct SettingsView {
     booth_viewer_mode: String,
     /// BOOTH サイトのページめくり方向
     booth_page_turn: String,
+    /// FANZA同人サイトのビューアー表示モード（viewer.mode.fanza と同期）
+    fanza_viewer_mode: String,
+    /// FANZA同人サイトのページめくり方向
+    fanza_page_turn: String,
+    /// DLsite サイトのビューアー表示モード（viewer.mode.dlsite と同期）
+    dlsite_viewer_mode: String,
+    /// DLsite サイトのページめくり方向
+    dlsite_page_turn: String,
     /// データベース情報: 未読/読書中/読了 の冊数
     status_counts: (usize, usize, usize),
     /// プロフィール再取得中フラグ（設定画面表示時のログイン状態チェック）
@@ -99,6 +107,20 @@ impl SettingsView {
                 .unwrap_or_else(|| "single".into()),
             booth_page_turn: Self::read_setting(cx, "viewer.page_turn.booth")
                 .unwrap_or_else(|| "left-to-right".into()),
+            // FANZA は既定で見開き + 右綴じ（サイト設定が無ければ）。
+            fanza_viewer_mode: Self::read_setting(cx, "viewer.mode.fanza")
+                .or_else(|| Self::read_setting(cx, "viewer.mode"))
+                .unwrap_or_else(|| "spread".into()),
+            fanza_page_turn: Self::read_setting(cx, "viewer.page_turn.fanza")
+                .or_else(|| Self::read_setting(cx, "viewer.page_turn"))
+                .unwrap_or_else(|| "right-to-left".into()),
+            // DLsite も同人漫画のため既定で見開き + 右綴じ。
+            dlsite_viewer_mode: Self::read_setting(cx, "viewer.mode.dlsite")
+                .or_else(|| Self::read_setting(cx, "viewer.mode"))
+                .unwrap_or_else(|| "spread".into()),
+            dlsite_page_turn: Self::read_setting(cx, "viewer.page_turn.dlsite")
+                .or_else(|| Self::read_setting(cx, "viewer.page_turn"))
+                .unwrap_or_else(|| "right-to-left".into()),
             status_counts: (0, 0, 0),
             profile_fetching: false,
             book_count: 0,
@@ -184,6 +206,34 @@ impl SettingsView {
     pub fn set_booth_page_turn(&mut self, cx: &mut Context<Self>, direction: &str) {
         self.booth_page_turn = direction.to_string();
         Self::write_setting(cx, "viewer.page_turn.booth", direction);
+        cx.notify();
+    }
+
+    /// FANZA同人サイトの表示モードを保存。
+    pub fn set_fanza_viewer_mode(&mut self, cx: &mut Context<Self>, mode: &str) {
+        self.fanza_viewer_mode = mode.to_string();
+        Self::write_setting(cx, "viewer.mode.fanza", mode);
+        cx.notify();
+    }
+
+    /// FANZA同人サイトのページめくり方向を保存。
+    pub fn set_fanza_page_turn(&mut self, cx: &mut Context<Self>, direction: &str) {
+        self.fanza_page_turn = direction.to_string();
+        Self::write_setting(cx, "viewer.page_turn.fanza", direction);
+        cx.notify();
+    }
+
+    /// DLsite サイトの表示モードを保存。
+    pub fn set_dlsite_viewer_mode(&mut self, cx: &mut Context<Self>, mode: &str) {
+        self.dlsite_viewer_mode = mode.to_string();
+        Self::write_setting(cx, "viewer.mode.dlsite", mode);
+        cx.notify();
+    }
+
+    /// DLsite サイトのページめくり方向を保存。
+    pub fn set_dlsite_page_turn(&mut self, cx: &mut Context<Self>, direction: &str) {
+        self.dlsite_page_turn = direction.to_string();
+        Self::write_setting(cx, "viewer.page_turn.dlsite", direction);
         cx.notify();
     }
 
@@ -542,6 +592,40 @@ impl SettingsView {
                 cx,
             );
         }
+        cx.notify();
+    }
+
+    pub fn logout_fanza(&mut self, cx: &mut Context<Self>) {
+        let t = std::time::Instant::now();
+        {
+            let state = AppState::global(cx);
+            *state.fanza_session.lock() = None;
+            *state.fanza_logged_in.lock() = false;
+            let db = state.db_pool.clone();
+            cx.background_spawn(async move {
+                let _ = db::settings::delete(&db, "fanza.session");
+            })
+            .detach();
+        }
+        log::info!("logout_fanza: cleared ({:?})", t.elapsed());
+        self.show_toast("FANZA からログアウトしました", cx);
+        cx.notify();
+    }
+
+    pub fn logout_dlsite(&mut self, cx: &mut Context<Self>) {
+        let t = std::time::Instant::now();
+        {
+            let state = AppState::global(cx);
+            *state.dlsite_session.lock() = None;
+            *state.dlsite_logged_in.lock() = false;
+            let db = state.db_pool.clone();
+            cx.background_spawn(async move {
+                let _ = db::settings::delete(&db, "dlsite.session");
+            })
+            .detach();
+        }
+        log::info!("logout_dlsite: cleared ({:?})", t.elapsed());
+        self.show_toast("DLsite からログアウトしました", cx);
         cx.notify();
     }
 
@@ -919,6 +1003,10 @@ impl SettingsView {
                                                 .update(cx, |this, cx| {
                                                     if site_id == "booth" {
                                                         this.set_booth_viewer_mode(cx, &value);
+                                                    } else if site_id == "fanza" {
+                                                        this.set_fanza_viewer_mode(cx, &value);
+                                                    } else if site_id == "dlsite" {
+                                                        this.set_dlsite_viewer_mode(cx, &value);
                                                     } else {
                                                         this.set_viewer_mode(cx, &value);
                                                     }
@@ -986,6 +1074,10 @@ impl SettingsView {
                                                     .update(cx, |this, cx| {
                                                         if site_id == "booth" {
                                                             this.set_booth_page_turn(cx, &value);
+                                                        } else if site_id == "fanza" {
+                                                            this.set_fanza_page_turn(cx, &value);
+                                                        } else if site_id == "dlsite" {
+                                                            this.set_dlsite_page_turn(cx, &value);
                                                         } else {
                                                             this.set_page_turn(cx, &value);
                                                         }
@@ -1109,6 +1201,10 @@ impl Render for SettingsView {
         let tbf_page_turn = self.tbf_page_turn.clone();
         let booth_viewer_mode = self.booth_viewer_mode.clone();
         let booth_page_turn = self.booth_page_turn.clone();
+        let fanza_viewer_mode = self.fanza_viewer_mode.clone();
+        let fanza_page_turn = self.fanza_page_turn.clone();
+        let dlsite_viewer_mode = self.dlsite_viewer_mode.clone();
+        let dlsite_page_turn = self.dlsite_page_turn.clone();
         let status_counts = self.status_counts;
         let last_synced_at = Self::read_setting(cx, "api.last_sync_at");
         let handle = cx.entity();
@@ -1131,6 +1227,22 @@ impl Render for SettingsView {
             "BOOTH サイトの設定",
             booth_viewer_mode,
             booth_page_turn,
+        );
+        let fanza_viewer_settings = self.site_viewer_settings_card(
+            cx,
+            "fanza",
+            "FANZA同人サイト設定",
+            "FANZA同人サイトの設定",
+            fanza_viewer_mode,
+            fanza_page_turn,
+        );
+        let dlsite_viewer_settings = self.site_viewer_settings_card(
+            cx,
+            "dlsite",
+            "DLsite サイト設定",
+            "DLsite サイトの設定",
+            dlsite_viewer_mode,
+            dlsite_page_turn,
         );
 
         let storage_settings = self.settings_card(
@@ -1746,6 +1858,8 @@ impl Render for SettingsView {
                     .child(account_settings)
                     .child(viewer_settings)
                     .child(booth_viewer_settings)
+                    .child(fanza_viewer_settings)
+                    .child(dlsite_viewer_settings)
                     // データ設定（Web のセクション見出し）
                     .child(
                         div()
@@ -2198,6 +2312,16 @@ mod tests {
                     is_hidden: 0,
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
                 },
             )
             .unwrap();

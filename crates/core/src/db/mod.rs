@@ -56,6 +56,30 @@ pub fn connect(path: &Path) -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
+/// 開発中のためマイグレーションファイルは作らず、既存の runtime DDL（hidden_at /
+/// owner_sub 等）と同様に PRAGMA で列の有無を確認してから `ALTER TABLE ... ADD COLUMN` で
+/// 冪等に列を追加する。
+async fn ensure_column(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), sqlx::Error> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(&mut *conn)
+    .await?;
+    if exists == 0 {
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Apply pending migrations. Idempotent; tracked in the `_sqlx_migrations`
 /// table (independent of the legacy `user_version` marker).
 pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -149,6 +173,41 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         // 冪等に適用する。1 冊 × 1 ページの累計表示回数・累計滞在秒数を持つ集計表）
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS page_views (               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               page_number INTEGER NOT NULL,               view_count INTEGER NOT NULL DEFAULT 0,               total_seconds REAL NOT NULL DEFAULT 0,               last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               PRIMARY KEY (book_id, page_number)             );             CREATE INDEX IF NOT EXISTS idx_page_views_book ON page_views(book_id)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        // 共有ソースメタ列（FANZA同人 / DLsite）。開発中のためマイグレーションファイルは
+        // 作らず、既存 runtime DDL（hidden_at / owner_sub 等）と同様に冪等に適用する。
+        {
+            let cols = [
+                "media_category TEXT",
+                "ai_type TEXT",
+                "is_drm INTEGER NOT NULL DEFAULT 0",
+                "release_date TEXT",
+                "description TEXT",
+                "theme TEXT",
+                "maker_id TEXT",
+                "page_count INTEGER",
+                "age_rating TEXT",
+                "series_name TEXT",
+            ];
+            for table in ["bookshelf_items", "books"] {
+                for def in cols {
+                    let col = def.split_whitespace().next().unwrap();
+                    ensure_column(&mut *conn, table, col, def).await?;
+                }
+            }
+        }
+        // FANZA同人 / DLsite の sites 行（冪等）。
+        sqlx::query(
+            "INSERT OR IGNORE INTO sites (id, name, url, display_order, is_visible) \
+             VALUES ('fanza', 'FANZA同人', 'https://www.dmm.co.jp/dc/doujin/', 2, 1)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO sites (id, name, url, display_order, is_visible) \
+             VALUES ('dlsite', 'DLsite', 'https://www.dlsite.com/', 3, 1)",
         )
         .execute(&mut *conn)
         .await?;

@@ -9,6 +9,8 @@ use gpui_kit::ReadGlobal as _;
 use gpui_kit::{App, Bounds, Global, Point, Size, Window, WindowBounds, px};
 use parking_lot::Mutex;
 use thundoku_core::booth::BoothSession;
+use thundoku_core::dlsite::client::DlsiteSession;
+use thundoku_core::fanza::client::FanzaSession;
 use thundoku_core::db;
 use thundoku_core::google::{GoogleClient, GoogleProfile};
 use thundoku_core::secrets::SecretStore;
@@ -49,6 +51,12 @@ pub struct AppState {
     /// BOOTH（booth.pm）のセッション Cookie
     pub booth_session: Arc<Mutex<Option<BoothSession>>>,
     pub booth_logged_in: Arc<Mutex<bool>>,
+    /// FANZA同人（www.dmm.co.jp/dc/doujin）のセッション Cookie
+    pub fanza_session: Arc<Mutex<Option<FanzaSession>>>,
+    pub fanza_logged_in: Arc<Mutex<bool>>,
+    /// DLsite（www.dlsite.com）のセッション Cookie
+    pub dlsite_session: Arc<Mutex<Option<DlsiteSession>>>,
+    pub dlsite_logged_in: Arc<Mutex<bool>>,
     /// アプリ全体のトーストメッセージ（workspace が表示する）
     pub toast_message: Arc<Mutex<Option<String>>>,
     /// トーストの世代（新メッセージごとに増える。タイマー再起動用）
@@ -201,6 +209,24 @@ impl AppState {
             }
         );
 
+        // FANZA同人セッションも DB（app_settings）から復元する（BOOTH と同様、
+        // Cookie が巨大で keyring 上限を超えるため DB 保存）。
+        let fanza_session = db::settings::get(&db_pool, "fanza.session")
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .filter(|session: &FanzaSession| session.logged_in());
+        let fanza_logged_in = fanza_session.is_some();
+
+        // DLsite セッションも DB（app_settings）から復元する（FANZA と同様、
+        // Cookie が巨大で keyring 上限を超えるため DB 保存）。
+        let dlsite_session = db::settings::get(&db_pool, "dlsite.session")
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .filter(|session: &DlsiteSession| session.logged_in());
+        let dlsite_logged_in = dlsite_session.is_some();
+
         cx.set_global(Self {
             data_dir,
             packs_dir,
@@ -215,6 +241,10 @@ impl AppState {
             tbf_logged_in: Arc::new(Mutex::new(tbf_logged_in)),
             booth_session: Arc::new(Mutex::new(booth_session)),
             booth_logged_in: Arc::new(Mutex::new(booth_logged_in)),
+            fanza_session: Arc::new(Mutex::new(fanza_session)),
+            fanza_logged_in: Arc::new(Mutex::new(fanza_logged_in)),
+            dlsite_session: Arc::new(Mutex::new(dlsite_session)),
+            dlsite_logged_in: Arc::new(Mutex::new(dlsite_logged_in)),
             toast_message: Arc::new(Mutex::new(None)),
             toast_generation: Arc::new(Mutex::new(0)),
             workspace: Arc::new(Mutex::new(None)),
@@ -269,6 +299,10 @@ impl AppState {
             tbf_logged_in: Arc::new(Mutex::new(false)),
             booth_session: Arc::new(Mutex::new(None)),
             booth_logged_in: Arc::new(Mutex::new(false)),
+            fanza_session: Arc::new(Mutex::new(None)),
+            fanza_logged_in: Arc::new(Mutex::new(false)),
+            dlsite_session: Arc::new(Mutex::new(None)),
+            dlsite_logged_in: Arc::new(Mutex::new(false)),
             toast_message: Arc::new(Mutex::new(None)),
             toast_generation: Arc::new(Mutex::new(0)),
             workspace: Arc::new(Mutex::new(None)),
@@ -356,6 +390,46 @@ pub fn clear_booth_session(cx: &App) {
     let _ = db::settings::delete(&state.db_pool, "booth.session");
     *state.booth_session.lock() = None;
     *state.booth_logged_in.lock() = false;
+}
+
+/// FANZA同人 のセッションを DB（app_settings）に永続化し、グローバル状態を更新する。
+/// BOOTH と同様、セッション Cookie は keyring 上限を超えるため DB に保存する。
+pub fn save_fanza_session(cx: &App, session: &FanzaSession) {
+    let state = AppState::global(cx);
+    let logged_in = session.logged_in();
+    if let Ok(json) = serde_json::to_string(session) {
+        let _ = db::settings::set(&state.db_pool, "fanza.session", &json);
+    }
+    *state.fanza_session.lock() = Some(session.clone());
+    *state.fanza_logged_in.lock() = logged_in;
+}
+
+/// FANZA同人 のセッションを破棄する（ログアウト）。
+pub fn clear_fanza_session(cx: &App) {
+    let state = AppState::global(cx);
+    let _ = db::settings::delete(&state.db_pool, "fanza.session");
+    *state.fanza_session.lock() = None;
+    *state.fanza_logged_in.lock() = false;
+}
+
+/// DLsite のセッションを DB（app_settings）に永続化し、グローバル状態を更新する。
+/// BOOTH/FANZA と同様、セッション Cookie は keyring 上限を超えるため DB に保存する。
+pub fn save_dlsite_session(cx: &App, session: &DlsiteSession) {
+    let state = AppState::global(cx);
+    let logged_in = session.logged_in();
+    if let Ok(json) = serde_json::to_string(session) {
+        let _ = db::settings::set(&state.db_pool, "dlsite.session", &json);
+    }
+    *state.dlsite_session.lock() = Some(session.clone());
+    *state.dlsite_logged_in.lock() = logged_in;
+}
+
+/// DLsite のセッションを破棄する（ログアウト）。
+pub fn clear_dlsite_session(cx: &App) {
+    let state = AppState::global(cx);
+    let _ = db::settings::delete(&state.db_pool, "dlsite.session");
+    *state.dlsite_session.lock() = None;
+    *state.dlsite_logged_in.lock() = false;
 }
 
 /// 保存済みのウィンドウ状態（最大化/通常/フルスクリーン + 復元 size）の DB キー。

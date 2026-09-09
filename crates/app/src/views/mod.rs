@@ -3,6 +3,8 @@ pub mod auth;
 pub mod bookshelf;
 pub mod booth_login;
 pub mod checklist;
+pub mod dlsite_login;
+pub mod fanza_login;
 pub mod google_login;
 pub mod reader;
 pub mod settings;

@@ -73,7 +73,7 @@ fn migrate_is_idempotent() {
             .await
     })
     .unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 4);
 }
 
 #[test]
@@ -118,6 +118,16 @@ fn book_insert_get_list_delete() {
         is_hidden: 0,
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     books::insert(&pool, &book).unwrap();
     let loaded = books::get(&pool, "book-1").unwrap().unwrap();
@@ -149,6 +159,16 @@ fn set_tbf_product_id_links_downloaded_book_to_shelf() {
         is_hidden: 0,
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     books::insert(&pool, &book).unwrap();
     // ダウンロード完了後に bookshelf_items.database_id との対応を付ける
@@ -180,6 +200,16 @@ fn owner_sub_roundtrip() {
         is_hidden: 0,
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     books::insert(&pool, &book).unwrap();
     // 初期状態は NULL（未所属）
@@ -222,6 +252,16 @@ fn resolve_reuse_id_returns_owned_match_only() {
         is_hidden: 0,
         created_at: "2026-01-01 00:00:00".into(),
         updated_at: "2026-01-01 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     // book-1: sub-A に所属(暗号化済み) / book-2: 未所属(NULL)
     books::insert(&pool, &mk("book-1")).unwrap();
@@ -271,6 +311,16 @@ fn owned_book_ids_filters_by_owner() {
         is_hidden: 0,
         created_at: "2026-01-01 00:00:00".into(),
         updated_at: "2026-01-01 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     // book-1: A 所属 / book-2: 未所属(NULL) / book-3: B 所属
     books::insert(&pool, &mk("book-1")).unwrap();
@@ -320,6 +370,16 @@ fn clear_owner_model_first_run_wipes_and_sets_flag() {
         is_hidden: 0,
         created_at: "2026-01-01 00:00:00".into(),
         updated_at: "2026-01-01 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     books::insert(&pool, &book).unwrap();
     // 初回 → クリア & フラグセット
@@ -363,6 +423,16 @@ fn bookshelf_upsert_replaces_existing_row() {
         synced_at: "2026-08-21 00:00:00".into(),
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     bookshelf::upsert(&pool, &item("古いタイトル")).unwrap();
     bookshelf::upsert(&pool, &item("新しいタイトル")).unwrap();
@@ -401,6 +471,16 @@ fn bookshelf_upsert_preserves_author() {
         synced_at: "2026-08-21 00:00:00".into(),
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     // BOOTH は shop = 作成者名を author に格納する
     bookshelf::upsert(&pool, &item("YORIMIYA STUDIO", "booth", "b-1")).unwrap();
@@ -441,6 +521,16 @@ fn bookshelf_list_orders_by_caused_at_desc() {
         synced_at: "2026-08-21 00:00:00".into(),
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     bookshelf::upsert(&pool, &item("古い", Some("2026-01-01 00:00:00"), "db-1")).unwrap();
     bookshelf::upsert(&pool, &item("新しい", Some("2026-06-01 00:00:00"), "db-2")).unwrap();
@@ -480,6 +570,16 @@ fn bookshelf_list_all_returns_every_site() {
         synced_at: "2026-08-21 00:00:00".into(),
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     bookshelf::upsert(&pool, &tbf).unwrap();
     tbf.site_id = "booth".into();
@@ -532,6 +632,16 @@ fn bookshelf_update_tags_writes_tags_json() {
         synced_at: "2026-08-21 00:00:00".into(),
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     bookshelf::upsert(&pool, &item).unwrap();
     bookshelf::update_tags(
@@ -624,6 +734,16 @@ fn reading_progress_roundtrip() {
         is_hidden: 0,
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     books::insert(&pool, &book).unwrap();
     let progress = progress::ReadingProgress {
@@ -660,6 +780,16 @@ fn tags_set_list_and_favorites() {
         is_hidden: 0,
         created_at: "2026-08-21 00:00:00".into(),
         updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     books::insert(&pool, &book).unwrap();
     tags::set_for_book(
@@ -705,4 +835,148 @@ fn drive_sync_state_crud() {
     assert_eq!(list.len(), 1);
     sync_state::delete(&pool, "pack-1").unwrap();
     assert!(sync_state::get(&pool, "pack-1").unwrap().is_none());
+}
+
+fn column_exists(pool: &thundoku_core::db::SqlitePool, table: &str, column: &str) -> bool {
+    thundoku_core::db::block_on(async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+    })
+    .unwrap()
+        > 0
+}
+
+// FANZA同人 / DLsite の共有メタ列（media_category / ai_type / is_drm / release_date /
+// description / theme / maker_id / page_count / age_rating / series_name）がマイグレーションで
+// 追加されること、および両ソースの sites 行が存在することを検証する。
+#[test]
+fn source_metadata_columns_and_sites_exist() {
+    let pool = memory_db();
+    let cols = [
+        "media_category",
+        "ai_type",
+        "is_drm",
+        "release_date",
+        "description",
+        "theme",
+        "maker_id",
+        "page_count",
+        "age_rating",
+        "series_name",
+    ];
+    for c in cols {
+        assert!(
+            column_exists(&pool, "bookshelf_items", c),
+            "bookshelf_items.{c} is missing"
+        );
+        assert!(column_exists(&pool, "books", c), "books.{c} is missing");
+    }
+    let sites: Vec<String> = thundoku_core::db::block_on(async {
+        sqlx::query_scalar("SELECT id FROM sites ORDER BY id")
+            .fetch_all(&pool)
+            .await
+    })
+    .unwrap();
+    assert!(
+        sites.contains(&"fanza".to_string()),
+        "site 'fanza' missing: {sites:?}"
+    );
+    assert!(
+        sites.contains(&"dlsite".to_string()),
+        "site 'dlsite' missing: {sites:?}"
+    );
+}
+
+// FANZA同人 / DLsite の共有ソースメタ列が Book に入出力（insert/get/upsert）で
+// roundtrip すること、および is_drm のデフォルト（0）を検証する。
+#[test]
+fn book_metadata_roundtrip() {
+    let pool = memory_db();
+    let book = books::Book {
+        id: "book-meta".into(),
+        title: "メタ本".into(),
+        author: "作者".into(),
+        circle_name: "サークル".into(),
+        purchase_date: Some("2026-09-01".into()),
+        file_name: "b.zip".into(),
+        file_size: 100,
+        opfs_path: "book-meta.opfspack".into(),
+        cover_thumbnail: None,
+        tbf_product_id: Some("RJ00000001".into()),
+        site_id: Some("dlsite".into()),
+        tags_fetched: 1,
+        pack_id: Some("book-meta".into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: "2026-09-01 00:00:00".into(),
+        updated_at: "2026-09-01 00:00:00".into(),
+        media_category: Some("comic".into()),
+        ai_type: Some("none".into()),
+        is_drm: 0,
+        release_date: Some("2025-06-17".into()),
+        description: Some("あらすじ".into()),
+        theme: Some("オリジナル".into()),
+        maker_id: Some("RG01048868".into()),
+        page_count: Some(40),
+        age_rating: Some("全年齢".into()),
+        series_name: Some("少年エルフ".into()),
+    };
+    books::insert(&pool, &book).unwrap();
+    assert_eq!(books::get(&pool, "book-meta").unwrap().unwrap(), book);
+    // upsert でも roundtrip（id 衝突で update）
+    books::upsert(&pool, &book).unwrap();
+    assert_eq!(books::get(&pool, "book-meta").unwrap().unwrap(), book);
+}
+
+// FANZA同人 / DLsite の共有ソースメタ列が BookshelfItem に入出力（upsert/list）で
+// roundtrip することを検証する。
+#[test]
+fn bookshelf_metadata_roundtrip() {
+    let pool = memory_db();
+    let item = bookshelf::BookshelfItem {
+        site_id: "fanza".into(),
+        database_id: "d_123".into(),
+        title: "タイトル".into(),
+        circle_name: "サークル".into(),
+        author: "作者".into(),
+        thumbnail_url: Some("https://example.com/thumb.jpg".into()),
+        format: "ZIP".into(),
+        caused_at: Some("2026-09-01".into()),
+        event_name: None,
+        event_slug: None,
+        event_id: None,
+        file_name: Some("d_123.zip".into()),
+        download_url: Some("https://example.com/dl".into()),
+        is_downloadable: 1,
+        is_checked: 0,
+        is_purchased: 1,
+        is_new: 0,
+        is_active: 1,
+        is_favorite: 0,
+        is_hidden: 0,
+        hidden_at: None,
+        tags_json: None,
+        synced_at: "2026-09-01 00:00:00".into(),
+        created_at: "2026-09-01 00:00:00".into(),
+        updated_at: "2026-09-01 00:00:00".into(),
+        media_category: Some("comic".into()),
+        ai_type: Some("none".into()),
+        is_drm: 0,
+        release_date: Some("2025-06-17".into()),
+        description: Some("説明".into()),
+        theme: Some("オリジナル".into()),
+        maker_id: Some("RG01048868".into()),
+        page_count: Some(40),
+        age_rating: Some("全年齢".into()),
+        series_name: Some("少年エルフ".into()),
+    };
+    bookshelf::upsert(&pool, &item).unwrap();
+    // upsert の upsert でも roundtrip（コンフリクトで更新）
+    bookshelf::upsert(&pool, &item).unwrap();
+    assert_eq!(bookshelf::list(&pool, "fanza").unwrap(), vec![item]);
 }

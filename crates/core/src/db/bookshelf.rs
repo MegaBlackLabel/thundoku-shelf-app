@@ -33,12 +33,24 @@ pub struct BookshelfItem {
     pub synced_at: String,
     pub created_at: String,
     pub updated_at: String,
+    // 共有ソースメタ列（FANZA同人 / DLsite）
+    pub media_category: Option<String>,
+    pub ai_type: Option<String>,
+    pub is_drm: i64,
+    pub release_date: Option<String>,
+    pub description: Option<String>,
+    pub theme: Option<String>,
+    pub maker_id: Option<String>,
+    pub page_count: Option<i64>,
+    pub age_rating: Option<String>,
+    pub series_name: Option<String>,
 }
 
 const COLUMNS: &str = "site_id, database_id, title, circle_name, author, thumbnail_url, format, \
      causedAt, event_name, event_slug, event_id, file_name, download_url, is_downloadable, \
      is_checked, is_purchased, is_new, is_active, is_favorite, is_hidden, hidden_at, tags_json, \
-     synced_at, created_at, updated_at";
+     synced_at, created_at, updated_at, media_category, ai_type, is_drm, release_date, \
+     description, theme, maker_id, page_count, age_rating, series_name";
 
 /// Upsert by (site_id, database_id).
 pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error> {
@@ -46,7 +58,7 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
         sqlx::query(&format!(
             "INSERT INTO bookshelf_items ({COLUMNS}) VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-             ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
              ON CONFLICT(site_id, database_id) DO UPDATE SET
                title = excluded.title,
                circle_name = excluded.circle_name,
@@ -68,7 +80,17 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
                hidden_at = bookshelf_items.hidden_at,
                tags_json = excluded.tags_json,
                synced_at = excluded.synced_at,
-               updated_at = excluded.updated_at"
+               updated_at = excluded.updated_at,
+               media_category = excluded.media_category,
+               ai_type = excluded.ai_type,
+               is_drm = excluded.is_drm,
+               release_date = excluded.release_date,
+               description = excluded.description,
+               theme = excluded.theme,
+               maker_id = excluded.maker_id,
+               page_count = excluded.page_count,
+               age_rating = excluded.age_rating,
+               series_name = excluded.series_name"
         ))
         .bind(&item.site_id)
         .bind(&item.database_id)
@@ -95,6 +117,16 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
         .bind(&item.synced_at)
         .bind(&item.created_at)
         .bind(&item.updated_at)
+        .bind(&item.media_category)
+        .bind(&item.ai_type)
+        .bind(item.is_drm)
+        .bind(&item.release_date)
+        .bind(&item.description)
+        .bind(&item.theme)
+        .bind(&item.maker_id)
+        .bind(item.page_count)
+        .bind(&item.age_rating)
+        .bind(&item.series_name)
         .execute(pool)
         .await?;
         Ok(())

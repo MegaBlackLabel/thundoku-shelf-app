@@ -90,7 +90,11 @@ fn thumbnail_of(page: &[u8]) -> Result<(Vec<u8>, u32, u32), ImportError> {
     Ok((data, thumb_width, thumb_height))
 }
 
-fn book_id_for(identity: Option<&Identity>) -> String {
+fn book_id_for(identity: Option<&Identity>, reuse_book_id: Option<&str>) -> String {
+    // 再ダウンロード時は既存本を再利用して重複を防ぐ（未ログイン＝identity None でも）。
+    if let Some(reuse) = reuse_book_id {
+        return reuse.to_string();
+    }
     identity
         .map(|i| i.pack_id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
@@ -143,8 +147,9 @@ fn finish_import(
     file_name: &str,
     source_bytes_len: i64,
     spec: PackSpec,
+    reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
-    let book_id = book_id_for(identity);
+    let book_id = book_id_for(identity, reuse_book_id);
     let title = base_title(file_name);
     let timestamp = now();
     log::info!("finish_import: 開始（{} ページ）", spec.total_pages);
@@ -181,6 +186,16 @@ fn finish_import(
         is_hidden: 0,
         created_at: timestamp.clone(),
         updated_at: timestamp.clone(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
     };
     books::insert(pool, &book)?;
     log::info!("finish_import: books 挿入完了");
@@ -321,7 +336,7 @@ pub fn import_file(
     match extension.as_str() {
         "pdf" => import_pdf_bytes(pool, &file_name, &bytes, packs_dir, identity, progress),
         "epub" => import_epub_bytes(pool, &file_name, &bytes, packs_dir, identity),
-        "zip" => import_zip_bytes(pool, &file_name, &bytes, packs_dir, identity, progress),
+        "zip" => import_zip_bytes(pool, &file_name, &bytes, packs_dir, identity, progress, None),
         _ => Err(ImportError::UnsupportedType(extension)),
     }
 }
@@ -410,6 +425,7 @@ pub fn import_rendered_pdf_pages(
             source_type: "pdf".to_string(),
             total_pages,
         },
+        None,
     )
 }
 
@@ -440,10 +456,77 @@ pub fn import_epub_bytes(
             source_type: "epub".to_string(),
             total_pages: 0,
         },
+        None,
     )
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+/// ファイル名を (is_numeric, chunk) の列に分解する（自然順ソート用）。
+fn natural_key(s: &str) -> Vec<(bool, String)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_num = false;
+    for c in s.chars() {
+        let is_num = c.is_ascii_digit();
+        if cur.is_empty() || is_num == cur_num {
+            cur.push(c);
+        } else {
+            out.push((cur_num, std::mem::take(&mut cur)));
+            cur.push(c);
+        }
+        cur_num = is_num;
+    }
+    if !cur.is_empty() {
+        out.push((cur_num, cur));
+    }
+    out
+}
+
+/// ファイル名の自然順比較（`1.jpg` < `2.jpg` < `10.jpg`）。数字の連続は数値として比較する。
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let ka = natural_key(a);
+    let kb = natural_key(b);
+    for (ia, ib) in ka.iter().zip(kb.iter()) {
+        let ord = if ia.0 && ib.0 {
+            let at = ia.1.trim_start_matches('0');
+            let bt = ib.1.trim_start_matches('0');
+            at.len()
+                .cmp(&bt.len())
+                .then_with(|| at.cmp(bt))
+        } else {
+            ia.1.cmp(&ib.1)
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    ka.len().cmp(&kb.len())
+}
+
+#[cfg(test)]
+mod natural_sort_tests {
+    use super::{natural_cmp, natural_key};
+    use std::cmp::Ordering;
+
+    #[test]
+    fn natural_cmp_orders_numeric_sequences() {
+        let mut v = vec!["2.jpg", "10.jpg", "1.jpg", "3.jpg"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, vec!["1.jpg", "2.jpg", "3.jpg", "10.jpg"]);
+    }
+
+    #[test]
+    fn natural_cmp_matches_lexicographic_for_nonnumeric() {
+        assert_eq!(natural_cmp("a.jpg", "b.jpg"), Ordering::Less);
+        assert_eq!(natural_cmp("b.jpg", "a.jpg"), Ordering::Greater);
+    }
+
+    #[test]
+    fn natural_key_splits_numeric_runs() {
+        assert_eq!(natural_key("page10.jpg"), vec![(false, "page".into()), (true, "10".into()), (false, ".jpg".into())]);
+    }
+}
 
 /// Import a ZIP: PDF > EPUB > image set (file-import.ts priority).
 pub fn import_zip_bytes(
@@ -453,6 +536,7 @@ pub fn import_zip_bytes(
     packs_dir: &Path,
     identity: Option<&Identity>,
     progress: &mut (dyn FnMut(f32) + Send),
+    reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| ImportError::Zip(e.to_string()))?;
@@ -498,7 +582,7 @@ pub fn import_zip_bytes(
             "zip without pdf/epub/images".into(),
         ));
     }
-    images.sort_by(|a, b| a.0.cmp(&b.0));
+    images.sort_by(|a, b| natural_cmp(&a.0, &b.0));
 
     let mut pack_entries = Vec::new();
     let mut page_rows = Vec::new();
@@ -548,6 +632,7 @@ pub fn import_zip_bytes(
             source_type: "image-set".to_string(),
             total_pages,
         },
+        reuse_book_id,
     )
 }
 
@@ -599,5 +684,6 @@ pub fn import_image_bytes(
             source_type: "image".to_string(),
             total_pages: 1,
         },
+        None,
     )
 }

@@ -809,6 +809,8 @@ impl Workspace {
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
+        let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
+        let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
 
         let google_email = AppState::global(cx)
             .google_profile
@@ -958,6 +960,18 @@ impl Workspace {
                 booth_logged_in,
                 Some(AuthProvider::Booth),
                 Some(crate::views::settings::SettingsView::logout_booth),
+            ))
+            .child(site_row(
+                "FANZA同人",
+                fanza_logged_in,
+                Some(AuthProvider::Fanza),
+                Some(crate::views::settings::SettingsView::logout_fanza),
+            ))
+            .child(site_row(
+                "DLsite",
+                dlsite_logged_in,
+                Some(AuthProvider::Dlsite),
+                Some(crate::views::settings::SettingsView::logout_dlsite),
             ))
     }
 
@@ -1982,6 +1996,8 @@ impl Workspace {
         let site_filter = self.bookshelf.update(cx, |b, _| b.site_filter());
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
+        let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
+        let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
 
         div()
             .id("bookshelf-submenu-wrap")
@@ -2092,6 +2108,70 @@ impl Workspace {
                                 .child("BOOTH"),
                         )
                     })
+                    .when(fanza_logged_in, |this| {
+                        this.child(
+                            div()
+                                .id("bookshelf-site-fanza")
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded_lg()
+                                .px_2()
+                                .py_1p5()
+                                .text_xs()
+                                .when(site_filter.as_deref() == Some("fanza"), |this| {
+                                    this.bg(theme.secondary)
+                                })
+                                .hover(|style| style.bg(theme.secondary))
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        cx.stop_propagation();
+                                        handle.update(cx, |this, cx| {
+                                            this.bookshelf.update(cx, |b, cx| {
+                                                b.set_site_filter(cx, Some("fanza"));
+                                            });
+                                            this.switch_to(NavTarget::Bookshelf, cx);
+                                            this.refresh_unread_count(cx);
+                                        });
+                                    }
+                                })
+                                .child("FANZA同人"),
+                        )
+                    })
+                    .when(dlsite_logged_in, |this| {
+                        this.child(
+                            div()
+                                .id("bookshelf-site-dlsite")
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded_lg()
+                                .px_2()
+                                .py_1p5()
+                                .text_xs()
+                                .when(site_filter.as_deref() == Some("dlsite"), |this| {
+                                    this.bg(theme.secondary)
+                                })
+                                .hover(|style| style.bg(theme.secondary))
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        cx.stop_propagation();
+                                        handle.update(cx, |this, cx| {
+                                            this.bookshelf.update(cx, |b, cx| {
+                                                b.set_site_filter(cx, Some("dlsite"));
+                                            });
+                                            this.switch_to(NavTarget::Bookshelf, cx);
+                                            this.refresh_unread_count(cx);
+                                        });
+                                    }
+                                })
+                                .child("DLsite"),
+                        )
+                    })
                     .with_animation(
                         SharedString::from(format!(
                             "bookshelf-submenu-anim-{}",
@@ -2100,7 +2180,7 @@ impl Workspace {
                         Animation::new(Duration::from_millis(200)).with_easing(gpui_kit::ease_in_out),
                         move |this, t| {
                             let t = t.clamp(0.0, 1.0);
-                            let height = if open { 120.0 * t } else { 120.0 * (1.0 - t) };
+                            let height = if open { 150.0 * t } else { 150.0 * (1.0 - t) };
                             let opacity = if open { t } else { 1.0 - t };
                             this.max_h(px(height)).opacity(opacity.clamp(0.0, 1.0))
                         },
@@ -2190,6 +2270,16 @@ mod tests {
                     is_hidden: 0,
                     created_at: "2026-08-21 00:00:00".into(),
                     updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
                 },
             )
             .unwrap();
