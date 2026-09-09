@@ -337,8 +337,8 @@ impl ImageViewer {
                 Some("spread") => ViewMode::Spread,
                 Some("scroll") => ViewMode::Scroll,
                 Some(_) => ViewMode::Single,
-                // 未設定のときのデフォルト: FANZA は見開き。
-                None if site_id.as_deref() == Some("fanza") => ViewMode::Spread,
+                // 未設定のときのデフォルト: FANZA / DLsite は見開き。
+                None if site_id.as_deref() == Some("fanza") || site_id.as_deref() == Some("dlsite") => ViewMode::Spread,
                 None => ViewMode::Single,
             }
         };
@@ -355,8 +355,8 @@ impl ImageViewer {
             match direction.as_deref() {
                 Some("right-to-left") => true,
                 Some("left-to-right") => false,
-                // 未設定のときのデフォルト: FANZA は右綴じ。
-                _ => site_id.as_deref() == Some("fanza"),
+                // 未設定のときのデフォルト: FANZA / DLsite は右綴じ。
+                _ => site_id.as_deref() == Some("fanza") || site_id.as_deref() == Some("dlsite"),
             }
         };
         // 自動再生の間隔（サイト別キー → グローバル → デフォルト）

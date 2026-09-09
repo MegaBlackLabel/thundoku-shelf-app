@@ -204,6 +204,47 @@ pub fn set_tbf_product_id(
     })
 }
 
+/// インポート後にソース側の共有メタ列（media_category / ai_type / is_drm / release_date /
+/// description / theme / maker_id / page_count / age_rating / series_name）を上書きする。
+/// FANZA同人 / DLsite のリッチメタ補完に使う。
+#[allow(clippy::too_many_arguments)]
+pub fn set_source_metadata(
+    pool: &SqlitePool,
+    id: &str,
+    media_category: Option<&str>,
+    ai_type: Option<&str>,
+    is_drm: i64,
+    release_date: Option<&str>,
+    description: Option<&str>,
+    theme: Option<&str>,
+    maker_id: Option<&str>,
+    page_count: Option<i64>,
+    age_rating: Option<&str>,
+    series_name: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query(
+            "UPDATE books SET media_category = ?1, ai_type = ?2, is_drm = ?3, release_date = ?4, \
+             description = ?5, theme = ?6, maker_id = ?7, page_count = ?8, age_rating = ?9, \
+             series_name = ?10, updated_at = CURRENT_TIMESTAMP WHERE id = ?11",
+        )
+        .bind(media_category)
+        .bind(ai_type)
+        .bind(is_drm)
+        .bind(release_date)
+        .bind(description)
+        .bind(theme)
+        .bind(maker_id)
+        .bind(page_count)
+        .bind(age_rating)
+        .bind(series_name)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+}
+
 /// Set the (encrypted) owner sub for a book. `Some` = その sub で暗号化された pack、
 /// `None` = 未所属（未暗号化）。呼び出し側で暗号化済み blob を渡す（不透明な文字列）。
 pub fn set_owner_sub(
