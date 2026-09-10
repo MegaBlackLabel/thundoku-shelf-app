@@ -15,7 +15,7 @@ use thundoku_core::db;
 
 use crate::app_state::AppState;
 use crate::components::image_viewer::{
-    Base64PageLoader, ContentEntry, FormatEntry, ImageViewer, PackPageLoader, PageListAction,
+    Base64PageLoader, ContentEntry, FormatEntry, ImageViewer, PackPageLoader,
 };
 
 pub struct ReaderView {
@@ -288,35 +288,27 @@ impl ReaderView {
     /// ページ毎の閲覧記録と進捗保存をまとめて行う。ページ移動のみを検知するため、
     /// 画像ロードなどの notify では記録しない（`last_page` 比較で弾く）。
     fn on_viewer_changed(&mut self, viewer: Entity<ImageViewer>, cx: &mut Context<Self>) {
-        // ページ一覧の操作（コンテンツ切替 / 優先の変更）を反映する
-        if let Some(action) = viewer.update(cx, |viewer, _| viewer.take_action()) {
-            self.apply_page_list_action(action, viewer.clone(), cx);
+        // メニューの切替を反映する（選択したコンテンツが既定表示になる）
+        if let Some((content_id, format_id)) = viewer.update(cx, |viewer, _| viewer.take_action()) {
+            self.apply_switch(content_id, format_id, cx);
         }
         self.record_page_view(viewer.clone(), cx);
         self.save_progress(viewer, cx);
     }
 
-    /// ページ一覧の操作を DB / ローダーに反映する。
-    fn apply_page_list_action(
+    /// メニューで選ばれたコンテンツ／レンディションに切り替える。
+    /// 選択したコンテンツはその本の既定表示（`is_primary`）にする。
+    fn apply_switch(
         &mut self,
-        action: PageListAction,
-        viewer: Entity<ImageViewer>,
+        content_id: String,
+        format_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(book_id) = self.book_id.clone() else {
-            return;
-        };
-        match action {
-            PageListAction::Select {
-                content_id,
-                format_id,
-            } => self.switch_selection(cx, Some(content_id), format_id),
-            PageListAction::SetPrimary { content_id } => {
-                let state = AppState::global(cx);
-                let _ = db::contents::set_primary(&state.db_pool, &book_id, &content_id);
-                self.refresh_contents(&viewer, cx);
-            }
+        if let Some(book_id) = self.book_id.clone() {
+            let state = AppState::global(cx);
+            let _ = db::contents::set_primary(&state.db_pool, &book_id, &content_id);
         }
+        self.switch_selection(cx, Some(content_id), format_id);
     }
 
     /// ページ一覧用のコンテンツ一覧を DB から読み直してビューアに渡す。
@@ -789,16 +781,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn page_list_radio_sets_primary(cx: &mut TestAppContext) {
+    async fn selecting_content_makes_it_the_default(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
         seed_book_with_two_contents(cx, "b5");
 
         let reader = cx.new(|cx| ReaderView::for_book(cx, "b5".to_string()));
         let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        // 初期状態は本編（3 ページ）が既定表示
+        assert!(viewer.read_with(cx, |v, _| v.contents()[0].is_primary));
 
-        // 別冊を優先（既定表示）にする
-        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_set_primary(cx, 1)));
+        // 別冊を選ぶ → 表示が切り替わり、そのコンテンツが既定表示になる
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 1, 0)));
         cx.run_until_parked();
 
         let primary = cx.update(|cx| {
@@ -808,14 +802,13 @@ mod tests {
                 .unwrap()
                 .content_id
         });
-        assert_eq!(primary, "c-sub", "DB の既定表示が入れ替わる");
+        assert_eq!(primary, "c-sub", "選択したコンテンツが既定表示になる");
         assert!(viewer.read_with(cx, |v, _| v.contents()[1].is_primary));
         assert!(!viewer.read_with(cx, |v, _| v.contents()[0].is_primary));
-        // 優先の変更だけでは表示中のコンテンツは変わらない
-        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 3);
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 1);
         assert_eq!(
             reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
-            Some("c-main".to_string())
+            Some("c-sub".to_string())
         );
     }
 
@@ -927,6 +920,11 @@ mod tests {
         assert_eq!(
             viewer.read_with(cx, |v, _| v.menu_row_titles()),
             vec!["画像".to_string(), "PDF".to_string()]
+        );
+        // 補足は「画像 Nファイル」「PDF Nページ」
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_subtitles()),
+            vec!["画像 3ファイル".to_string(), "PDF 2ページ".to_string()]
         );
 
         // PDF 版に切り替えるとページ数が変わる

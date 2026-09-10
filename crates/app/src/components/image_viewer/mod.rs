@@ -77,35 +77,20 @@ struct SwitchRow {
     /// `image` / `pdf` / `epub` / `audio` / `video`
     kind: String,
     is_current: bool,
-    is_primary: bool,
-    show_radio: bool,
-    /// コンテンツ行の下にぶら下がるレンディション行か（字下げする）。
+    /// コンテンツの 2 つ目以降のレンディション行か（字下げする）。
     indent: bool,
 }
 
-/// 切替行の補足（`フォルダ 13項目` / `PDF ドキュメント`）。
+/// 切替行の補足（`画像 48ファイル` / `PDF 16ページ`）。
 fn format_subtitle(format: &FormatEntry) -> String {
     match format.format_kind.as_str() {
-        "image" => format!("フォルダ {}項目", format.page_count),
-        "pdf" => "PDF ドキュメント".to_string(),
-        "epub" => "EPUB ドキュメント".to_string(),
-        "audio" => format!("音声 {}項目", format.page_count),
-        "video" => format!("動画 {}項目", format.page_count),
+        "image" => format!("画像 {}ファイル", format.page_count),
+        "pdf" => format!("PDF {}ページ", format.page_count),
+        "epub" => format!("EPUB {}ページ", format.page_count),
+        "audio" => format!("音声 {}ファイル", format.page_count),
+        "video" => format!("動画 {}ファイル", format.page_count),
         _ => format!("{} ページ", format.page_count),
     }
-}
-
-/// ページ一覧の操作。`ImageViewer` は保留するだけで、`ReaderView` が拾って
-/// DB（優先の付け替え）とローダー（コンテンツ／レンディションの切替）に反映する。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PageListAction {
-    /// そのコンテンツ（レンディション指定があればそれ）を表示する
-    Select {
-        content_id: String,
-        format_id: Option<String>,
-    },
-    /// 既定表示（優先）コンテンツを変更する
-    SetPrimary { content_id: String },
 }
 
 /// Loads pages from a book's `.opfspack` (via `document_images`).
@@ -364,8 +349,8 @@ pub struct ImageViewer {
     /// 現在表示中のコンテンツ／レンディション（未指定 = 旧データ / 単一コンテンツ）。
     current_content_id: Option<String>,
     current_format_id: Option<String>,
-    /// ページ一覧の操作の保留（`ReaderView` が `take_action` で拾う）。
-    pending_action: Option<PageListAction>,
+    /// 切替操作の保留（`(content_id, format_id)`。`ReaderView` が `take_action` で拾う）。
+    pending_action: Option<(String, Option<String>)>,
 }
 
 impl ImageViewer {
@@ -566,8 +551,8 @@ impl ImageViewer {
         cx.notify();
     }
 
-    /// ページ一覧の操作を取り出す（`ReaderView` が反映する）。
-    pub fn take_action(&mut self) -> Option<PageListAction> {
+    /// 切替操作を取り出す（`(content_id, format_id)`。`ReaderView` が反映する）。
+    pub fn take_action(&mut self) -> Option<(String, Option<String>)> {
         self.pending_action.take()
     }
 
@@ -595,19 +580,8 @@ impl ImageViewer {
         cx.notify();
     }
 
-    /// 優先（既定表示）コンテンツを変更する（ラジオ）。
-    pub fn page_list_set_primary(&mut self, cx: &mut Context<Self>, index: usize) {
-        let Some(content) = self.contents.get(index) else {
-            return;
-        };
-        self.pending_action = Some(PageListAction::SetPrimary {
-            content_id: content.content_id.clone(),
-        });
-        cx.notify();
-    }
-
     /// レンディションを切り替える（同じコンテンツの別形式・別バリアント）。
-    /// 切替後はそのレンディションのページ一覧（サムネイル）を開く。
+    /// ページ一覧（サムネイル）を開くのは「一覧 ›」ボタンの役目。
     pub fn page_list_select_format(
         &mut self,
         cx: &mut Context<Self>,
@@ -620,11 +594,9 @@ impl ImageViewer {
         let Some(format) = content.formats.get(format_index) else {
             return;
         };
-        self.pending_action = Some(PageListAction::Select {
-            content_id: content.content_id.clone(),
-            format_id: Some(format.format_id.clone()),
-        });
-        self.open_page_list(cx);
+        self.pending_action = Some((content.content_id.clone(), Some(format.format_id.clone())));
+        // `ReaderView` の observer が拾えるように通知する（メニューの「表示中」も更新される）
+        cx.notify();
     }
 
     /// サムネイルを読み込む（ページ一覧を開いている間だけ）。
@@ -639,15 +611,17 @@ impl ImageViewer {
 
     /// トップバーのメニューに出す切替行（コンテンツ × レンディションを平坦に並べる）。
     /// レンディションが 1 つだけの本でも 1 行出す（`PDF` / `JPEG` など）。
+    /// トップバーのメニューに出す切替行（コンテンツ × レンディションを平坦に並べる）。
+    ///
+    /// - 行のクリック = その形式に切り替える（＝そのコンテンツが既定表示になる）
+    /// - 右端の「一覧 ›」= その形式のページ一覧（サムネイル）を開く
     fn switch_rows(&self) -> Vec<SwitchRow> {
-        let multi = self.contents.len() > 1;
         let mut rows = Vec::new();
         for (content_index, content) in self.contents.iter().enumerate() {
             let multi_formats = content.formats.len() > 1;
             // 直下の画像セットは合成名（`本文`）。その場合はレンディション名を出す。
             let named = content.display_name != "本文";
             for (format_index, format) in content.formats.iter().enumerate() {
-                let first_of_content = format_index == 0;
                 let title = if !named {
                     format.label.clone()
                 } else if multi_formats {
@@ -663,10 +637,7 @@ impl ImageViewer {
                     kind: format.format_kind.clone(),
                     is_current: self.current_format_id.as_deref()
                         == Some(format.format_id.as_str()),
-                    is_primary: multi && first_of_content && content.is_primary,
-                    // 複数コンテンツのときだけ優先ラジオ（コンテンツの先頭レンディション行）
-                    show_radio: multi && first_of_content,
-                    indent: multi && !first_of_content,
+                    indent: multi_formats && format_index > 0,
                 });
             }
         }
@@ -681,15 +652,23 @@ impl ImageViewer {
             .collect()
     }
 
-    /// 切替行 1 つ（アイコン + 名前 + 種別。複数コンテンツのときだけ優先ラジオ）。
+    /// メニューに出す切替行の補足（テスト・UI 用）。
+    pub fn menu_row_subtitles(&self) -> Vec<String> {
+        self.switch_rows()
+            .into_iter()
+            .map(|row| row.subtitle)
+            .collect()
+    }
+
+    /// 切替行 1 つ（アイコン + 名前 + 種別。右端に「表示中」と「一覧 ›」）。
     fn switch_row_element(
         &self,
         row: SwitchRow,
         handle: &Entity<ImageViewer>,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let radio_handle = handle.clone();
-        let click_handle = handle.clone();
+        let open_handle = handle.clone();
+        let list_handle = handle.clone();
         let content_index = row.content_index;
         let format_index = row.format_index;
         let is_folder = row.kind == "image";
@@ -712,32 +691,13 @@ impl ImageViewer {
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
+            .gap_2()
             .px_3()
             .py_2()
             .when(row.indent, |el| el.pl_8())
             .border_b_1()
             .border_color(cx.theme().muted)
-            .when(row.show_radio, |el| {
-                el.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "viewer-switch-radio-{content_index}-{format_index}"
-                        )))
-                        .cursor_pointer()
-                        .text_color(if row.is_primary {
-                            cx.theme().primary
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .on_click(move |_, _window, cx| {
-                            radio_handle.update(cx, |this, cx| {
-                                this.page_list_set_primary(cx, content_index);
-                            });
-                        })
-                        .child(if row.is_primary { "◉" } else { "○" }),
-                )
-            })
+            // 行本体: アイコン + 名前 + 種別（クリックで切替）
             .child(
                 div()
                     .id(SharedString::from(format!(
@@ -750,7 +710,7 @@ impl ImageViewer {
                     .flex_grow(1.0)
                     .cursor_pointer()
                     .on_click(move |_, _window, cx| {
-                        click_handle.update(cx, |this, cx| {
+                        open_handle.update(cx, |this, cx| {
                             this.page_list_select_format(cx, content_index, format_index);
                         });
                     })
@@ -772,20 +732,60 @@ impl ImageViewer {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(row.subtitle),
                             ),
+                    ),
+            )
+            // 表示中（緑のチェック付き）
+            .when(row.is_current, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .text_color(gpui_kit::rgb(0x16a34a))
+                        .child(Icon::new(IconName::CircleCheck).size(px(14.0)))
+                        .child(div().text_xs().child("表示中")),
+                )
+            })
+            // 一覧 ›（その形式のページ一覧を開く）
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "viewer-switch-list-{content_index}-{format_index}"
+                    )))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().muted)
+                    .hover(|style| style.bg(cx.theme().muted))
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
+                        list_handle.update(cx, |this, cx| {
+                            this.page_list_select_format(cx, content_index, format_index);
+                            this.open_page_list(cx);
+                        });
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .child("一覧"),
                     )
-                    .when(row.is_current, |el| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().primary)
-                                .child("表示中"),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("›"),
+                    ),
             )
             .into_any_element()
     }
 
-    /// トップバーのメニュー: 切替行（形式ごとのページ一覧）を並べる。
     fn menu_switch_elements(
         &self,
         handle: &Entity<ImageViewer>,
