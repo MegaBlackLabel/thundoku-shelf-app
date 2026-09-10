@@ -394,27 +394,55 @@ impl ReaderView {
     }
 }
 
-/// ページ一覧用のコンテンツ一覧（レンディション付き）を DB から読む。
+/// ページ一覧メニュー用のコンテンツ一覧（レンディション付き）を DB から読む。
+///
+/// フェーズ2以前に取り込んだ本は `book_contents` を持たないため、取り込み済み
+/// ドキュメントから 1 行だけ合成する（メニューは「アイコン + 一覧 ›」の同じ形）。
 fn load_content_entries(db: &thundoku_core::db::SqlitePool, book_id: &str) -> Vec<ContentEntry> {
-    db::contents::list_with_formats(db, book_id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(content, formats)| ContentEntry {
-            content_id: content.content_id,
-            display_name: content.display_name,
-            media_kind: content.media_kind,
-            is_primary: content.is_primary != 0,
-            formats: formats
-                .into_iter()
-                .map(|format| FormatEntry {
-                    format_id: format.format_id,
-                    label: format.label,
-                    page_count: format.page_count,
-                    format_kind: format.format_kind,
-                })
-                .collect(),
-        })
-        .collect()
+    let stored = db::contents::list_with_formats(db, book_id).unwrap_or_default();
+    if !stored.is_empty() {
+        return stored
+            .into_iter()
+            .map(|(content, formats)| ContentEntry {
+                content_id: content.content_id,
+                display_name: content.display_name,
+                media_kind: content.media_kind,
+                is_primary: content.is_primary != 0,
+                formats: formats
+                    .into_iter()
+                    .map(|format| FormatEntry {
+                        format_id: format.format_id,
+                        label: format.label,
+                        page_count: format.page_count,
+                        format_kind: format.format_kind,
+                    })
+                    .collect(),
+            })
+            .collect();
+    }
+    let Some(document) = db::documents::get_document_by_book_id(db, book_id)
+        .ok()
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    let (label, kind) = match document.source_type.as_str() {
+        "pdf" => ("PDF", "pdf"),
+        "epub" => ("EPUB", "epub"),
+        _ => ("画像", "image"),
+    };
+    vec![ContentEntry {
+        content_id: String::new(),
+        display_name: String::new(),
+        media_kind: kind.to_string(),
+        is_primary: true,
+        formats: vec![FormatEntry {
+            format_id: String::new(),
+            label: label.to_string(),
+            page_count: document.total_pages,
+            format_kind: kind.to_string(),
+        }],
+    }]
 }
 
 impl Render for ReaderView {
@@ -745,6 +773,22 @@ mod tests {
             viewer.read_with(cx, |v, _| v.menu_row_titles()),
             vec!["1.尻穴便女".to_string()]
         );
+
+        // 旧データ（`book_contents` なし）も同じ「アイコン + 一覧 ›」の行を出す
+        seed_book_with_pages(cx, "b9", "旧データ本", 2);
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b9".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec!["PDF".to_string()]
+        );
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_subtitles()),
+            vec!["PDF 2ページ".to_string()]
+        );
+        // 切替は起きず、ページ一覧だけが開く
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 0, 0)));
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 2);
     }
 
     #[gpui_kit::test]

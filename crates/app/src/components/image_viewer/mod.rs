@@ -86,7 +86,7 @@ fn format_subtitle(format: &FormatEntry) -> String {
     match format.format_kind.as_str() {
         "image" => format!("画像 {}ファイル", format.page_count),
         "pdf" => format!("PDF {}ページ", format.page_count),
-        "epub" => format!("EPUB {}ページ", format.page_count),
+        "epub" => "EPUB ドキュメント".to_string(),
         "audio" => format!("音声 {}ファイル", format.page_count),
         "video" => format!("動画 {}ファイル", format.page_count),
         _ => format!("{} ページ", format.page_count),
@@ -594,6 +594,11 @@ impl ImageViewer {
         let Some(format) = content.formats.get(format_index) else {
             return;
         };
+        if format.format_id.is_empty() {
+            // 旧データ（コンテンツ情報なし）は切替不要。ページ一覧だけ開く
+            self.open_page_list(cx);
+            return;
+        }
         self.pending_action = Some((content.content_id.clone(), Some(format.format_id.clone())));
         // `ReaderView` の observer が拾えるように通知する（メニューの「表示中」も更新される）
         cx.notify();
@@ -619,8 +624,9 @@ impl ImageViewer {
         let mut rows = Vec::new();
         for (content_index, content) in self.contents.iter().enumerate() {
             let multi_formats = content.formats.len() > 1;
-            // 直下の画像セットは合成名（`本文`）。その場合はレンディション名を出す。
-            let named = content.display_name != "本文";
+            // 直下の画像セットは合成名（`本文`）。旧データは表示名なし。
+            // どちらもレンディション名（`JPEG` / `PDF`）を出す。
+            let named = !content.display_name.is_empty() && content.display_name != "本文";
             for (format_index, format) in content.formats.iter().enumerate() {
                 let title = if !named {
                     format.label.clone()
