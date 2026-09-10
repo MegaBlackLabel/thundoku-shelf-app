@@ -532,6 +532,19 @@ impl ImageViewer {
         self.pan_max = gpui_kit::Point::new(0.0, 0.0);
         self.drag_start = None;
         self.load_error = None;
+        // 新しいページ列の**表示に必要な分を読み込む**（切替直後に白いページを出さない。
+        // ここで読み込まないと、ページ送りをするまで表示が更新されない）。
+        if self.mode == ViewMode::Scroll {
+            for index in 0..self.images.len() {
+                self.ensure_loaded(cx, index);
+            }
+            self.scroll_handle.scroll_to_item(self.current_page);
+        } else {
+            // 現在ページ + 隣接ページ（見開きで片方が読み込み中のままになるのを防ぐ）
+            self.ensure_loaded(cx, self.current_page);
+            let next = (self.current_page + 1).min(page_count.saturating_sub(1));
+            self.ensure_loaded(cx, next);
+        }
         // ページ一覧を開いたまま切り替えた場合はサムネイルを読み直す
         self.load_page_list_thumbnails(cx);
         cx.notify();
@@ -3239,6 +3252,28 @@ mod tests {
         assert!(
             view.read_with(cx, |v, _| v.load_error.is_some()),
             "pack を読めないときは理由を保持する"
+        );
+    }
+
+    /// ローダー差し替え（コンテンツ切替）直後に現在ページが読み込まれること。
+    /// 読み込まれないと切り替え直後が白いページになり、ページ送りで初めて表示される。
+    #[gpui_kit::test]
+    async fn set_loader_loads_the_current_page(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 3);
+        cx.run_until_parked();
+
+        // 別コンテンツ相当のローダーへ差し替える
+        let loader = Arc::new(FakeLoader {
+            count: 2,
+            png: make_png(100, 140),
+        });
+        cx.update(|cx| view.update(cx, |v, cx| v.set_loader(cx, loader, 0)));
+        cx.run_until_parked();
+
+        assert!(
+            view.read_with(cx, |v, _| v.images.iter().all(|image| image.is_some())),
+            "切替直後に表示に必要なページ（現在 + 隣接）が読み込まれること"
         );
     }
 
