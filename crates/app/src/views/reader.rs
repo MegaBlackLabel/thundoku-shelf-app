@@ -669,23 +669,20 @@ mod tests {
         );
         assert!(viewer.read_with(cx, |v, _| v.contents()[0].is_primary));
 
-        // 開いた直後はコンテンツ一覧（ドリルインしていない）
+        // 開くと切替行が一番上に出る（コンテンツ 2 件）
         cx.update(|cx| viewer.update(cx, |v, cx| v.open_page_list(cx)));
-        assert_eq!(viewer.read_with(cx, |v, _| v.page_list_drill()), None);
+        assert_eq!(viewer.read_with(cx, |v, _| v.contents().len()), 2);
 
-        // 別冊の行を開く → ReaderView が反映してページ数が変わる
-        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_drill_in(cx, 1)));
+        // 別冊の行を選ぶ → ReaderView が反映してページ数が変わる
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_content(cx, 1)));
         cx.run_until_parked();
         assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 1);
-        assert_eq!(viewer.read_with(cx, |v, _| v.page_list_drill()), Some(1));
         assert_eq!(
             reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
             Some("c-sub".to_string())
         );
-
-        // 戻る → コンテンツ一覧へ
-        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_back(cx)));
-        assert_eq!(viewer.read_with(cx, |v, _| v.page_list_drill()), None);
+        // 切替行は開いたまま（ドリルインしない）
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 1);
     }
 
     #[gpui_kit::test]
@@ -823,13 +820,8 @@ mod tests {
             2
         );
 
-        // レンディションが複数あるのでコンテンツ一覧（チップ付き）から始まる
+        // レンディションが複数あるので切替行が一番上に出る
         cx.update(|cx| viewer.update(cx, |v, cx| v.open_page_list(cx)));
-        assert_eq!(
-            viewer.read_with(cx, |v, _| v.page_list_drill()),
-            None,
-            "コンテンツ一覧が出る（グリッド直行ではない）"
-        );
 
         // PDF 版に切り替えるとページ数が変わる
         cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 0, 1)));
@@ -839,7 +831,6 @@ mod tests {
             reader.read_with(cx, |r, _| r.selection().1.map(|s| s.to_string())),
             Some("f-pdf".to_string())
         );
-        assert_eq!(viewer.read_with(cx, |v, _| v.page_list_drill()), Some(0));
     }
 
     #[gpui_kit::test]

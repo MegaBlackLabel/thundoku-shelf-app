@@ -79,6 +79,8 @@ struct SwitchRow {
     is_current: bool,
     is_primary: bool,
     show_radio: bool,
+    /// コンテンツ行の下にぶら下がるレンディション行か（字下げする）。
+    indent: bool,
 }
 
 /// 切替行の補足（`フォルダ 13項目` / `PDF ドキュメント`）。
@@ -362,8 +364,6 @@ pub struct ImageViewer {
     /// 現在表示中のコンテンツ／レンディション（未指定 = 旧データ / 単一コンテンツ）。
     current_content_id: Option<String>,
     current_format_id: Option<String>,
-    /// ページ一覧のドリルイン状態（`None` = コンテンツ一覧、`Some(i)` = i 番目を展開中）。
-    page_list_drill: Option<usize>,
     /// ページ一覧の操作の保留（`ReaderView` が `take_action` で拾う）。
     pending_action: Option<PageListAction>,
 }
@@ -457,7 +457,6 @@ impl ImageViewer {
             contents: Vec::new(),
             current_content_id: None,
             current_format_id: None,
-            page_list_drill: None,
             pending_action: None,
             images: (0..page_count).map(|_| None).collect(),
             overlay_visible: true,
@@ -577,11 +576,6 @@ impl ImageViewer {
         &self.contents
     }
 
-    /// ドリルイン中のコンテンツ添字（`None` = コンテンツ一覧）。
-    pub fn page_list_drill(&self) -> Option<usize> {
-        self.page_list_drill
-    }
-
     /// 現在表示中のコンテンツ／レンディション。
     pub fn current_selection(&self) -> (Option<String>, Option<String>) {
         (
@@ -591,40 +585,25 @@ impl ImageViewer {
     }
 
     /// ページ一覧を開く。コンテンツが複数なら一覧、単一ならサムネイルグリッドを直接出す。
+    /// ページ一覧を開く。切替（コンテンツ / レンディション）があれば
+    /// パネルの一番上に並べ、その下に現在のページのサムネイルを出す。
     pub fn open_page_list(&mut self, cx: &mut Context<Self>) {
         self.active_panel = Some(PanelView::PageList);
-        self.page_list_drill = if self.show_content_list() {
-            None
-        } else {
-            Some(0)
-        };
         self.load_page_list_thumbnails(cx);
         self.restart_hide_timer(cx);
         cx.notify();
     }
 
-    /// コンテンツ行をドリルインする（= そのコンテンツを開く）。
-    pub fn page_list_drill_in(&mut self, cx: &mut Context<Self>, index: usize) {
+    /// コンテンツ行を選ぶ（= そのコンテンツの先頭レンディションに切り替える）。
+    pub fn page_list_select_content(&mut self, cx: &mut Context<Self>, index: usize) {
         let Some(content) = self.contents.get(index) else {
             return;
         };
-        let content_id = content.content_id.clone();
-        self.page_list_drill = Some(index);
         self.pending_action = Some(PageListAction::Select {
-            content_id,
+            content_id: content.content_id.clone(),
             format_id: None,
         });
         cx.notify();
-    }
-
-    /// ページ一覧の「戻る」。ドリルイン中ならコンテンツ一覧へ、一覧ならメニューへ。
-    pub fn page_list_back(&mut self, cx: &mut Context<Self>) {
-        if self.show_content_list() && self.page_list_drill.is_some() {
-            self.page_list_drill = None;
-            cx.notify();
-            return;
-        }
-        self.open_panel(cx, PanelView::Menu);
     }
 
     /// 優先（既定表示）コンテンツを変更する（ラジオ）。
@@ -651,7 +630,6 @@ impl ImageViewer {
         let Some(format) = content.formats.get(format_index) else {
             return;
         };
-        self.page_list_drill = Some(content_index);
         self.pending_action = Some(PageListAction::Select {
             content_id: content.content_id.clone(),
             format_id: Some(format.format_id.clone()),
@@ -659,9 +637,9 @@ impl ImageViewer {
         cx.notify();
     }
 
-    /// サムネイルを読み込む。コンテンツ一覧を出している間は何もしない（遅延読み込み）。
+    /// サムネイルを読み込む（ページ一覧を開いている間だけ）。
     fn load_page_list_thumbnails(&mut self, cx: &mut Context<Self>) {
-        if self.show_content_list() && self.page_list_drill.is_none() {
+        if self.active_panel != Some(PanelView::PageList) {
             return;
         }
         for index in 0..self.loader.page_count() {
@@ -669,8 +647,7 @@ impl ImageViewer {
         }
     }
 
-    /// コンテンツ一覧（＝切替一覧）を挟むか。
-    /// 複数コンテンツ、または単一コンテンツでレンディションが複数あるとき。
+    /// 切替行を出すか（複数コンテンツ、またはレンディションが複数あるとき）。
     fn show_content_list(&self) -> bool {
         self.contents.len() > 1
             || self
@@ -679,8 +656,10 @@ impl ImageViewer {
                 .is_some_and(|content| content.formats.len() > 1)
     }
 
-    /// ページ一覧の切替行。複数コンテンツならコンテンツ行、単一コンテンツなら
-    /// レンディション行を並べる（コンテンツ名の見出し行は出さない）。
+    /// ページ一覧の切替行。
+    ///
+    /// - 複数コンテンツ: コンテンツ行（優先ラジオ付き）+ そのレンディション行（複数あるとき）
+    /// - 単一コンテンツ: レンディション行だけ（見出しは出さない）
     fn switch_rows(&self) -> Vec<SwitchRow> {
         let multi = self.contents.len() > 1;
         let mut rows = Vec::new();
@@ -699,7 +678,24 @@ impl ImageViewer {
                         == Some(content.content_id.as_str()),
                     is_primary: content.is_primary,
                     show_radio: true,
+                    indent: false,
                 });
+                if content.formats.len() > 1 {
+                    for (format_index, format) in content.formats.iter().enumerate() {
+                        rows.push(SwitchRow {
+                            content_index,
+                            format_index: Some(format_index),
+                            title: format.label.clone(),
+                            subtitle: format_subtitle(format),
+                            kind: format.format_kind.clone(),
+                            is_current: self.current_format_id.as_deref()
+                                == Some(format.format_id.as_str()),
+                            is_primary: false,
+                            show_radio: true,
+                            indent: true,
+                        });
+                    }
+                }
             } else {
                 for (format_index, format) in content.formats.iter().enumerate() {
                     rows.push(SwitchRow {
@@ -712,6 +708,7 @@ impl ImageViewer {
                             == Some(format.format_id.as_str()),
                         is_primary: false,
                         show_radio: false,
+                        indent: false,
                     });
                 }
             }
@@ -753,13 +750,14 @@ impl ImageViewer {
             .gap_3()
             .px_3()
             .py_2()
+            .when(row.indent, |el| el.pl_8())
             .border_b_1()
             .border_color(cx.theme().muted)
             .when(row.show_radio, |el| {
                 el.child(
                     div()
                         .id(SharedString::from(format!(
-                            "viewer-switch-radio-{content_index}"
+                            "viewer-switch-radio-{content_index}-{format_index:?}"
                         )))
                         .cursor_pointer()
                         .text_color(if row.is_primary {
@@ -791,7 +789,7 @@ impl ImageViewer {
                             Some(format_index) => {
                                 this.page_list_select_format(cx, content_index, format_index)
                             }
-                            None => this.page_list_drill_in(cx, content_index),
+                            None => this.page_list_select_content(cx, content_index),
                         });
                     })
                     .child(Icon::new(icon).size(px(24.0)).text_color(icon_color))
@@ -825,157 +823,84 @@ impl ImageViewer {
             .into_any_element()
     }
 
-    /// ページ一覧: 切替一覧（コンテンツ / レンディション）。
-    fn switch_list_panel(
-        &self,
-        handle: &Entity<ImageViewer>,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
-        let mut rows = Vec::new();
-        for row in self.switch_rows() {
-            rows.push(self.switch_row_element(row, handle, cx));
-        }
-        div()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .py_1()
-                    .h(px(420.0))
-                    .overflow_y_scrollbar()
-                    .children(rows),
-            )
-            .child(self.panel_back(handle, cx))
-            .into_any_element()
-    }
-
-    /// ページ一覧: サムネイルグリッド（単一コンテンツ・単一レンディションは従来どおり）。
-    fn page_grid_panel(
+    /// ページ一覧パネル: 切替行（あれば）を一番上に、その下にサムネイルグリッド。
+    fn page_list_panel(
         &self,
         handle: &Entity<ImageViewer>,
         total: usize,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let grid = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap_2()
-            .p_3()
-            .children((0..total).map(|index| {
-                let handle = handle.clone();
-                let image = self.images.get(index).cloned().flatten();
-                let is_current = index == self.current_page;
-                div()
-                    .id(SharedString::from(format!("viewer-thumb-{index}")))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_1()
-                    .p_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if is_current {
-                        cx.theme().primary
-                    } else {
-                        cx.theme().muted
-                    })
-                    .hover(|style| style.bg(cx.theme().muted))
-                    .cursor_pointer()
-                    .on_click(move |_, _window, cx| {
-                        handle.update(cx, |this, cx| {
-                            this.set_page(cx, index);
-                        });
-                    })
-                    .child(
-                        div()
-                            .w(px(100.0))
-                            .aspect_ratio(100.0 / 141.0)
-                            .rounded_sm()
-                            .bg(gpui_kit::white())
-                            .overflow_hidden()
-                            .child(match image {
-                                Some(image) => img(image)
-                                    .size_full()
-                                    .object_fit(gpui_kit::ObjectFit::Contain)
-                                    .into_any_element(),
-                                None => div().size_full().into_any_element(),
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{}", index + 1)),
-                    )
-                    .child(if is_current {
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("現在")
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
-            }));
-        // 複数コンテンツでドリルイン中、そのコンテンツにレンディションが複数あれば
-        // グリッドの上に切替行を出す（一覧に戻らず切り替えられるように）
         let mut body: Vec<gpui_kit::AnyElement> = Vec::new();
-        let drilled = if self.contents.len() > 1 {
-            self.page_list_drill
-                .and_then(|index| self.contents.get(index).map(|content| (index, content)))
-        } else {
-            None
-        };
-        if let Some((content_index, content)) = drilled
-            && content.formats.len() > 1
-        {
-            for (format_index, format) in content.formats.iter().enumerate() {
-                body.push(self.switch_row_element(
-                    SwitchRow {
-                        content_index,
-                        format_index: Some(format_index),
-                        title: format.label.clone(),
-                        subtitle: format_subtitle(format),
-                        kind: format.format_kind.clone(),
-                        is_current: self.current_format_id.as_deref()
-                            == Some(format.format_id.as_str()),
-                        is_primary: false,
-                        show_radio: false,
-                    },
-                    handle,
-                    cx,
-                ));
+        if self.show_content_list() {
+            for row in self.switch_rows() {
+                body.push(self.switch_row_element(row, handle, cx));
             }
         }
-        body.push(grid.into_any_element());
-        // 複数コンテンツ / 複数レンディションのときは一覧へ戻れる
-        let back = if self.show_content_list() {
-            let back_handle = handle.clone();
+        body.push(
             div()
-                .w_full()
                 .flex()
                 .flex_row()
-                .items_center()
-                .justify_center()
-                .py_2()
-                .border_t_1()
-                .border_color(cx.theme().muted)
-                .child(
-                    Button::new("viewer-panel-back-list")
-                        .cursor_pointer()
-                        .label("← 上の階層に戻る")
+                .flex_wrap()
+                .gap_2()
+                .p_3()
+                .children((0..total).map(|index| {
+                    let handle = handle.clone();
+                    let image = self.images.get(index).cloned().flatten();
+                    let is_current = index == self.current_page;
+                    div()
+                        .id(SharedString::from(format!("viewer-thumb-{index}")))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .p_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if is_current {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted
+                        })
+                        .hover(|style| style.bg(cx.theme().muted))
                         .cursor_pointer()
                         .on_click(move |_, _window, cx| {
-                            back_handle.update(cx, |this, cx| this.page_list_back(cx));
-                        }),
-                )
-                .into_any_element()
-        } else {
-            self.panel_back(handle, cx).into_any_element()
-        };
+                            handle.update(cx, |this, cx| {
+                                this.set_page(cx, index);
+                            });
+                        })
+                        .child(
+                            div()
+                                .w(px(100.0))
+                                .aspect_ratio(100.0 / 141.0)
+                                .rounded_sm()
+                                .bg(gpui_kit::white())
+                                .overflow_hidden()
+                                .child(match image {
+                                    Some(image) => img(image)
+                                        .size_full()
+                                        .object_fit(gpui_kit::ObjectFit::Contain)
+                                        .into_any_element(),
+                                    None => div().size_full().into_any_element(),
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{}", index + 1)),
+                        )
+                        .child(if is_current {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("現在")
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        })
+                }))
+                .into_any_element(),
+        );
         div()
             .flex()
             .flex_col()
@@ -987,7 +912,7 @@ impl ImageViewer {
                     .overflow_y_scrollbar()
                     .children(body),
             )
-            .child(back)
+            .child(self.panel_back(handle, cx))
             .into_any_element()
     }
 
@@ -2546,13 +2471,11 @@ impl Render for ImageViewer {
                                                 .child("›"),
                                         ),
                                 ),
-                            PanelView::PageList => div().child(
-                                if self.show_content_list() && self.page_list_drill.is_none() {
-                                    self.switch_list_panel(&handle, cx)
-                                } else {
-                                    self.page_grid_panel(&handle, total, cx)
-                                },
-                            ),
+                            PanelView::PageList => div().child(self.page_list_panel(
+                                &handle,
+                                total,
+                                cx,
+                            )),
                             PanelView::Shortcuts => {
                                 let kbd = |stroke: &str| Kbd::new(gpui_kit::Keystroke::parse(stroke).unwrap());
                                 let row = |label: String, strokes: Vec<&str>| {
