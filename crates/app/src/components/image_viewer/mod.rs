@@ -77,8 +77,6 @@ struct SwitchRow {
     /// `image` / `pdf` / `epub` / `audio` / `video`
     kind: String,
     is_current: bool,
-    /// コンテンツの 2 つ目以降のレンディション行か（字下げする）。
-    indent: bool,
 }
 
 /// 切替行の補足（`画像 48ファイル` / `PDF 16ページ`）。
@@ -647,7 +645,6 @@ impl ImageViewer {
                     kind: format.format_kind.clone(),
                     is_current: self.current_format_id.as_deref()
                         == Some(format.format_id.as_str()),
-                    indent: multi_formats && format_index > 0,
                 });
             }
         }
@@ -704,7 +701,6 @@ impl ImageViewer {
             .gap_2()
             .px_3()
             .py_2()
-            .when(row.indent, |el| el.pl_8())
             .border_b_1()
             .border_color(cx.theme().muted)
             // 行本体: アイコン + 名前 + 種別（クリックで切替）
@@ -2317,7 +2313,7 @@ impl Render for ImageViewer {
                         .absolute()
                         .top(px(12.0 - 32.0 * (1.0 - overlay_progress)))
                         .left_3()
-                        .w(px(380.0))
+                        .w(px(460.0))
                         .opacity(overlay_progress)
                         .when(overlay_progress < 0.01, |this| this.invisible())
                         .bg(panel_bg)

@@ -387,8 +387,8 @@ fn plan_content(group: Group, metas: &[EntryMeta]) -> Option<PlannedContent> {
     })
 }
 
-/// レンディションの表示名。画像は実際の拡張子（`JPEG` / `PNG` …）、PDF / EPUB は
-/// ファイル名を出す（Web 版の「形式一覧」の見せ方に合わせる）。
+/// レンディションの表示名。画像は実際の拡張子（`JPEG` / `PNG` …）、
+/// PDF / EPUB は種別名（拡張子を出さない: メニューでは内容名と並べるため）。
 fn rendition_label(kind: EntryKind, ordinals: &[usize], metas: &[EntryMeta]) -> String {
     let first = ordinals.first().and_then(|ordinal| metas.get(*ordinal));
     let extension = first
@@ -405,9 +405,7 @@ fn rendition_label(kind: EntryKind, ordinals: &[usize], metas: &[EntryMeta]) -> 
             .and_then(crate::db::contents::image_label_for_extension)
             .map(str::to_string)
             .unwrap_or_else(fallback),
-        EntryKind::Pdf | EntryKind::Epub => first
-            .map(|meta| entry_file_name(&meta.name).to_string())
-            .unwrap_or_else(fallback),
+        EntryKind::Pdf | EntryKind::Epub => fallback(),
         _ => fallback(),
     }
 }

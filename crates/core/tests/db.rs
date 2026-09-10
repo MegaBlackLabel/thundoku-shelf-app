@@ -1064,7 +1064,8 @@ fn legacy_content_labels_are_migrated() {
         }],
         &[
             mk_format("f-img", "c", "画像", "image", 0),
-            mk_format("f-pdf", "c", "PDF", "pdf", 1),
+            // 旧移行でファイル名になっていた行も種別名へ戻す
+            mk_format("f-pdf", "c", "本編.pdf", "pdf", 1),
         ],
     )
     .unwrap();
@@ -1077,8 +1078,8 @@ fn legacy_content_labels_are_migrated() {
         "画像セットは元拡張子が残らないため JPEG とみなす"
     );
     assert_eq!(
-        formats[1].label, "本編.pdf",
-        "PDF はコンテンツ名からファイル名を推定する"
+        formats[1].label, "PDF",
+        "PDF は種別名にする（拡張子は出さない）"
     );
 
     // 2 回目は対象が無い（冪等）
@@ -1117,12 +1118,12 @@ fn legacy_content_labels_are_migrated() {
             sort_order: 0,
             created_at: stamp.into(),
         }],
-        &[mk_format("f3", "c3", "PDF", "pdf", 0)],
+        &[mk_format("f3", "c3", "only.pdf", "pdf", 0)],
     )
     .unwrap();
     assert_eq!(contents::run_legacy_label_migration(&pool).unwrap(), 1);
     let formats = contents::formats_for_content(&pool, "c3").unwrap();
-    assert_eq!(formats[0].label, "only.pdf");
+    assert_eq!(formats[0].label, "PDF");
 }
 
 // フェーズ2: コンテンツ（読む単位）とレンディション（切替可能な表示形態）が

@@ -182,7 +182,7 @@ pub fn image_label_for_extension(extension: &str) -> Option<&'static str> {
 ///
 /// フェーズ2以前の取り込みでは `content_formats.label` が種別名のままだった。
 /// Pack には元の拡張子が残らない（ページは webp 化されている）ため、
-/// - PDF / EPUB: 本のファイル名（単体取り込み）→ コンテンツ名 + 拡張子 の順で推定
+/// - PDF / EPUB: 種別名（`PDF` / `EPUB`。ファイル名は出さない）
 /// - 画像: 本のファイル名に画像拡張子があればそれ、無ければ `JPEG` とみなす
 ///
 /// 対象は旧ラベルの行だけなので、繰り返し実行しても何もしない（冪等）。
@@ -197,18 +197,19 @@ pub fn run_legacy_label_migration(pool: &SqlitePool) -> Result<u64, sqlx::Error>
 pub(crate) async fn migrate_legacy_labels(
     conn: &mut sqlx::SqliteConnection,
 ) -> Result<u64, sqlx::Error> {
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT f.format_id, f.format_kind, c.display_name, b.file_name \
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT f.format_id, f.format_kind, b.file_name \
          FROM content_formats f \
          JOIN book_contents c ON c.content_id = f.content_id \
          JOIN books b ON b.id = c.book_id \
-         WHERE f.label IN ('画像', 'PDF', 'EPUB')",
+         WHERE (f.format_kind IN ('pdf', 'epub') AND f.label NOT IN ('PDF', 'EPUB')) \
+           OR (f.format_kind = 'image' AND f.label = '画像')",
     )
     .fetch_all(&mut *conn)
     .await?;
     let mut updated = 0;
-    for (format_id, format_kind, display_name, book_file_name) in rows {
-        let Some(label) = legacy_label(&format_kind, &display_name, &book_file_name) else {
+    for (format_id, format_kind, book_file_name) in rows {
+        let Some(label) = legacy_label(&format_kind, &book_file_name) else {
             continue;
         };
         sqlx::query("UPDATE content_formats SET label = ?1 WHERE format_id = ?2")
@@ -222,18 +223,9 @@ pub(crate) async fn migrate_legacy_labels(
 }
 
 /// 旧ラベルから新しい表示名を推定する。対象外の種別は `None`。
-fn legacy_label(format_kind: &str, display_name: &str, book_file_name: &str) -> Option<String> {
+fn legacy_label(format_kind: &str, book_file_name: &str) -> Option<String> {
     match format_kind {
-        "pdf" | "epub" => {
-            let suffix = format!(".{format_kind}");
-            if book_file_name.to_lowercase().ends_with(&suffix) {
-                Some(book_file_name.to_string())
-            } else if display_name.to_lowercase().ends_with(&suffix) {
-                Some(display_name.to_string())
-            } else {
-                Some(format!("{display_name}{suffix}"))
-            }
-        }
+        "pdf" | "epub" => Some(format_kind.to_uppercase()),
         "image" => {
             let from_book = book_file_name
                 .rsplit_once('.')
