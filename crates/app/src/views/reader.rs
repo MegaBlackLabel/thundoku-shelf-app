@@ -858,7 +858,7 @@ mod tests {
 
     /// 1 コンテンツ + 2 レンディション（画像 3 ページ / PDF 2 ページ）の本。
     /// 実データの「PDF版 + 画像版」と同じ形（`姉とアナルセックスする話` 相当）。
-    fn seed_book_with_two_renditions(cx: &mut TestAppContext, id: &str) {
+    fn seed_book_with_two_renditions(cx: &mut TestAppContext, id: &str, display_name: &str) {
         cx.update(|cx| {
             let state = crate::app_state::AppState::global(cx);
             let db = &state.db_pool;
@@ -882,9 +882,9 @@ mod tests {
             db::contents::insert_batch(
                 db,
                 &[db::contents::BookContent {
-                    content_id: "c-one".into(),
+                    content_id: format!("{id}-c"),
                     book_id: id.into(),
-                    display_name: "本文".into(),
+                    display_name: display_name.into(),
                     media_kind: "image".into(),
                     is_primary: 1,
                     sort_order: 0,
@@ -892,8 +892,8 @@ mod tests {
                 }],
                 &[
                     db::contents::ContentFormat {
-                        format_id: "f-img".into(),
-                        content_id: "c-one".into(),
+                        format_id: format!("{id}-f-img"),
+                        content_id: format!("{id}-c"),
                         label: "画像".into(),
                         format_kind: "image".into(),
                         page_count: 3,
@@ -902,8 +902,8 @@ mod tests {
                         created_at: stamp.into(),
                     },
                     db::contents::ContentFormat {
-                        format_id: "f-pdf".into(),
-                        content_id: "c-one".into(),
+                        format_id: format!("{id}-f-pdf"),
+                        content_id: format!("{id}-c"),
                         label: "PDF".into(),
                         format_kind: "pdf".into(),
                         page_count: 2,
@@ -920,7 +920,7 @@ mod tests {
                     &documents::DocumentImage {
                         id: format!("{id}-img{index}"),
                         document_id: format!("{id}-doc"),
-                        content_id: Some("c-one".into()),
+                        content_id: Some(format!("{id}-c")),
                         format_id: Some(format.into()),
                         page_number: page,
                         image_type: "page".into(),
@@ -937,10 +937,10 @@ mod tests {
                 .unwrap();
             };
             for page in 1..=3 {
-                insert_page("f-img", page, page as usize);
+                insert_page(&format!("{id}-f-img"), page, page as usize);
             }
             for page in 1..=2 {
-                insert_page("f-pdf", page, 3 + page as usize);
+                insert_page(&format!("{id}-f-pdf"), page, 3 + page as usize);
             }
         });
     }
@@ -949,7 +949,7 @@ mod tests {
     async fn page_list_shows_rendition_switch_for_single_content(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
-        seed_book_with_two_renditions(cx, "b6");
+        seed_book_with_two_renditions(cx, "b6", "本文");
 
         let reader = cx.new(|cx| ReaderView::for_book(cx, "b6".to_string()));
         let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
@@ -977,7 +977,23 @@ mod tests {
         assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 2);
         assert_eq!(
             reader.read_with(cx, |r, _| r.selection().1.map(|s| s.to_string())),
-            Some("f-pdf".to_string())
+            Some("b6-f-pdf".to_string())
+        );
+
+        // 内容名があるときは行タイトルに形式名を付けない（アイコンと補足で分かる）
+        seed_book_with_two_renditions(cx, "b10", "姉とアナルセックスする話");
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b10".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec![
+                "姉とアナルセックスする話".to_string(),
+                "姉とアナルセックスする話".to_string()
+            ]
+        );
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_subtitles()),
+            vec!["画像 3ファイル".to_string(), "PDF 2ページ".to_string()]
         );
     }
 

@@ -625,17 +625,15 @@ impl ImageViewer {
     fn switch_rows(&self) -> Vec<SwitchRow> {
         let mut rows = Vec::new();
         for (content_index, content) in self.contents.iter().enumerate() {
-            let multi_formats = content.formats.len() > 1;
             // 直下の画像セットは合成名（`本文`）。旧データは表示名なし。
             // どちらもレンディション名（`JPEG` / `PDF`）を出す。
             let named = !content.display_name.is_empty() && content.display_name != "本文";
             for (format_index, format) in content.formats.iter().enumerate() {
-                let title = if !named {
-                    format.label.clone()
-                } else if multi_formats {
-                    format!("{}・{}", content.display_name, format.label)
-                } else {
+                // 名前は内容名だけ。形式はアイコンと補足（`画像 48ファイル` / `PDF 16ページ`）で分かる
+                let title = if named {
                     content.display_name.clone()
+                } else {
+                    format.label.clone()
                 };
                 rows.push(SwitchRow {
                     content_index,
