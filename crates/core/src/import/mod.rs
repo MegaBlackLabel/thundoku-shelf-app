@@ -229,29 +229,70 @@ pub struct ImportPlan {
 
 /// コンテンツごとのエントリを集めるための作業用バケット。
 struct Group {
-    name: String,
+    /// 同一性のキー（フォルダのパス。直下のファイルは `""` かファイル名）。
+    key: String,
+    /// 表示名（フォルダ名 / ファイル名 / `本文`）。
+    display_name: String,
     /// `(種別, メタ情報の並び順)`。
     entries: Vec<(EntryKind, usize)>,
 }
 
-/// 最上位フォルダ名（直下のファイルは `""`）。
-fn top_level_folder(name: &str) -> Option<&str> {
-    name.split_once(['/', '\\']).map(|(folder, _)| folder)
+/// パスの区切り（ZIP は `/`。全角 `／` で書き出す作品もあるため両方見る）。
+const PATH_SEPARATORS: [char; 3] = ['/', '\\', '／'];
+
+/// 形式だけを表すフォルダ名か（このフォルダ自体は読む単位にしない）。
+/// `1.尻穴便女/jpg/…` のように形式フォルダが挟まる構造で、内容のフォルダ名を採るため。
+fn is_format_folder(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    matches!(
+        lower.as_str(),
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "webp"
+            | "gif"
+            | "bmp"
+            | "tif"
+            | "tiff"
+            | "pdf"
+            | "epub"
+            | "カラー"
+            | "モノクロ"
+            | "文字あり"
+            | "文字なし"
+            | "seあり"
+            | "seなし"
+    ) || lower.ends_with("版")
+        || lower.starts_with("画像")
+}
+
+/// エントリが属する読む単位（コンテンツ）のフォルダ。
+///
+/// 末尾が形式フォルダなら 1 つ上を使う（`1.尻穴便女/jpg/001.jpg` → `1.尻穴便女`）。
+/// 戻り値は `(キー, 表示名)`。直下のファイルは `None`。
+fn content_folder(name: &str) -> Option<(String, String)> {
+    let mut components: Vec<&str> = name.split(PATH_SEPARATORS).collect();
+    components.pop(); // ファイル名を落とす
+    while components.last().is_some_and(|last| is_format_folder(last)) {
+        components.pop();
+    }
+    let display_name = components.last()?.to_string();
+    Some((components.join("/"), display_name))
 }
 
 /// ファイル名から拡張子を除いた部分。
 fn file_stem(name: &str) -> &str {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let base = name.rsplit(PATH_SEPARATORS).next().unwrap_or(name);
     base.rsplit_once('.').map_or(base, |(stem, _)| stem)
 }
 
 /// エントリ一覧からコンテンツ（読む単位）を組み立てる。
 ///
-/// - 最上位フォルダは 1 コンテンツ（入れ子は同じコンテンツに畳む）
+/// - **ページを直接含むフォルダ**を 1 コンテンツにする（形式フォルダは飛ばす）。
+///   入れ子の上位フォルダ（`総集編/1.話A/…` の `総集編`）は単位にしない。
 /// - 直下の画像はまとめて 1 コンテンツ（`本文`）
-/// - 直下の PDF / EPUB / 音声 / 動画はファイルごとに 1 コンテンツ
-/// - 直下 PDF のファイル名がフォルダ名と一致する場合は、そのフォルダの
-///   レンディションとして畳む（`PDF版` / `画像版`。§3.2）
+/// - 直下の PDF / EPUB / 音声 / 動画はファイルごとに 1 コンテンツ。
+///   同じ名前のフォルダがあればそのレンディションとして畳む（`PDF版` / `画像版`。§3.2）
 fn build_contents(metas: &[EntryMeta]) -> Vec<PlannedContent> {
     let mut groups: Vec<Group> = Vec::new();
     let mut root_entries: Vec<(EntryKind, usize, String)> = Vec::new();
@@ -263,19 +304,26 @@ fn build_contents(metas: &[EntryMeta]) -> Vec<PlannedContent> {
         if !is_readable_kind(kind) {
             continue;
         }
-        match top_level_folder(&meta.name) {
-            Some(folder) => group_push(&mut groups, folder, kind, ordinal),
+        match content_folder(&meta.name) {
+            Some((key, display_name)) => {
+                group_push(&mut groups, &key, &display_name, kind, ordinal)
+            }
             None => root_entries.push((kind, ordinal, file_stem(&meta.name).to_string())),
         }
     }
-    // 直下の画像は 1 つにまとめ、それ以外はファイル単位。PDF は同名フォルダへ畳む。
+    // 直下の画像は 1 つにまとめ、それ以外はファイル単位。PDF は同名コンテンツへ畳む。
     for (kind, ordinal, stem) in root_entries {
-        let target = match kind {
-            EntryKind::Image => "本文",
-            _ => stem.as_str(),
-        };
-        group_push(&mut groups, target, kind, ordinal);
+        match kind {
+            EntryKind::Image => group_push(&mut groups, "", "本文", kind, ordinal),
+            _ => match groups.iter_mut().find(|group| group.display_name == stem) {
+                Some(group) => group.entries.push((kind, ordinal)),
+                None => group_push(&mut groups, &stem, &stem, kind, ordinal),
+            },
+        }
     }
+
+    // フォルダ名の数字接頭辞（`1.` / `2.`）は作者の意図的な順序（§5.1）なので自然順で並べる
+    groups.sort_by(|a, b| natural_cmp(&a.display_name, &b.display_name));
 
     groups
         .into_iter()
@@ -283,11 +331,18 @@ fn build_contents(metas: &[EntryMeta]) -> Vec<PlannedContent> {
         .collect()
 }
 
-fn group_push(groups: &mut Vec<Group>, name: &str, kind: EntryKind, ordinal: usize) {
-    match groups.iter_mut().find(|group| group.name == name) {
+fn group_push(
+    groups: &mut Vec<Group>,
+    key: &str,
+    display_name: &str,
+    kind: EntryKind,
+    ordinal: usize,
+) {
+    match groups.iter_mut().find(|group| group.key == key) {
         Some(group) => group.entries.push((kind, ordinal)),
         None => groups.push(Group {
-            name: name.to_string(),
+            key: key.to_string(),
+            display_name: display_name.to_string(),
             entries: vec![(kind, ordinal)],
         }),
     }
@@ -326,7 +381,7 @@ fn plan_content(group: Group, metas: &[EntryMeta]) -> Option<PlannedContent> {
         });
     }
     Some(PlannedContent {
-        display_name: group.name,
+        display_name: group.display_name,
         media_kind: media_kind?,
         renditions,
     })

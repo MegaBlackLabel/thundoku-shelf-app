@@ -644,10 +644,11 @@ impl ImageViewer {
         let mut rows = Vec::new();
         for (content_index, content) in self.contents.iter().enumerate() {
             let multi_formats = content.formats.len() > 1;
+            // 直下の画像セットは合成名（`本文`）。その場合はレンディション名を出す。
+            let named = content.display_name != "本文";
             for (format_index, format) in content.formats.iter().enumerate() {
                 let first_of_content = format_index == 0;
-                let title = if !multi {
-                    // 単一コンテンツはレンディション名そのもの（`JPEG` / `PDF`）
+                let title = if !named {
                     format.label.clone()
                 } else if multi_formats {
                     format!("{}・{}", content.display_name, format.label)

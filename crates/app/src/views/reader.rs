@@ -653,7 +653,7 @@ mod tests {
     }
 
     /// 1 コンテンツ + 1 レンディション（PDF 2 ページ）の本。
-    fn seed_book_with_single_rendition(cx: &mut TestAppContext, id: &str) {
+    fn seed_book_with_single_rendition(cx: &mut TestAppContext, id: &str, display_name: &str) {
         cx.update(|cx| {
             let state = crate::app_state::AppState::global(cx);
             let db = &state.db_pool;
@@ -677,17 +677,17 @@ mod tests {
             db::contents::insert_batch(
                 db,
                 &[db::contents::BookContent {
-                    content_id: "c-only".into(),
+                    content_id: format!("{id}-c"),
                     book_id: id.into(),
-                    display_name: "本文".into(),
+                    display_name: display_name.into(),
                     media_kind: "pdf".into(),
                     is_primary: 1,
                     sort_order: 0,
                     created_at: stamp.into(),
                 }],
                 &[db::contents::ContentFormat {
-                    format_id: "f-only".into(),
-                    content_id: "c-only".into(),
+                    format_id: format!("{id}-f"),
+                    content_id: format!("{id}-c"),
                     label: "PDF".into(),
                     format_kind: "pdf".into(),
                     page_count: 2,
@@ -703,8 +703,8 @@ mod tests {
                     &documents::DocumentImage {
                         id: format!("{id}-img{page}"),
                         document_id: format!("{id}-doc"),
-                        content_id: Some("c-only".into()),
-                        format_id: Some("f-only".into()),
+                        content_id: Some(format!("{id}-c")),
+                        format_id: Some(format!("{id}-f")),
                         page_number: page,
                         image_type: "page".into(),
                         opfs_path: format!("{id}/p{page}"),
@@ -726,7 +726,7 @@ mod tests {
     async fn menu_shows_row_even_for_single_format(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
-        seed_book_with_single_rendition(cx, "b7");
+        seed_book_with_single_rendition(cx, "b7", "本文");
 
         let reader = cx.new(|cx| ReaderView::for_book(cx, "b7".to_string()));
         let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
@@ -742,7 +742,16 @@ mod tests {
         assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 2);
         assert_eq!(
             reader.read_with(cx, |r, _| r.selection().1.map(|s| s.to_string())),
-            Some("f-only".to_string())
+            Some("b7-f".to_string())
+        );
+
+        // フォルダ名があるコンテンツはそのフォルダ名を出す（合成名 `本文` のときだけ形式名）
+        seed_book_with_single_rendition(cx, "b8", "1.尻穴便女");
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b8".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec!["1.尻穴便女".to_string()]
         );
     }
 

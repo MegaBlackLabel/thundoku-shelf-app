@@ -883,6 +883,59 @@ fn zip_with_two_folder_contents_persists_structure() {
 }
 
 #[test]
+fn zip_nested_folders_become_separate_contents() {
+    // 実データ（d_614383 尻穴便女 総集編）は「総集編フォルダ / 1.話A / 2.話B …」の形。
+    // **ページを直接含むフォルダ**が読む単位になり、上位フォルダは単位にしない。
+    let env = TestEnv::new("nested-folders");
+    let zip_path = env.root.join("nested.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, color) in [
+        ("総集編/1.話A/001.jpg", [255, 0, 0]),
+        ("総集編/1.話A/002.jpg", [0, 255, 0]),
+        ("総集編/2.話B/001.jpg", [0, 0, 255]),
+        // 形式フォルダを挟む場合は、その上のフォルダ名を採る
+        ("総集編/3.話C/jpg/001.jpg", [255, 255, 0]),
+        ("総集編/4.オマケ漫画/001.jpg", [128, 0, 128]),
+    ] {
+        zip.start_file(name, options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, color)).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let stored = db::contents::list_with_formats(&env.pool, &imported.book.id).unwrap();
+    let names: Vec<&str> = stored
+        .iter()
+        .map(|(content, _)| content.display_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["1.話A", "2.話B", "3.話C", "4.オマケ漫画"],
+        "ページを含むフォルダが単位になる（自然順）"
+    );
+    // 形式フォルダ（jpg）ではなくその上のフォルダ名を使う
+    let talk_c = stored
+        .iter()
+        .find(|(content, _)| content.display_name == "3.話C")
+        .unwrap();
+    assert_eq!(talk_c.1.len(), 1);
+    assert_eq!(talk_c.1[0].page_count, 1);
+    assert_eq!(talk_c.1[0].label, "JPEG");
+    assert_eq!(
+        talk_c.1[0].pack_entry_prefix.as_deref(),
+        Some("contents/2/r0")
+    );
+    // 既定表示はページ数最多（1.話A = 2 ページ）
+    let primary = db::contents::primary_for_book(&env.pool, &imported.book.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(primary.display_name, "1.話A");
+    assert_eq!(imported.document.total_pages, 2);
+}
+
+#[test]
 fn unsupported_extension_is_rejected() {
     let env = TestEnv::new("unsupported");
     let path = env.root.join("notes.txt");
