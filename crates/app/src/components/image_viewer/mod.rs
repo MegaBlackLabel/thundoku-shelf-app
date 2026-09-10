@@ -351,6 +351,8 @@ pub struct ImageViewer {
     current_format_id: Option<String>,
     /// 切替操作の保留（`(content_id, format_id)`。`ReaderView` が `take_action` で拾う）。
     pending_action: Option<(String, Option<String>)>,
+    /// ページ画像を読めなかった理由（pack 欠損・破損など）。0 件なら `None`。
+    load_error: Option<String>,
 }
 
 impl ImageViewer {
@@ -443,6 +445,7 @@ impl ImageViewer {
             current_content_id: None,
             current_format_id: None,
             pending_action: None,
+            load_error: None,
             images: (0..page_count).map(|_| None).collect(),
             overlay_visible: true,
             hovering_ui: false,
@@ -530,6 +533,7 @@ impl ImageViewer {
         self.pan_velocity = gpui_kit::Point::new(0.0, 0.0);
         self.pan_max = gpui_kit::Point::new(0.0, 0.0);
         self.drag_start = None;
+        self.load_error = None;
         // ページ一覧を開いたまま切り替えた場合はサムネイルを読み直す
         self.load_page_list_thumbnails(cx);
         cx.notify();
@@ -875,6 +879,20 @@ impl ImageViewer {
         div()
             .flex()
             .flex_col()
+            .when_some(self.load_error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().danger)
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(format!(
+                            "ページ画像を読み込めませんでした: {error}（再ダウンロードしてください）"
+                        )),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1020,7 +1038,12 @@ impl ImageViewer {
                 if index < this.images.len() {
                     match result {
                         Ok(image) => this.images[index] = Some(image),
-                        Err(_) => this.images[index] = None,
+                        Err(error) => {
+                            this.images[index] = None;
+                            if this.load_error.is_none() {
+                                this.load_error = Some(error);
+                            }
+                        }
                     }
                 }
                 cx.notify();
@@ -1643,16 +1666,39 @@ impl ImageViewer {
                         .into_any_element()
                 }
             }
-            None => div()
-                .size_full()
-                .bg(viewer_bg())
-                .flex()
-                .items_center()
-                .justify_center()
+            None => match self.load_error.clone() {
+                // 読めない理由が分かっているときは、白画面ではなく説明を出す
+                // （pack が無い / 壊れている = 再ダウンロードが必要）
+                Some(error) => div()
+                    .size_full()
+                    .bg(viewer_bg())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .child("ページ画像を読み込めませんでした"),
+                    )
+                    .child(div().text_xs().text_color(_muted_foreground).child(
+                        "パック（.opfspack）が無いか壊れています。再ダウンロードしてください",
+                    ))
+                    .child(div().text_xs().text_color(_muted_foreground).child(error))
+                    .into_any_element(),
                 // 開いた直後などの読み込み待ちはスピナーを表示して
                 // 「止まってる感じ」を出さない（数十 ms で画像に差し替わる）
-                .child(gpui_kit::component::spinner::Spinner::new())
-                .into_any_element(),
+                None => div()
+                    .size_full()
+                    .bg(viewer_bg())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(gpui_kit::component::spinner::Spinner::new())
+                    .into_any_element(),
+            },
         }
     }
 }
@@ -2995,6 +3041,206 @@ mod tests {
         assert!(!view.read_with(cx, |v, _| v.overlay_visible));
         cx.update(|cx| view.update(cx, |this, cx| this.toggle_overlay(cx)));
         assert!(view.read_with(cx, |v, _| v.overlay_visible));
+    }
+
+    /// 実 pack（opfspack）を使った再現テスト: 画像だけの本（1 コンテンツ + 1 レンディション）
+    /// でページ一覧のサムネイルが読み込めること。`pack_entry_path` が実在しないと
+    /// 空タイルになるため、実際に pack を書いて検証する。
+    #[gpui_kit::test]
+    async fn page_list_thumbnails_load_from_real_pack(cx: &mut TestAppContext) {
+        use thundoku_core::db;
+
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        let (db_pool, packs_dir) = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            (state.db_pool.clone(), state.packs_dir.clone())
+        });
+
+        let book_id = "real-pack-book";
+        let content_id = "real-pack-content";
+        let format_id = "real-pack-format";
+        let stamp = "2026-09-11 00:00:00";
+
+        // 実 pack を作る（ページ 3 枚の PNG）
+        let mut builder = opfspack::PackBuilder::new(1);
+        for page in 1..=3 {
+            builder.add_entry(
+                &format!("pages/page_{page:04}.png"),
+                make_png(60, 80),
+                "image/png",
+                false,
+            );
+        }
+        let pack = builder.build(None, true).unwrap();
+        std::fs::create_dir_all(&packs_dir).unwrap();
+        std::fs::write(packs_dir.join(format!("{book_id}.opfspack")), &pack).unwrap();
+
+        // DB 行（画像だけの本 = 1 コンテンツ + 1 レンディション）
+        db::books::insert(
+            &db_pool,
+            &db::books::Book {
+                id: book_id.into(),
+                title: "画像だけの本".into(),
+                author: String::new(),
+                circle_name: String::new(),
+                purchase_date: None,
+                file_name: "images.zip".into(),
+                file_size: 1,
+                opfs_path: format!("{book_id}.opfspack"),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 1,
+                pack_id: Some(book_id.into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: stamp.into(),
+                updated_at: stamp.into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
+            },
+        )
+        .unwrap();
+        db::documents::insert_document(
+            &db_pool,
+            &db::documents::ImportedDocument {
+                id: format!("{book_id}-doc"),
+                book_id: book_id.into(),
+                source_type: "image-set".into(),
+                file_hash: "h".into(),
+                total_pages: 3,
+                metadata: None,
+                status: "completed".into(),
+                created_at: stamp.into(),
+                updated_at: stamp.into(),
+            },
+        )
+        .unwrap();
+        db::contents::insert_batch(
+            &db_pool,
+            &[db::contents::BookContent {
+                content_id: content_id.into(),
+                book_id: book_id.into(),
+                display_name: "mhszplum".into(),
+                media_kind: "image".into(),
+                is_primary: 1,
+                sort_order: 0,
+                created_at: stamp.into(),
+            }],
+            &[db::contents::ContentFormat {
+                format_id: format_id.into(),
+                content_id: content_id.into(),
+                label: "JPEG".into(),
+                format_kind: "image".into(),
+                page_count: 3,
+                pack_entry_prefix: Some("pages".into()),
+                sort_order: 0,
+                created_at: stamp.into(),
+            }],
+        )
+        .unwrap();
+        for page in 1..=3 {
+            db::documents::insert_image(
+                &db_pool,
+                &db::documents::DocumentImage {
+                    id: format!("{book_id}-img{page}"),
+                    document_id: format!("{book_id}-doc"),
+                    content_id: Some(content_id.into()),
+                    format_id: Some(format_id.into()),
+                    page_number: page,
+                    image_type: "page".into(),
+                    opfs_path: format!("{book_id}.opfspack"),
+                    width: 60,
+                    height: 80,
+                    mime_type: "image/png".into(),
+                    file_size: 1,
+                    extracted_text: None,
+                    pack_entry_path: Some(format!("pages/page_{page:04}.png")),
+                    created_at: stamp.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        // レンディションを選んだ状態のローダー（= メニューで選んだあと）
+        let images = db::documents::images_for_selection(
+            &db_pool,
+            book_id,
+            Some(content_id),
+            Some(format_id),
+        )
+        .unwrap();
+        let loader = Arc::new(PackPageLoader {
+            images,
+            packs_dir,
+            db: db_pool,
+            identity: None,
+            pack_bytes: std::sync::OnceLock::new(),
+            pack_key: std::sync::OnceLock::new(),
+        });
+        let view = cx.new(|cx| ImageViewer::new(cx, loader, "画像だけの本", 0, None));
+
+        // ページ一覧を開くと全サムネイルが読める
+        cx.update(|cx| view.update(cx, |v, cx| v.open_page_list(cx)));
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.images.iter().all(|image| image.is_some())),
+            "real pack からサムネイルが読めること"
+        );
+    }
+
+    /// pack が無い / 壊れている本は、白画面ではなく理由を出す（再ダウンロード導線）。
+    #[gpui_kit::test]
+    async fn missing_pack_surfaces_load_error(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| {
+            if cx.try_global::<crate::app_state::AppState>().is_none() {
+                crate::app_state::AppState::init_test(cx);
+            }
+        });
+        let (db_pool, packs_dir) = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            (state.db_pool.clone(), state.packs_dir.clone())
+        });
+        // 実在しない pack を指す 1 ページ（壊れた重複本と同じ状態）
+        let loader = Arc::new(PackPageLoader {
+            images: vec![DocumentImage {
+                id: "missing-img1".into(),
+                document_id: "missing-doc".into(),
+                content_id: None,
+                format_id: None,
+                page_number: 1,
+                image_type: "page".into(),
+                opfs_path: "missing.opfspack".into(),
+                width: 60,
+                height: 80,
+                mime_type: "image/png".into(),
+                file_size: 1,
+                extracted_text: None,
+                pack_entry_path: Some("pages/page_0001.png".into()),
+                created_at: "2026-01-01 00:00:00".into(),
+            }],
+            packs_dir,
+            db: db_pool,
+            identity: None,
+            pack_bytes: std::sync::OnceLock::new(),
+            pack_key: std::sync::OnceLock::new(),
+        });
+        let view = cx.new(|cx| ImageViewer::new(cx, loader, "欠損本", 0, None));
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.load_error.is_some()),
+            "pack を読めないときは理由を保持する"
+        );
     }
 
     #[gpui_kit::test]
