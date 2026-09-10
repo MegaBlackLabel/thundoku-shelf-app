@@ -48,6 +48,37 @@ pub trait PageLoader: Send + Sync + 'static {
     fn load(&self, index: usize) -> Result<Arc<RenderImage>, String>;
 }
 
+/// ページ一覧に出すコンテンツ 1 行（UI 表示用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentEntry {
+    pub content_id: String,
+    pub display_name: String,
+    pub media_kind: String,
+    pub is_primary: bool,
+    pub formats: Vec<FormatEntry>,
+}
+
+/// レンディション（切替可能な表示形態）1 行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatEntry {
+    pub format_id: String,
+    pub label: String,
+    pub page_count: i64,
+}
+
+/// ページ一覧の操作。`ImageViewer` は保留するだけで、`ReaderView` が拾って
+/// DB（優先の付け替え）とローダー（コンテンツ／レンディションの切替）に反映する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageListAction {
+    /// そのコンテンツ（レンディション指定があればそれ）を表示する
+    Select {
+        content_id: String,
+        format_id: Option<String>,
+    },
+    /// 既定表示（優先）コンテンツを変更する
+    SetPrimary { content_id: String },
+}
+
 /// Loads pages from a book's `.opfspack` (via `document_images`).
 pub struct PackPageLoader {
     pub images: Vec<DocumentImage>,
@@ -299,6 +330,15 @@ pub struct ImageViewer {
     /// スクロールモードで最後に反映した表示中ページ（render での
     /// ポーリングの再入防止用）
     last_scroll_page: usize,
+    /// ページ一覧に出すコンテンツ（`ReaderView` が DB から設定する）。
+    contents: Vec<ContentEntry>,
+    /// 現在表示中のコンテンツ／レンディション（未指定 = 旧データ / 単一コンテンツ）。
+    current_content_id: Option<String>,
+    current_format_id: Option<String>,
+    /// ページ一覧のドリルイン状態（`None` = コンテンツ一覧、`Some(i)` = i 番目を展開中）。
+    page_list_drill: Option<usize>,
+    /// ページ一覧の操作の保留（`ReaderView` が `take_action` で拾う）。
+    pending_action: Option<PageListAction>,
 }
 
 impl ImageViewer {
@@ -387,6 +427,11 @@ impl ImageViewer {
             page_turn_right_to_left,
             autoplay_interval_ms: saved_autoplay_interval,
             last_scroll_page: initial,
+            contents: Vec::new(),
+            current_content_id: None,
+            current_format_id: None,
+            page_list_drill: None,
+            pending_action: None,
             images: (0..page_count).map(|_| None).collect(),
             overlay_visible: true,
             hovering_ui: false,
@@ -474,7 +519,383 @@ impl ImageViewer {
         self.pan_velocity = gpui_kit::Point::new(0.0, 0.0);
         self.pan_max = gpui_kit::Point::new(0.0, 0.0);
         self.drag_start = None;
+        // ページ一覧を開いたまま切り替えた場合はサムネイルを読み直す
+        self.load_page_list_thumbnails(cx);
         cx.notify();
+    }
+
+    // -- page list (contents) -----------------------------------------------
+
+    /// ページ一覧に出すコンテンツ一覧と、現在表示中の選択を設定する（`ReaderView` から）。
+    pub fn set_contents(
+        &mut self,
+        cx: &mut Context<Self>,
+        contents: Vec<ContentEntry>,
+        current_content_id: Option<String>,
+        current_format_id: Option<String>,
+    ) {
+        self.contents = contents;
+        self.current_content_id = current_content_id;
+        self.current_format_id = current_format_id;
+        cx.notify();
+    }
+
+    /// ページ一覧の操作を取り出す（`ReaderView` が反映する）。
+    pub fn take_action(&mut self) -> Option<PageListAction> {
+        self.pending_action.take()
+    }
+
+    /// ページ一覧に出すコンテンツ（テスト・UI 用）。
+    pub fn contents(&self) -> &[ContentEntry] {
+        &self.contents
+    }
+
+    /// ドリルイン中のコンテンツ添字（`None` = コンテンツ一覧）。
+    pub fn page_list_drill(&self) -> Option<usize> {
+        self.page_list_drill
+    }
+
+    /// 現在表示中のコンテンツ／レンディション。
+    pub fn current_selection(&self) -> (Option<String>, Option<String>) {
+        (
+            self.current_content_id.clone(),
+            self.current_format_id.clone(),
+        )
+    }
+
+    /// ページ一覧を開く。コンテンツが複数なら一覧、単一ならサムネイルグリッドを直接出す。
+    pub fn open_page_list(&mut self, cx: &mut Context<Self>) {
+        self.active_panel = Some(PanelView::PageList);
+        self.page_list_drill = if self.show_content_list() {
+            None
+        } else {
+            Some(0)
+        };
+        self.load_page_list_thumbnails(cx);
+        self.restart_hide_timer(cx);
+        cx.notify();
+    }
+
+    /// コンテンツ行をドリルインする（= そのコンテンツを開く）。
+    pub fn page_list_drill_in(&mut self, cx: &mut Context<Self>, index: usize) {
+        let Some(content) = self.contents.get(index) else {
+            return;
+        };
+        let content_id = content.content_id.clone();
+        self.page_list_drill = Some(index);
+        self.pending_action = Some(PageListAction::Select {
+            content_id,
+            format_id: None,
+        });
+        cx.notify();
+    }
+
+    /// ページ一覧の「戻る」。ドリルイン中ならコンテンツ一覧へ、一覧ならメニューへ。
+    pub fn page_list_back(&mut self, cx: &mut Context<Self>) {
+        if self.show_content_list() && self.page_list_drill.is_some() {
+            self.page_list_drill = None;
+            cx.notify();
+            return;
+        }
+        self.open_panel(cx, PanelView::Menu);
+    }
+
+    /// 優先（既定表示）コンテンツを変更する（ラジオ）。
+    pub fn page_list_set_primary(&mut self, cx: &mut Context<Self>, index: usize) {
+        let Some(content) = self.contents.get(index) else {
+            return;
+        };
+        self.pending_action = Some(PageListAction::SetPrimary {
+            content_id: content.content_id.clone(),
+        });
+        cx.notify();
+    }
+
+    /// レンディションを切り替える（同じコンテンツの別形式・別バリアント）。
+    pub fn page_list_select_format(
+        &mut self,
+        cx: &mut Context<Self>,
+        content_index: usize,
+        format_index: usize,
+    ) {
+        let Some(content) = self.contents.get(content_index) else {
+            return;
+        };
+        let Some(format) = content.formats.get(format_index) else {
+            return;
+        };
+        self.page_list_drill = Some(content_index);
+        self.pending_action = Some(PageListAction::Select {
+            content_id: content.content_id.clone(),
+            format_id: Some(format.format_id.clone()),
+        });
+        cx.notify();
+    }
+
+    /// サムネイルを読み込む。コンテンツ一覧を出している間は何もしない（遅延読み込み）。
+    fn load_page_list_thumbnails(&mut self, cx: &mut Context<Self>) {
+        if self.show_content_list() && self.page_list_drill.is_none() {
+            return;
+        }
+        for index in 0..self.loader.page_count() {
+            self.ensure_loaded(cx, index);
+        }
+    }
+
+    /// コンテンツ一覧を挟むか（複数コンテンツ、またはレンディションが複数あるとき）。
+    fn show_content_list(&self) -> bool {
+        self.contents.len() > 1
+            || self
+                .contents
+                .first()
+                .is_some_and(|content| content.formats.len() > 1)
+    }
+
+    /// ページ一覧: コンテンツ一覧（優先ラジオ + 表示名 + 種別 + ページ数 + ドリルイン）。
+    fn content_list_panel(
+        &self,
+        handle: &Entity<ImageViewer>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let rows = self.contents.iter().enumerate().map(|(index, content)| {
+            let radio_handle = handle.clone();
+            let row_handle = handle.clone();
+            let is_current =
+                self.current_content_id.as_deref() == Some(content.content_id.as_str());
+            let page_count = content
+                .formats
+                .iter()
+                .map(|format| format.page_count)
+                .max()
+                .unwrap_or(0);
+            let kind = match content.media_kind.as_str() {
+                "pdf" => "PDF".to_string(),
+                "epub" => "EPUB".to_string(),
+                "audio" => "音声".to_string(),
+                "video" => "動画".to_string(),
+                _ => content
+                    .formats
+                    .first()
+                    .map(|format| format.label.clone())
+                    .unwrap_or_else(|| "画像".to_string()),
+            };
+            // レンディション切替（複数あるときだけ出す）
+            let format_chips = content
+                .formats
+                .iter()
+                .enumerate()
+                .map(|(format_index, format)| {
+                    let chip_handle = handle.clone();
+                    let selected =
+                        self.current_format_id.as_deref() == Some(format.format_id.as_str());
+                    div()
+                        .id(SharedString::from(format!(
+                            "viewer-format-{index}-{format_index}"
+                        )))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if selected {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted
+                        })
+                        .text_xs()
+                        .cursor_pointer()
+                        .on_click(move |_, _window, cx| {
+                            chip_handle.update(cx, |this, cx| {
+                                this.page_list_select_format(cx, index, format_index);
+                            });
+                        })
+                        .child(format.label.clone())
+                });
+            div()
+                .id(SharedString::from(format!("viewer-content-{index}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(if is_current {
+                    cx.theme().primary
+                } else {
+                    cx.theme().muted
+                })
+                .child(
+                    div()
+                        .id(SharedString::from(format!("viewer-content-radio-{index}")))
+                        .cursor_pointer()
+                        .text_color(if content.is_primary {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .on_click(move |_, _window, cx| {
+                            radio_handle.update(cx, |this, cx| {
+                                this.page_list_set_primary(cx, index);
+                            });
+                        })
+                        .child(if content.is_primary { "◉" } else { "○" }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_grow(1.0)
+                        .gap_1()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("viewer-content-open-{index}")))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .on_click(move |_, _window, cx| {
+                                    row_handle.update(cx, |this, cx| {
+                                        this.page_list_drill_in(cx, index);
+                                    });
+                                })
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .child(content.display_name.clone()),
+                                )
+                                .child(div().text_color(cx.theme().muted_foreground).child("›")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{kind}・{page_count} ページ")),
+                        )
+                        .child(div().flex().flex_row().gap_1().children(format_chips)),
+                )
+        });
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .h(px(420.0))
+                    .overflow_y_scrollbar()
+                    .children(rows),
+            )
+            .child(self.panel_back(handle, cx))
+            .into_any_element()
+    }
+
+    /// ページ一覧: サムネイルグリッド（単一コンテンツは従来どおり）。
+    fn page_grid_panel(
+        &self,
+        handle: &Entity<ImageViewer>,
+        total: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let grid = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .p_3()
+            .h(px(420.0))
+            .overflow_y_scrollbar()
+            .children((0..total).map(|index| {
+                let handle = handle.clone();
+                let image = self.images.get(index).cloned().flatten();
+                let is_current = index == self.current_page;
+                div()
+                    .id(SharedString::from(format!("viewer-thumb-{index}")))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if is_current {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().muted
+                    })
+                    .hover(|style| style.bg(cx.theme().muted))
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
+                        handle.update(cx, |this, cx| {
+                            this.set_page(cx, index);
+                        });
+                    })
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .aspect_ratio(100.0 / 141.0)
+                            .rounded_sm()
+                            .bg(gpui_kit::white())
+                            .overflow_hidden()
+                            .child(match image {
+                                Some(image) => img(image)
+                                    .size_full()
+                                    .object_fit(gpui_kit::ObjectFit::Contain)
+                                    .into_any_element(),
+                                None => div().size_full().into_any_element(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{}", index + 1)),
+                    )
+                    .child(if is_current {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("現在")
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+            }));
+        // 複数コンテンツ / 複数レンディションのときは一覧へ戻れる
+        let back = if self.show_content_list() {
+            let back_handle = handle.clone();
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .py_2()
+                .border_t_1()
+                .border_color(cx.theme().muted)
+                .child(
+                    Button::new("viewer-panel-back-list")
+                        .cursor_pointer()
+                        .label("← 上の階層に戻る")
+                        .cursor_pointer()
+                        .on_click(move |_, _window, cx| {
+                            back_handle.update(cx, |this, cx| this.page_list_back(cx));
+                        }),
+                )
+                .into_any_element()
+        } else {
+            self.panel_back(handle, cx).into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(grid)
+            .child(back)
+            .into_any_element()
     }
 
     // -- page navigation ----------------------------------------------------
@@ -940,15 +1361,12 @@ impl ImageViewer {
 
     /// パネルビューを開く（Web 版の `openPanel(view)` 相当）。
     fn open_panel(&mut self, cx: &mut Context<Self>, view: PanelView) {
-        self.active_panel = Some(view);
         if view == PanelView::PageList {
-            // Web 版はサムネイルを遅延ロード。デスクトップは images キャッシュを
-            // 使うため、開いた時点で全ページのサムネイル読み込みを開始する。
-            let count = self.loader.page_count();
-            for index in 0..count {
-                self.ensure_loaded(cx, index);
-            }
+            // コンテンツが複数なら一覧、単一ならサムネイルグリッドを直接出す
+            self.open_page_list(cx);
+            return;
         }
+        self.active_panel = Some(view);
         self.restart_hide_timer(cx);
         cx.notify();
     }
@@ -2035,82 +2453,13 @@ impl Render for ImageViewer {
                                                 .child("›"),
                                         ),
                                 ),
-                            PanelView::PageList => div()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .p_3()
-                                        .h(px(420.0))
-                                        .overflow_y_scrollbar()
-                                        .children((0..total).map(|index| {
-                                            let handle = handle.clone();
-                                            let image = self.images.get(index).cloned().flatten();
-                                            let is_current = index == self.current_page;
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "viewer-thumb-{index}"
-                                                )))
-                                                .flex()
-                                                .flex_col()
-                                                .items_center()
-                                                .gap_1()
-                                                .p_1()
-                                                .rounded_md()
-                                                .border_1()
-                                                .border_color(if is_current {
-                                                    cx.theme().primary
-                                                } else {
-                                                    cx.theme().muted
-                                                })
-                                                .hover(|style| style.bg(cx.theme().muted))
-                                                .cursor_pointer()
-                                                .on_click(move |_, _window, cx| {
-                                                    handle.update(cx, |this, cx| {
-                                                        this.set_page(cx, index);
-                                                    });
-                                                })
-                                                .child(
-                                                    div()
-                                                        .w(px(100.0))
-                                                        .aspect_ratio(100.0 / 141.0)
-                                                        .rounded_sm()
-                                                        .bg(gpui_kit::white())
-                                                        .overflow_hidden()
-                                                        .child(match image {
-                                                            Some(image) => img(image)
-                                                                .size_full()
-                                                                .object_fit(
-                                                                    gpui_kit::ObjectFit::Contain,
-                                                                )
-                                                                .into_any_element(),
-                                                            None => {
-                                                                div().size_full().into_any_element()
-                                                            }
-                                                        }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child(format!("{}", index + 1)),
-                                                )
-                                                .child(if is_current {
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child("現在")
-                                                        .into_any_element()
-                                                } else {
-                                                    div().into_any_element()
-                                                })
-                                        })),
-                                )
-                                .child(self.panel_back(&handle, cx)),
+                            PanelView::PageList => div().child(
+                                if self.show_content_list() && self.page_list_drill.is_none() {
+                                    self.content_list_panel(&handle, cx)
+                                } else {
+                                    self.page_grid_panel(&handle, total, cx)
+                                },
+                            ),
                             PanelView::Shortcuts => {
                                 let kbd = |stroke: &str| Kbd::new(gpui_kit::Keystroke::parse(stroke).unwrap());
                                 let row = |label: String, strokes: Vec<&str>| {

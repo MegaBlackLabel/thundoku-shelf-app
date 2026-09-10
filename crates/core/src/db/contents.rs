@@ -129,6 +129,41 @@ pub fn formats_for_content(
     })
 }
 
+/// コンテンツとレンディションをまとめて返す（UI のページ一覧用）。
+pub fn list_with_formats(
+    pool: &SqlitePool,
+    book_id: &str,
+) -> Result<Vec<(BookContent, Vec<ContentFormat>)>, sqlx::Error> {
+    let contents = list_for_book(pool, book_id)?;
+    let mut out = Vec::with_capacity(contents.len());
+    for content in contents {
+        let formats = formats_for_content(pool, &content.content_id)?;
+        out.push((content, formats));
+    }
+    Ok(out)
+}
+
+/// 既定表示コンテンツを付け替える（`is_primary` は常に 1 本だけ）。
+/// ページ数の再計算や読了の再評価（§8.3）はフェーズ5で対応する。
+pub fn set_primary(pool: &SqlitePool, book_id: &str, content_id: &str) -> Result<(), sqlx::Error> {
+    crate::db::block_on(async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("UPDATE book_contents SET is_primary = 0 WHERE book_id = ?1")
+            .bind(book_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE book_contents SET is_primary = 1 WHERE book_id = ?1 AND content_id = ?2",
+        )
+        .bind(book_id)
+        .bind(content_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    })
+}
+
 /// 本に紐づくコンテンツ／レンディションを削除する（再取り込み用）。
 /// 子（`content_formats`）→ 親（`book_contents`）の順で消す。
 pub fn delete_for_book(pool: &SqlitePool, book_id: &str) -> Result<(), sqlx::Error> {

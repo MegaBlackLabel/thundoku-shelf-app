@@ -1086,6 +1086,53 @@ fn book_contents_and_formats_roundtrip() {
             .is_empty()
     );
 
+    // 2 つ目のコンテンツ（別冊）
+    let stamp = "2026-01-01 00:00:00";
+    contents::insert_batch(
+        &pool,
+        &[contents::BookContent {
+            content_id: "c2".into(),
+            book_id: "book-c".into(),
+            display_name: "別冊".into(),
+            media_kind: "image".into(),
+            is_primary: 0,
+            sort_order: 1,
+            created_at: stamp.into(),
+        }],
+        &[contents::ContentFormat {
+            format_id: "f2".into(),
+            content_id: "c2".into(),
+            label: "画像".into(),
+            format_kind: "image".into(),
+            page_count: 1,
+            pack_entry_prefix: Some("contents/1/r0".into()),
+            sort_order: 0,
+            created_at: stamp.into(),
+        }],
+    )
+    .unwrap();
+
+    // 一覧はレンディション付きで表示順に返る（UI が 1 回で組める）
+    let listed = contents::list_with_formats(&pool, "book-c").unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].0.display_name, "本文");
+    assert_eq!(listed[0].1.len(), 1);
+    assert_eq!(listed[1].0.display_name, "別冊");
+    assert_eq!(listed[1].1[0].format_id, "f2");
+
+    // 優先の付け替え（is_primary は常に 1 本だけ）
+    contents::set_primary(&pool, "book-c", "c2").unwrap();
+    let listed = contents::list_with_formats(&pool, "book-c").unwrap();
+    assert_eq!(listed[0].0.is_primary, 0, "旧 primary は外れる");
+    assert_eq!(listed[1].0.is_primary, 1, "新しい primary が立つ");
+    assert_eq!(
+        contents::primary_for_book(&pool, "book-c")
+            .unwrap()
+            .unwrap()
+            .content_id,
+        "c2"
+    );
+
     contents::delete_for_book(&pool, "book-c").unwrap();
     assert!(contents::list_for_book(&pool, "book-c").unwrap().is_empty());
     assert!(

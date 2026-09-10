@@ -14,7 +14,9 @@ use gpui_kit::{
 use thundoku_core::db;
 
 use crate::app_state::AppState;
-use crate::components::image_viewer::{Base64PageLoader, ImageViewer, PackPageLoader};
+use crate::components::image_viewer::{
+    Base64PageLoader, ContentEntry, FormatEntry, ImageViewer, PackPageLoader, PageListAction,
+};
 
 pub struct ReaderView {
     viewer: Entity<ImageViewer>,
@@ -77,7 +79,7 @@ impl ReaderView {
         let loader = Arc::new(PackPageLoader {
             images,
             packs_dir,
-            db,
+            db: db.clone(),
             identity: google_sub.map(|sub| opfspack::Identity {
                 sub,
                 pack_id: book_id.to_string(),
@@ -85,13 +87,25 @@ impl ReaderView {
             pack_bytes: std::sync::OnceLock::new(),
             pack_key: std::sync::OnceLock::new(),
         });
+        // レンディション未指定なら、そのコンテンツの先頭を実際の選択として記録する
+        let resolved_format = match &format_id {
+            Some(id) => Some(id.clone()),
+            None => content_id.as_deref().and_then(|content_id| {
+                db::contents::formats_for_content(&db, content_id)
+                    .ok()
+                    .and_then(|formats| formats.into_iter().next())
+                    .map(|format| format.format_id)
+            }),
+        };
         self.content_id = content_id.map(SharedString::from);
-        self.format_id = format_id.map(SharedString::from);
+        self.format_id = resolved_format.map(SharedString::from);
         self.last_saved_page = 0;
         self.last_pages = vec![0];
         self.last_page_at = Some(Instant::now());
         let viewer = self.viewer.clone();
         viewer.update(cx, |viewer, cx| viewer.set_loader(cx, loader, 0));
+        // ページ一覧の「現在表示中」マークを更新する
+        self.refresh_contents(&viewer, cx);
         cx.notify();
     }
 
@@ -157,6 +171,7 @@ impl ReaderView {
             sub,
             pack_id: book_id.clone(),
         });
+        let contents = load_content_entries(&db, &book_id);
         let loader = Arc::new(PackPageLoader {
             images,
             packs_dir,
@@ -179,6 +194,17 @@ impl ReaderView {
 
         let viewer =
             cx.new(|cx| ImageViewer::new(cx, loader, title.clone(), initial_page, site_id));
+        // ページ一覧で使うコンテンツ一覧を渡す（複数コンテンツ / レンディションの切替用）
+        viewer.update(cx, |viewer, cx| {
+            viewer.set_contents(
+                cx,
+                contents,
+                selection.as_ref().map(|(content_id, _)| content_id.clone()),
+                selection
+                    .as_ref()
+                    .and_then(|(_, format_id)| format_id.clone()),
+            )
+        });
         // 閲覧履歴のセッションを開始する（途中で落ちた場合に備え ended_at は
         // 開始時刻で初期化された状態で作成される）
         let view_session_id = {
@@ -262,8 +288,49 @@ impl ReaderView {
     /// ページ毎の閲覧記録と進捗保存をまとめて行う。ページ移動のみを検知するため、
     /// 画像ロードなどの notify では記録しない（`last_page` 比較で弾く）。
     fn on_viewer_changed(&mut self, viewer: Entity<ImageViewer>, cx: &mut Context<Self>) {
+        // ページ一覧の操作（コンテンツ切替 / 優先の変更）を反映する
+        if let Some(action) = viewer.update(cx, |viewer, _| viewer.take_action()) {
+            self.apply_page_list_action(action, viewer.clone(), cx);
+        }
         self.record_page_view(viewer.clone(), cx);
         self.save_progress(viewer, cx);
+    }
+
+    /// ページ一覧の操作を DB / ローダーに反映する。
+    fn apply_page_list_action(
+        &mut self,
+        action: PageListAction,
+        viewer: Entity<ImageViewer>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(book_id) = self.book_id.clone() else {
+            return;
+        };
+        match action {
+            PageListAction::Select {
+                content_id,
+                format_id,
+            } => self.switch_selection(cx, Some(content_id), format_id),
+            PageListAction::SetPrimary { content_id } => {
+                let state = AppState::global(cx);
+                let _ = db::contents::set_primary(&state.db_pool, &book_id, &content_id);
+                self.refresh_contents(&viewer, cx);
+            }
+        }
+    }
+
+    /// ページ一覧用のコンテンツ一覧を DB から読み直してビューアに渡す。
+    fn refresh_contents(&self, viewer: &Entity<ImageViewer>, cx: &mut Context<Self>) {
+        let Some(book_id) = self.book_id.clone() else {
+            return;
+        };
+        let state = AppState::global(cx);
+        let contents = load_content_entries(&state.db_pool, &book_id);
+        let current_content = self.content_id.as_ref().map(|id| id.to_string());
+        let current_format = self.format_id.as_ref().map(|id| id.to_string());
+        viewer.update(cx, |viewer, cx| {
+            viewer.set_contents(cx, contents, current_content, current_format)
+        });
     }
 
     /// ページ毎の閲覧回数・滞在時間を記録する。
@@ -333,6 +400,28 @@ impl ReaderView {
             },
         );
     }
+}
+
+/// ページ一覧用のコンテンツ一覧（レンディション付き）を DB から読む。
+fn load_content_entries(db: &thundoku_core::db::SqlitePool, book_id: &str) -> Vec<ContentEntry> {
+    db::contents::list_with_formats(db, book_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(content, formats)| ContentEntry {
+            content_id: content.content_id,
+            display_name: content.display_name,
+            media_kind: content.media_kind,
+            is_primary: content.is_primary != 0,
+            formats: formats
+                .into_iter()
+                .map(|format| FormatEntry {
+                    format_id: format.format_id,
+                    label: format.label,
+                    page_count: format.page_count,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 impl Render for ReaderView {
@@ -560,6 +649,73 @@ mod tests {
             });
         });
         assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 3);
+    }
+
+    #[gpui_kit::test]
+    async fn page_list_lists_contents_and_switches(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book_with_two_contents(cx, "b4");
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b4".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+
+        // 一覧はコンテンツ 2 件（表示名つき）。既定表示は本編。
+        assert_eq!(viewer.read_with(cx, |v, _| v.contents().len()), 2);
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.contents()[0].display_name.clone()),
+            "本編"
+        );
+        assert!(viewer.read_with(cx, |v, _| v.contents()[0].is_primary));
+
+        // 開いた直後はコンテンツ一覧（ドリルインしていない）
+        cx.update(|cx| viewer.update(cx, |v, cx| v.open_page_list(cx)));
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_list_drill()), None);
+
+        // 別冊の行を開く → ReaderView が反映してページ数が変わる
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_drill_in(cx, 1)));
+        cx.run_until_parked();
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 1);
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_list_drill()), Some(1));
+        assert_eq!(
+            reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
+            Some("c-sub".to_string())
+        );
+
+        // 戻る → コンテンツ一覧へ
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_back(cx)));
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_list_drill()), None);
+    }
+
+    #[gpui_kit::test]
+    async fn page_list_radio_sets_primary(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book_with_two_contents(cx, "b5");
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b5".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+
+        // 別冊を優先（既定表示）にする
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_set_primary(cx, 1)));
+        cx.run_until_parked();
+
+        let primary = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            db::contents::primary_for_book(&state.db_pool, "b5")
+                .unwrap()
+                .unwrap()
+                .content_id
+        });
+        assert_eq!(primary, "c-sub", "DB の既定表示が入れ替わる");
+        assert!(viewer.read_with(cx, |v, _| v.contents()[1].is_primary));
+        assert!(!viewer.read_with(cx, |v, _| v.contents()[0].is_primary));
+        // 優先の変更だけでは表示中のコンテンツは変わらない
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 3);
+        assert_eq!(
+            reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
+            Some("c-main".to_string())
+        );
     }
 
     #[gpui_kit::test]
