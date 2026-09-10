@@ -770,6 +770,7 @@ fn reading_progress_roundtrip() {
     books::insert(&pool, &book).unwrap();
     let progress = progress::ReadingProgress {
         book_id: "book-1".into(),
+        content_id: String::new(),
         current_page: 7,
         total_pages: Some(42),
         finished_at: None,
@@ -999,6 +1000,242 @@ fn bookshelf_metadata_roundtrip() {
     // upsert の upsert でも roundtrip（コンフリクトで更新）
     bookshelf::upsert(&pool, &item).unwrap();
     assert_eq!(bookshelf::list(&pool, "fanza").unwrap(), vec![item]);
+}
+
+// フェーズ5: 進捗・ページ毎記録のコンテンツ単位化。
+// 旧スキーマ（book_id が PK）の行が「優先コンテンツ」の行として引き継がれること。
+#[test]
+fn legacy_progress_is_migrated_to_content_scope() {
+    let pool = memory_db();
+    let stamp = "2026-01-01 00:00:00";
+    let mk_book = |id: &str| books::Book {
+        id: id.into(),
+        title: "移行テスト".into(),
+        author: String::new(),
+        circle_name: String::new(),
+        purchase_date: None,
+        file_name: "t.zip".into(),
+        file_size: 1,
+        opfs_path: format!("{id}.opfspack"),
+        cover_thumbnail: None,
+        tbf_product_id: None,
+        site_id: None,
+        tags_fetched: 1,
+        pack_id: Some(id.into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: stamp.into(),
+        updated_at: stamp.into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
+    };
+    books::insert(&pool, &mk_book("book-p")).unwrap();
+    contents::insert_batch(
+        &pool,
+        &[
+            contents::BookContent {
+                content_id: "c1".into(),
+                book_id: "book-p".into(),
+                display_name: "本文".into(),
+                media_kind: "image".into(),
+                is_primary: 1,
+                sort_order: 0,
+                created_at: stamp.into(),
+            },
+            contents::BookContent {
+                content_id: "c2".into(),
+                book_id: "book-p".into(),
+                display_name: "別冊".into(),
+                media_kind: "image".into(),
+                is_primary: 0,
+                sort_order: 1,
+                created_at: stamp.into(),
+            },
+        ],
+        &[],
+    )
+    .unwrap();
+
+    // 旧スキーマ（content_id 無し）を再現して旧行を入れる
+    thundoku_core::db::block_on(async {
+        sqlx::query("DROP TABLE reading_progress")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE reading_progress (book_id TEXT PRIMARY KEY REFERENCES books(id), \
+             current_page INTEGER NOT NULL DEFAULT 0, total_pages INTEGER, finished_at TEXT, \
+             last_read_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, scroll_position REAL NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO reading_progress (book_id, current_page, total_pages, last_read_at) \
+             VALUES ('book-p', 7, 10, '2026-01-01 00:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DROP TABLE page_views")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE page_views (book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE, \
+             page_number INTEGER NOT NULL, view_count INTEGER NOT NULL DEFAULT 0, \
+             total_seconds REAL NOT NULL DEFAULT 0, \
+             last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             PRIMARY KEY (book_id, page_number))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO page_views (book_id, page_number, view_count) VALUES ('book-p', 3, 4)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    });
+
+    let moved = thundoku_core::db::run_progress_content_migration(&pool).unwrap();
+    assert_eq!(moved, 2, "進捗 1 行 + ページ毎記録 1 行が移行される");
+
+    // 優先コンテンツ（c1）の行として引き継がれる
+    let migrated = progress::get_for(&pool, "book-p", "c1").unwrap().unwrap();
+    assert_eq!(migrated.current_page, 7);
+    assert_eq!(
+        progress::get(&pool, "book-p").unwrap().unwrap().content_id,
+        "c1"
+    );
+    let views = thundoku_core::db::page_views::for_book(&pool, "book-p").unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].content_id, "c1");
+    assert_eq!(views[0].view_count, 4);
+
+    // 2 回目は対象が無い（冪等）
+    assert_eq!(
+        thundoku_core::db::run_progress_content_migration(&pool).unwrap(),
+        0
+    );
+}
+
+// 進捗はコンテンツごとに独立し、カード用（get）は優先コンテンツの行を見る。
+#[test]
+fn progress_is_scoped_per_content() {
+    let pool = memory_db();
+    let stamp = "2026-01-01 00:00:00";
+    let book = books::Book {
+        id: "book-s".into(),
+        title: "スコープ".into(),
+        author: String::new(),
+        circle_name: String::new(),
+        purchase_date: None,
+        file_name: "s.zip".into(),
+        file_size: 1,
+        opfs_path: "book-s.opfspack".into(),
+        cover_thumbnail: None,
+        tbf_product_id: None,
+        site_id: None,
+        tags_fetched: 1,
+        pack_id: Some("book-s".into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: stamp.into(),
+        updated_at: stamp.into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
+    };
+    books::insert(&pool, &book).unwrap();
+    contents::insert_batch(
+        &pool,
+        &[
+            contents::BookContent {
+                content_id: "c1".into(),
+                book_id: "book-s".into(),
+                display_name: "本文".into(),
+                media_kind: "image".into(),
+                is_primary: 1,
+                sort_order: 0,
+                created_at: stamp.into(),
+            },
+            contents::BookContent {
+                content_id: "c2".into(),
+                book_id: "book-s".into(),
+                display_name: "別冊".into(),
+                media_kind: "image".into(),
+                is_primary: 0,
+                sort_order: 1,
+                created_at: stamp.into(),
+            },
+        ],
+        &[],
+    )
+    .unwrap();
+
+    let mk = |content_id: &str, current: i64, total: i64| progress::ReadingProgress {
+        book_id: "book-s".into(),
+        content_id: content_id.into(),
+        current_page: current,
+        total_pages: Some(total),
+        finished_at: None,
+        last_read_at: stamp.into(),
+        scroll_position: 0.0,
+    };
+    progress::upsert(&pool, &mk("c1", 5, 10)).unwrap();
+    progress::upsert(&pool, &mk("c2", 2, 3)).unwrap();
+
+    assert_eq!(
+        progress::get_for(&pool, "book-s", "c1")
+            .unwrap()
+            .unwrap()
+            .current_page,
+        5
+    );
+    assert_eq!(
+        progress::get_for(&pool, "book-s", "c2")
+            .unwrap()
+            .unwrap()
+            .current_page,
+        2
+    );
+    // カード用は優先コンテンツ（c1）
+    assert_eq!(
+        progress::get(&pool, "book-s").unwrap().unwrap().content_id,
+        "c1"
+    );
+
+    // 優先を変えるとカードが見る行が変わる（§8.1: 読了は優先コンテンツ基準）
+    contents::set_primary(&pool, "book-s", "c2").unwrap();
+    let card = progress::get(&pool, "book-s").unwrap().unwrap();
+    assert_eq!(card.content_id, "c2");
+    assert_eq!(card.current_page, 2);
+
+    // 削除はコンテンツ単位
+    progress::delete_for_content(&pool, "book-s", "c2").unwrap();
+    assert!(progress::get_for(&pool, "book-s", "c2").unwrap().is_none());
+    assert!(progress::get_for(&pool, "book-s", "c1").unwrap().is_some());
+
+    // 本単位の削除は全コンテンツ分
+    progress::delete(&pool, "book-s").unwrap();
+    assert!(progress::get_for(&pool, "book-s", "c1").unwrap().is_none());
 }
 
 // フェーズ2以前に取り込んだ本の `content_formats.label`（画像 / PDF / EPUB）を

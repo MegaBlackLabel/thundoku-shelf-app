@@ -5,6 +5,8 @@ use crate::db::SqlitePool;
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct ReadingProgress {
     pub book_id: String,
+    /// コンテンツ（`book_contents.content_id`）。`''` = 未指定（旧データ / 単一コンテンツ）。
+    pub content_id: String,
     pub current_page: i64,
     pub total_pages: Option<i64>,
     /// Set once the last page has been reached; never cleared afterwards.
@@ -22,13 +24,28 @@ impl ReadingProgress {
     }
 }
 
+/// **既定表示（優先）コンテンツ**の進捗を返す（本棚カード・未読数・統計用）。
+/// コンテンツ情報を持たない旧データは `content_id = ''` の行を見る。
 pub fn get(pool: &SqlitePool, book_id: &str) -> Result<Option<ReadingProgress>, sqlx::Error> {
+    let content_id = crate::db::contents::primary_for_book(pool, book_id)?
+        .map(|content| content.content_id)
+        .unwrap_or_default();
+    get_for(pool, book_id, &content_id)
+}
+
+/// 指定コンテンツの進捗を返す（リーダーが再開位置に使う）。
+pub fn get_for(
+    pool: &SqlitePool,
+    book_id: &str,
+    content_id: &str,
+) -> Result<Option<ReadingProgress>, sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query_as::<_, ReadingProgress>(
-            "SELECT book_id, current_page, total_pages, finished_at, last_read_at, scroll_position \
-             FROM reading_progress WHERE book_id = ?1",
+            "SELECT book_id, content_id, current_page, total_pages, finished_at, last_read_at, \
+             scroll_position FROM reading_progress WHERE book_id = ?1 AND content_id = ?2",
         )
         .bind(book_id)
+        .bind(content_id)
         .fetch_optional(pool)
         .await
     })
@@ -45,9 +62,9 @@ pub fn upsert(pool: &SqlitePool, progress: &ReadingProgress) -> Result<(), sqlx:
     });
     crate::db::block_on(async {
         sqlx::query(
-            "INSERT INTO reading_progress (book_id, current_page, total_pages, finished_at, \
-             last_read_at, scroll_position) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(book_id) DO UPDATE SET
+            "INSERT INTO reading_progress (book_id, content_id, current_page, total_pages, \
+             finished_at, last_read_at, scroll_position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(book_id, content_id) DO UPDATE SET
                current_page = excluded.current_page,
                total_pages = excluded.total_pages,
                finished_at = CASE
@@ -58,6 +75,7 @@ pub fn upsert(pool: &SqlitePool, progress: &ReadingProgress) -> Result<(), sqlx:
                scroll_position = excluded.scroll_position",
         )
         .bind(&progress.book_id)
+        .bind(&progress.content_id)
         .bind(progress.current_page)
         .bind(progress.total_pages)
         .bind(&finished_at)
@@ -69,10 +87,27 @@ pub fn upsert(pool: &SqlitePool, progress: &ReadingProgress) -> Result<(), sqlx:
     })
 }
 
+/// その本の全コンテンツ分の進捗を消す。
 pub fn delete(pool: &SqlitePool, book_id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query("DELETE FROM reading_progress WHERE book_id = ?1")
             .bind(book_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    })
+}
+
+/// 指定コンテンツの進捗だけ消す（コンテンツ削除時など）。
+pub fn delete_for_content(
+    pool: &SqlitePool,
+    book_id: &str,
+    content_id: &str,
+) -> Result<(), sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query("DELETE FROM reading_progress WHERE book_id = ?1 AND content_id = ?2")
+            .bind(book_id)
+            .bind(content_id)
             .execute(pool)
             .await?;
         Ok(())
@@ -122,6 +157,7 @@ mod tests {
         .unwrap();
         let base = ReadingProgress {
             book_id: "b1".into(),
+            content_id: String::new(),
             current_page: 0,
             total_pages: Some(10),
             finished_at: None,

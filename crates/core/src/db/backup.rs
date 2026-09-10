@@ -85,8 +85,8 @@ fn pk_columns(table: &str) -> Option<&'static [&'static str]> {
         "tbf_events" => &["id"],
         "book_contents" => &["content_id"],
         "content_formats" => &["format_id"],
-        "reading_progress" => &["book_id"],
-        "page_views" => &["book_id", "page_number"],
+        "reading_progress" => &["book_id", "content_id"],
+        "page_views" => &["book_id", "content_id", "page_number"],
         "book_tags" => &["id"],
         "favorite_tags" => &["tag_name"],
         "imported_documents" => &["id"],
@@ -425,6 +425,7 @@ mod tests {
             &src,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: "c1".into(),
                 current_page: 12,
                 total_pages: Some(120),
                 finished_at: None,
@@ -439,10 +440,10 @@ mod tests {
             1
         );
         // ページ毎閲覧記録を入れる（バックアップ対象に含まれるべき）
-        crate::db::page_views::record_view(&src, "book-1", 1).unwrap();
-        crate::db::page_views::record_view(&src, "book-1", 2).unwrap();
-        crate::db::page_views::add_dwell(&src, "book-1", 1, 3.5).unwrap();
-        crate::db::page_views::add_dwell(&src, "book-1", 2, 1.25).unwrap();
+        crate::db::page_views::record_view(&src, "book-1", "c1", 1).unwrap();
+        crate::db::page_views::record_view(&src, "book-1", "c1", 2).unwrap();
+        crate::db::page_views::add_dwell(&src, "book-1", "c1", 1, 3.5).unwrap();
+        crate::db::page_views::add_dwell(&src, "book-1", "c1", 2, 1.25).unwrap();
 
         let json = export_json(&src, None).unwrap();
         // view_history がバックアップに含まれる
@@ -533,6 +534,7 @@ mod tests {
                 &pool,
                 &ReadingProgress {
                     book_id: id.into(),
+                    content_id: String::new(),
                     current_page: page,
                     total_pages: Some(10),
                     finished_at: None,

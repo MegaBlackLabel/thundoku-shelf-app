@@ -601,6 +601,7 @@ mod tests {
             &src,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 42,
                 total_pages: Some(200),
                 finished_at: None,
@@ -684,6 +685,7 @@ mod tests {
             &src,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 42,
                 total_pages: Some(200),
                 finished_at: None,
@@ -735,6 +737,7 @@ mod tests {
             &same,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 42,
                 total_pages: Some(200),
                 finished_at: None,
@@ -784,6 +787,7 @@ mod tests {
             &same,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 100,
                 total_pages: Some(200),
                 finished_at: None,
@@ -842,6 +846,7 @@ mod tests {
             &local,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 42,
                 total_pages: Some(200),
                 finished_at: None,

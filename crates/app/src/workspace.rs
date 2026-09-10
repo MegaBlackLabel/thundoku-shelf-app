@@ -2388,6 +2388,7 @@ mod tests {
                 &state.db_pool,
                 &progress::ReadingProgress {
                     book_id: "b1".into(),
+                    content_id: String::new(),
                     current_page: 3,
                     total_pages: Some(3),
                     finished_at: Some("2026-09-01 00:00:00".into()),

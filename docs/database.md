@@ -94,11 +94,15 @@ Drive 同期設定など）。
 
 ### reading_progress
 
-読書進捗（1 書籍 1 行）。
+読書進捗（**1 書籍 × 1 コンテンツ = 1 行**）。複数コンテンツ（本文 / 別冊 等）や
+レンディション違いは**コンテンツ単位**で持ち、レンディション間では共有する
+（`docs/import-patterns.md` §8）。読み出しは `progress::get`（= 優先コンテンツの行）/
+`progress::get_for(book_id, content_id)`（リーダーの再開位置）。
 
 | カラム | 型 | 説明 |
 |---|---|---|
-| book_id | TEXT PK FK→books | |
+| book_id | TEXT PK FK→books (ON DELETE CASCADE) | |
+| content_id | TEXT PK | `book_contents.content_id`。`''` = 未指定（旧データ / 単一コンテンツ） |
 | current_page | INTEGER | **1-indexed**（0 は未読扱い） |
 | total_pages | INTEGER | 全ページ数 |
 | finished_at | TEXT | 読了日時。一度セットすると戻っても維持 |
@@ -130,12 +134,13 @@ Drive 同期設定など）。
 | カラム | 型 | 説明 |
 |---|---|---|
 | book_id | TEXT PK FK→books (ON DELETE CASCADE) | 本 |
+| content_id | TEXT PK | コンテンツ（`''` = 未指定 / 旧データ） |
 | page_number | INTEGER PK | **1-indexed**（表示ページ番号） |
 | view_count | INTEGER | そのページが表示された累計回数 |
 | total_seconds | REAL | そのページでの累計滞在秒数 |
 | last_viewed_at | TEXT | 最終表示時刻 |
 
-- `page_views::record_view(book_id, page)` で表示回数を +1（単一表示は 1 ページ、見開きは左右両ページ）
+- `page_views::record_view(book_id, content_id, page)` で表示回数を +1（単一表示は 1 ページ、見開きは左右両ページ）
 - `page_views::add_dwell(book_id, page, secs)` で滞在秒数を加算
 - `page_views::for_book(book_id)` でページ毎の記録を取得
 
@@ -256,7 +261,10 @@ Zenn のタグメタデータ（`https://zenn.dev/api/tags` 相当から取得�
   （新しいマイグレーションファイルは作らない方針）
 - `content_formats.label` の旧値（`画像` / `PDF` / `EPUB`）は `migrate()` 内の
   データ移行（`contents::migrate_legacy_labels`）で実データに合わせて書き換える
-  （画像 = 拡張子名、PDF/EPUB = ファイル名。Pack に元拡張子が残らないため推定を含む）
+  （画像 = 拡張子名、PDF/EPUB = 種別名）
+- `reading_progress` / `page_views` は `migrate()` 内のデータ移行
+  （`db::migrate_progress_content_id`）で**コンテンツ単位の PK**に作り替える
+  （PK 変更は ALTER 不可のため新テーブルへ INSERT SELECT。既存行は優先コンテンツの行として引き継ぐ）
 - テスト用には `test_pool()`（インメモリ + 全マイグレーション適用）を使用
 
 ## データの流れ

@@ -44,6 +44,14 @@ impl ReaderView {
         self.book_id.clone()
     }
 
+    /// DB に保存するコンテンツキー（未指定 = `''`。旧データ / 単一コンテンツ）。
+    fn content_key(&self) -> String {
+        self.content_id
+            .as_ref()
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+    }
+
     /// 表示中の（コンテンツ, レンディション）。None は未指定（既定表示 / 単一コンテンツ）。
     pub fn selection(&self) -> (Option<SharedString>, Option<SharedString>) {
         (self.content_id.clone(), self.format_id.clone())
@@ -99,11 +107,18 @@ impl ReaderView {
         };
         self.content_id = content_id.map(SharedString::from);
         self.format_id = resolved_format.map(SharedString::from);
-        self.last_saved_page = 0;
-        self.last_pages = vec![0];
+        // そのコンテンツの保存位置から再開する（コンテンツごとに独立した進捗）
+        let content_str = self.content_key();
+        let initial_page = db::progress::get_for(&db, &book_id, &content_str)
+            .ok()
+            .flatten()
+            .map(|progress| progress.current_page.max(1).saturating_sub(1) as usize)
+            .unwrap_or(0);
+        self.last_saved_page = initial_page as i64 + 1;
+        self.last_pages = vec![initial_page];
         self.last_page_at = Some(Instant::now());
         let viewer = self.viewer.clone();
-        viewer.update(cx, |viewer, cx| viewer.set_loader(cx, loader, 0));
+        viewer.update(cx, |viewer, cx| viewer.set_loader(cx, loader, initial_page));
         // ページ一覧の「現在表示中」マークを更新する
         self.refresh_contents(&viewer, cx);
         cx.notify();
@@ -120,11 +135,13 @@ impl ReaderView {
             let secs = started.elapsed().as_secs_f64();
             if secs > 0.0 {
                 let book_str = book_id.to_string();
+                let content_str = self.content_key();
                 let state = AppState::global(cx);
                 for page in &self.last_pages {
                     let _ = db::page_views::add_dwell(
                         &state.db_pool,
                         &book_str,
+                        &content_str,
                         *page as i64 + 1,
                         secs,
                     );
@@ -216,9 +233,18 @@ impl ReaderView {
         // 初期表示ページ集合（単一: 1 ページ、見開き: 左右 2 ページ）を計上する
         let initial_pages = viewer.read(cx).spread_pages();
         {
+            let content_str = selection
+                .as_ref()
+                .map(|(content_id, _)| content_id.clone())
+                .unwrap_or_default();
             let state = AppState::global(cx);
             for page in &initial_pages {
-                let _ = db::page_views::record_view(&state.db_pool, &book_id, *page as i64 + 1);
+                let _ = db::page_views::record_view(
+                    &state.db_pool,
+                    &book_id,
+                    &content_str,
+                    *page as i64 + 1,
+                );
             }
         }
         let subscription = cx.observe(&viewer, |this, viewer, cx| {
@@ -345,16 +371,24 @@ impl ReaderView {
         if let Some(started) = self.last_page_at {
             let secs = now.duration_since(started).as_secs_f64();
             if secs > 0.0 {
+                let content_str = self.content_key();
                 for page in &self.last_pages {
-                    let _ = db::page_views::add_dwell(db, &book_str, *page as i64 + 1, secs);
+                    let _ = db::page_views::add_dwell(
+                        db,
+                        &book_str,
+                        &content_str,
+                        *page as i64 + 1,
+                        secs,
+                    );
                 }
             }
         }
         // 新しい表示ページ集合を計上し、滞在計測を開始する
         self.last_pages = current_pages.clone();
         self.last_page_at = Some(now);
+        let content_str = self.content_key();
         for page in &current_pages {
-            let _ = db::page_views::record_view(db, &book_str, *page as i64 + 1);
+            let _ = db::page_views::record_view(db, &book_str, &content_str, *page as i64 + 1);
         }
     }
 
@@ -384,6 +418,7 @@ impl ReaderView {
             db,
             &db::progress::ReadingProgress {
                 book_id: book_id.to_string(),
+                content_id: self.content_key(),
                 current_page,
                 total_pages: Some(total_pages),
                 finished_at,
@@ -822,6 +857,54 @@ mod tests {
             reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
             Some("c-sub".to_string())
         );
+    }
+
+    #[gpui_kit::test]
+    async fn switching_content_resumes_its_own_position(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book_with_two_contents(cx, "b11");
+        // 本編（3 ページ）を最後まで読んだ状態にしておく
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            db::progress::upsert(
+                &state.db_pool,
+                &db::progress::ReadingProgress {
+                    book_id: "b11".into(),
+                    content_id: "c-main".into(),
+                    current_page: 3,
+                    total_pages: Some(3),
+                    finished_at: None,
+                    last_read_at: "2026-01-01 00:00:00".into(),
+                    scroll_position: 0.0,
+                },
+            )
+            .unwrap();
+        });
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b11".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        // 保存位置（3 ページ目 = index 2）から再開する
+        assert_eq!(viewer.read_with(cx, |v, _| v.current_page()), 2);
+
+        // 別冊（進捗なし）へ切り替えると先頭から
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 1, 0)));
+        cx.run_until_parked();
+        assert_eq!(viewer.read_with(cx, |v, _| v.current_page()), 0);
+
+        // 本編に戻ると保存位置へ
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 0, 0)));
+        cx.run_until_parked();
+        assert_eq!(viewer.read_with(cx, |v, _| v.current_page()), 2);
+
+        // 別冊を見ても本編の進捗は壊れない（コンテンツ単位）
+        let main = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            db::progress::get_for(&state.db_pool, "b11", "c-main")
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(main.current_page, 3, "別冊の閲覧で本編の進捗が壊れない");
     }
 
     #[gpui_kit::test]

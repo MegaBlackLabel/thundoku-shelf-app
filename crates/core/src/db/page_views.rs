@@ -9,6 +9,8 @@ use crate::db::SqlitePool;
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct PageView {
     pub book_id: String,
+    /// コンテンツ（`''` = 未指定 / 旧データ）。コンテンツを跨いだページ番号の衝突を防ぐ。
+    pub content_id: String,
     /// 1-indexed（リーダーの `current_page` は 0 始まりなので +1 して保存する。
     /// `reading_progress` や `document_images.page_number` と同じ規約）。
     pub page_number: i64,
@@ -18,16 +20,22 @@ pub struct PageView {
 }
 
 /// ページが現在ページになったことを記録する（view_count を +1）。
-pub fn record_view(pool: &SqlitePool, book_id: &str, page_number: i64) -> Result<(), sqlx::Error> {
+pub fn record_view(
+    pool: &SqlitePool,
+    book_id: &str,
+    content_id: &str,
+    page_number: i64,
+) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query(
-            "INSERT INTO page_views (book_id, page_number, view_count, total_seconds, last_viewed_at) \
-             VALUES (?1, ?2, 1, 0, CURRENT_TIMESTAMP) \
-             ON CONFLICT(book_id, page_number) DO UPDATE SET \
+            "INSERT INTO page_views (book_id, content_id, page_number, view_count, total_seconds, \
+             last_viewed_at) VALUES (?1, ?2, ?3, 1, 0, CURRENT_TIMESTAMP) \
+             ON CONFLICT(book_id, content_id, page_number) DO UPDATE SET \
                view_count = view_count + 1, \
                last_viewed_at = CURRENT_TIMESTAMP",
         )
         .bind(book_id)
+        .bind(content_id)
         .bind(page_number)
         .execute(pool)
         .await?;
@@ -39,18 +47,20 @@ pub fn record_view(pool: &SqlitePool, book_id: &str, page_number: i64) -> Result
 pub fn add_dwell(
     pool: &SqlitePool,
     book_id: &str,
+    content_id: &str,
     page_number: i64,
     seconds: f64,
 ) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query(
-            "INSERT INTO page_views (book_id, page_number, view_count, total_seconds, last_viewed_at) \
-             VALUES (?1, ?2, 0, ?3, CURRENT_TIMESTAMP) \
-             ON CONFLICT(book_id, page_number) DO UPDATE SET \
+            "INSERT INTO page_views (book_id, content_id, page_number, view_count, total_seconds, \
+             last_viewed_at) VALUES (?1, ?2, ?3, 0, ?4, CURRENT_TIMESTAMP) \
+             ON CONFLICT(book_id, content_id, page_number) DO UPDATE SET \
                total_seconds = total_seconds + excluded.total_seconds, \
                last_viewed_at = CURRENT_TIMESTAMP",
         )
         .bind(book_id)
+        .bind(content_id)
         .bind(page_number)
         .bind(seconds)
         .execute(pool)
@@ -63,8 +73,8 @@ pub fn add_dwell(
 pub fn for_book(pool: &SqlitePool, book_id: &str) -> Result<Vec<PageView>, sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query_as::<_, PageView>(
-            "SELECT book_id, page_number, view_count, total_seconds, last_viewed_at \
-             FROM page_views WHERE book_id = ?1 ORDER BY page_number ASC",
+            "SELECT book_id, content_id, page_number, view_count, total_seconds, last_viewed_at \
+             FROM page_views WHERE book_id = ?1 ORDER BY content_id, page_number ASC",
         )
         .bind(book_id)
         .fetch_all(pool)
@@ -118,10 +128,10 @@ mod tests {
         seed_book(&pool);
 
         // 同じページの表示回数と滞在秒数が加算される
-        record_view(&pool, "b1", 1).unwrap();
-        record_view(&pool, "b1", 1).unwrap();
-        add_dwell(&pool, "b1", 1, 3.5).unwrap();
-        add_dwell(&pool, "b1", 1, 1.5).unwrap();
+        record_view(&pool, "b1", "", 1).unwrap();
+        record_view(&pool, "b1", "", 1).unwrap();
+        add_dwell(&pool, "b1", "", 1, 3.5).unwrap();
+        add_dwell(&pool, "b1", "", 1, 1.5).unwrap();
 
         let rows = for_book(&pool, "b1").unwrap();
         assert_eq!(rows.len(), 1);
@@ -130,7 +140,7 @@ mod tests {
         assert!((rows[0].total_seconds - 5.0).abs() < 1e-9);
 
         // 別ページは別行
-        record_view(&pool, "b1", 2).unwrap();
+        record_view(&pool, "b1", "", 2).unwrap();
         let rows = for_book(&pool, "b1").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].page_number, 2);

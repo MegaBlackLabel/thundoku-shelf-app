@@ -106,12 +106,14 @@ CREATE INDEX IF NOT EXISTS bookshelf_items_site_id_idx ON bookshelf_items(site_i
 CREATE INDEX IF NOT EXISTS bookshelf_items_event_id_idx ON bookshelf_items(event_id);
 
 CREATE TABLE IF NOT EXISTS reading_progress (
-  book_id TEXT PRIMARY KEY REFERENCES books(id),
+  book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+  content_id TEXT NOT NULL DEFAULT '',
   current_page INTEGER NOT NULL DEFAULT 0,
   total_pages INTEGER,
   finished_at TEXT,
   last_read_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  scroll_position REAL NOT NULL DEFAULT 0
+  scroll_position REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (book_id, content_id)
 );
 
 CREATE TABLE IF NOT EXISTS checked_items (
@@ -187,9 +189,22 @@ CREATE TABLE IF NOT EXISTS document_images (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS page_views (
+  book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+  content_id TEXT NOT NULL DEFAULT '',
+  page_number INTEGER NOT NULL,
+  view_count INTEGER NOT NULL DEFAULT 0,
+  total_seconds REAL NOT NULL DEFAULT 0,
+  last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (book_id, content_id, page_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_page_views_book ON page_views(book_id);
+
 CREATE TABLE IF NOT EXISTS document_text (
   id TEXT PRIMARY KEY,
   document_id TEXT NOT NULL REFERENCES imported_documents(id),
+  content_id TEXT NOT NULL DEFAULT '',
   page_number INTEGER NOT NULL,
   text_content TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -198,6 +213,7 @@ CREATE TABLE IF NOT EXISTS document_text (
 CREATE TABLE IF NOT EXISTS token_analysis (
   id TEXT PRIMARY KEY,
   document_id TEXT NOT NULL REFERENCES imported_documents(id),
+  content_id TEXT NOT NULL DEFAULT '',
   page_number INTEGER NOT NULL,
   token TEXT NOT NULL,
   pos TEXT NOT NULL,
