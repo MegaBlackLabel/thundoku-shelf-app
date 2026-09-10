@@ -2556,6 +2556,10 @@ impl Render for ImageViewer {
                     .justify_center()
                     .opacity(overlay_progress)
                     .when(overlay_progress < 0.01, |this| this.invisible())
+                    // ドック内のクリックを下の層へ伝えない（トップパネルと同じ）
+                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .on_hover({
                         let handle = handle.clone();
                         move |hovered, _window, cx| {
@@ -2583,6 +2587,7 @@ impl Render for ImageViewer {
                             .child(
                                 Button::new("viewer-back")
                                     .cursor_pointer()
+                                    .debug_selector(|| "viewer-back".into())
                                     .label("戻る")
                                     .cursor_pointer()
                                     .on_click(|_, _window, cx| {

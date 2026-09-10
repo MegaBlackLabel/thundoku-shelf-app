@@ -15,14 +15,14 @@ use gpui_kit::{
 };
 
 use crate::components::dialog::{dialog_surface, fade_dialog};
-use gpui_kit::{
-    AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
-    SharedString, Window, div, px,
-};
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode};
+use gpui_kit::{
+    AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
+    SharedString, Window, div, px,
+};
 #[cfg(windows)]
 use raw_window_handle::HasWindowHandle;
 
@@ -183,9 +183,7 @@ impl Workspace {
                     flag.store(false, std::sync::atomic::Ordering::SeqCst);
                     // Drive 設定をバックグラウンドで照会（RefCell 借用中のブロッキング SQL を避ける）
                     // 「最終同期が無い（一度も同期していない）」なら同期確認を出す。
-                    let last_sync = db::settings::get(&db, "drive.last_sync_at")
-                        .ok()
-                        .flatten();
+                    let last_sync = db::settings::get(&db, "drive.last_sync_at").ok().flatten();
                     let _ = handle.update(cx, |this, cx| {
                         this.show_auth = false;
                         this.auth_dialog = None;
@@ -1224,6 +1222,12 @@ impl Render for Workspace {
                     .bottom_0()
                     .left_0()
                     .bg(theme.background.clone())
+                    // リーダー内のクリックを下の層（本棚）へ伝えない。
+                    // これが無いと、リーダーの余白をクリックしたときに
+                    // 下にある本棚のカードが反応して本が開き直る。
+                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .child(view)
                     .into_any_element()
             } else {
@@ -1492,7 +1496,10 @@ impl Workspace {
     /// Windows の自前タイトルバー（MangaReader 方式）。
     /// `.window_control_area()` でネイティブのドラッグ/最小化/最大化/閉じるを再現する。
     #[cfg(windows)]
-    fn win_title_bar(window: &mut Window, theme: &gpui_kit::component::Theme) -> gpui_kit::AnyElement {
+    fn win_title_bar(
+        window: &mut Window,
+        theme: &gpui_kit::component::Theme,
+    ) -> gpui_kit::AnyElement {
         // Windows 標準のタイトルバーボタンのホバー色（テーマに応じて明暗を出す）。
         // 背景（theme.secondary）と区別できるよう、ダークは明るめ・ライトは濃いめのグレー。
         let hover_bg = match theme.mode {
@@ -2177,7 +2184,8 @@ impl Workspace {
                             "bookshelf-submenu-anim-{}",
                             if open { "open" } else { "closed" }
                         )),
-                        Animation::new(Duration::from_millis(200)).with_easing(gpui_kit::ease_in_out),
+                        Animation::new(Duration::from_millis(200))
+                            .with_easing(gpui_kit::ease_in_out),
                         move |this, t| {
                             let t = t.clamp(0.0, 1.0);
                             let height = if open { 150.0 * t } else { 150.0 * (1.0 - t) };
@@ -2222,6 +2230,44 @@ mod tests {
             ws.read_with(cx, |w, _| w.active),
             NavTarget::Settings,
             "active view should follow switch_to"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn reader_back_click_does_not_reach_the_layer_below(cx: &mut TestAppContext) {
+        // 回帰: リーダー下部の「戻る」クリックが下の層（本棚）へ抜けて
+        // 同じ位置の本が開き直らないこと（オーバーレイがクリックを遮る）。
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| w.open_reader(cx, "missing-book".into()));
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let back = visual
+            .debug_bounds("viewer-back")
+            .expect("戻るボタンが描画されている");
+        visual.simulate_click(back.center(), gpui_kit::Modifiers::default());
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        assert!(
+            ws.read_with(cx, |w, _| w.reader.is_none()),
+            "戻るで閉じたあと、クリックが下に抜けて本が開き直らないこと"
         );
     }
 
@@ -2324,8 +2370,9 @@ mod tests {
         // 本棚は構築時点の進捗（未読 1/3）をキャッシュしている
         let ws = cx.new(Workspace::new);
         let before = ws.read_with(cx, |w, _| {
-            w.bookshelf
-                .read_with(cx, |b, _| b.progress_for_book("b1").unwrap_or((0, None, false)))
+            w.bookshelf.read_with(cx, |b, _| {
+                b.progress_for_book("b1").unwrap_or((0, None, false))
+            })
         });
         assert_eq!(before.0, 1, "before reading the cache shows page 1");
         assert!(!before.2, "before reading the book is unread");
@@ -2356,8 +2403,9 @@ mod tests {
             ws.update(cx, |w, cx| w.close_reader(cx));
         });
         let after = ws.read_with(cx, |w, _| {
-            w.bookshelf
-                .read_with(cx, |b, _| b.progress_for_book("b1").unwrap_or((0, None, false)))
+            w.bookshelf.read_with(cx, |b, _| {
+                b.progress_for_book("b1").unwrap_or((0, None, false))
+            })
         });
         assert_eq!(after.0, 3, "closing the reader must show the last page");
         assert!(after.2, "closing the reader must mark the book as read");
