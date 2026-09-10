@@ -592,18 +592,11 @@ impl BookshelfView {
                 let local = entries.iter().find(|entry| {
                     entry.book.tbf_product_id.as_deref() == Some(shelf.database_id.as_str())
                 });
-                let cover = if shelf.site_id == "fanza" || shelf.site_id == "dlsite" {
-                    // FANZA / DLsite はダウンロード後のパック表紙に差し替えず、同期時の
-                    // サムネイル（thumbnail_url 由来のキャッシュ）を維持する。
-                    load_cached_cover(&thumbnails_dir, shelf)
-                        .or_else(|| local.and_then(|entry| entry.cover.clone()))
-                        .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
-                } else {
-                    local
-                        .and_then(|entry| entry.cover.clone())
-                        .or_else(|| load_cached_cover(&thumbnails_dir, shelf))
-                        .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
-                };
+                // カードの表紙は**サイトから取得した画像**（同期時のサムネイル）を優先する。
+                // 取得できていないときだけ pack の表紙（ローカル取り込み）へ落とす。
+                let cover = load_cached_cover(&thumbnails_dir, shelf)
+                    .or_else(|| local.and_then(|entry| entry.cover.clone()))
+                    .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name));
                 let tags = if shelf.site_id == "fanza" || shelf.site_id == "dlsite" {
                     // FANZA / DLsite: タグは shelf.tags_json を正とする（book_tags は重複本で
                     // 分かれるため）。保存/ジャンル取得で両方に書くが、表示は安定。
@@ -2572,32 +2565,25 @@ impl BookshelfView {
         let delete_id = local.map(|e| e.book.id.clone());
         let _ = window;
 
-        // -- 表紙: 画像 + 未読/既読バッジ + ダウンロード状態アイコン + 進捗リング --
-        // 枠の高さを画像のアスペクト比に合わせる（自然比率を保つ＝クロップ/レターボックスなし）。
-        // バッジ（未読/♡/↓）は枠=画像に乗る。FANZA は横長（4:3）サムネ等のため枠高さが変わる。
-        let cover_h: f32 = match &cover {
-            Some(render) => {
-                let size = render.size(0);
-                let w = size.width.0 as f32;
-                let h = size.height.0 as f32;
-                (144.0 * (h / w.max(1.0))).clamp(80.0, 420.0)
-            }
-            None => 192.0,
-        };
+        // -- 表紙（カードのヘッダー）: カード幅いっぱい + 4:3 の枠 --
+        // 画像は contain で収める（横長 200x150 は枠を埋め、縦長 107x150 / 287x405 の
+        // 表紙は**中央に収まる**。クロップしない）。バッジと進捗リングはこの上に乗せる。
+        let cover_h: f32 = (card_width * 0.75).clamp(120.0, 320.0);
         let image: gpui_kit::AnyElement = match &cover {
             Some(render) => div()
-                .w(px(144.0))
+                .w_full()
                 .h(px(cover_h))
                 .overflow_hidden()
+                .bg(theme.secondary)
                 .child(
                     img(render.clone())
                         .w_full()
                         .h_full()
-                        .object_fit(gpui_kit::ObjectFit::Cover),
+                        .object_fit(gpui_kit::ObjectFit::Contain),
                 )
                 .into_any_element(),
             None => div()
-                .w(px(144.0))
+                .w_full()
                 .h(px(cover_h))
                 .bg(theme.muted)
                 .into_any_element(),
@@ -2605,7 +2591,7 @@ impl BookshelfView {
 
         let mut cover_el = div()
             .relative()
-            .w(px(144.0))
+            .w_full()
             .h(px(cover_h))
             .child(image)
             // 左上: 未読/既読バッジ（Web の statusText と同じ）
@@ -2762,9 +2748,8 @@ impl BookshelfView {
             .w(px(card_width))
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
             .rounded_lg()
+            .overflow_hidden()
             .border_1()
             .border_color(if selected {
                 // ダークモードでは枠の明るさを少し落として目立ちすぎないように
@@ -2808,70 +2793,72 @@ impl BookshelfView {
         });
 
         card_el = card_el
-            // 表紙は中央寄せ（Web の mx-auto 相当）
+            // 表紙（カードのヘッダー）: 端まで出す。読了は少し薄く表示する
+            .child(if is_read {
+                div().opacity(0.75).child(cover_el)
+            } else {
+                div().child(cover_el)
+            })
+            // 以降はパディング付きの内容ブロック（ヘッダーだけ端まで）
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(if is_read {
-                        div().opacity(0.75).child(cover_el)
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    // タイトル（Web の BookInfo: line-clamp-2 font-semibold）
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    // イベント名 or 購入日（BOOTH はイベントがないため購入日を表示）
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            // Web の formatEventLabel と同じ: イベント不明のときは
+                            // 「イベント不明」を表示
+                            .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
+                                ("booth", Some(date))
+                                | ("fanza", Some(date))
+                                | ("dlsite", Some(date)) => format!("購入日: {date}"),
+                                _ => event_text.clone(),
+                            }),
+                    )
+                    // サークル名（非空のときだけ表示）
+                    .child(if !circle_name.is_empty() {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("サークル: {circle_name}"))
+                            .into_any_element()
                     } else {
-                        div().child(cover_el)
+                        div().into_any_element()
+                    })
+                    // 作者名（BOOTH 等。空でなければ表示。技術書典は author が空なので出ない）
+                    .child(if !author.is_empty() {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("作者: {author}"))
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(match progress_text.as_deref() {
+                        Some(text) => div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(text.to_string())
+                            .into_any_element(),
+                        None => div().into_any_element(),
                     }),
-            )
-            // タイトル（Web の BookInfo: line-clamp-2 font-semibold）
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            // イベント名 or 購入日（BOOTH はイベントがないため購入日を表示）
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    // Web の formatEventLabel と同じ: イベント不明のときは
-                    // 「イベント不明」を表示
-                    .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
-                        ("booth", Some(date)) | ("fanza", Some(date)) | ("dlsite", Some(date)) => {
-                            format!("購入日: {date}")
-                        }
-                        _ => event_text.clone(),
-                    }),
-            )
-            // サークル名（非空のときだけ表示）
-            .child(if !circle_name.is_empty() {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("サークル: {circle_name}"))
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            // 作者名（BOOTH 等。空でなければ表示。技術書典は author が空なので出ない）
-            .child(if !author.is_empty() {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("作者: {author}"))
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            .child(match progress_text.as_deref() {
-                Some(text) => div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(text.to_string())
-                    .into_any_element(),
-                None => div().into_any_element(),
-            });
+            );
 
         // タグ行: 編集中なら Web の TagsInput 風エディタを表示
-        card_el = card_el.child(if editing {
+        card_el = card_el.child(div().px_3().pb_3().child(if editing {
             BookshelfView::render_tag_editor(
                 window,
                 theme,
@@ -2907,7 +2894,7 @@ impl BookshelfView {
                     &database_id,
                 ))
                 .into_any_element()
-        });
+        }));
 
         card_el.context_menu({
             let has_local = delete_id.is_some();
