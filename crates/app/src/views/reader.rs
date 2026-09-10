@@ -652,6 +652,100 @@ mod tests {
         assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 3);
     }
 
+    /// 1 コンテンツ + 1 レンディション（PDF 2 ページ）の本。
+    fn seed_book_with_single_rendition(cx: &mut TestAppContext, id: &str) {
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let db = &state.db_pool;
+            db::books::insert(db, &book_row(id, "PDFだけの本", &format!("{id}.pdf"))).unwrap();
+            documents::insert_document(
+                db,
+                &documents::ImportedDocument {
+                    id: format!("{id}-doc"),
+                    book_id: id.into(),
+                    source_type: "pdf".into(),
+                    file_hash: "h".into(),
+                    total_pages: 2,
+                    metadata: None,
+                    status: "done".into(),
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                },
+            )
+            .unwrap();
+            let stamp = "2026-08-21 00:00:00";
+            db::contents::insert_batch(
+                db,
+                &[db::contents::BookContent {
+                    content_id: "c-only".into(),
+                    book_id: id.into(),
+                    display_name: "本文".into(),
+                    media_kind: "pdf".into(),
+                    is_primary: 1,
+                    sort_order: 0,
+                    created_at: stamp.into(),
+                }],
+                &[db::contents::ContentFormat {
+                    format_id: "f-only".into(),
+                    content_id: "c-only".into(),
+                    label: "PDF".into(),
+                    format_kind: "pdf".into(),
+                    page_count: 2,
+                    pack_entry_prefix: Some("pages".into()),
+                    sort_order: 0,
+                    created_at: stamp.into(),
+                }],
+            )
+            .unwrap();
+            for page in 1..=2 {
+                documents::insert_image(
+                    db,
+                    &documents::DocumentImage {
+                        id: format!("{id}-img{page}"),
+                        document_id: format!("{id}-doc"),
+                        content_id: Some("c-only".into()),
+                        format_id: Some("f-only".into()),
+                        page_number: page,
+                        image_type: "page".into(),
+                        opfs_path: format!("{id}/p{page}"),
+                        width: 1,
+                        height: 1,
+                        mime_type: "image/webp".into(),
+                        file_size: 1,
+                        extracted_text: None,
+                        pack_entry_path: None,
+                        created_at: stamp.into(),
+                    },
+                )
+                .unwrap();
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn menu_shows_row_even_for_single_format(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book_with_single_rendition(cx, "b7");
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b7".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        // 形式が 1 つだけでもメニューに 1 行出す（「ページ一覧」にフォールバックしない）
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec!["PDF".to_string()]
+        );
+
+        // 行を選ぶとその形式でページ一覧が開く
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 0, 0)));
+        cx.run_until_parked();
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 2);
+        assert_eq!(
+            reader.read_with(cx, |r, _| r.selection().1.map(|s| s.to_string())),
+            Some("f-only".to_string())
+        );
+    }
+
     #[gpui_kit::test]
     async fn page_list_lists_contents_and_switches(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
@@ -669,20 +763,20 @@ mod tests {
         );
         assert!(viewer.read_with(cx, |v, _| v.contents()[0].is_primary));
 
-        // 開くと切替行が一番上に出る（コンテンツ 2 件）
-        cx.update(|cx| viewer.update(cx, |v, cx| v.open_page_list(cx)));
-        assert_eq!(viewer.read_with(cx, |v, _| v.contents().len()), 2);
+        // メニューの「ページ一覧」位置に切替行が出る（コンテンツ名）
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec!["本編".to_string(), "別冊".to_string()]
+        );
 
         // 別冊の行を選ぶ → ReaderView が反映してページ数が変わる
-        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_content(cx, 1)));
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 1, 0)));
         cx.run_until_parked();
         assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 1);
         assert_eq!(
             reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
             Some("c-sub".to_string())
         );
-        // 切替行は開いたまま（ドリルインしない）
-        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 1);
     }
 
     #[gpui_kit::test]
@@ -820,8 +914,11 @@ mod tests {
             2
         );
 
-        // レンディションが複数あるので切替行が一番上に出る
-        cx.update(|cx| viewer.update(cx, |v, cx| v.open_page_list(cx)));
+        // メニューの「ページ一覧」位置に、形式の行が並ぶ
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec!["画像".to_string(), "PDF".to_string()]
+        );
 
         // PDF 版に切り替えるとページ数が変わる
         cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 0, 1)));

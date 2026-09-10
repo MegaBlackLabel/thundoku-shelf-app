@@ -71,7 +71,7 @@ pub struct FormatEntry {
 /// ページ一覧の切替行（コンテンツ or レンディション）。
 struct SwitchRow {
     content_index: usize,
-    format_index: Option<usize>,
+    format_index: usize,
     title: String,
     subtitle: String,
     /// `image` / `pdf` / `epub` / `audio` / `video`
@@ -587,22 +587,11 @@ impl ImageViewer {
     /// ページ一覧を開く。コンテンツが複数なら一覧、単一ならサムネイルグリッドを直接出す。
     /// ページ一覧を開く。切替（コンテンツ / レンディション）があれば
     /// パネルの一番上に並べ、その下に現在のページのサムネイルを出す。
+    /// ページ一覧を開く（サムネイル。切替行はトップバーのメニュー側に出す）。
     pub fn open_page_list(&mut self, cx: &mut Context<Self>) {
         self.active_panel = Some(PanelView::PageList);
         self.load_page_list_thumbnails(cx);
         self.restart_hide_timer(cx);
-        cx.notify();
-    }
-
-    /// コンテンツ行を選ぶ（= そのコンテンツの先頭レンディションに切り替える）。
-    pub fn page_list_select_content(&mut self, cx: &mut Context<Self>, index: usize) {
-        let Some(content) = self.contents.get(index) else {
-            return;
-        };
-        self.pending_action = Some(PageListAction::Select {
-            content_id: content.content_id.clone(),
-            format_id: None,
-        });
         cx.notify();
     }
 
@@ -618,6 +607,7 @@ impl ImageViewer {
     }
 
     /// レンディションを切り替える（同じコンテンツの別形式・別バリアント）。
+    /// 切替後はそのレンディションのページ一覧（サムネイル）を開く。
     pub fn page_list_select_format(
         &mut self,
         cx: &mut Context<Self>,
@@ -634,7 +624,7 @@ impl ImageViewer {
             content_id: content.content_id.clone(),
             format_id: Some(format.format_id.clone()),
         });
-        cx.notify();
+        self.open_page_list(cx);
     }
 
     /// サムネイルを読み込む（ページ一覧を開いている間だけ）。
@@ -647,73 +637,47 @@ impl ImageViewer {
         }
     }
 
-    /// 切替行を出すか（複数コンテンツ、またはレンディションが複数あるとき）。
-    fn show_content_list(&self) -> bool {
-        self.contents.len() > 1
-            || self
-                .contents
-                .first()
-                .is_some_and(|content| content.formats.len() > 1)
-    }
-
-    /// ページ一覧の切替行。
-    ///
-    /// - 複数コンテンツ: コンテンツ行（優先ラジオ付き）+ そのレンディション行（複数あるとき）
-    /// - 単一コンテンツ: レンディション行だけ（見出しは出さない）
+    /// トップバーのメニューに出す切替行（コンテンツ × レンディションを平坦に並べる）。
+    /// レンディションが 1 つだけの本でも 1 行出す（`PDF` / `JPEG` など）。
     fn switch_rows(&self) -> Vec<SwitchRow> {
         let multi = self.contents.len() > 1;
         let mut rows = Vec::new();
         for (content_index, content) in self.contents.iter().enumerate() {
-            if multi {
-                let first = content.formats.first();
+            let multi_formats = content.formats.len() > 1;
+            for (format_index, format) in content.formats.iter().enumerate() {
+                let first_of_content = format_index == 0;
+                let title = if !multi {
+                    // 単一コンテンツはレンディション名そのもの（`JPEG` / `PDF`）
+                    format.label.clone()
+                } else if multi_formats {
+                    format!("{}・{}", content.display_name, format.label)
+                } else {
+                    content.display_name.clone()
+                };
                 rows.push(SwitchRow {
                     content_index,
-                    format_index: None,
-                    title: content.display_name.clone(),
-                    subtitle: first.map(format_subtitle).unwrap_or_default(),
-                    kind: first
-                        .map(|format| format.format_kind.clone())
-                        .unwrap_or_else(|| content.media_kind.clone()),
-                    is_current: self.current_content_id.as_deref()
-                        == Some(content.content_id.as_str()),
-                    is_primary: content.is_primary,
-                    show_radio: true,
-                    indent: false,
+                    format_index,
+                    title,
+                    subtitle: format_subtitle(format),
+                    kind: format.format_kind.clone(),
+                    is_current: self.current_format_id.as_deref()
+                        == Some(format.format_id.as_str()),
+                    is_primary: multi && first_of_content && content.is_primary,
+                    // 複数コンテンツのときだけ優先ラジオ（コンテンツの先頭レンディション行）
+                    show_radio: multi && first_of_content,
+                    indent: multi && !first_of_content,
                 });
-                if content.formats.len() > 1 {
-                    for (format_index, format) in content.formats.iter().enumerate() {
-                        rows.push(SwitchRow {
-                            content_index,
-                            format_index: Some(format_index),
-                            title: format.label.clone(),
-                            subtitle: format_subtitle(format),
-                            kind: format.format_kind.clone(),
-                            is_current: self.current_format_id.as_deref()
-                                == Some(format.format_id.as_str()),
-                            is_primary: false,
-                            show_radio: true,
-                            indent: true,
-                        });
-                    }
-                }
-            } else {
-                for (format_index, format) in content.formats.iter().enumerate() {
-                    rows.push(SwitchRow {
-                        content_index,
-                        format_index: Some(format_index),
-                        title: format.label.clone(),
-                        subtitle: format_subtitle(format),
-                        kind: format.format_kind.clone(),
-                        is_current: self.current_format_id.as_deref()
-                            == Some(format.format_id.as_str()),
-                        is_primary: false,
-                        show_radio: false,
-                        indent: false,
-                    });
-                }
             }
         }
         rows
+    }
+
+    /// メニューに出す切替行の見出し（テスト・UI 用）。
+    pub fn menu_row_titles(&self) -> Vec<String> {
+        self.switch_rows()
+            .into_iter()
+            .map(|row| row.title)
+            .collect()
     }
 
     /// 切替行 1 つ（アイコン + 名前 + 種別。複数コンテンツのときだけ優先ラジオ）。
@@ -742,7 +706,7 @@ impl ImageViewer {
         };
         div()
             .id(SharedString::from(format!(
-                "viewer-switch-{content_index}-{format_index:?}"
+                "viewer-switch-{content_index}-{format_index}"
             )))
             .flex()
             .flex_row()
@@ -757,7 +721,7 @@ impl ImageViewer {
                 el.child(
                     div()
                         .id(SharedString::from(format!(
-                            "viewer-switch-radio-{content_index}-{format_index:?}"
+                            "viewer-switch-radio-{content_index}-{format_index}"
                         )))
                         .cursor_pointer()
                         .text_color(if row.is_primary {
@@ -776,7 +740,7 @@ impl ImageViewer {
             .child(
                 div()
                     .id(SharedString::from(format!(
-                        "viewer-switch-open-{content_index}-{format_index:?}"
+                        "viewer-switch-open-{content_index}-{format_index}"
                     )))
                     .flex()
                     .flex_row()
@@ -785,11 +749,8 @@ impl ImageViewer {
                     .flex_grow(1.0)
                     .cursor_pointer()
                     .on_click(move |_, _window, cx| {
-                        click_handle.update(cx, |this, cx| match format_index {
-                            Some(format_index) => {
-                                this.page_list_select_format(cx, content_index, format_index)
-                            }
-                            None => this.page_list_select_content(cx, content_index),
+                        click_handle.update(cx, |this, cx| {
+                            this.page_list_select_format(cx, content_index, format_index);
                         });
                     })
                     .child(Icon::new(icon).size(px(24.0)).text_color(icon_color))
@@ -823,84 +784,87 @@ impl ImageViewer {
             .into_any_element()
     }
 
-    /// ページ一覧パネル: 切替行（あれば）を一番上に、その下にサムネイルグリッド。
+    /// トップバーのメニュー: 切替行（形式ごとのページ一覧）を並べる。
+    fn menu_switch_elements(
+        &self,
+        handle: &Entity<ImageViewer>,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui_kit::AnyElement> {
+        self.switch_rows()
+            .into_iter()
+            .map(|row| self.switch_row_element(row, handle, cx))
+            .collect()
+    }
+
+    /// ページ一覧パネル: サムネイルグリッド（切替はトップバーのメニュー側）。
     fn page_list_panel(
         &self,
         handle: &Entity<ImageViewer>,
         total: usize,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let mut body: Vec<gpui_kit::AnyElement> = Vec::new();
-        if self.show_content_list() {
-            for row in self.switch_rows() {
-                body.push(self.switch_row_element(row, handle, cx));
-            }
-        }
-        body.push(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap_2()
-                .p_3()
-                .children((0..total).map(|index| {
-                    let handle = handle.clone();
-                    let image = self.images.get(index).cloned().flatten();
-                    let is_current = index == self.current_page;
-                    div()
-                        .id(SharedString::from(format!("viewer-thumb-{index}")))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_1()
-                        .p_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if is_current {
-                            cx.theme().primary
-                        } else {
-                            cx.theme().muted
-                        })
-                        .hover(|style| style.bg(cx.theme().muted))
-                        .cursor_pointer()
-                        .on_click(move |_, _window, cx| {
-                            handle.update(cx, |this, cx| {
-                                this.set_page(cx, index);
-                            });
-                        })
-                        .child(
-                            div()
-                                .w(px(100.0))
-                                .aspect_ratio(100.0 / 141.0)
-                                .rounded_sm()
-                                .bg(gpui_kit::white())
-                                .overflow_hidden()
-                                .child(match image {
-                                    Some(image) => img(image)
-                                        .size_full()
-                                        .object_fit(gpui_kit::ObjectFit::Contain)
-                                        .into_any_element(),
-                                    None => div().size_full().into_any_element(),
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("{}", index + 1)),
-                        )
-                        .child(if is_current {
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("現在")
-                                .into_any_element()
-                        } else {
-                            div().into_any_element()
-                        })
-                }))
-                .into_any_element(),
-        );
+        let grid = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .p_3()
+            .children((0..total).map(|index| {
+                let handle = handle.clone();
+                let image = self.images.get(index).cloned().flatten();
+                let is_current = index == self.current_page;
+                div()
+                    .id(SharedString::from(format!("viewer-thumb-{index}")))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if is_current {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().muted
+                    })
+                    .hover(|style| style.bg(cx.theme().muted))
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
+                        handle.update(cx, |this, cx| {
+                            this.set_page(cx, index);
+                        });
+                    })
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .aspect_ratio(100.0 / 141.0)
+                            .rounded_sm()
+                            .bg(gpui_kit::white())
+                            .overflow_hidden()
+                            .child(match image {
+                                Some(image) => img(image)
+                                    .size_full()
+                                    .object_fit(gpui_kit::ObjectFit::Contain)
+                                    .into_any_element(),
+                                None => div().size_full().into_any_element(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{}", index + 1)),
+                    )
+                    .child(if is_current {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("現在")
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+            }));
         div()
             .flex()
             .flex_col()
@@ -910,7 +874,7 @@ impl ImageViewer {
                     .flex_col()
                     .h(px(420.0))
                     .overflow_y_scrollbar()
-                    .children(body),
+                    .child(grid),
             )
             .child(self.panel_back(handle, cx))
             .into_any_element()
@@ -2361,14 +2325,16 @@ impl Render for ImageViewer {
                         .border_t_1()
                         .border_color(cx.theme().muted)
                         .child(match view {
-                            PanelView::Menu => div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .p_3()
-                                .child(
+                            PanelView::Menu => {
+                                let switch_rows = self.menu_switch_elements(&handle, cx);
+                                let has_switch = !switch_rows.is_empty();
+                                let menu_row = |id: &'static str,
+                                                label: &'static str,
+                                                view: PanelView,
+                                                handle: &Entity<ImageViewer>| {
+                                    let handle = handle.clone();
                                     div()
-                                        .id("viewer-menu-page-list")
+                                        .id(id)
                                         .flex()
                                         .flex_row()
                                         .items_center()
@@ -2380,97 +2346,50 @@ impl Render for ImageViewer {
                                         .border_color(cx.theme().muted)
                                         .hover(|style| style.bg(cx.theme().muted))
                                         .cursor_pointer()
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                handle.update(cx, |this, cx| {
-                                                    this.open_panel(cx, PanelView::PageList);
-                                                });
-                                            }
+                                        .on_click(move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| this.open_panel(cx, view));
                                         })
                                         .child(
                                             div()
                                                 .text_sm()
                                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .child("ページ一覧"),
+                                                .child(label),
                                         )
                                         .child(
                                             div()
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child("›"),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id("viewer-menu-shortcuts")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(cx.theme().muted)
-                                        .hover(|style| style.bg(cx.theme().muted))
-                                        .cursor_pointer()
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                handle.update(cx, |this, cx| {
-                                                    this.open_panel(cx, PanelView::Shortcuts);
-                                                });
-                                            }
-                                        })
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .child("ショートカット"),
                                         )
-                                        .child(
-                                            div()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("›"),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id("viewer-menu-autoplay")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(cx.theme().muted)
-                                        .hover(|style| style.bg(cx.theme().muted))
-                                        .cursor_pointer()
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                handle.update(cx, |this, cx| {
-                                                    this.open_panel(
-                                                        cx,
-                                                        PanelView::AutoplaySettings,
-                                                    );
-                                                });
-                                            }
-                                        })
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .child("自動再生設定"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("›"),
-                                        ),
-                                ),
+                                };
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .p_3()
+                                    // 切替行（形式ごとのページ一覧）。レンディションが
+                                    // 無い本（旧データ）は「ページ一覧」にフォールバック。
+                                    .children(switch_rows)
+                                    .when(!has_switch, |el| {
+                                        el.child(menu_row(
+                                            "viewer-menu-page-list",
+                                            "ページ一覧",
+                                            PanelView::PageList,
+                                            &handle,
+                                        ))
+                                    })
+                                    .child(menu_row(
+                                        "viewer-menu-shortcuts",
+                                        "ショートカット",
+                                        PanelView::Shortcuts,
+                                        &handle,
+                                    ))
+                                    .child(menu_row(
+                                        "viewer-menu-autoplay",
+                                        "自動再生設定",
+                                        PanelView::AutoplaySettings,
+                                        &handle,
+                                    ))
+                            }
                             PanelView::PageList => div().child(self.page_list_panel(
                                 &handle,
                                 total,
