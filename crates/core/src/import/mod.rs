@@ -320,7 +320,7 @@ fn plan_content(group: Group, metas: &[EntryMeta]) -> Option<PlannedContent> {
             media_kind = media_kind_of(*kind);
         }
         renditions.push(PlannedRendition {
-            label: media_kind_of(*kind)?.label().to_string(),
+            label: rendition_label(*kind, &ordinals, metas),
             kind: media_kind_of(*kind)?,
             entries: ordinals,
         });
@@ -330,6 +330,35 @@ fn plan_content(group: Group, metas: &[EntryMeta]) -> Option<PlannedContent> {
         media_kind: media_kind?,
         renditions,
     })
+}
+
+/// レンディションの表示名。画像は実際の拡張子（`JPEG` / `PNG` …）、PDF / EPUB は
+/// ファイル名を出す（Web 版の「形式一覧」の見せ方に合わせる）。
+fn rendition_label(kind: EntryKind, ordinals: &[usize], metas: &[EntryMeta]) -> String {
+    let first = ordinals.first().and_then(|ordinal| metas.get(*ordinal));
+    let extension = first
+        .and_then(|meta| meta.name.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_lowercase());
+    let fallback = || {
+        media_kind_of(kind)
+            .map(|media| media.label().to_string())
+            .unwrap_or_default()
+    };
+    match kind {
+        EntryKind::Image => match extension.as_deref() {
+            Some("jpg" | "jpeg") => "JPEG".to_string(),
+            Some("png") => "PNG".to_string(),
+            Some("webp") => "WEBP".to_string(),
+            Some("gif") => "GIF".to_string(),
+            Some("bmp") => "BMP".to_string(),
+            Some("tif" | "tiff") => "TIFF".to_string(),
+            _ => fallback(),
+        },
+        EntryKind::Pdf | EntryKind::Epub => first
+            .map(|meta| entry_file_name(&meta.name).to_string())
+            .unwrap_or_else(fallback),
+        _ => fallback(),
+    }
 }
 
 impl MediaKind {

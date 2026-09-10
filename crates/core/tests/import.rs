@@ -409,6 +409,10 @@ fn zip_with_pdf_reuses_book_id_without_duplicate() {
     // 題名・file_name は ZIP 内パスではなくファイル名を使う（"inner/inside.pdf" ではなく "inside.pdf"）
     assert_eq!(first.book.file_name, "inside.pdf");
     assert_eq!(first.book.title, "inside");
+    // PDF レンディションはファイル名を表示名にする（形式一覧の見せ方）
+    let stored = db::contents::list_with_formats(&env.pool, &first.book.id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].1[0].label, "inside.pdf");
 
     db::books::set_favorite(&env.pool, &first.book.id, true).unwrap();
 
@@ -766,6 +770,10 @@ fn zip_with_two_folder_contents_persists_structure() {
         db::contents::formats_for_content(&env.pool, &primary.content_id).unwrap();
     assert_eq!(primary_formats.len(), 1);
     assert_eq!(primary_formats[0].page_count, 2);
+    assert_eq!(
+        primary_formats[0].label, "JPEG",
+        "画像レンディションは拡張子を表示名にする"
+    );
     assert_eq!(
         primary_formats[0].pack_entry_prefix.as_deref(),
         Some("pages")

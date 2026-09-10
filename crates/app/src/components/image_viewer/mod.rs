@@ -64,6 +64,33 @@ pub struct FormatEntry {
     pub format_id: String,
     pub label: String,
     pub page_count: i64,
+    /// `image` / `pdf` / `epub` / `audio` / `video`
+    pub format_kind: String,
+}
+
+/// ページ一覧の切替行（コンテンツ or レンディション）。
+struct SwitchRow {
+    content_index: usize,
+    format_index: Option<usize>,
+    title: String,
+    subtitle: String,
+    /// `image` / `pdf` / `epub` / `audio` / `video`
+    kind: String,
+    is_current: bool,
+    is_primary: bool,
+    show_radio: bool,
+}
+
+/// 切替行の補足（`フォルダ 13項目` / `PDF ドキュメント`）。
+fn format_subtitle(format: &FormatEntry) -> String {
+    match format.format_kind.as_str() {
+        "image" => format!("フォルダ {}項目", format.page_count),
+        "pdf" => "PDF ドキュメント".to_string(),
+        "epub" => "EPUB ドキュメント".to_string(),
+        "audio" => format!("音声 {}項目", format.page_count),
+        "video" => format!("動画 {}項目", format.page_count),
+        _ => format!("{} ページ", format.page_count),
+    }
 }
 
 /// ページ一覧の操作。`ImageViewer` は保留するだけで、`ReaderView` が拾って
@@ -642,7 +669,8 @@ impl ImageViewer {
         }
     }
 
-    /// コンテンツ一覧を挟むか（複数コンテンツ、またはレンディションが複数あるとき）。
+    /// コンテンツ一覧（＝切替一覧）を挟むか。
+    /// 複数コンテンツ、または単一コンテンツでレンディションが複数あるとき。
     fn show_content_list(&self) -> bool {
         self.contents.len() > 1
             || self
@@ -651,132 +679,162 @@ impl ImageViewer {
                 .is_some_and(|content| content.formats.len() > 1)
     }
 
-    /// ページ一覧: コンテンツ一覧（優先ラジオ + 表示名 + 種別 + ページ数 + ドリルイン）。
-    fn content_list_panel(
+    /// ページ一覧の切替行。複数コンテンツならコンテンツ行、単一コンテンツなら
+    /// レンディション行を並べる（コンテンツ名の見出し行は出さない）。
+    fn switch_rows(&self) -> Vec<SwitchRow> {
+        let multi = self.contents.len() > 1;
+        let mut rows = Vec::new();
+        for (content_index, content) in self.contents.iter().enumerate() {
+            if multi {
+                let first = content.formats.first();
+                rows.push(SwitchRow {
+                    content_index,
+                    format_index: None,
+                    title: content.display_name.clone(),
+                    subtitle: first.map(format_subtitle).unwrap_or_default(),
+                    kind: first
+                        .map(|format| format.format_kind.clone())
+                        .unwrap_or_else(|| content.media_kind.clone()),
+                    is_current: self.current_content_id.as_deref()
+                        == Some(content.content_id.as_str()),
+                    is_primary: content.is_primary,
+                    show_radio: true,
+                });
+            } else {
+                for (format_index, format) in content.formats.iter().enumerate() {
+                    rows.push(SwitchRow {
+                        content_index,
+                        format_index: Some(format_index),
+                        title: format.label.clone(),
+                        subtitle: format_subtitle(format),
+                        kind: format.format_kind.clone(),
+                        is_current: self.current_format_id.as_deref()
+                            == Some(format.format_id.as_str()),
+                        is_primary: false,
+                        show_radio: false,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// 切替行 1 つ（アイコン + 名前 + 種別。複数コンテンツのときだけ優先ラジオ）。
+    fn switch_row_element(
         &self,
+        row: SwitchRow,
         handle: &Entity<ImageViewer>,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let rows = self.contents.iter().enumerate().map(|(index, content)| {
-            let radio_handle = handle.clone();
-            let row_handle = handle.clone();
-            let is_current =
-                self.current_content_id.as_deref() == Some(content.content_id.as_str());
-            let page_count = content
-                .formats
-                .iter()
-                .map(|format| format.page_count)
-                .max()
-                .unwrap_or(0);
-            let kind = match content.media_kind.as_str() {
-                "pdf" => "PDF".to_string(),
-                "epub" => "EPUB".to_string(),
-                "audio" => "音声".to_string(),
-                "video" => "動画".to_string(),
-                _ => content
-                    .formats
-                    .first()
-                    .map(|format| format.label.clone())
-                    .unwrap_or_else(|| "画像".to_string()),
-            };
-            // レンディション切替（複数あるときだけ出す）
-            let format_chips = content
-                .formats
-                .iter()
-                .enumerate()
-                .map(|(format_index, format)| {
-                    let chip_handle = handle.clone();
-                    let selected =
-                        self.current_format_id.as_deref() == Some(format.format_id.as_str());
+        let radio_handle = handle.clone();
+        let click_handle = handle.clone();
+        let content_index = row.content_index;
+        let format_index = row.format_index;
+        let is_folder = row.kind == "image";
+        let icon = if is_folder {
+            IconName::FolderOpen
+        } else {
+            IconName::FileText
+        };
+        let icon_color = if is_folder {
+            gpui_kit::rgb(0xf5c451).into()
+        } else if row.kind == "pdf" {
+            gpui_kit::rgb(0xdc2626).into()
+        } else {
+            cx.theme().muted_foreground
+        };
+        div()
+            .id(SharedString::from(format!(
+                "viewer-switch-{content_index}-{format_index:?}"
+            )))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().muted)
+            .when(row.show_radio, |el| {
+                el.child(
                     div()
                         .id(SharedString::from(format!(
-                            "viewer-format-{index}-{format_index}"
+                            "viewer-switch-radio-{content_index}"
                         )))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if selected {
-                            cx.theme().primary
-                        } else {
-                            cx.theme().muted
-                        })
-                        .text_xs()
                         .cursor_pointer()
-                        .on_click(move |_, _window, cx| {
-                            chip_handle.update(cx, |this, cx| {
-                                this.page_list_select_format(cx, index, format_index);
-                            });
-                        })
-                        .child(format.label.clone())
-                });
-            div()
-                .id(SharedString::from(format!("viewer-content-{index}")))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .border_1()
-                .border_color(if is_current {
-                    cx.theme().primary
-                } else {
-                    cx.theme().muted
-                })
-                .child(
-                    div()
-                        .id(SharedString::from(format!("viewer-content-radio-{index}")))
-                        .cursor_pointer()
-                        .text_color(if content.is_primary {
+                        .text_color(if row.is_primary {
                             cx.theme().primary
                         } else {
                             cx.theme().muted_foreground
                         })
                         .on_click(move |_, _window, cx| {
                             radio_handle.update(cx, |this, cx| {
-                                this.page_list_set_primary(cx, index);
+                                this.page_list_set_primary(cx, content_index);
                             });
                         })
-                        .child(if content.is_primary { "◉" } else { "○" }),
+                        .child(if row.is_primary { "◉" } else { "○" }),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_grow(1.0)
-                        .gap_1()
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("viewer-content-open-{index}")))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .cursor_pointer()
-                                .on_click(move |_, _window, cx| {
-                                    row_handle.update(cx, |this, cx| {
-                                        this.page_list_drill_in(cx, index);
-                                    });
-                                })
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                        .child(content.display_name.clone()),
-                                )
-                                .child(div().text_color(cx.theme().muted_foreground).child("›")),
-                        )
-                        .child(
+            })
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "viewer-switch-open-{content_index}-{format_index:?}"
+                    )))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .flex_grow(1.0)
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
+                        click_handle.update(cx, |this, cx| match format_index {
+                            Some(format_index) => {
+                                this.page_list_select_format(cx, content_index, format_index)
+                            }
+                            None => this.page_list_drill_in(cx, content_index),
+                        });
+                    })
+                    .child(Icon::new(icon).size(px(24.0)).text_color(icon_color))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_grow(1.0)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .child(row.title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(row.subtitle),
+                            ),
+                    )
+                    .when(row.is_current, |el| {
+                        el.child(
                             div()
                                 .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("{kind}・{page_count} ページ")),
+                                .text_color(cx.theme().primary)
+                                .child("表示中"),
                         )
-                        .child(div().flex().flex_row().gap_1().children(format_chips)),
-                )
-        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// ページ一覧: 切替一覧（コンテンツ / レンディション）。
+    fn switch_list_panel(
+        &self,
+        handle: &Entity<ImageViewer>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let mut rows = Vec::new();
+        for row in self.switch_rows() {
+            rows.push(self.switch_row_element(row, handle, cx));
+        }
         div()
             .flex()
             .flex_col()
@@ -784,8 +842,7 @@ impl ImageViewer {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .p_3()
+                    .py_1()
                     .h(px(420.0))
                     .overflow_y_scrollbar()
                     .children(rows),
@@ -794,7 +851,7 @@ impl ImageViewer {
             .into_any_element()
     }
 
-    /// ページ一覧: サムネイルグリッド（単一コンテンツは従来どおり）。
+    /// ページ一覧: サムネイルグリッド（単一コンテンツ・単一レンディションは従来どおり）。
     fn page_grid_panel(
         &self,
         handle: &Entity<ImageViewer>,
@@ -807,8 +864,6 @@ impl ImageViewer {
             .flex_wrap()
             .gap_2()
             .p_3()
-            .h(px(420.0))
-            .overflow_y_scrollbar()
             .children((0..total).map(|index| {
                 let handle = handle.clone();
                 let image = self.images.get(index).cloned().flatten();
@@ -865,6 +920,37 @@ impl ImageViewer {
                         div().into_any_element()
                     })
             }));
+        // 複数コンテンツでドリルイン中、そのコンテンツにレンディションが複数あれば
+        // グリッドの上に切替行を出す（一覧に戻らず切り替えられるように）
+        let mut body: Vec<gpui_kit::AnyElement> = Vec::new();
+        let drilled = if self.contents.len() > 1 {
+            self.page_list_drill
+                .and_then(|index| self.contents.get(index).map(|content| (index, content)))
+        } else {
+            None
+        };
+        if let Some((content_index, content)) = drilled
+            && content.formats.len() > 1
+        {
+            for (format_index, format) in content.formats.iter().enumerate() {
+                body.push(self.switch_row_element(
+                    SwitchRow {
+                        content_index,
+                        format_index: Some(format_index),
+                        title: format.label.clone(),
+                        subtitle: format_subtitle(format),
+                        kind: format.format_kind.clone(),
+                        is_current: self.current_format_id.as_deref()
+                            == Some(format.format_id.as_str()),
+                        is_primary: false,
+                        show_radio: false,
+                    },
+                    handle,
+                    cx,
+                ));
+            }
+        }
+        body.push(grid.into_any_element());
         // 複数コンテンツ / 複数レンディションのときは一覧へ戻れる
         let back = if self.show_content_list() {
             let back_handle = handle.clone();
@@ -893,7 +979,14 @@ impl ImageViewer {
         div()
             .flex()
             .flex_col()
-            .child(grid)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .h(px(420.0))
+                    .overflow_y_scrollbar()
+                    .children(body),
+            )
             .child(back)
             .into_any_element()
     }
@@ -2455,7 +2548,7 @@ impl Render for ImageViewer {
                                 ),
                             PanelView::PageList => div().child(
                                 if self.show_content_list() && self.page_list_drill.is_none() {
-                                    self.content_list_panel(&handle, cx)
+                                    self.switch_list_panel(&handle, cx)
                                 } else {
                                     self.page_grid_panel(&handle, total, cx)
                                 },

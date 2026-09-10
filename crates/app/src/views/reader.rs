@@ -418,6 +418,7 @@ fn load_content_entries(db: &thundoku_core::db::SqlitePool, book_id: &str) -> Ve
                     format_id: format.format_id,
                     label: format.label,
                     page_count: format.page_count,
+                    format_kind: format.format_kind,
                 })
                 .collect(),
         })
@@ -716,6 +717,129 @@ mod tests {
             reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
             Some("c-main".to_string())
         );
+    }
+
+    /// 1 コンテンツ + 2 レンディション（画像 3 ページ / PDF 2 ページ）の本。
+    /// 実データの「PDF版 + 画像版」と同じ形（`姉とアナルセックスする話` 相当）。
+    fn seed_book_with_two_renditions(cx: &mut TestAppContext, id: &str) {
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let db = &state.db_pool;
+            db::books::insert(db, &book_row(id, "画像とPDFの本", &format!("{id}.zip"))).unwrap();
+            documents::insert_document(
+                db,
+                &documents::ImportedDocument {
+                    id: format!("{id}-doc"),
+                    book_id: id.into(),
+                    source_type: "image-set".into(),
+                    file_hash: "h".into(),
+                    total_pages: 3,
+                    metadata: None,
+                    status: "done".into(),
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                },
+            )
+            .unwrap();
+            let stamp = "2026-08-21 00:00:00";
+            db::contents::insert_batch(
+                db,
+                &[db::contents::BookContent {
+                    content_id: "c-one".into(),
+                    book_id: id.into(),
+                    display_name: "本文".into(),
+                    media_kind: "image".into(),
+                    is_primary: 1,
+                    sort_order: 0,
+                    created_at: stamp.into(),
+                }],
+                &[
+                    db::contents::ContentFormat {
+                        format_id: "f-img".into(),
+                        content_id: "c-one".into(),
+                        label: "画像".into(),
+                        format_kind: "image".into(),
+                        page_count: 3,
+                        pack_entry_prefix: Some("pages".into()),
+                        sort_order: 0,
+                        created_at: stamp.into(),
+                    },
+                    db::contents::ContentFormat {
+                        format_id: "f-pdf".into(),
+                        content_id: "c-one".into(),
+                        label: "PDF".into(),
+                        format_kind: "pdf".into(),
+                        page_count: 2,
+                        pack_entry_prefix: Some("contents/0/r1".into()),
+                        sort_order: 1,
+                        created_at: stamp.into(),
+                    },
+                ],
+            )
+            .unwrap();
+            let insert_page = |format: &str, page: i64, index: usize| {
+                documents::insert_image(
+                    db,
+                    &documents::DocumentImage {
+                        id: format!("{id}-img{index}"),
+                        document_id: format!("{id}-doc"),
+                        content_id: Some("c-one".into()),
+                        format_id: Some(format.into()),
+                        page_number: page,
+                        image_type: "page".into(),
+                        opfs_path: format!("{id}/p{index}"),
+                        width: 1,
+                        height: 1,
+                        mime_type: "image/webp".into(),
+                        file_size: 1,
+                        extracted_text: None,
+                        pack_entry_path: None,
+                        created_at: stamp.into(),
+                    },
+                )
+                .unwrap();
+            };
+            for page in 1..=3 {
+                insert_page("f-img", page, page as usize);
+            }
+            for page in 1..=2 {
+                insert_page("f-pdf", page, 3 + page as usize);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn page_list_shows_rendition_switch_for_single_content(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book_with_two_renditions(cx, "b6");
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b6".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        // 1 コンテンツ + 2 レンディション
+        assert_eq!(viewer.read_with(cx, |v, _| v.contents().len()), 1);
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.contents()[0].formats.len()),
+            2
+        );
+
+        // レンディションが複数あるのでコンテンツ一覧（チップ付き）から始まる
+        cx.update(|cx| viewer.update(cx, |v, cx| v.open_page_list(cx)));
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.page_list_drill()),
+            None,
+            "コンテンツ一覧が出る（グリッド直行ではない）"
+        );
+
+        // PDF 版に切り替えるとページ数が変わる
+        cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 0, 1)));
+        cx.run_until_parked();
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 2);
+        assert_eq!(
+            reader.read_with(cx, |r, _| r.selection().1.map(|s| s.to_string())),
+            Some("f-pdf".to_string())
+        );
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_list_drill()), Some(0));
     }
 
     #[gpui_kit::test]
