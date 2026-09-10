@@ -345,15 +345,11 @@ fn rendition_label(kind: EntryKind, ordinals: &[usize], metas: &[EntryMeta]) -> 
             .unwrap_or_default()
     };
     match kind {
-        EntryKind::Image => match extension.as_deref() {
-            Some("jpg" | "jpeg") => "JPEG".to_string(),
-            Some("png") => "PNG".to_string(),
-            Some("webp") => "WEBP".to_string(),
-            Some("gif") => "GIF".to_string(),
-            Some("bmp") => "BMP".to_string(),
-            Some("tif" | "tiff") => "TIFF".to_string(),
-            _ => fallback(),
-        },
+        EntryKind::Image => extension
+            .as_deref()
+            .and_then(crate::db::contents::image_label_for_extension)
+            .map(str::to_string)
+            .unwrap_or_else(fallback),
         EntryKind::Pdf | EntryKind::Epub => first
             .map(|meta| entry_file_name(&meta.name).to_string())
             .unwrap_or_else(fallback),

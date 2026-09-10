@@ -206,6 +206,12 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             "format_id TEXT REFERENCES content_formats(format_id)",
         )
         .await?;
+        // フェーズ2以前の旧ラベル（画像 / PDF / EPUB）を実データに合わせて書き換える
+        // （データ移行。対象が無ければ何もしない）
+        let migrated_labels = contents::migrate_legacy_labels(&mut conn).await?;
+        if migrated_labels > 0 {
+            log::info!("migrate: content_formats.label を {migrated_labels} 件更新");
+        }
         // 共有ソースメタ列（FANZA同人 / DLsite）。開発中のためマイグレーションファイルは
         // 作らず、既存 runtime DDL（hidden_at / owner_sub 等）と同様に冪等に適用する。
         {

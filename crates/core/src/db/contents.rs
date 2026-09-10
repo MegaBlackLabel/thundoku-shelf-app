@@ -164,7 +164,87 @@ pub fn set_primary(pool: &SqlitePool, book_id: &str, content_id: &str) -> Result
     })
 }
 
-/// 本に紐づくコンテンツ／レンディションを削除する（再取り込み用）。
+/// ファイル名や拡張子から画像の表示名（`JPEG` / `PNG` …）を推定する。
+/// 実データ（FANZA 290 件）では画像セットは JPEG が主流。
+pub fn image_label_for_extension(extension: &str) -> Option<&'static str> {
+    match extension.to_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("JPEG"),
+        "png" => Some("PNG"),
+        "webp" => Some("WEBP"),
+        "gif" => Some("GIF"),
+        "bmp" => Some("BMP"),
+        "tif" | "tiff" => Some("TIFF"),
+        _ => None,
+    }
+}
+
+/// 旧ラベル（`画像` / `PDF` / `EPUB`）を実データに合わせて書き換えるデータ移行。
+///
+/// フェーズ2以前の取り込みでは `content_formats.label` が種別名のままだった。
+/// Pack には元の拡張子が残らない（ページは webp 化されている）ため、
+/// - PDF / EPUB: 本のファイル名（単体取り込み）→ コンテンツ名 + 拡張子 の順で推定
+/// - 画像: 本のファイル名に画像拡張子があればそれ、無ければ `JPEG` とみなす
+///
+/// 対象は旧ラベルの行だけなので、繰り返し実行しても何もしない（冪等）。
+pub fn run_legacy_label_migration(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    crate::db::block_on(async {
+        let mut conn = pool.acquire().await?;
+        migrate_legacy_labels(&mut conn).await
+    })
+}
+
+/// `run_legacy_label_migration` の本体（`migrate()` から同じ接続で呼ぶ）。
+pub(crate) async fn migrate_legacy_labels(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT f.format_id, f.format_kind, c.display_name, b.file_name \
+         FROM content_formats f \
+         JOIN book_contents c ON c.content_id = f.content_id \
+         JOIN books b ON b.id = c.book_id \
+         WHERE f.label IN ('画像', 'PDF', 'EPUB')",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut updated = 0;
+    for (format_id, format_kind, display_name, book_file_name) in rows {
+        let Some(label) = legacy_label(&format_kind, &display_name, &book_file_name) else {
+            continue;
+        };
+        sqlx::query("UPDATE content_formats SET label = ?1 WHERE format_id = ?2")
+            .bind(&label)
+            .bind(&format_id)
+            .execute(&mut *conn)
+            .await?;
+        updated += 1;
+    }
+    Ok(updated)
+}
+
+/// 旧ラベルから新しい表示名を推定する。対象外の種別は `None`。
+fn legacy_label(format_kind: &str, display_name: &str, book_file_name: &str) -> Option<String> {
+    match format_kind {
+        "pdf" | "epub" => {
+            let suffix = format!(".{format_kind}");
+            if book_file_name.to_lowercase().ends_with(&suffix) {
+                Some(book_file_name.to_string())
+            } else if display_name.to_lowercase().ends_with(&suffix) {
+                Some(display_name.to_string())
+            } else {
+                Some(format!("{display_name}{suffix}"))
+            }
+        }
+        "image" => {
+            let from_book = book_file_name
+                .rsplit_once('.')
+                .and_then(|(_, extension)| image_label_for_extension(extension));
+            Some(from_book.unwrap_or("JPEG").to_string())
+        }
+        _ => None,
+    }
+}
+
+/// コンテンツとレンディションを削除する（再取り込み用）。
 /// 子（`content_formats`）→ 親（`book_contents`）の順で消す。
 pub fn delete_for_book(pool: &SqlitePool, book_id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {

@@ -1001,6 +1001,130 @@ fn bookshelf_metadata_roundtrip() {
     assert_eq!(bookshelf::list(&pool, "fanza").unwrap(), vec![item]);
 }
 
+// フェーズ2以前に取り込んだ本の `content_formats.label`（画像 / PDF / EPUB）を
+// 実データに合わせて書き換える移行。Pack には元の拡張子が残らないため推定を含む。
+#[test]
+fn legacy_content_labels_are_migrated() {
+    let pool = memory_db();
+    let stamp = "2026-01-01 00:00:00";
+    let mk_book = |id: &str, file_name: &str| books::Book {
+        id: id.into(),
+        title: "移行テスト".into(),
+        author: String::new(),
+        circle_name: String::new(),
+        purchase_date: None,
+        file_name: file_name.into(),
+        file_size: 1,
+        opfs_path: format!("{id}.opfspack"),
+        cover_thumbnail: None,
+        tbf_product_id: None,
+        site_id: None,
+        tags_fetched: 1,
+        pack_id: Some(id.into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: stamp.into(),
+        updated_at: stamp.into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
+    };
+    let mk_format = |format_id: &str, content_id: &str, label: &str, kind: &str, order: i64| {
+        contents::ContentFormat {
+            format_id: format_id.into(),
+            content_id: content_id.into(),
+            label: label.into(),
+            format_kind: kind.into(),
+            page_count: if kind == "pdf" { 16 } else { 13 },
+            pack_entry_prefix: Some("pages".into()),
+            sort_order: order,
+            created_at: stamp.into(),
+        }
+    };
+
+    // 旧ラベルの本（ZIP 取り込み: 画像セット + PDF 版）
+    books::insert(&pool, &mk_book("book-legacy", "sample.zip")).unwrap();
+    contents::insert_batch(
+        &pool,
+        &[contents::BookContent {
+            content_id: "c".into(),
+            book_id: "book-legacy".into(),
+            display_name: "本編".into(),
+            media_kind: "image".into(),
+            is_primary: 1,
+            sort_order: 0,
+            created_at: stamp.into(),
+        }],
+        &[
+            mk_format("f-img", "c", "画像", "image", 0),
+            mk_format("f-pdf", "c", "PDF", "pdf", 1),
+        ],
+    )
+    .unwrap();
+
+    let updated = contents::run_legacy_label_migration(&pool).unwrap();
+    assert_eq!(updated, 2, "旧ラベルの 2 件が書き換わる");
+    let formats = contents::formats_for_content(&pool, "c").unwrap();
+    assert_eq!(
+        formats[0].label, "JPEG",
+        "画像セットは元拡張子が残らないため JPEG とみなす"
+    );
+    assert_eq!(
+        formats[1].label, "本編.pdf",
+        "PDF はコンテンツ名からファイル名を推定する"
+    );
+
+    // 2 回目は対象が無い（冪等）
+    assert_eq!(contents::run_legacy_label_migration(&pool).unwrap(), 0);
+
+    // 単体画像（元ファイル名に拡張子がある）はその拡張子を使う
+    books::insert(&pool, &mk_book("book-img", "illust.png")).unwrap();
+    contents::insert_batch(
+        &pool,
+        &[contents::BookContent {
+            content_id: "c2".into(),
+            book_id: "book-img".into(),
+            display_name: "本文".into(),
+            media_kind: "image".into(),
+            is_primary: 1,
+            sort_order: 0,
+            created_at: stamp.into(),
+        }],
+        &[mk_format("f2", "c2", "画像", "image", 0)],
+    )
+    .unwrap();
+    assert_eq!(contents::run_legacy_label_migration(&pool).unwrap(), 1);
+    let formats = contents::formats_for_content(&pool, "c2").unwrap();
+    assert_eq!(formats[0].label, "PNG");
+
+    // 単体 PDF は本のファイル名をそのまま使う
+    books::insert(&pool, &mk_book("book-pdf", "only.pdf")).unwrap();
+    contents::insert_batch(
+        &pool,
+        &[contents::BookContent {
+            content_id: "c3".into(),
+            book_id: "book-pdf".into(),
+            display_name: "本文".into(),
+            media_kind: "pdf".into(),
+            is_primary: 1,
+            sort_order: 0,
+            created_at: stamp.into(),
+        }],
+        &[mk_format("f3", "c3", "PDF", "pdf", 0)],
+    )
+    .unwrap();
+    assert_eq!(contents::run_legacy_label_migration(&pool).unwrap(), 1);
+    let formats = contents::formats_for_content(&pool, "c3").unwrap();
+    assert_eq!(formats[0].label, "only.pdf");
+}
+
 // フェーズ2: コンテンツ（読む単位）とレンディション（切替可能な表示形態）が
 // DB に保存・取得・削除できること。`document_images` が content を指せること。
 #[test]

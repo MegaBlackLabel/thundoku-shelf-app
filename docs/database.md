@@ -254,6 +254,9 @@ Zenn のタグメタデータ（`https://zenn.dev/api/tags` 相当から取得�
   `document_images.content_id` / `format_id`: `migrate()` 内の
   `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN` で適用
   （新しいマイグレーションファイルは作らない方針）
+- `content_formats.label` の旧値（`画像` / `PDF` / `EPUB`）は `migrate()` 内の
+  データ移行（`contents::migrate_legacy_labels`）で実データに合わせて書き換える
+  （画像 = 拡張子名、PDF/EPUB = ファイル名。Pack に元拡張子が残らないため推定を含む）
 - テスト用には `test_pool()`（インメモリ + 全マイグレーション適用）を使用
 
 ## データの流れ
