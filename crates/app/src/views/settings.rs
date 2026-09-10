@@ -4,15 +4,15 @@ use std::path::PathBuf;
 
 use crate::components::dialog::{dialog_surface, fade_dialog};
 use gpui_kit::StyledImage as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement as _, Subscription, Window,
     div, img, px,
 };
 use gpui_kit::{ReadGlobal as _, Styled as _};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
 
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
@@ -315,18 +315,23 @@ impl SettingsView {
                 if response.into_reader().read_to_end(&mut buf).is_err() {
                     continue;
                 }
-                // 288px に縮小して PNG 保存（本棚の fetch と同じ形式）
+                // 448px に縮小して PNG 保存（本棚の fetch と同じ形式・同じ解像度）
                 if let Ok(decoded) = image::load_from_memory(&buf) {
-                    let resized = if decoded.width() > 288 {
-                        let scale = 288.0 / decoded.width() as f32;
+                    let resized = if decoded.width() > 448 {
+                        let scale = 448.0 / decoded.width() as f32;
                         let w = (decoded.width() as f32 * scale).max(1.0) as u32;
                         let h = (decoded.height() as f32 * scale).max(1.0) as u32;
-                        decoded.resize(w, h, image::imageops::FilterType::Triangle)
+                        decoded.resize(w, h, image::imageops::FilterType::Lanczos3)
                     } else {
                         decoded
                     };
-                    let _ = std::fs::create_dir_all(data_dir.join("thumbnails"));
-                    let _ = resized.save(data_dir.join("thumbnails").join(format!("{site_id}_{database_id}.png")));
+                    let thumbnails_dir = data_dir.join("thumbnails");
+                    let _ = std::fs::create_dir_all(&thumbnails_dir);
+                    let _ = resized.save(crate::views::bookshelf::cover_cache_path(
+                        &thumbnails_dir,
+                        &site_id,
+                        &database_id,
+                    ));
                 }
             }
             let _ = handle.update(cx, |this, cx| {
@@ -812,59 +817,60 @@ impl SettingsView {
             new_dir.join("downloads"),
         );
         let new_dir2 = new_dir.clone();
-        let task: gpui_kit::Task<(PathBuf, Vec<String>)> = cx.background_executor().spawn(async move {
-            // 新規ディレクトリを作成
-            for d in [&ndb, &npacks, &nthumbs, &ndl] {
-                if let Some(parent) = d.parent() {
-                    std::fs::create_dir_all(parent).ok();
+        let task: gpui_kit::Task<(PathBuf, Vec<String>)> =
+            cx.background_executor().spawn(async move {
+                // 新規ディレクトリを作成
+                for d in [&ndb, &npacks, &nthumbs, &ndl] {
+                    if let Some(parent) = d.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
                 }
-            }
-            // 既存ファイル/ディレクトリを移動。DB（+WAL/SHM）と各サブディレクトリ。
-            let mut moved = Vec::new();
-            // 移動（rename）は同一ボリューム間でしか動かないため、
-            // 別ドライブ（C: → D: など）では コピー → 削除 でフォールバックする。
-            let move_item =
-                |from: &std::path::Path, to: &std::path::Path, moved: &mut Vec<String>| {
-                    if from.exists() && from != to && !to.exists() {
-                        let ok = std::fs::rename(from, to).is_ok() || {
-                            // rename 失敗（別ボリューム等）は コピー → 削除 で試す
-                            let copy_ok = if from.is_dir() {
-                                copy_dir_recursive(from, to).is_ok()
-                            } else {
-                                std::fs::copy(from, to).map(|_| ()).is_ok()
+                // 既存ファイル/ディレクトリを移動。DB（+WAL/SHM）と各サブディレクトリ。
+                let mut moved = Vec::new();
+                // 移動（rename）は同一ボリューム間でしか動かないため、
+                // 別ドライブ（C: → D: など）では コピー → 削除 でフォールバックする。
+                let move_item =
+                    |from: &std::path::Path, to: &std::path::Path, moved: &mut Vec<String>| {
+                        if from.exists() && from != to && !to.exists() {
+                            let ok = std::fs::rename(from, to).is_ok() || {
+                                // rename 失敗（別ボリューム等）は コピー → 削除 で試す
+                                let copy_ok = if from.is_dir() {
+                                    copy_dir_recursive(from, to).is_ok()
+                                } else {
+                                    std::fs::copy(from, to).map(|_| ()).is_ok()
+                                };
+                                if copy_ok {
+                                    std::fs::remove_dir_all(from)
+                                        .or_else(|_| std::fs::remove_file(from))
+                                        .ok();
+                                }
+                                copy_ok
                             };
-                            if copy_ok {
-                                std::fs::remove_dir_all(from)
-                                    .or_else(|_| std::fs::remove_file(from))
-                                    .ok();
-                            }
-                            copy_ok
-                        };
-                        if ok {
-                            if let Some(name) = from.file_name() {
-                                moved.push(name.to_string_lossy().to_string());
+                            if ok {
+                                if let Some(name) = from.file_name() {
+                                    moved.push(name.to_string_lossy().to_string());
+                                }
                             }
                         }
-                    }
-                };
-            for (from, to) in [
-                (&db_path, &ndb),
-                (
-                    &db_path.with_extension("db-shm"),
-                    &ndb.with_extension("db-shm"),
-                ),
-                (
-                    &db_path.with_extension("db-wal"),
-                    &ndb.with_extension("db-wal"),
-                ),
-                (&packs, &npacks),
-                (&thumbnails, &nthumbs),
-                (&downloads, &ndl),
-            ] {
-                move_item(from, to, &mut moved);
-            }
-            (new_dir2, moved)
-        });
+                    };
+                for (from, to) in [
+                    (&db_path, &ndb),
+                    (
+                        &db_path.with_extension("db-shm"),
+                        &ndb.with_extension("db-shm"),
+                    ),
+                    (
+                        &db_path.with_extension("db-wal"),
+                        &ndb.with_extension("db-wal"),
+                    ),
+                    (&packs, &npacks),
+                    (&thumbnails, &nthumbs),
+                    (&downloads, &ndl),
+                ] {
+                    move_item(from, to, &mut moved);
+                }
+                (new_dir2, moved)
+            });
         cx.spawn(async move |_window, cx| {
             let (new_dir, moved) = task.await;
             handle.update(cx, |this, cx| {
@@ -1498,7 +1504,10 @@ impl Render for SettingsView {
                     ),
             );
 
-        let poll_state = self.poll_interval_input.clone().expect("poll input ensured");
+        let poll_state = self
+            .poll_interval_input
+            .clone()
+            .expect("poll input ensured");
         let checklist_poll_settings =
             self.settings_card(
                 cx,

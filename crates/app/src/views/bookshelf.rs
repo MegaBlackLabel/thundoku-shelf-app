@@ -832,6 +832,25 @@ impl BookshelfView {
                                 // プロトコル相対 URL は上で絶対化済み。TBF クライアントには
                                 // フォールバックしない（誤った経路で失敗するため）。
                                 fetch_bytes(agent, &resolved)
+                            } else if site_id == "fanza" {
+                                // FANZA の表紙は `-200x150` を外した**原寸**を優先する
+                                // （実測 200x150 → 560x420）。原寸が無い作品もあるため、
+                                // 失敗したら保存済みの縮小 URL に戻す。
+                                let full =
+                                    thundoku_core::fanza::sync::full_size_thumb(&resolved);
+                                if full == resolved {
+                                    fetch_bytes(agent, &resolved)
+                                } else {
+                                    match fetch_bytes(agent, &full) {
+                                        Some(bytes) => Some(bytes),
+                                        None => {
+                                            log::warn!(
+                                                "FANZA 原寸表紙を取得できず縮小版にフォールバック: {full}"
+                                            );
+                                            fetch_bytes(agent, &resolved)
+                                        }
+                                    }
+                                }
                             } else {
                                 // TBF の表紙も公開 URL なら直接取得する（4 並列が機能する）。
                                 // 失敗した場合のみセッション付きクライアントにフォールバック
@@ -872,16 +891,22 @@ impl BookshelfView {
                                 _ => "jpg",
                             };
                             // 縮小済みサムネイルを PNG で保存する（reload 時のキャッシュ
-                            // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）
+                            // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）。
+                            // カードのヘッダーは最大 ~320px 幅なので、粗くならないよう 448px で持つ。
                             let cache_path =
-                                thumbnails_dir.join(format!("{site_id}_{database_id}.png"));
-                            if let Some(cached) = resize_for_cache(&bytes, 288) {
+                                cover_cache_path(thumbnails_dir, &site_id, &database_id);
+                            if let Some(cached) = resize_for_cache(&bytes, 448) {
                                 let _ = std::fs::write(&cache_path, &cached);
+                                remove_legacy_cover_cache(
+                                    thumbnails_dir,
+                                    &site_id,
+                                    &database_id,
+                                );
                             }
                             // デコード + 縮小はこのスレッド（4 並列）で行い、UI には
                             // デコード済みサムネイルだけ送る（UI スレッドで 307 枚
                             // デコードすると固まるため）
-                            let Some(image) = decode_and_resize(&bytes, 288) else {
+                            let Some(image) = decode_and_resize(&bytes, 448) else {
                                 fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 log::warn!("表紙のデコード失敗: {site_id} / {database_id}");
                                 let _ = fail_tx.send((site_id.clone(), database_id.clone()));
@@ -2151,11 +2176,18 @@ impl BookshelfView {
         // 表紙キャッシュも破棄して再取得させる（reload の fetch_remote_covers が
         // thumbnail_url から取り直す）。キャッシュファイル + カードの cover をクリア。
         if !card.shelf.site_id.is_empty() {
-            let cache_path = state.data_dir.join("thumbnails").join(format!(
-                "{}_{}.png",
-                card.shelf.site_id, card.shelf.database_id
-            ));
+            let thumbnails_dir = state.data_dir.join("thumbnails");
+            let cache_path = cover_cache_path(
+                &thumbnails_dir,
+                &card.shelf.site_id,
+                &card.shelf.database_id,
+            );
             let _ = std::fs::remove_file(&cache_path);
+            remove_legacy_cover_cache(
+                &thumbnails_dir,
+                &card.shelf.site_id,
+                &card.shelf.database_id,
+            );
             if let Some(slot) = self.shelf_cards.iter_mut().find(|c| {
                 c.shelf.site_id == card.shelf.site_id
                     && c.shelf.database_id == card.shelf.database_id
@@ -4375,7 +4407,7 @@ fn resize_for_cache(data: &[u8], max_width: u32) -> Option<Vec<u8>> {
         let scale = max_width as f32 / w as f32;
         let nw = (w as f32 * scale).max(1.0) as u32;
         let nh = (h as f32 * scale).max(1.0) as u32;
-        img.resize(nw, nh, image::imageops::FilterType::Triangle)
+        img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
     } else {
         img
     };
@@ -4394,7 +4426,7 @@ fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
         let scale = max_width as f32 / w as f32;
         let nw = (w as f32 * scale).max(1.0) as u32;
         let nh = (h as f32 * scale).max(1.0) as u32;
-        decoded.resize(nw, nh, image::imageops::FilterType::Triangle)
+        decoded.resize(nw, nh, image::imageops::FilterType::Lanczos3)
     } else {
         decoded
     };
@@ -4409,23 +4441,37 @@ fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
 
 fn decode_bytes_to_render_image(data: &[u8]) -> Option<Arc<RenderImage>> {
     // カード枠比（0.75）へのクロップを全経路（キャッシュ・ローカル本）に適用する
-    decode_and_resize(data, 288)
+    decode_and_resize(data, 448)
 }
 
-/// `thumbnails/{site_id}_{database_id}.{ext}` cache file -> RenderImage.
+/// 表紙キャッシュのパス。**解像度をファイル名に埋め込む**ことで、縮小サイズを
+/// 変えたときに古い低解像度キャッシュを自動的に無効化する（`_448` = 最大 448px 幅）。
+pub(crate) fn cover_cache_path(
+    thumbnails_dir: &std::path::Path,
+    site_id: &str,
+    database_id: &str,
+) -> std::path::PathBuf {
+    thumbnails_dir.join(format!("{site_id}_{database_id}_448.png"))
+}
+
+/// 旧解像度のキャッシュ（`{site}_{db}.png`）を消す。パス変更前の残骸で、
+/// 二度と読まれないファイルがディスクに残るのを防ぐ。
+pub(crate) fn remove_legacy_cover_cache(
+    thumbnails_dir: &std::path::Path,
+    site_id: &str,
+    database_id: &str,
+) {
+    let _ = std::fs::remove_file(thumbnails_dir.join(format!("{site_id}_{database_id}.png")));
+}
+
+/// `thumbnails/{site_id}_{database_id}_448.png` キャッシュ -> RenderImage。
 fn load_cached_cover(
     thumbnails_dir: &std::path::Path,
     shelf: &bookshelf::BookshelfItem,
 ) -> Option<Arc<RenderImage>> {
-    for ext in ["png", "jpg", "jpeg", "webp"] {
-        let path = thumbnails_dir.join(format!("{}_{}.{ext}", shelf.site_id, shelf.database_id));
-        if let Ok(data) = std::fs::read(&path)
-            && let Some(image) = decode_bytes_to_render_image(&data)
-        {
-            return Some(image);
-        }
-    }
-    None
+    let path = cover_cache_path(thumbnails_dir, &shelf.site_id, &shelf.database_id);
+    let data = std::fs::read(&path).ok()?;
+    decode_bytes_to_render_image(&data)
 }
 
 /// Web-style placeholder SVG (`data:image/svg+xml;utf8,...`) rasterized to a
