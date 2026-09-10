@@ -499,6 +499,7 @@ fn metadata_entry(
 }
 
 /// `book_contents` に書く 1 コンテンツ分の行。
+#[derive(Clone)]
 struct ContentSpec {
     content_id: String,
     display_name: String,
@@ -509,6 +510,7 @@ struct ContentSpec {
 }
 
 /// `content_formats` に書く 1 レンディション分の行。
+#[derive(Clone)]
 struct FormatSpec {
     format_id: String,
     label: String,
@@ -1369,6 +1371,348 @@ pub fn import_zip_bytes(
         reuse_book_id,
         &plan,
     )
+}
+
+/// pack（`.opfspack`）から DB の取り込み状態（`imported_documents` / `book_contents` /
+/// `content_formats` / `document_images`）を再構築する（Drive 復元用）。
+///
+/// - すでにその本のドキュメント行があるときは何もしない（ローカルの取り込みを壊さない）
+/// - 構造は pack の `metadata.json` の `contents`（フェーズ2で書き出し）を使い、
+///   無い場合はエントリから 1 コンテンツとして推定する
+/// - ページ画像の寸法はエントリのヘッダから読む（画素デコードはしない）
+/// - 戻り値は再構築したかどうか
+pub fn rebuild_from_pack(
+    pool: &SqlitePool,
+    pack_id: &str,
+    pack_bytes: &[u8],
+    identity: Option<&Identity>,
+) -> Result<bool, ImportError> {
+    if documents::get_document_by_book_id(pool, pack_id)?.is_some() {
+        return Ok(false);
+    }
+    let reader = opfspack::PackReader::open(pack_bytes)?;
+    let timestamp = now();
+    let entry_paths: Vec<String> = reader.entries().iter().map(|e| e.path.clone()).collect();
+
+    // metadata.json から題名と構造を読む
+    let metadata: Option<serde_json::Value> = reader
+        .read_entry("metadata.json", identity)
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok());
+    let title = metadata
+        .as_ref()
+        .and_then(|value| value.get("title").and_then(|v| v.as_str()))
+        .unwrap_or(pack_id)
+        .to_string();
+    let mut contents: Vec<ContentSpec> = metadata
+        .as_ref()
+        .and_then(|value| value.get("contents"))
+        .and_then(|value| value.as_array())
+        .map(|list| list.iter().filter_map(content_from_metadata).collect())
+        .unwrap_or_default();
+    if contents.is_empty() {
+        contents = infer_contents(&title, &entry_paths);
+    }
+    if contents.is_empty() {
+        return Ok(false); // ページもコンテンツも無い pack は復元しない
+    }
+    let primary = contents
+        .iter()
+        .find(|content| content.is_primary)
+        .cloned()
+        .or_else(|| contents.first().cloned())
+        .expect("contents is not empty");
+
+    // 画像行（ページ + サムネイル）。document 行は最後に作るが、行の document_id は先に採番する
+    let document_id = uuid::Uuid::new_v4().to_string();
+    let mut image_rows: Vec<documents::DocumentImage> = Vec::new();
+    let mut primary_pages = 0i64;
+    for entry in reader.entries() {
+        let path = &entry.path;
+        if path == "metadata.json" {
+            continue;
+        }
+        let Ok(data) = reader.read_entry(path, identity) else {
+            continue;
+        };
+        let (width, height) = image_dimensions(&data);
+        if path == "thumbnail.webp" {
+            image_rows.push(document_image_row(
+                &document_id,
+                pack_id,
+                &primary.content_id,
+                primary
+                    .formats
+                    .first()
+                    .map(|format| format.format_id.clone()),
+                "thumbnail",
+                1,
+                path,
+                width,
+                height,
+                data.len() as i64,
+                timestamp.clone(),
+            ));
+            continue;
+        }
+        if path == "cover.webp" {
+            continue; // カバーは pack 側のエントリで完結（行は作らない）
+        }
+        let Some((content, format)) = contents.iter().find_map(|content| {
+            content
+                .formats
+                .iter()
+                .find(|format| {
+                    format
+                        .pack_entry_prefix
+                        .as_deref()
+                        .is_some_and(|prefix| path.starts_with(prefix))
+                })
+                .map(|format| (content, format))
+        }) else {
+            continue; // EPUB の生エントリなど
+        };
+        let Some(page_number) = page_number_of(path) else {
+            continue;
+        };
+        let is_primary_format = content.content_id == primary.content_id
+            && primary
+                .formats
+                .first()
+                .is_some_and(|first| first.format_id == format.format_id);
+        if is_primary_format {
+            primary_pages = primary_pages.max(page_number);
+        }
+        image_rows.push(document_image_row(
+            &document_id,
+            pack_id,
+            &content.content_id,
+            Some(format.format_id.clone()),
+            "page",
+            page_number,
+            path,
+            width,
+            height,
+            data.len() as i64,
+            timestamp.clone(),
+        ));
+    }
+    if primary_pages == 0 {
+        return Ok(false);
+    }
+
+    let source_type = match primary.media_kind {
+        MediaKind::Pdf => "pdf",
+        MediaKind::Epub => "epub",
+        _ => "image-set",
+    };
+    let document = documents::ImportedDocument {
+        id: document_id.clone(),
+        book_id: pack_id.to_string(),
+        source_type: source_type.to_string(),
+        file_hash: sha256_hex(pack_bytes),
+        total_pages: primary_pages,
+        metadata: None,
+        status: "completed".to_string(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp.clone(),
+    };
+    documents::insert_document(pool, &document)?;
+
+    let content_rows: Vec<contents::BookContent> = contents
+        .iter()
+        .map(|content| contents::BookContent {
+            content_id: content.content_id.clone(),
+            book_id: pack_id.to_string(),
+            display_name: content.display_name.clone(),
+            media_kind: content.media_kind.as_str().to_string(),
+            is_primary: i64::from(content.is_primary),
+            sort_order: content.sort_order,
+            created_at: timestamp.clone(),
+        })
+        .collect();
+    let format_rows: Vec<contents::ContentFormat> = contents
+        .iter()
+        .flat_map(|content| {
+            content
+                .formats
+                .iter()
+                .map(|format| contents::ContentFormat {
+                    format_id: format.format_id.clone(),
+                    content_id: content.content_id.clone(),
+                    label: format.label.clone(),
+                    format_kind: format.kind.as_str().to_string(),
+                    page_count: format.page_count,
+                    pack_entry_prefix: format.pack_entry_prefix.clone(),
+                    sort_order: format.sort_order,
+                    created_at: timestamp.clone(),
+                })
+        })
+        .collect();
+    contents::insert_batch(pool, &content_rows, &format_rows)?;
+    documents::insert_images_batch(pool, &image_rows)?;
+    log::info!(
+        "drive restore: pack から再構築（{pack_id}: {} コンテンツ / {} ページ）",
+        content_rows.len(),
+        primary_pages
+    );
+    Ok(true)
+}
+
+/// `metadata.json` の 1 コンテンツ分を復元する。
+fn content_from_metadata(value: &serde_json::Value) -> Option<ContentSpec> {
+    let content_id = value.get("contentId")?.as_str()?.to_string();
+    let media_kind = media_kind_from_str(value.get("mediaKind")?.as_str()?)?;
+    let formats = value
+        .get("formats")
+        .and_then(|value| value.as_array())
+        .map(|formats| {
+            formats
+                .iter()
+                .filter_map(|format| {
+                    Some(FormatSpec {
+                        format_id: format.get("formatId")?.as_str()?.to_string(),
+                        label: format
+                            .get("label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        kind: media_kind_from_str(format.get("formatKind")?.as_str()?)?,
+                        page_count: format
+                            .get("pageCount")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0),
+                        pack_entry_prefix: format
+                            .get("packEntryPrefix")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        sort_order: format
+                            .get("sortOrder")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(ContentSpec {
+        content_id,
+        display_name: value
+            .get("displayName")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        media_kind,
+        is_primary: value
+            .get("isPrimary")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        sort_order: value.get("sortOrder").and_then(|v| v.as_i64()).unwrap_or(0),
+        formats,
+    })
+}
+
+/// `contents` を持たない古い pack から 1 コンテンツを推定する。
+fn infer_contents(title: &str, entry_paths: &[String]) -> Vec<ContentSpec> {
+    let pages: Vec<&String> = entry_paths
+        .iter()
+        .filter(|path| page_number_of(path).is_some())
+        .collect();
+    let raw = entry_paths
+        .iter()
+        .find(|path| path.ends_with(".epub") || (path.ends_with(".pdf") && !path.contains('/')));
+    let (media_kind, prefix) = if !pages.is_empty() {
+        (MediaKind::Image, "pages")
+    } else if let Some(path) = raw {
+        if path.ends_with(".epub") {
+            (MediaKind::Epub, "")
+        } else {
+            (MediaKind::Pdf, "")
+        }
+    } else {
+        return Vec::new();
+    };
+    let page_count = pages.len() as i64;
+    vec![ContentSpec {
+        content_id: uuid::Uuid::new_v4().to_string(),
+        display_name: title.to_string(),
+        media_kind,
+        is_primary: true,
+        sort_order: 0,
+        formats: vec![FormatSpec {
+            format_id: uuid::Uuid::new_v4().to_string(),
+            label: media_kind.label().to_string(),
+            kind: media_kind,
+            page_count,
+            pack_entry_prefix: if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix.to_string())
+            },
+            sort_order: 0,
+        }],
+    }]
+}
+
+fn media_kind_from_str(value: &str) -> Option<MediaKind> {
+    match value {
+        "image" => Some(MediaKind::Image),
+        "pdf" => Some(MediaKind::Pdf),
+        "epub" => Some(MediaKind::Epub),
+        "audio" => Some(MediaKind::Audio),
+        "video" => Some(MediaKind::Video),
+        _ => None,
+    }
+}
+
+/// `pages/page_0001.webp` / `contents/0/r1/page_0012.webp` からページ番号を取る。
+fn page_number_of(path: &str) -> Option<i64> {
+    let name = path.rsplit('/').next()?;
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    stem.strip_prefix("page_")?.parse().ok()
+}
+
+/// 画像の寸法をヘッダから読む（画素はデコードしない）。
+fn image_dimensions(data: &[u8]) -> (i64, i64) {
+    image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok())
+        .map(|(width, height)| (width as i64, height as i64))
+        .unwrap_or((0, 0))
+}
+
+/// 再構築した 1 行分（ページ / サムネイル）。
+#[allow(clippy::too_many_arguments)]
+fn document_image_row(
+    document_id: &str,
+    pack_id: &str,
+    content_id: &str,
+    format_id: Option<String>,
+    image_type: &str,
+    page_number: i64,
+    entry_path: &str,
+    width: i64,
+    height: i64,
+    file_size: i64,
+    timestamp: String,
+) -> documents::DocumentImage {
+    documents::DocumentImage {
+        id: uuid::Uuid::new_v4().to_string(),
+        document_id: document_id.to_string(),
+        content_id: Some(content_id.to_string()),
+        format_id,
+        page_number,
+        image_type: image_type.to_string(),
+        opfs_path: format!("{pack_id}.opfspack"),
+        width,
+        height,
+        mime_type: "image/webp".to_string(),
+        file_size,
+        extracted_text: None,
+        pack_entry_path: Some(entry_path.to_string()),
+        created_at: timestamp,
+    }
 }
 
 /// 単体画像（jpg / png / webp / gif 等）を 1 ページの本として取り込む。

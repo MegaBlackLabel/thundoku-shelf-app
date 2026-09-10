@@ -514,9 +514,12 @@ DB に入る**（実 DB に `âMâUÄòé┼é⌐éφéóéóùtÄqé│é±.pdf
     `purchaseDate` / `readingProgress` のみ
 - **Pack が消えても構造は復元できる**:
   - DB バックアップ（`backup.rs` の `TABLES`）に `book_contents` / `content_formats` を追加
-  - ⚠ **ただし現行の Pack 復元経路は `books` を upsert するだけ**
-    （`drive/sync.rs::import_book`）で `document_images` / `reading_progress` を再構築していない。
-    「Drive から pack を再取得すればページが戻る」は**未実装**（§9-6 で対応）
+  - ✅ **Pack 復元は取り込み状態まで再構築する（2026-09-11 実装）**:
+    `import::rebuild_from_pack` が pack の `metadata.json`（`contents`）とエントリから
+    `book_contents` / `content_formats` / `imported_documents` / `document_images` を作り直す。
+    すでに取り込み済みの本は何もしない（ローカルの取り込みを壊さない）。
+    ページ画像の寸法はエントリのヘッダから読む（画素デコードはしない）
+  - 進捗（`reading_progress`）は DB バックアップ（`thundoku-backup.json`）から復元される
   - FANZA 作品は `folder-structures` API で構造を再取得できる（§0）が、**ページ画像は Pack が必要**
 - 旧 Pack（`contents` なし）は「全ページ = 単一コンテンツ」にフォールバック
 
