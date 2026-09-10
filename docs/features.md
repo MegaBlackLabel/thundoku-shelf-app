@@ -422,3 +422,17 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
   - 本のページ単位で栞をつけることができる
   - どこにしおりをつけたかも検索できるようにする
   - 見開き時の栞の扱いについては要検討（ページ単位で保持するか、見開き単位にするか等）
+
+- [ ] **PDF の並列取り込みで稀にクラッシュする（未着手）**
+  - `crates/core/src/import/pdf.rs::render_pdf_pages` が **1 つの `PdfDocument` を 8 スレッドで
+    共有**してページを描画している（`std::thread::scope` + `chunk_size = total / 8`）。
+    PDFium のドキュメントはスレッドセーフではないため、同時アクセスは未定義動作になる
+  - 実測: `cargo test --workspace`（並列実行）で `crates/core/tests/import.rs` のバイナリが
+    `STATUS_ACCESS_VIOLATION` / `STATUS_STACK_BUFFER_OVERRUN` などで稀に異常終了する
+    （再現率 約 1/8。今回は画像取り込み系テストの追加で露出しやすくなった）
+  - `--test-threads=1` では再現しない。また今回追加したテスト（`analyze_zip` / `classify` /
+    `_export_text` / 壊れ画像）を外した 14 テスト構成でも再現したため、**特定テストではなく
+    PDFium の並列利用が原因**
+  - アプリ本体でも PDF を同時に複数取り込むと踏む可能性がある（テストだけの問題ではない）
+  - **修正案**: スレッドごとに `Pdfium::load_pdf_from_byte_slice` し直して `PdfDocument` を
+    共有しない（PDFium の推奨パターン）か、描画を直列化する。どちらも未検証
