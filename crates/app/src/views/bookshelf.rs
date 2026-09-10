@@ -1102,6 +1102,51 @@ impl BookshelfView {
         }
     }
 
+    /// 表紙キャッシュを全部捨てて、全カードの表紙を取り直す。
+    /// 表紙の取得元（URL / 解像度）を変えたときに、既存キャッシュに邪魔されず
+    /// 一括で更新するための導線（Web 版には無い、デスクトップ用の操作）。
+    pub fn refresh_all_covers(&mut self, cx: &mut Context<Self>) {
+        if self.fetching_covers {
+            self.toast = Some("表紙を取得中です（完了後にもう一度）".into());
+            cx.notify();
+            return;
+        }
+        // 1) ディスク上の表紙キャッシュを全部消す（`thumbnails/` は表紙専用）
+        let thumbnails_dir = Self::app_state(cx).data_dir.join("thumbnails");
+        let mut removed = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&thumbnails_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_image = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "png" | "jpg" | "jpeg" | "webp"));
+                if is_image && std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        // 2) メモリ上の表紙も捨てて取得対象に戻す（thumbnail_url を持つカードのみ）
+        let mut pending = 0usize;
+        for card in &mut self.shelf_cards {
+            if card.shelf.thumbnail_url.is_some() {
+                card.cover = None;
+                card.cover_fetch_failed = false;
+                pending += 1;
+            }
+        }
+        self.cover_fetch_retried = false;
+        self.filtered_dirty = true;
+        log::info!("refresh_all_covers: キャッシュ {removed} 件を削除、{pending} 件を再取得");
+        if pending == 0 {
+            self.toast = Some("再取得できる表紙がありません".into());
+            cx.notify();
+            return;
+        }
+        self.toast = Some(format!("表紙を再取得します（{pending} 件）"));
+        self.reload(cx);
+    }
+
     /// 同期ボタン: 技術書典の本棚同期に加えて、Google にログイン済みなら
     /// Drive 同期も実施する（Web 版の「同期」ボタン + Drive 同期の統合）。
     pub fn sync_all(&mut self, cx: &mut Context<Self>) {
@@ -4213,6 +4258,20 @@ impl Render for BookshelfView {
                             },
                             )
                             .child(
+                                Button::new("bookshelf-refresh-covers").cursor_pointer()
+                                    .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
+                                    .label("表紙更新")
+                                    .loading(self.fetching_covers)
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.refresh_all_covers(cx);
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
                                 Button::new("bookshelf-sync").cursor_pointer()
                                     .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
                                     .label(if busy { "同期中" } else { "同期" })
@@ -4661,6 +4720,7 @@ fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
 
