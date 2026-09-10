@@ -894,14 +894,10 @@ impl BookshelfView {
                             // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）。
                             // カードのヘッダーは最大 ~320px 幅なので、粗くならないよう 448px で持つ。
                             let cache_path =
-                                cover_cache_path(thumbnails_dir, &site_id, &database_id);
+                                cover_cache_path(thumbnails_dir, site_id, database_id);
                             if let Some(cached) = resize_for_cache(&bytes, 448) {
                                 let _ = std::fs::write(&cache_path, &cached);
-                                remove_legacy_cover_cache(
-                                    thumbnails_dir,
-                                    &site_id,
-                                    &database_id,
-                                );
+                                remove_legacy_cover_cache(thumbnails_dir, site_id, database_id);
                             }
                             // デコード + 縮小はこのスレッド（4 並列）で行い、UI には
                             // デコード済みサムネイルだけ送る（UI スレッドで 307 枚
@@ -2643,25 +2639,41 @@ impl BookshelfView {
         let _ = window;
 
         // -- 表紙（カードのヘッダー）: カード幅いっぱい + 4:3 の枠 --
-        // 画像は contain で収める（横長 200x150 は枠を埋め、縦長 107x150 / 287x405 の
-        // 表紙は**中央に収まる**。クロップしない）。バッジと進捗リングはこの上に乗せる。
+        // 画像は**比率を保って枠に収める**。横長は幅いっぱい（高さは比率なり）、
+        // **縦長は高さいっぱい**（幅は比率なり）にして中央に置く。カード幅に合わせて
+        // 縦長を拡大すると上下が切れて表紙の一部しか見えなくなるため。
+        // 角はカードと同じ丸み（`rounded_lg`）を上辺に付ける（GPUI の overflow_hidden は
+        // 矩形マスクなので、角丸のクリップは各要素側で指定する必要がある）。
         let cover_h: f32 = (card_width * 0.75).clamp(120.0, 320.0);
+        let draw_size = |render: &Arc<RenderImage>| -> (f32, f32) {
+            let size = render.size(0);
+            let (image_w, image_h) = (size.width.0.max(1) as f32, size.height.0.max(1) as f32);
+            let scale = (card_width / image_w).min(cover_h / image_h);
+            ((image_w * scale).max(1.0), (image_h * scale).max(1.0))
+        };
         let image: gpui_kit::AnyElement = match &cover {
-            Some(render) => div()
-                .w_full()
-                .h(px(cover_h))
-                .overflow_hidden()
-                .bg(theme.secondary)
-                .child(
-                    img(render.clone())
-                        .w_full()
-                        .h_full()
-                        .object_fit(gpui_kit::ObjectFit::Contain),
-                )
-                .into_any_element(),
+            Some(render) => {
+                let (draw_w, draw_h) = draw_size(render);
+                div()
+                    .w_full()
+                    .h(px(cover_h))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_t_lg()
+                    .bg(theme.secondary)
+                    .child(
+                        img(render.clone())
+                            .w(px(draw_w))
+                            .h(px(draw_h))
+                            .rounded_t_lg(),
+                    )
+                    .into_any_element()
+            }
             None => div()
                 .w_full()
                 .h(px(cover_h))
+                .rounded_t_lg()
                 .bg(theme.muted)
                 .into_any_element(),
         };
@@ -2677,6 +2689,7 @@ impl BookshelfView {
                     .absolute()
                     .left_0()
                     .top_0()
+                    .rounded_tl_lg()
                     .rounded_br_md()
                     .px_1()
                     .py_0p5()
@@ -2690,6 +2703,7 @@ impl BookshelfView {
                     .absolute()
                     .left_0()
                     .top_0()
+                    .rounded_tl_lg()
                     .rounded_br_md()
                     .px_1()
                     .py_0p5()
@@ -2786,6 +2800,7 @@ impl BookshelfView {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .rounded_t_lg()
                     .bg(gpui_kit::rgba(0x00000080))
                     .child(
                         div()
