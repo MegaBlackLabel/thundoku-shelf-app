@@ -4,15 +4,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::{
-    AppContext as _, InteractiveElement as _, ReadGlobal as _, ScrollHandle,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
-    prelude::FluentBuilder as _,
-};
-use gpui_kit::{
-    Context, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
-    SharedString, Window, div, img, px,
-};
 use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::animation::ease_out_cubic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -22,6 +13,15 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _};
 use gpui_kit::component::{Icon, IconName};
+use gpui_kit::{
+    AppContext as _, InteractiveElement as _, ReadGlobal as _, ScrollHandle,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
+    prelude::FluentBuilder as _,
+};
+use gpui_kit::{
+    Context, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
+    SharedString, Window, div, img, px,
+};
 use thundoku_core::db;
 
 use crate::actions::CloseReader;
@@ -338,7 +338,11 @@ impl ImageViewer {
                 Some("scroll") => ViewMode::Scroll,
                 Some(_) => ViewMode::Single,
                 // 未設定のときのデフォルト: FANZA / DLsite は見開き。
-                None if site_id.as_deref() == Some("fanza") || site_id.as_deref() == Some("dlsite") => ViewMode::Spread,
+                None if site_id.as_deref() == Some("fanza")
+                    || site_id.as_deref() == Some("dlsite") =>
+                {
+                    ViewMode::Spread
+                }
                 None => ViewMode::Single,
             }
         };
@@ -445,6 +449,32 @@ impl ImageViewer {
 
     pub fn mode(&self) -> ViewMode {
         self.mode
+    }
+
+    /// ローダー（コンテンツ／レンディション）を差し替え、ページ列と表示位置を作り直す。
+    /// フェーズ3: 複数コンテンツの切り替えはこの 1 点に集約する。
+    pub fn set_loader(
+        &mut self,
+        cx: &mut Context<Self>,
+        loader: Arc<dyn PageLoader>,
+        initial_page: usize,
+    ) {
+        let page_count = loader.page_count();
+        self.loader = loader;
+        self.images = (0..page_count).map(|_| None).collect();
+        self.loading.clear();
+        self.current_page = initial_page.min(page_count.saturating_sub(1));
+        self.scroll_top_initialized = false;
+        self.last_scroll_page = self.current_page;
+        self.page_turn_count = 0;
+        self.overlay_visible = true;
+        self.zoomed = false;
+        self.zoom_scale = 1.5;
+        self.pan_offset = gpui_kit::Point::new(0.0, 0.0);
+        self.pan_velocity = gpui_kit::Point::new(0.0, 0.0);
+        self.pan_max = gpui_kit::Point::new(0.0, 0.0);
+        self.drag_start = None;
+        cx.notify();
     }
 
     // -- page navigation ----------------------------------------------------
@@ -1358,7 +1388,9 @@ impl Render for ImageViewer {
                         .justify_center()
                         .child(
                             div()
-                                .w(gpui_kit::Length::Definite(gpui_kit::DefiniteLength::Fraction(0.8)))
+                                .w(gpui_kit::Length::Definite(
+                                    gpui_kit::DefiniteLength::Fraction(0.8),
+                                ))
                                 .aspect_ratio(aspect)
                                 .bg(viewer_bg())
                                 .overflow_hidden()
@@ -1465,8 +1497,10 @@ impl Render for ImageViewer {
                 .on_mouse_down(gpui_kit::MouseButton::Left, {
                     let handle = handle.clone();
                     move |event, _window, cx| {
-                        let position =
-                            gpui_kit::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
+                        let position = gpui_kit::Point::new(
+                            event.position.x.as_f32(),
+                            event.position.y.as_f32(),
+                        );
                         let now = std::time::Instant::now();
                         let is_double = handle
                             .read(cx)

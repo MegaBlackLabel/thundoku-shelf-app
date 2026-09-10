@@ -133,6 +133,31 @@ CREATE TABLE IF NOT EXISTS checked_items (
   createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS book_contents (
+  content_id TEXT PRIMARY KEY,
+  book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+  display_name TEXT NOT NULL,
+  media_kind TEXT NOT NULL,
+  is_primary INTEGER NOT NULL DEFAULT 0,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_book_contents_book ON book_contents(book_id);
+
+CREATE TABLE IF NOT EXISTS content_formats (
+  format_id TEXT PRIMARY KEY,
+  content_id TEXT NOT NULL REFERENCES book_contents(content_id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  format_kind TEXT NOT NULL,
+  page_count INTEGER NOT NULL DEFAULT 0,
+  pack_entry_prefix TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_formats_content ON content_formats(content_id);
+
 CREATE TABLE IF NOT EXISTS imported_documents (
   id TEXT PRIMARY KEY,
   book_id TEXT REFERENCES books(id),
@@ -148,6 +173,8 @@ CREATE TABLE IF NOT EXISTS imported_documents (
 CREATE TABLE IF NOT EXISTS document_images (
   id TEXT PRIMARY KEY,
   document_id TEXT NOT NULL REFERENCES imported_documents(id),
+  content_id TEXT REFERENCES book_contents(content_id),
+  format_id TEXT REFERENCES content_formats(format_id),
   page_number INTEGER NOT NULL,
   image_type TEXT NOT NULL,
   opfs_path TEXT NOT NULL,

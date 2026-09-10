@@ -17,6 +17,8 @@ const TABLES: &[&str] = &[
     "bookshelf_items",
     "checked_items",
     "tbf_events",
+    "book_contents",
+    "content_formats",
     "reading_progress",
     "page_views",
     "book_tags",
@@ -81,6 +83,8 @@ fn pk_columns(table: &str) -> Option<&'static [&'static str]> {
         "bookshelf_items" => &["site_id", "database_id"],
         "checked_items" => &["id"],
         "tbf_events" => &["id"],
+        "book_contents" => &["content_id"],
+        "content_formats" => &["format_id"],
         "reading_progress" => &["book_id"],
         "page_views" => &["book_id", "page_number"],
         "book_tags" => &["id"],
@@ -131,8 +135,15 @@ async fn table_rows(
                 where_sql = " WHERE id IN (SELECT value FROM json_each(?))".into();
                 bind_json = Some(json);
             }
-            "reading_progress" | "page_views" | "book_tags" | "view_history" | "imported_documents" => {
+            "reading_progress" | "page_views" | "book_tags" | "view_history"
+            | "imported_documents" | "book_contents" => {
                 where_sql = " WHERE book_id IN (SELECT value FROM json_each(?))".into();
+                bind_json = Some(json);
+            }
+            "content_formats" => {
+                where_sql = " WHERE content_id IN (SELECT content_id FROM book_contents \
+                             WHERE book_id IN (SELECT value FROM json_each(?)))"
+                    .into();
                 bind_json = Some(json);
             }
             _ => {}
@@ -386,6 +397,30 @@ mod tests {
             },
         )
         .unwrap();
+        // フェーズ2: コンテンツ構造もバックアップ／復元の対象
+        crate::db::contents::insert_batch(
+            &src,
+            &[crate::db::contents::BookContent {
+                content_id: "c1".into(),
+                book_id: "book-1".into(),
+                display_name: "本文".into(),
+                media_kind: "image".into(),
+                is_primary: 1,
+                sort_order: 0,
+                created_at: "2026-08-23 00:00:00".into(),
+            }],
+            &[crate::db::contents::ContentFormat {
+                format_id: "f1".into(),
+                content_id: "c1".into(),
+                label: "画像".into(),
+                format_kind: "image".into(),
+                page_count: 2,
+                pack_entry_prefix: Some("pages".into()),
+                sort_order: 0,
+                created_at: "2026-08-23 00:00:00".into(),
+            }],
+        )
+        .unwrap();
         crate::db::progress::upsert(
             &src,
             &ReadingProgress {
@@ -420,12 +455,22 @@ mod tests {
         let p1 = pv.iter().find(|r| r["page_number"] == 1).unwrap();
         assert_eq!(p1["view_count"], 1);
         assert!((p1["total_seconds"].as_f64().unwrap() - 3.5).abs() < 1e-9);
+        // コンテンツ構造もバックアップに含まれる
+        assert_eq!(payload["book_contents"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["content_formats"].as_array().unwrap().len(), 1);
 
         // 空の DB にインポートすると本・進捗・閲覧履歴が復元される
         let dst = crate::db::test_pool();
         import_json(&dst, &json).unwrap();
         let restored = crate::db::books::get(&dst, "book-1").unwrap().unwrap();
         assert_eq!(restored.title, "テスト本");
+        // コンテンツ構造も復元される（FK 順が正しくないと失敗する）
+        let restored_contents = crate::db::contents::list_for_book(&dst, "book-1").unwrap();
+        assert_eq!(restored_contents.len(), 1);
+        assert_eq!(restored_contents[0].display_name, "本文");
+        let restored_formats = crate::db::contents::formats_for_content(&dst, "c1").unwrap();
+        assert_eq!(restored_formats.len(), 1);
+        assert_eq!(restored_formats[0].page_count, 2);
         let progress = crate::db::progress::get(&dst, "book-1").unwrap().unwrap();
         assert_eq!(progress.current_page, 12);
         assert_eq!(
@@ -477,18 +522,10 @@ mod tests {
         };
         crate::db::books::insert(&pool, &mk("book-A")).unwrap();
         crate::db::books::insert(&pool, &mk("book-B")).unwrap();
-        crate::db::books::set_owner_sub(
-            &pool,
-            "book-A",
-            Some(crate::owner::encrypt(&key, "A")),
-        )
-        .unwrap();
-        crate::db::books::set_owner_sub(
-            &pool,
-            "book-B",
-            Some(crate::owner::encrypt(&key, "B")),
-        )
-        .unwrap();
+        crate::db::books::set_owner_sub(&pool, "book-A", Some(crate::owner::encrypt(&key, "A")))
+            .unwrap();
+        crate::db::books::set_owner_sub(&pool, "book-B", Some(crate::owner::encrypt(&key, "B")))
+            .unwrap();
         // 進捗も入れる
         use crate::db::progress::ReadingProgress;
         for (id, page) in [("book-A", 5), ("book-B", 9)] {

@@ -9253,6 +9253,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "chrono",
+ "encoding_rs",
  "image",
  "keyring",
  "libwebp-sys",

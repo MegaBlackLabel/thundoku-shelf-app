@@ -4,13 +4,19 @@
 
 pub mod pdf;
 
+pub mod classify;
+pub mod export_text;
+mod zip_names;
+
+use classify::{EntryKind, classify_entry, is_readable_kind};
+
 use std::io::Read;
 use std::path::Path;
 
 use opfspack::{Identity, PackBuilder};
 use sha2::{Digest, Sha256};
 
-use crate::db::{SqlitePool, books, documents, tags as tags_repo};
+use crate::db::{SqlitePool, books, contents, documents, tags as tags_repo};
 
 #[derive(Debug)]
 pub struct ImportedBook {
@@ -18,6 +24,8 @@ pub struct ImportedBook {
     pub document: documents::ImportedDocument,
     /// Tags written to `book_tags` (source=generated).
     pub tags: Vec<String>,
+    /// 取り込み時に読み飛ばしたエントリ（壊れた画像など）。0 件なら空。
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +98,15 @@ fn thumbnail_of(page: &[u8]) -> Result<(Vec<u8>, u32, u32), ImportError> {
     Ok((data, thumb_width, thumb_height))
 }
 
+/// 画像エントリ 1 件をページ用 WebP へ変換する
+/// （元が小さい画像は Lanczos3 で 1000px 幅まで拡大。表示時のぼやけ軽減）。
+fn render_page_image(data: &[u8]) -> Result<(Vec<u8>, u32, u32), ImportError> {
+    let decoded = image::load_from_memory(data).map_err(|e| ImportError::Image(e.to_string()))?;
+    let decoded = upscale_if_small(&decoded, 1000);
+    let (width, height) = (decoded.width(), decoded.height());
+    Ok((encode_webp(&decoded, 88)?, width, height))
+}
+
 fn book_id_for(identity: Option<&Identity>, reuse_book_id: Option<&str>) -> String {
     // 再ダウンロード時は既存本を再利用して重複を防ぐ（未ログイン＝identity None でも）。
     if let Some(reuse) = reuse_book_id {
@@ -100,6 +117,256 @@ fn book_id_for(identity: Option<&Identity>, reuse_book_id: Option<&str>) -> Stri
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
+/// ZIP エントリパスからファイル名部分を取り出す（`dir/book.pdf` → `book.pdf`）。
+fn entry_file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// ZIP エントリの索引と名前（本体データは保持しない）。
+struct EntryMeta {
+    index: usize,
+    name: String,
+}
+
+/// エントリの名前だけを集める（本体は伸長しない）。
+///
+/// `zip` crate の `name()` は UTF-8 フラグの無い名前を CP437 として復号するため、
+/// 日本語（Shift-JIS / CP932）の名前が文字化けする。生バイトから自前でデコードする。
+fn collect_entry_metas<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<Vec<EntryMeta>, ImportError> {
+    let mut metas = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(index)
+            .map_err(|e| ImportError::Zip(e.to_string()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        metas.push(EntryMeta {
+            index,
+            name: zip_names::decode_entry_name(entry.name_raw()),
+        });
+    }
+    Ok(metas)
+}
+
+/// ZIP のエントリを 1 件読み出す。
+/// 全エントリを同時にメモリへ載せないよう、呼び出しごとに 1 件だけ伸長する。
+fn read_zip_entry<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: usize,
+) -> Result<Vec<u8>, ImportError> {
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|e| ImportError::Zip(e.to_string()))?;
+    let mut data = Vec::new();
+    entry
+        .read_to_end(&mut data)
+        .map_err(|e| ImportError::Zip(e.to_string()))?;
+    Ok(data)
+}
+
+/// コンテンツのメディア種別（`book_contents.media_kind` の下地）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Pdf,
+    Epub,
+    Audio,
+    Video,
+}
+
+/// レンディション（切替可能な表示形態）。同じ内容の別形式・別バリアント
+/// （`PDF版` / `画像版`、`文字あり` / `文字なし` など）をここに畳む。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedRendition {
+    /// 切替 UI に出す名前（`画像` / `PDF` など）。
+    pub label: String,
+    /// メディア種別（`content_formats.format_kind` の元）。
+    pub kind: MediaKind,
+    /// エントリの並び順（`collect_entry_metas` が返す一覧の添字。ページ順）。
+    pub entries: Vec<usize>,
+}
+
+/// 読む単位（`book_contents` の下地）。表紙・junk は含まない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedContent {
+    pub display_name: String,
+    pub media_kind: MediaKind,
+    pub renditions: Vec<PlannedRendition>,
+}
+
+impl PlannedContent {
+    /// 主レンディションのページ数の目安。
+    /// PDF / EPUB はページ数が展開するまで不明なので 1 ファイル = 1 として数える。
+    fn page_hint(&self) -> usize {
+        self.renditions.first().map_or(0, |r| r.entries.len())
+    }
+}
+
+/// 取り込む対象が無いときの理由（通知文言は UI 側で決める。§11.2 R3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// 画像 / PDF / EPUB / 音声 / 動画が 1 件も無い（txt のみ・ゲーム等）。
+    NotAReadableWork,
+}
+
+/// ZIP の解析結果。DB にもディスクにも書かない。
+#[derive(Debug, Clone)]
+pub struct ImportPlan {
+    /// 読む単位。`import_zip_bytes` が見るのは `primary` の 1 件だけ。
+    pub contents: Vec<PlannedContent>,
+    /// 既定で選ばれるコンテンツの添字（`contents` が空なら無意味）。
+    pub primary: usize,
+    /// `_export.txt` から読んだ `(page_number, text)`。
+    pub export_text: Vec<(i64, String)>,
+    /// 解析時に読み飛ばしたエントリ。
+    pub warnings: Vec<String>,
+    /// 取り込む対象が無いときの理由。
+    pub skip_reason: Option<SkipReason>,
+}
+
+/// コンテンツごとのエントリを集めるための作業用バケット。
+struct Group {
+    name: String,
+    /// `(種別, メタ情報の並び順)`。
+    entries: Vec<(EntryKind, usize)>,
+}
+
+/// 最上位フォルダ名（直下のファイルは `""`）。
+fn top_level_folder(name: &str) -> Option<&str> {
+    name.split_once(['/', '\\']).map(|(folder, _)| folder)
+}
+
+/// ファイル名から拡張子を除いた部分。
+fn file_stem(name: &str) -> &str {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base.rsplit_once('.').map_or(base, |(stem, _)| stem)
+}
+
+/// エントリ一覧からコンテンツ（読む単位）を組み立てる。
+///
+/// - 最上位フォルダは 1 コンテンツ（入れ子は同じコンテンツに畳む）
+/// - 直下の画像はまとめて 1 コンテンツ（`本文`）
+/// - 直下の PDF / EPUB / 音声 / 動画はファイルごとに 1 コンテンツ
+/// - 直下 PDF のファイル名がフォルダ名と一致する場合は、そのフォルダの
+///   レンディションとして畳む（`PDF版` / `画像版`。§3.2）
+fn build_contents(metas: &[EntryMeta]) -> Vec<PlannedContent> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut root_entries: Vec<(EntryKind, usize, String)> = Vec::new();
+
+    // 索引はアーカイブ索引ではなく `metas` 内の**並び順**を使う
+    // （ディレクトリエントリを除いた分だけ両者はずれる）。
+    for (ordinal, meta) in metas.iter().enumerate() {
+        let kind = classify_entry(&meta.name);
+        if !is_readable_kind(kind) {
+            continue;
+        }
+        match top_level_folder(&meta.name) {
+            Some(folder) => group_push(&mut groups, folder, kind, ordinal),
+            None => root_entries.push((kind, ordinal, file_stem(&meta.name).to_string())),
+        }
+    }
+    // 直下の画像は 1 つにまとめ、それ以外はファイル単位。PDF は同名フォルダへ畳む。
+    for (kind, ordinal, stem) in root_entries {
+        let target = match kind {
+            EntryKind::Image => "本文",
+            _ => stem.as_str(),
+        };
+        group_push(&mut groups, target, kind, ordinal);
+    }
+
+    groups
+        .into_iter()
+        .filter_map(|group| plan_content(group, metas))
+        .collect()
+}
+
+fn group_push(groups: &mut Vec<Group>, name: &str, kind: EntryKind, ordinal: usize) {
+    match groups.iter_mut().find(|group| group.name == name) {
+        Some(group) => group.entries.push((kind, ordinal)),
+        None => groups.push(Group {
+            name: name.to_string(),
+            entries: vec![(kind, ordinal)],
+        }),
+    }
+}
+
+/// バケットを `PlannedContent` へ変換する。読める種別が無ければ `None`。
+fn plan_content(group: Group, metas: &[EntryMeta]) -> Option<PlannedContent> {
+    // レンディションの並び順（先頭が主）。画像を先頭にする。
+    const ORDER: &[EntryKind] = &[
+        EntryKind::Image,
+        EntryKind::Pdf,
+        EntryKind::Epub,
+        EntryKind::Audio,
+        EntryKind::Video,
+    ];
+    let mut renditions = Vec::new();
+    let mut media_kind = None;
+    for kind in ORDER {
+        let mut ordinals: Vec<usize> = group
+            .entries
+            .iter()
+            .filter(|(entry_kind, _)| entry_kind == kind)
+            .map(|(_, ordinal)| *ordinal)
+            .collect();
+        if ordinals.is_empty() {
+            continue;
+        }
+        ordinals.sort_by(|a, b| natural_cmp(&metas[*a].name, &metas[*b].name));
+        if media_kind.is_none() {
+            media_kind = media_kind_of(*kind);
+        }
+        renditions.push(PlannedRendition {
+            label: media_kind_of(*kind)?.label().to_string(),
+            kind: media_kind_of(*kind)?,
+            entries: ordinals,
+        });
+    }
+    Some(PlannedContent {
+        display_name: group.name,
+        media_kind: media_kind?,
+        renditions,
+    })
+}
+
+impl MediaKind {
+    /// 切替 UI に出す名前。
+    fn label(self) -> &'static str {
+        match self {
+            MediaKind::Image => "画像",
+            MediaKind::Pdf => "PDF",
+            MediaKind::Epub => "EPUB",
+            MediaKind::Audio => "音声",
+            MediaKind::Video => "動画",
+        }
+    }
+
+    /// DB（`book_contents.media_kind` / `content_formats.format_kind`）に入れる値。
+    fn as_str(self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Pdf => "pdf",
+            MediaKind::Epub => "epub",
+            MediaKind::Audio => "audio",
+            MediaKind::Video => "video",
+        }
+    }
+}
+
+fn media_kind_of(kind: EntryKind) -> Option<MediaKind> {
+    match kind {
+        EntryKind::Image => Some(MediaKind::Image),
+        EntryKind::Pdf => Some(MediaKind::Pdf),
+        EntryKind::Epub => Some(MediaKind::Epub),
+        EntryKind::Audio => Some(MediaKind::Audio),
+        EntryKind::Video => Some(MediaKind::Video),
+        EntryKind::Cover | EntryKind::ExportText | EntryKind::Junk => None,
+    }
+}
+
 fn base_title(file_name: &str) -> String {
     file_name
         .rsplit_once('.')
@@ -107,7 +374,37 @@ fn base_title(file_name: &str) -> String {
         .unwrap_or_else(|| file_name.to_string())
 }
 
-fn metadata_entry(title: &str, total_pages: Option<i64>) -> (Vec<u8>, String) {
+fn metadata_entry(
+    title: &str,
+    total_pages: Option<i64>,
+    contents: &[ContentSpec],
+) -> (Vec<u8>, String) {
+    let contents_json: Vec<serde_json::Value> = contents
+        .iter()
+        .map(|content| {
+            serde_json::json!({
+                "contentId": content.content_id,
+                "displayName": content.display_name,
+                "mediaKind": content.media_kind.as_str(),
+                "isPrimary": content.is_primary,
+                "sortOrder": content.sort_order,
+                "formats": content
+                    .formats
+                    .iter()
+                    .map(|format| {
+                        serde_json::json!({
+                            "formatId": format.format_id,
+                            "label": format.label,
+                            "formatKind": format.kind.as_str(),
+                            "pageCount": format.page_count,
+                            "packEntryPrefix": format.pack_entry_prefix,
+                            "sortOrder": format.sort_order,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     let metadata = serde_json::json!({
         "schemaVersion": 1,
         "title": title,
@@ -115,6 +412,7 @@ fn metadata_entry(title: &str, total_pages: Option<i64>) -> (Vec<u8>, String) {
         "circleName": "",
         "purchaseDate": null,
         "readingProgress": { "currentPage": 0, "totalPages": total_pages },
+        "contents": contents_json,
     });
     (
         serde_json::to_vec(&metadata).expect("metadata json"),
@@ -122,16 +420,69 @@ fn metadata_entry(title: &str, total_pages: Option<i64>) -> (Vec<u8>, String) {
     )
 }
 
+/// `book_contents` に書く 1 コンテンツ分の行。
+struct ContentSpec {
+    content_id: String,
+    display_name: String,
+    media_kind: MediaKind,
+    is_primary: bool,
+    sort_order: i64,
+    formats: Vec<FormatSpec>,
+}
+
+/// `content_formats` に書く 1 レンディション分の行。
+struct FormatSpec {
+    format_id: String,
+    label: String,
+    kind: MediaKind,
+    page_count: i64,
+    /// pack 内でこの形式のページが置かれる接頭辞（`pages` / `contents/1/r0`）。
+    pack_entry_prefix: Option<String>,
+    sort_order: i64,
+}
+
+/// 単体ファイル取り込み用の「1 コンテンツ + 1 レンディション」を作る。
+fn single_content(
+    media_kind: MediaKind,
+    format_label: &str,
+    page_count: i64,
+    pack_entry_prefix: Option<&str>,
+) -> ContentSpec {
+    ContentSpec {
+        content_id: uuid::Uuid::new_v4().to_string(),
+        display_name: "本文".to_string(),
+        media_kind,
+        is_primary: true,
+        sort_order: 0,
+        formats: vec![FormatSpec {
+            format_id: uuid::Uuid::new_v4().to_string(),
+            label: format_label.to_string(),
+            kind: media_kind,
+            page_count,
+            pack_entry_prefix: pack_entry_prefix.map(str::to_string),
+            sort_order: 0,
+        }],
+    }
+}
+
 struct PackSpec {
     /// (entry path, data, mime, compress)
     entries: Vec<(String, Vec<u8>, String, bool)>,
     page_rows: Vec<PageRow>,
-    texts: Vec<String>,
+    /// (page_number, text) — PDF の抽出テキストや `_export.txt` の中身。
+    texts: Vec<(i64, String)>,
+    /// 読み飛ばしたエントリの説明（壊れた画像など）。
+    warnings: Vec<String>,
+    /// 永続化するコンテンツ構造（フェーズ2）。
+    contents: Vec<ContentSpec>,
     source_type: String,
+    /// 既定表示（primary）コンテンツのページ数。
     total_pages: i64,
 }
 
 struct PageRow {
+    content_id: Option<String>,
+    format_id: Option<String>,
     page_number: i64,
     width: i64,
     height: i64,
@@ -158,7 +509,7 @@ fn finish_import(
     // Build the pack first (metadata + pages), so document.file_hash can
     // reference the real pack bytes.
     let mut builder = PackBuilder::new(chrono::Utc::now().timestamp_millis() as u64);
-    let (metadata, metadata_path) = metadata_entry(&title, Some(spec.total_pages));
+    let (metadata, metadata_path) = metadata_entry(&title, Some(spec.total_pages), &spec.contents);
     builder.add_entry(&metadata_path, metadata, "application/json", false);
     for (path, data, mime, compress) in &spec.entries {
         builder.add_entry(path, data.clone(), mime, *compress);
@@ -197,8 +548,28 @@ fn finish_import(
         age_rating: None,
         series_name: None,
     };
-    books::insert(pool, &book)?;
-    log::info!("finish_import: books 挿入完了");
+    // 再ダウンロード時は同じ book_id を再利用する（重複本を作らない）。
+    // 既存行がある場合はユーザー状態を引き継いで置き換え、古いページ行を消してから入れる。
+    let previous = reuse_book_id.and_then(|id| books::get(pool, id).ok().flatten());
+    let book = match &previous {
+        Some(prev) => {
+            let mut book = book;
+            book.is_favorite = prev.is_favorite;
+            book.is_hidden = prev.is_hidden;
+            book.created_at = prev.created_at.clone();
+            book
+        }
+        None => book,
+    };
+    if previous.is_some() {
+        documents::delete_for_book(pool, &book_id)?;
+        contents::delete_for_book(pool, &book_id)?;
+        books::upsert(pool, &book)?;
+        log::info!("finish_import: books 更新（再取り込み）");
+    } else {
+        books::insert(pool, &book)?;
+        log::info!("finish_import: books 挿入完了");
+    }
 
     let document = documents::ImportedDocument {
         id: uuid::Uuid::new_v4().to_string(),
@@ -214,6 +585,47 @@ fn finish_import(
     documents::insert_document(pool, &document)?;
     log::info!("finish_import: document 挿入完了");
 
+    // コンテンツ構造（book_contents / content_formats）を保存する（フェーズ2）。
+    // 再取り込み時は `contents::delete_for_book` で消してから入れ直す。
+    let content_rows: Vec<contents::BookContent> = spec
+        .contents
+        .iter()
+        .map(|content| contents::BookContent {
+            content_id: content.content_id.clone(),
+            book_id: book_id.clone(),
+            display_name: content.display_name.clone(),
+            media_kind: content.media_kind.as_str().to_string(),
+            is_primary: i64::from(content.is_primary),
+            sort_order: content.sort_order,
+            created_at: timestamp.clone(),
+        })
+        .collect();
+    let format_rows: Vec<contents::ContentFormat> = spec
+        .contents
+        .iter()
+        .flat_map(|content| {
+            content
+                .formats
+                .iter()
+                .map(|format| contents::ContentFormat {
+                    format_id: format.format_id.clone(),
+                    content_id: content.content_id.clone(),
+                    label: format.label.clone(),
+                    format_kind: format.kind.as_str().to_string(),
+                    page_count: format.page_count,
+                    pack_entry_prefix: format.pack_entry_prefix.clone(),
+                    sort_order: format.sort_order,
+                    created_at: timestamp.clone(),
+                })
+        })
+        .collect();
+    contents::insert_batch(pool, &content_rows, &format_rows)?;
+    log::info!(
+        "finish_import: contents 挿入完了（{} コンテンツ / {} レンディション）",
+        content_rows.len(),
+        format_rows.len()
+    );
+
     // 画像・テキスト・トークンをバッチで一括 INSERT する
     // （1 件 1 クエリだと数百ページ × トークン数万件の block_on が重く、
     //   取り込みが遅くなるため。トランザクション + バッチに集約する）。
@@ -222,6 +634,8 @@ fn finish_import(
         image_rows.push(documents::DocumentImage {
             id: uuid::Uuid::new_v4().to_string(),
             document_id: document.id.clone(),
+            content_id: row.content_id.clone(),
+            format_id: row.format_id.clone(),
             page_number: row.page_number,
             image_type: "page".to_string(),
             opfs_path: format!("{book_id}.opfspack"),
@@ -234,6 +648,20 @@ fn finish_import(
             created_at: timestamp.clone(),
         });
     }
+    // サムネイル行は既定表示コンテンツのものとして紐づける
+    let primary_ids = spec
+        .contents
+        .iter()
+        .find(|content| content.is_primary)
+        .map(|content| {
+            (
+                content.content_id.clone(),
+                content
+                    .formats
+                    .first()
+                    .map(|format| format.format_id.clone()),
+            )
+        });
     if let Some((_, data, _, _)) = spec
         .entries
         .iter()
@@ -245,6 +673,12 @@ fn finish_import(
         image_rows.push(documents::DocumentImage {
             id: uuid::Uuid::new_v4().to_string(),
             document_id: document.id.clone(),
+            content_id: primary_ids
+                .as_ref()
+                .map(|(content_id, _)| content_id.clone()),
+            format_id: primary_ids
+                .as_ref()
+                .and_then(|(_, format_id)| format_id.clone()),
             page_number: 1,
             image_type: "thumbnail".to_string(),
             opfs_path: format!("{book_id}.opfspack"),
@@ -261,11 +695,11 @@ fn finish_import(
     log::info!("finish_import: images バッチ挿入完了");
 
     let mut text_rows = Vec::with_capacity(spec.texts.len());
-    for (page_number, text) in spec.texts.iter().enumerate() {
+    for (page_number, text) in &spec.texts {
         text_rows.push(documents::DocumentText {
             id: uuid::Uuid::new_v4().to_string(),
             document_id: document.id.clone(),
-            page_number: page_number as i64 + 1,
+            page_number: *page_number,
             text_content: text.clone(),
             created_at: timestamp.clone(),
         });
@@ -275,12 +709,12 @@ fn finish_import(
 
     // Token analysis rows (nouns per page).
     let mut token_rows = Vec::new();
-    for (page_number, text) in spec.texts.iter().enumerate() {
+    for (page_number, text) in &spec.texts {
         for (word, count) in crate::tags::extract_nouns(text, &[&title]) {
             token_rows.push(documents::TokenRow {
                 id: uuid::Uuid::new_v4().to_string(),
                 document_id: document.id.clone(),
-                page_number: page_number as i64 + 1,
+                page_number: *page_number,
                 token: word.clone(),
                 pos: "名詞".to_string(),
                 base_form: Some(word.clone()),
@@ -298,7 +732,7 @@ fn finish_import(
     );
     // Generated tags (Zenn matching with noun-only fallback).
     let zenn_tags = crate::tags::fetch_zenn_tags().unwrap_or_default();
-    let text_refs: Vec<&str> = spec.texts.iter().map(String::as_str).collect();
+    let text_refs: Vec<&str> = spec.texts.iter().map(|(_, text)| text.as_str()).collect();
     let generated = crate::tags::generate_tags(&text_refs, &[&title], &zenn_tags);
     let tag_pairs: Vec<(&str, &str)> = generated
         .iter()
@@ -311,6 +745,7 @@ fn finish_import(
         book,
         document,
         tags: generated,
+        warnings: spec.warnings,
     })
 }
 
@@ -334,9 +769,13 @@ pub fn import_file(
         .to_lowercase();
     let bytes = std::fs::read(source_path)?;
     match extension.as_str() {
-        "pdf" => import_pdf_bytes(pool, &file_name, &bytes, packs_dir, identity, progress),
-        "epub" => import_epub_bytes(pool, &file_name, &bytes, packs_dir, identity),
-        "zip" => import_zip_bytes(pool, &file_name, &bytes, packs_dir, identity, progress, None),
+        "pdf" => import_pdf_bytes(
+            pool, &file_name, &bytes, packs_dir, identity, progress, None,
+        ),
+        "epub" => import_epub_bytes(pool, &file_name, &bytes, packs_dir, identity, None),
+        "zip" => import_zip_bytes(
+            pool, &file_name, &bytes, packs_dir, identity, progress, None,
+        ),
         _ => Err(ImportError::UnsupportedType(extension)),
     }
 }
@@ -349,6 +788,7 @@ pub fn import_pdf_bytes(
     packs_dir: &Path,
     identity: Option<&Identity>,
     progress: &mut (dyn FnMut(f32) + Send),
+    reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     let pages = pdf::render_pdf_pages(bytes, progress)?;
     import_rendered_pdf_pages(
@@ -358,6 +798,7 @@ pub fn import_pdf_bytes(
         pages,
         packs_dir,
         identity,
+        reuse_book_id,
     )
 }
 
@@ -371,11 +812,15 @@ pub fn import_rendered_pdf_pages(
     pages: Vec<pdf::PageImage>,
     packs_dir: &Path,
     identity: Option<&Identity>,
+    reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     if pages.is_empty() {
         return Err(ImportError::Pdf("no pages rendered".into()));
     }
     let total_pages = pages.len() as i64;
+    let content = single_content(MediaKind::Pdf, "PDF", total_pages, Some("pages"));
+    let content_id = content.content_id.clone();
+    let format_id = content.formats[0].format_id.clone();
     let mut entries = Vec::new();
     let mut page_rows = Vec::new();
     let mut texts = Vec::new();
@@ -388,6 +833,8 @@ pub fn import_rendered_pdf_pages(
             false,
         ));
         page_rows.push(PageRow {
+            content_id: Some(content_id.clone()),
+            format_id: Some(format_id.clone()),
             page_number: index as i64 + 1,
             width: page.width as i64,
             height: page.height as i64,
@@ -395,7 +842,7 @@ pub fn import_rendered_pdf_pages(
             file_size: page.data.len() as i64,
             text: Some(page.text.clone()),
         });
-        texts.push(page.text.clone());
+        texts.push((index as i64 + 1, page.text.clone()));
     }
     // cover = page 1; thumbnail = page 1 scaled to 200px width.
     entries.push((
@@ -422,10 +869,12 @@ pub fn import_rendered_pdf_pages(
             entries,
             page_rows,
             texts,
+            warnings: Vec::new(),
+            contents: vec![content],
             source_type: "pdf".to_string(),
             total_pages,
         },
-        None,
+        reuse_book_id,
     )
 }
 
@@ -436,6 +885,7 @@ pub fn import_epub_bytes(
     bytes: &[u8],
     packs_dir: &Path,
     identity: Option<&Identity>,
+    reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     let entry_path = file_name.to_string();
     finish_import(
@@ -453,14 +903,14 @@ pub fn import_epub_bytes(
             )],
             page_rows: Vec::new(),
             texts: Vec::new(),
+            warnings: Vec::new(),
+            contents: vec![single_content(MediaKind::Epub, "EPUB", 0, None)],
             source_type: "epub".to_string(),
             total_pages: 0,
         },
-        None,
+        reuse_book_id,
     )
 }
-
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
 
 /// ファイル名を (is_numeric, chunk) の列に分解する（自然順ソート用）。
 fn natural_key(s: &str) -> Vec<(bool, String)> {
@@ -491,9 +941,7 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
         let ord = if ia.0 && ib.0 {
             let at = ia.1.trim_start_matches('0');
             let bt = ib.1.trim_start_matches('0');
-            at.len()
-                .cmp(&bt.len())
-                .then_with(|| at.cmp(bt))
+            at.len().cmp(&bt.len()).then_with(|| at.cmp(bt))
         } else {
             ia.1.cmp(&ib.1)
         };
@@ -504,31 +952,325 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     ka.len().cmp(&kb.len())
 }
 
-#[cfg(test)]
-mod natural_sort_tests {
-    use super::{natural_cmp, natural_key};
-    use std::cmp::Ordering;
-
-    #[test]
-    fn natural_cmp_orders_numeric_sequences() {
-        let mut v = vec!["2.jpg", "10.jpg", "1.jpg", "3.jpg"];
-        v.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(v, vec!["1.jpg", "2.jpg", "3.jpg", "10.jpg"]);
+/// 既定の優先コンテンツを選ぶ（表紙・junk は `build_contents` で除外済み）。
+///
+/// 1. 名前に「本文」系の語を含むもの
+/// 2. ページ数の目安が最大のもの
+/// 3. 同数なら PDF / EPUB を優先、最後は索引順
+fn choose_primary(contents: &[PlannedContent]) -> usize {
+    // ビューアで読める種別だけを候補にする（音声・動画は取り込めない）
+    let candidates: Vec<usize> = contents
+        .iter()
+        .enumerate()
+        .filter(|(_, content)| is_viewable_media(content.media_kind))
+        .map(|(index, _)| index)
+        .collect();
+    let Some(&fallback) = candidates.first() else {
+        return 0;
+    };
+    if let Some(&body) = candidates
+        .iter()
+        .find(|&&index| is_body_name(&contents[index].display_name))
+    {
+        return body;
     }
-
-    #[test]
-    fn natural_cmp_matches_lexicographic_for_nonnumeric() {
-        assert_eq!(natural_cmp("a.jpg", "b.jpg"), Ordering::Less);
-        assert_eq!(natural_cmp("b.jpg", "a.jpg"), Ordering::Greater);
+    let mut best = fallback;
+    for &index in &candidates {
+        let pages = contents[index].page_hint();
+        let best_pages = contents[best].page_hint();
+        let prefer_media = matches!(contents[index].media_kind, MediaKind::Pdf | MediaKind::Epub)
+            && !matches!(contents[best].media_kind, MediaKind::Pdf | MediaKind::Epub);
+        if pages > best_pages || (pages == best_pages && prefer_media) {
+            best = index;
+        }
     }
+    best
+}
 
-    #[test]
-    fn natural_key_splits_numeric_runs() {
-        assert_eq!(natural_key("page10.jpg"), vec![(false, "page".into()), (true, "10".into()), (false, ".jpg".into())]);
+/// 現行ビューアで読めるメディア種別か（コンテンツの候補・取り込み対象）。
+fn is_viewable_media(kind: MediaKind) -> bool {
+    matches!(kind, MediaKind::Image | MediaKind::Pdf | MediaKind::Epub)
+}
+
+/// PDF を描画する。`progress` が `Some` のときだけ進捗を流す
+/// （`progress` の型がプラットフォームで違うため、ここで吸収する）。
+fn render_pdf_with(
+    bytes: &[u8],
+    progress: Option<&mut (dyn FnMut(f32) + Send)>,
+) -> Result<Vec<pdf::PageImage>, ImportError> {
+    match progress {
+        Some(progress) => pdf::render_pdf_pages(bytes, progress),
+        None => pdf::render_pdf_pages(bytes, &mut |_| {}),
     }
 }
 
-/// Import a ZIP: PDF > EPUB > image set (file-import.ts priority).
+/// 名前に「本文」系の語を含むか（docs/import-patterns.md §5.1 の語彙）。
+fn is_body_name(name: &str) -> bool {
+    name.contains("本文") || name.contains("本編")
+}
+
+/// ZIP を解析して取り込み計画を立てる。DB にもディスクにも書かない。
+pub fn analyze_zip(bytes: &[u8]) -> Result<ImportPlan, ImportError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| ImportError::Zip(e.to_string()))?;
+    // 1 周目: 名前だけを集める（ページ画像は伸長しない）。
+    let metas = collect_entry_metas(&mut archive)?;
+    if metas.is_empty() {
+        return Err(ImportError::EmptyArchive);
+    }
+    let contents = build_contents(&metas);
+    let primary = choose_primary(&contents);
+
+    // `_export.txt` は本文テキストなので解析時に読む（小さく、画像の伸長は伴わない）。
+    let mut warnings = Vec::new();
+    let mut export_texts: Vec<(i64, String)> = Vec::new();
+    for meta in metas
+        .iter()
+        .filter(|meta| classify_entry(&meta.name) == EntryKind::ExportText)
+    {
+        match read_zip_entry(&mut archive, meta.index) {
+            Ok(data) => {
+                let decoded = zip_names::decode_text_bytes(&data);
+                export_texts.extend(export_text::parse_export_text(&decoded));
+            }
+            Err(error) => warnings.push(format!("{}: {error}", meta.name)),
+        }
+    }
+
+    let skip_reason = contents.is_empty().then_some(SkipReason::NotAReadableWork);
+    Ok(ImportPlan {
+        contents,
+        primary,
+        export_text: export_texts,
+        warnings,
+        skip_reason,
+    })
+}
+
+/// `ImportPlan` の全コンテンツ／全レンディションを実際に取り込み、pack と DB を作る。
+///
+/// pack 内のパスは、既定表示コンテンツの第 1 レンディションだけ従来どおり
+/// `pages/page_NNNN.webp` に置く（既存 pack・カバー規約との互換）。それ以外は
+/// `contents/{content}/{rendition}/...` に入れる。
+// 引数は取り込みの文脈そのもの（plan を足すと 8 個になる）。分割すると呼び出し側で
+// 束ね直すだけなので、そのまま受け取る。
+#[allow(clippy::too_many_arguments)]
+pub fn commit_zip(
+    pool: &SqlitePool,
+    file_name: &str,
+    bytes: &[u8],
+    packs_dir: &Path,
+    identity: Option<&Identity>,
+    progress: &mut (dyn FnMut(f32) + Send),
+    reuse_book_id: Option<&str>,
+    plan: &ImportPlan,
+) -> Result<ImportedBook, ImportError> {
+    let unsupported = || ImportError::UnsupportedType("zip without pdf/epub/images".into());
+    let primary = plan.contents.get(plan.primary).ok_or_else(unsupported)?;
+    if !is_viewable_media(primary.media_kind) {
+        // 音声・動画は現行ビューアの対象外（docs/import-patterns.md §3.3）
+        return Err(unsupported());
+    }
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| ImportError::Zip(e.to_string()))?;
+    let metas = collect_entry_metas(&mut archive)?;
+
+    // 2 周目: 選んだエントリだけを 1 件ずつ読む。
+    // 旧実装は全エントリを `Vec<(String, Vec<u8>)>` に読み込んでいたため、
+    // 巨大 ZIP（実データ最大 1.19GB / 展開後 1.33GB）で展開後のデータを
+    // 同時に保持していた。ここでは 1 件ずつ伸長して使い終わったら捨てる。
+    let mut pack_entries: Vec<(String, Vec<u8>, String, bool)> = Vec::new();
+    let mut page_rows: Vec<PageRow> = Vec::new();
+    let mut warnings = plan.warnings.clone();
+    let mut contents_spec: Vec<ContentSpec> = Vec::new();
+    let mut primary_pages = 0i64;
+    let mut primary_thumbnail: Option<Vec<u8>> = None;
+    let mut primary_cover: Option<Vec<u8>> = None;
+    // ZIP に PDF / EPUB が 1 つだけ入っている場合は、その中身を本の実体として
+    // 扱う（題名・ファイル名を内側のエントリ名から採る。フェーズ1の仕様）。
+    let mut book_file_name = file_name.to_string();
+
+    for (content_index, content) in plan.contents.iter().enumerate() {
+        let is_primary = content_index == plan.primary;
+        let content_id = uuid::Uuid::new_v4().to_string();
+        let mut formats = Vec::new();
+        for (rendition_index, rendition) in content.renditions.iter().enumerate() {
+            let format_id = uuid::Uuid::new_v4().to_string();
+            // 既定表示コンテンツの第 1 レンディションだけ従来のパスに置く
+            let legacy = is_primary && rendition_index == 0;
+            let prefix = if legacy {
+                "pages".to_string()
+            } else {
+                format!("contents/{content_index}/r{rendition_index}")
+            };
+            let page_count = match rendition.kind {
+                MediaKind::Image => {
+                    let start = page_rows.len();
+                    for ordinal in &rendition.entries {
+                        let meta = metas.get(*ordinal).ok_or_else(unsupported)?;
+                        let data = read_zip_entry(&mut archive, meta.index)?;
+                        // 壊れた画像 1 枚で全体を失敗させない（決定 D6）
+                        let (webp, width, height) = match render_page_image(&data) {
+                            Ok(rendered) => rendered,
+                            Err(error) => {
+                                warnings.push(format!("{}: {error}", meta.name));
+                                continue;
+                            }
+                        };
+                        if legacy && primary_thumbnail.is_none() {
+                            primary_thumbnail = Some(webp.clone());
+                        }
+                        let page_number = (page_rows.len() - start) as i64 + 1;
+                        let entry_path = format!("{prefix}/page_{page_number:04}.webp");
+                        pack_entries.push((
+                            entry_path.clone(),
+                            webp.clone(),
+                            "image/webp".to_string(),
+                            false,
+                        ));
+                        page_rows.push(PageRow {
+                            content_id: Some(content_id.clone()),
+                            format_id: Some(format_id.clone()),
+                            page_number,
+                            width: width as i64,
+                            height: height as i64,
+                            entry_path,
+                            file_size: webp.len() as i64,
+                            text: None,
+                        });
+                    }
+                    (page_rows.len() - start) as i64
+                }
+                MediaKind::Pdf => {
+                    let ordinal = rendition.entries.first().ok_or_else(unsupported)?;
+                    let meta = metas.get(*ordinal).ok_or_else(unsupported)?;
+                    let data = read_zip_entry(&mut archive, meta.index)?;
+                    // 進捗は既定表示コンテンツの PDF だけに流す（他は描画の副作用を避ける）
+                    let pages = if legacy {
+                        render_pdf_with(&data, Some(&mut *progress))?
+                    } else {
+                        render_pdf_with(&data, None)?
+                    };
+                    for (index, page) in pages.iter().enumerate() {
+                        let page_number = index as i64 + 1;
+                        let entry_path = format!("{prefix}/page_{page_number:04}.webp");
+                        pack_entries.push((
+                            entry_path.clone(),
+                            page.data.clone(),
+                            "image/webp".to_string(),
+                            false,
+                        ));
+                        page_rows.push(PageRow {
+                            content_id: Some(content_id.clone()),
+                            format_id: Some(format_id.clone()),
+                            page_number,
+                            width: page.width as i64,
+                            height: page.height as i64,
+                            entry_path,
+                            file_size: page.data.len() as i64,
+                            text: Some(page.text.clone()),
+                        });
+                    }
+                    if legacy {
+                        book_file_name = entry_file_name(&meta.name).to_string();
+                        primary_thumbnail = pages.first().map(|page| page.data.clone());
+                        primary_cover = pages.first().map(|page| page.data.clone());
+                    }
+                    pages.len() as i64
+                }
+                MediaKind::Epub => {
+                    let ordinal = rendition.entries.first().ok_or_else(unsupported)?;
+                    let meta = metas.get(*ordinal).ok_or_else(unsupported)?;
+                    let data = read_zip_entry(&mut archive, meta.index)?;
+                    let entry_path = if legacy {
+                        book_file_name = entry_file_name(&meta.name).to_string();
+                        entry_file_name(&meta.name).to_string()
+                    } else {
+                        format!("{prefix}/{}", entry_file_name(&meta.name))
+                    };
+                    pack_entries.push((
+                        entry_path,
+                        data,
+                        "application/epub+zip".to_string(),
+                        false,
+                    ));
+                    0
+                }
+                // 音声・動画はページを持たない（構造だけ記録する）
+                MediaKind::Audio | MediaKind::Video => 0,
+            };
+            if legacy {
+                primary_pages = page_count;
+            }
+            formats.push(FormatSpec {
+                format_id,
+                label: rendition.label.clone(),
+                kind: rendition.kind,
+                page_count,
+                pack_entry_prefix: Some(prefix),
+                sort_order: rendition_index as i64,
+            });
+        }
+        contents_spec.push(ContentSpec {
+            content_id,
+            display_name: content.display_name.clone(),
+            media_kind: content.media_kind,
+            is_primary,
+            sort_order: content_index as i64,
+            formats,
+        });
+    }
+
+    // 既定表示コンテンツが読めるページを持っていること（EPUB はページ列を持たない）
+    if primary_pages == 0 && primary.media_kind != MediaKind::Epub {
+        return Err(ImportError::Image(format!(
+            "primary content has no pages: {}",
+            primary.display_name
+        )));
+    }
+    if let Some(thumbnail_source) = &primary_thumbnail {
+        if let Some(cover_source) = &primary_cover {
+            pack_entries.push((
+                "cover.webp".to_string(),
+                cover_source.clone(),
+                "image/webp".to_string(),
+                false,
+            ));
+        }
+        let (thumb, _, _) = thumbnail_of(thumbnail_source)?;
+        pack_entries.push((
+            "thumbnail.webp".to_string(),
+            thumb,
+            "image/webp".to_string(),
+            false,
+        ));
+    }
+
+    let source_type = match primary.media_kind {
+        MediaKind::Pdf => "pdf",
+        MediaKind::Epub => "epub",
+        _ => "image-set",
+    };
+    finish_import(
+        pool,
+        packs_dir,
+        identity,
+        &book_file_name,
+        bytes.len() as i64,
+        PackSpec {
+            entries: pack_entries,
+            page_rows,
+            texts: plan.export_text.clone(),
+            warnings,
+            contents: contents_spec,
+            source_type: source_type.to_string(),
+            total_pages: primary_pages,
+        },
+        reuse_book_id,
+    )
+}
+
+/// Import a ZIP: `analyze_zip` で計画を立て、既定の優先コンテンツを取り込む。
 pub fn import_zip_bytes(
     pool: &SqlitePool,
     file_name: &str,
@@ -538,101 +1280,16 @@ pub fn import_zip_bytes(
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| ImportError::Zip(e.to_string()))?;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|e| ImportError::Zip(e.to_string()))?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry.name().to_string();
-        let mut data = Vec::new();
-        entry
-            .read_to_end(&mut data)
-            .map_err(|e| ImportError::Zip(e.to_string()))?;
-        entries.push((name, data));
-    }
-    if entries.is_empty() {
-        return Err(ImportError::EmptyArchive);
-    }
-    if let Some((name, data)) = entries
-        .iter()
-        .find(|(name, _)| name.to_lowercase().ends_with(".pdf"))
-    {
-        return import_pdf_bytes(pool, name, data, packs_dir, identity, progress);
-    }
-    if let Some((name, data)) = entries
-        .iter()
-        .find(|(name, _)| name.to_lowercase().ends_with(".epub"))
-    {
-        return import_epub_bytes(pool, name, data, packs_dir, identity);
-    }
-    let mut images: Vec<&(String, Vec<u8>)> = entries
-        .iter()
-        .filter(|(name, _)| {
-            name.rsplit_once('.')
-                .is_some_and(|(_, ext)| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        })
-        .collect();
-    if images.is_empty() {
-        return Err(ImportError::UnsupportedType(
-            "zip without pdf/epub/images".into(),
-        ));
-    }
-    images.sort_by(|a, b| natural_cmp(&a.0, &b.0));
-
-    let mut pack_entries = Vec::new();
-    let mut page_rows = Vec::new();
-    let total_pages = images.len() as i64;
-    for (index, (name, data)) in images.iter().enumerate() {
-        let decoded = image::load_from_memory(data)
-            .map_err(|e| ImportError::Image(format!("{name}: {e}")))?;
-        // 元画像が小さい場合は Lanczos3 で 1000px 幅まで拡大してから保存する
-        // （表示時のぼやけ軽減。RustMangaReader の Smart Scaling と同じ方式）
-        let decoded = upscale_if_small(&decoded, 1000);
-        let (width, height) = (decoded.width(), decoded.height());
-        let webp = encode_webp(&decoded, 88)?;
-        let entry_path = format!("pages/page_{:04}.webp", index + 1);
-        pack_entries.push((
-            entry_path.clone(),
-            webp.clone(),
-            "image/webp".to_string(),
-            false,
-        ));
-        page_rows.push(PageRow {
-            page_number: index as i64 + 1,
-            width: width as i64,
-            height: height as i64,
-            entry_path,
-            file_size: webp.len() as i64,
-            text: None,
-        });
-    }
-    let (thumb, _, _) = thumbnail_of(&pack_entries[0].1)?;
-    pack_entries.push((
-        "thumbnail.webp".to_string(),
-        thumb,
-        "image/webp".to_string(),
-        false,
-    ));
-
-    finish_import(
+    let plan = analyze_zip(bytes)?;
+    commit_zip(
         pool,
+        file_name,
+        bytes,
         packs_dir,
         identity,
-        file_name,
-        bytes.len() as i64,
-        PackSpec {
-            entries: pack_entries,
-            page_rows,
-            texts: Vec::new(),
-            source_type: "image-set".to_string(),
-            total_pages,
-        },
+        progress,
         reuse_book_id,
+        &plan,
     )
 }
 
@@ -651,6 +1308,9 @@ pub fn import_image_bytes(
     let (width, height) = (decoded.width(), decoded.height());
     let webp = encode_webp(&decoded, 88)?;
     let (thumb, _, _) = thumbnail_of(&webp)?;
+    let content = single_content(MediaKind::Image, "画像", 1, Some("pages"));
+    let content_id = content.content_id.clone();
+    let format_id = content.formats[0].format_id.clone();
     finish_import(
         pool,
         packs_dir,
@@ -673,6 +1333,8 @@ pub fn import_image_bytes(
                 ),
             ],
             page_rows: vec![PageRow {
+                content_id: Some(content_id),
+                format_id: Some(format_id),
                 page_number: 1,
                 width: width as i64,
                 height: height as i64,
@@ -681,9 +1343,42 @@ pub fn import_image_bytes(
                 text: None,
             }],
             texts: Vec::new(),
+            warnings: Vec::new(),
+            contents: vec![content],
             source_type: "image".to_string(),
             total_pages: 1,
         },
         None,
     )
+}
+
+#[cfg(test)]
+mod natural_sort_tests {
+    use super::{natural_cmp, natural_key};
+    use std::cmp::Ordering;
+
+    #[test]
+    fn natural_cmp_orders_numeric_sequences() {
+        let mut v = vec!["2.jpg", "10.jpg", "1.jpg", "3.jpg"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, vec!["1.jpg", "2.jpg", "3.jpg", "10.jpg"]);
+    }
+
+    #[test]
+    fn natural_cmp_matches_lexicographic_for_nonnumeric() {
+        assert_eq!(natural_cmp("a.jpg", "b.jpg"), Ordering::Less);
+        assert_eq!(natural_cmp("b.jpg", "a.jpg"), Ordering::Greater);
+    }
+
+    #[test]
+    fn natural_key_splits_numeric_runs() {
+        assert_eq!(
+            natural_key("page10.jpg"),
+            vec![
+                (false, "page".into()),
+                (true, "10".into()),
+                (false, ".jpg".into())
+            ]
+        );
+    }
 }

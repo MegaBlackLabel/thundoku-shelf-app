@@ -1797,6 +1797,7 @@ impl BookshelfView {
                         pages,
                         &packs_dir,
                         identity.as_ref(),
+                        reuse_book_id.as_deref(),
                     )
                     .map_err(|e| e.to_string())?;
                     // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
@@ -1838,7 +1839,12 @@ impl BookshelfView {
                 } else {
                     let imported = match extension.as_str() {
                         "epub" => thundoku_core::import::import_epub_bytes(
-                            &db, &file_name, &bytes, &packs_dir, identity.as_ref(),
+                            &db,
+                            &file_name,
+                            &bytes,
+                            &packs_dir,
+                            identity.as_ref(),
+                            reuse_book_id.as_deref(),
                         ),
                         "zip" => thundoku_core::import::import_zip_bytes(
                             &db,

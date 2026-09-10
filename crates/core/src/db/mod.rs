@@ -9,6 +9,7 @@ pub mod backup;
 pub mod books;
 pub mod bookshelf;
 pub mod checklist;
+pub mod contents;
 pub mod documents;
 pub mod page_views;
 pub mod progress;
@@ -65,13 +66,12 @@ async fn ensure_column(
     column: &str,
     definition: &str,
 ) -> Result<(), sqlx::Error> {
-    let exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-    )
-    .bind(table)
-    .bind(column)
-    .fetch_one(&mut *conn)
-    .await?;
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2")
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *conn)
+            .await?;
     if exists == 0 {
         sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
             .execute(&mut *conn)
@@ -176,6 +176,36 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         )
         .execute(&mut *conn)
         .await?;
+        // コンテンツ（読む単位）とレンディション（切替可能な表示形態）。1 冊に複数の
+        // 本文・別冊・PDF版/画像版を持たせるための構造（docs/import-patterns.md §3.3）。
+        // 開発中のためマイグレーションファイルは作らず、他の後発テーブルと同様に
+        // IF NOT EXISTS で冪等に適用する。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS book_contents (               content_id TEXT PRIMARY KEY,               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               display_name TEXT NOT NULL,               media_kind TEXT NOT NULL,               is_primary INTEGER NOT NULL DEFAULT 0,               sort_order INTEGER NOT NULL DEFAULT 0,               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP             );             CREATE INDEX IF NOT EXISTS idx_book_contents_book ON book_contents(book_id)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS content_formats (               format_id TEXT PRIMARY KEY,               content_id TEXT NOT NULL REFERENCES book_contents(content_id) ON DELETE CASCADE,               label TEXT NOT NULL,               format_kind TEXT NOT NULL,               page_count INTEGER NOT NULL DEFAULT 0,               pack_entry_prefix TEXT,               sort_order INTEGER NOT NULL DEFAULT 0,               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP             );             CREATE INDEX IF NOT EXISTS idx_content_formats_content ON content_formats(content_id)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        // `document_images` にコンテンツ / レンディションへの参照を追加する
+        // （NULL = フェーズ2以前に取り込んだ旧データ。単一コンテンツ扱い）。
+        ensure_column(
+            &mut conn,
+            "document_images",
+            "content_id",
+            "content_id TEXT REFERENCES book_contents(content_id)",
+        )
+        .await?;
+        ensure_column(
+            &mut conn,
+            "document_images",
+            "format_id",
+            "format_id TEXT REFERENCES content_formats(format_id)",
+        )
+        .await?;
         // 共有ソースメタ列（FANZA同人 / DLsite）。開発中のためマイグレーションファイルは
         // 作らず、既存 runtime DDL（hidden_at / owner_sub 等）と同様に冪等に適用する。
         {
@@ -240,6 +270,8 @@ pub fn clear_owner_model_if_first_run(
         "token_analysis",
         "document_text",
         "document_images",
+        "content_formats",
+        "book_contents",
         "imported_documents",
         "book_tags",
         "reading_progress",

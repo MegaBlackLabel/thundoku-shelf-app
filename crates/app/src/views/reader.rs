@@ -6,11 +6,11 @@ use std::time::Instant;
 
 use gpui_kit::Styled as _;
 use gpui_kit::Subscription;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement, ReadGlobal as _, Render,
     SharedString, Window, div,
 };
-use gpui_kit::component::ActiveTheme as _;
 use thundoku_core::db;
 
 use crate::app_state::AppState;
@@ -20,6 +20,10 @@ pub struct ReaderView {
     viewer: Entity<ImageViewer>,
     /// 本棚の本の場合のみ Some（進捗保存対象）。試し読みは None。
     book_id: Option<SharedString>,
+    /// 表示中のコンテンツ（フェーズ3。None = 既定表示コンテンツ）。
+    content_id: Option<SharedString>,
+    /// 表示中のレンディション（None = そのコンテンツの先頭レンディション）。
+    format_id: Option<SharedString>,
     _subscription: Option<Subscription>,
     /// 最後に保存したページ（1-indexed）。同じページの再保存を防ぐ。
     last_saved_page: i64,
@@ -36,6 +40,59 @@ impl ReaderView {
     /// このリーダーが開いている本の ID（試し読みは None）。
     pub(crate) fn book_id(&self) -> Option<SharedString> {
         self.book_id.clone()
+    }
+
+    /// 表示中の（コンテンツ, レンディション）。None は未指定（既定表示 / 単一コンテンツ）。
+    pub fn selection(&self) -> (Option<SharedString>, Option<SharedString>) {
+        (self.content_id.clone(), self.format_id.clone())
+    }
+
+    /// 表示するコンテンツ／レンディションを切り替える（フェーズ4の UI から呼ぶ）。
+    ///
+    /// 先頭ページに戻し、ページ毎記録の起点も切り替える。進捗（`reading_progress`）は
+    /// フェーズ5でコンテンツ単位にするまで本単位のまま（切り替えても保存先は同じ）。
+    pub fn switch_selection(
+        &mut self,
+        cx: &mut Context<Self>,
+        content_id: Option<String>,
+        format_id: Option<String>,
+    ) {
+        let Some(book_id) = self.book_id.clone() else {
+            return;
+        };
+        let state = AppState::global(cx);
+        let db = state.db_pool.clone();
+        let packs_dir = state.packs_dir.clone();
+        let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+        let images = db::documents::images_for_selection(
+            &db,
+            &book_id,
+            content_id.as_deref(),
+            format_id.as_deref(),
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|image| image.image_type == "page")
+        .collect::<Vec<_>>();
+        let loader = Arc::new(PackPageLoader {
+            images,
+            packs_dir,
+            db,
+            identity: google_sub.map(|sub| opfspack::Identity {
+                sub,
+                pack_id: book_id.to_string(),
+            }),
+            pack_bytes: std::sync::OnceLock::new(),
+            pack_key: std::sync::OnceLock::new(),
+        });
+        self.content_id = content_id.map(SharedString::from);
+        self.format_id = format_id.map(SharedString::from);
+        self.last_saved_page = 0;
+        self.last_pages = vec![0];
+        self.last_page_at = Some(Instant::now());
+        let viewer = self.viewer.clone();
+        viewer.update(cx, |viewer, cx| viewer.set_loader(cx, loader, 0));
+        cx.notify();
     }
 
     /// 閲覧履歴セッションを終了する（ビューアーを閉じる際に呼ぶ）。
@@ -69,7 +126,7 @@ impl ReaderView {
         let packs_dir = state.packs_dir.clone();
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
 
-        let (title, images, progress, site_id) = {
+        let (title, images, progress, site_id, selection) = {
             let book = db::books::get(&db, &book_id).ok().flatten();
             let title = book
                 .as_ref()
@@ -82,7 +139,18 @@ impl ReaderView {
                 .filter(|image| image.image_type == "page")
                 .collect::<Vec<_>>();
             let progress = db::progress::get(&db, &book_id).ok().flatten();
-            (title, images, progress, site_id)
+            // 既定表示コンテンツとその先頭レンディション（旧データは None = 未指定）
+            let selection = db::contents::primary_for_book(&db, &book_id)
+                .ok()
+                .flatten()
+                .map(|content| {
+                    let format_id = db::contents::formats_for_content(&db, &content.content_id)
+                        .ok()
+                        .and_then(|formats| formats.into_iter().next())
+                        .map(|format| format.format_id);
+                    (content.content_id, format_id)
+                });
+            (title, images, progress, site_id, selection)
         };
 
         let identity = google_sub.map(|sub| opfspack::Identity {
@@ -124,11 +192,7 @@ impl ReaderView {
         {
             let state = AppState::global(cx);
             for page in &initial_pages {
-                let _ = db::page_views::record_view(
-                    &state.db_pool,
-                    &book_id,
-                    *page as i64 + 1,
-                );
+                let _ = db::page_views::record_view(&state.db_pool, &book_id, *page as i64 + 1);
             }
         }
         let subscription = cx.observe(&viewer, |this, viewer, cx| {
@@ -137,6 +201,13 @@ impl ReaderView {
         Self {
             viewer,
             book_id: Some(book_id.into()),
+            content_id: selection
+                .as_ref()
+                .map(|(content_id, _)| SharedString::from(content_id.clone())),
+            format_id: selection
+                .as_ref()
+                .and_then(|(_, format_id)| format_id.clone())
+                .map(SharedString::from),
             _subscription: Some(subscription),
             // 初期ページ（1-indexed）を保存済みとしてマークし、開いた直後の
             // 不要な保存をスキップする（ページを移動してから保存される）
@@ -176,6 +247,8 @@ impl ReaderView {
         Self {
             viewer,
             book_id: None,
+            content_id: None,
+            format_id: None,
             _subscription: None,
             last_saved_page: -1,
             view_session_id: None,
@@ -278,43 +351,43 @@ mod tests {
     use thundoku_core::db::documents;
     use thundoku_core::db::page_views;
 
+    fn book_row(id: &str, title: &str, file_name: &str) -> db::books::Book {
+        db::books::Book {
+            id: id.into(),
+            title: title.into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: file_name.to_string(),
+            file_size: 10,
+            opfs_path: format!("{id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some(id.into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-08-21 00:00:00".into(),
+            updated_at: "2026-08-21 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        }
+    }
+
     fn seed_book_with_pages(cx: &mut TestAppContext, id: &str, title: &str, page_count: i64) {
         cx.update(|cx| {
             let state = crate::app_state::AppState::global(cx);
             let db = &state.db_pool;
-            db::books::insert(
-                db,
-                &db::books::Book {
-                    id: id.into(),
-                    title: title.into(),
-                    author: String::new(),
-                    circle_name: String::new(),
-                    purchase_date: None,
-                    file_name: format!("{id}.pdf"),
-                    file_size: 10,
-                    opfs_path: format!("{id}.opfspack"),
-                    cover_thumbnail: None,
-                    tbf_product_id: None,
-                    site_id: None,
-                    tags_fetched: 1,
-                    pack_id: Some(id.into()),
-                    is_favorite: 0,
-                    is_hidden: 0,
-                    created_at: "2026-08-21 00:00:00".into(),
-                    updated_at: "2026-08-21 00:00:00".into(),
-                    media_category: None,
-                    ai_type: None,
-                    is_drm: 0,
-                    release_date: None,
-                    description: None,
-                    theme: None,
-                    maker_id: None,
-                    page_count: None,
-                    age_rating: None,
-                    series_name: None,
-                },
-            )
-            .unwrap();
+            db::books::insert(db, &book_row(id, title, &format!("{id}.pdf"))).unwrap();
             documents::insert_document(
                 db,
                 &documents::ImportedDocument {
@@ -336,6 +409,8 @@ mod tests {
                     &documents::DocumentImage {
                         id: format!("{id}-img{page}"),
                         document_id: format!("{id}-doc"),
+                        content_id: None,
+                        format_id: None,
                         page_number: page + 1,
                         image_type: "page".into(),
                         opfs_path: format!("{id}/p{page}").into(),
@@ -351,6 +426,140 @@ mod tests {
                 .unwrap();
             }
         });
+    }
+
+    /// 2 コンテンツ（本編 3 ページ / 別冊 1 ページ）の本を入れる（フェーズ3 の切り替え用）。
+    fn seed_book_with_two_contents(cx: &mut TestAppContext, id: &str) {
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let db = &state.db_pool;
+            db::books::insert(db, &book_row(id, "複数コンテンツ本", &format!("{id}.zip"))).unwrap();
+            documents::insert_document(
+                db,
+                &documents::ImportedDocument {
+                    id: format!("{id}-doc"),
+                    book_id: id.into(),
+                    source_type: "image-set".into(),
+                    file_hash: "h".into(),
+                    total_pages: 3,
+                    metadata: None,
+                    status: "done".into(),
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                },
+            )
+            .unwrap();
+            let stamp = "2026-08-21 00:00:00";
+            db::contents::insert_batch(
+                db,
+                &[
+                    db::contents::BookContent {
+                        content_id: "c-main".into(),
+                        book_id: id.into(),
+                        display_name: "本編".into(),
+                        media_kind: "image".into(),
+                        is_primary: 1,
+                        sort_order: 0,
+                        created_at: stamp.into(),
+                    },
+                    db::contents::BookContent {
+                        content_id: "c-sub".into(),
+                        book_id: id.into(),
+                        display_name: "別冊".into(),
+                        media_kind: "image".into(),
+                        is_primary: 0,
+                        sort_order: 1,
+                        created_at: stamp.into(),
+                    },
+                ],
+                &[
+                    db::contents::ContentFormat {
+                        format_id: "f-main".into(),
+                        content_id: "c-main".into(),
+                        label: "画像".into(),
+                        format_kind: "image".into(),
+                        page_count: 3,
+                        pack_entry_prefix: Some("pages".into()),
+                        sort_order: 0,
+                        created_at: stamp.into(),
+                    },
+                    db::contents::ContentFormat {
+                        format_id: "f-sub".into(),
+                        content_id: "c-sub".into(),
+                        label: "画像".into(),
+                        format_kind: "image".into(),
+                        page_count: 1,
+                        pack_entry_prefix: Some("contents/1/r0".into()),
+                        sort_order: 0,
+                        created_at: stamp.into(),
+                    },
+                ],
+            )
+            .unwrap();
+            let insert_page = |content: &str, format: &str, page: i64, index: usize| {
+                documents::insert_image(
+                    db,
+                    &documents::DocumentImage {
+                        id: format!("{id}-img{index}"),
+                        document_id: format!("{id}-doc"),
+                        content_id: Some(content.into()),
+                        format_id: Some(format.into()),
+                        page_number: page,
+                        image_type: "page".into(),
+                        opfs_path: format!("{id}/p{index}").into(),
+                        width: 1,
+                        height: 1,
+                        mime_type: "image/webp".into(),
+                        file_size: 1,
+                        extracted_text: None,
+                        pack_entry_path: None,
+                        created_at: stamp.into(),
+                    },
+                )
+                .unwrap();
+            };
+            for page in 1..=3 {
+                insert_page("c-main", "f-main", page, page as usize);
+            }
+            insert_page("c-sub", "f-sub", 1, 4);
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn switching_selection_reloads_pages(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book_with_two_contents(cx, "b3");
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b3".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        // 既定表示 = 本編（3 ページ）
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 3);
+        assert_eq!(
+            reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
+            Some("c-main".to_string())
+        );
+
+        // 別冊へ切り替え（1 ページ・先頭に戻る）
+        cx.update(|cx| {
+            reader.update(cx, |r, cx| {
+                r.switch_selection(cx, Some("c-sub".into()), None)
+            });
+        });
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 1);
+        assert_eq!(viewer.read_with(cx, |v, _| v.current_page()), 0);
+        assert_eq!(
+            reader.read_with(cx, |r, _| r.selection().0.map(|s| s.to_string())),
+            Some("c-sub".to_string())
+        );
+
+        // 本編へ戻す（3 ページに戻る）
+        cx.update(|cx| {
+            reader.update(cx, |r, cx| {
+                r.switch_selection(cx, Some("c-main".into()), None)
+            });
+        });
+        assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 3);
     }
 
     #[gpui_kit::test]
@@ -389,7 +598,10 @@ mod tests {
             page_views::for_book(&state.db_pool, "b1").unwrap()
         });
         assert_eq!(rows.len(), 3);
-        assert!(rows[2].total_seconds >= 0.0, "closing finalizes last page dwell");
+        assert!(
+            rows[2].total_seconds >= 0.0,
+            "closing finalizes last page dwell"
+        );
     }
 
     #[gpui_kit::test]
@@ -419,7 +631,13 @@ mod tests {
             assert_eq!(row.view_count, 1, "each page of the spread shown once");
         }
         let pages: Vec<i64> = rows.iter().map(|r| r.page_number).collect();
-        assert!(pages.contains(&2), "right-hand page of first spread recorded");
-        assert!(pages.contains(&4), "right-hand page of second spread recorded");
+        assert!(
+            pages.contains(&2),
+            "right-hand page of first spread recorded"
+        );
+        assert!(
+            pages.contains(&4),
+            "right-hand page of second spread recorded"
+        );
     }
 }

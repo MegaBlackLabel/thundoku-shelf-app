@@ -151,6 +151,42 @@ Drive 同期設定など）。
 | price | INTEGER | 価格 |
 | is_purchased | INTEGER | 購入済みフラグ |
 
+### book_contents / content_formats
+
+1 冊に複数の「コンテンツ（読む単位）」と「レンディション（切替可能な表示形態）」を
+持たせるための表（`docs/import-patterns.md` §3.3）。**マイグレーションファイルではなく
+`migrate()` 内の冪等 DDL で作成**。
+
+`book_contents`:
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| content_id | TEXT PK | コンテンツ ID（UUID） |
+| book_id | TEXT FK→books (ON DELETE CASCADE) | |
+| display_name | TEXT | 表示名（`本文` / `本編` / フォルダ名 / 別冊 等） |
+| media_kind | TEXT | `image` / `pdf` / `epub` / `audio` / `video` |
+| is_primary | INTEGER | 既定表示にするコンテンツ（0/1） |
+| sort_order | INTEGER | 表示順（ZIP 内の並び） |
+| created_at | TEXT | |
+
+`content_formats`（同じ内容の別形式・別バリアント。`PDF版` / `画像版` 等）:
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| format_id | TEXT PK | レンディション ID（UUID） |
+| content_id | TEXT FK→book_contents (ON DELETE CASCADE) | |
+| label | TEXT | 切替 UI に出す名前（`画像` / `PDF`） |
+| format_kind | TEXT | `image` / `pdf` / `epub` / `audio` / `video` |
+| page_count | INTEGER | ページ数 |
+| pack_entry_prefix | TEXT | pack 内の接頭辞（`pages` / `contents/1/r0`） |
+| sort_order | INTEGER | 表示順（先頭が主レンディション） |
+| created_at | TEXT | |
+
+- 表紙・裏表紙はコンテンツにしない（カバー画像として `thumbnail.webp` / `cover.webp` に置く）
+- `import_zip_bytes` は**全コンテンツ × 全レンディション**を実体化して保存する
+  （既定表示コンテンツの第 1 レンディションだけ pack 内パスが従来どおり `pages/...`）
+- pack の `metadata.json` にも `contents` を書き出して同期復元用にする
+
 ### imported_documents
 
 インポートされたドキュメント（PDF 等）のメタ情報。
@@ -172,11 +208,17 @@ Drive 同期設定など）。
 | カラム | 型 | 説明 |
 |---|---|---|
 | document_id | TEXT FK→imported_documents | |
-| image_type | TEXT | page / thumbnail / cover |
+| content_id | TEXT FK→book_contents | 所属コンテンツ（NULL = 旧データ） |
+| format_id | TEXT FK→content_formats | 所属レンディション（NULL = 旧データ） |
+| image_type | TEXT | page / thumbnail |
 | pack_entry_path | TEXT | pack 内のパス（例: `pages/page_0001.webp`） |
 | width / height | INTEGER | 表示サイズ（ズーム範囲計算に使用） |
 | mime_type / file_size | TEXT/INT | |
 | created_at | TEXT | |
+
+`images_for_book` は**既定表示コンテンツの第 1 レンディションのページ**（と
+`content_id IS NULL` の旧データ）だけを返す。コンテンツを切り替えるページ一覧 UI は
+フェーズ4で対応する。
 
 ### document_text / token_analysis
 
@@ -207,8 +249,10 @@ Zenn のタグメタデータ（`https://zenn.dev/api/tags` 相当から取得�
 ## マイグレーション
 
 - `crates/core/migrations/0001_init.sql`: 初期スキーマ（`sqlx::migrate!` で
-  チェックサム管理）
-- `view_history`: `migrate()` 内の `CREATE TABLE IF NOT EXISTS` で適用
+  チェックサム管理。**変更すると既存 DB が VersionMismatch で開けなくなる**）
+- `view_history` / `page_views` / `book_contents` / `content_formats`、
+  `document_images.content_id` / `format_id`: `migrate()` 内の
+  `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN` で適用
   （新しいマイグレーションファイルは作らない方針）
 - テスト用には `test_pool()`（インメモリ + 全マイグレーション適用）を使用
 

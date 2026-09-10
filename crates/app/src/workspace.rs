@@ -2304,6 +2304,8 @@ mod tests {
                     &documents::DocumentImage {
                         id: format!("img{page}"),
                         document_id: "d1".into(),
+                        content_id: None,
+                        format_id: None,
                         page_number: page,
                         image_type: "page".into(),
                         opfs_path: format!("b1/p{page}").into(),

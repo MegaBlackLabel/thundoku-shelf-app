@@ -1,6 +1,8 @@
 //! Storage/DB tests: verbatim schema migration + repository CRUD.
 
-use thundoku_core::db::{books, bookshelf, checklist, progress, settings, sync_state, tags};
+use thundoku_core::db::{
+    books, bookshelf, checklist, contents, progress, settings, sync_state, tags,
+};
 
 fn memory_db() -> thundoku_core::db::SqlitePool {
     thundoku_core::db::test_pool()
@@ -24,11 +26,13 @@ fn migrate_creates_all_schema_tables() {
         vec![
             "_sqlx_migrations",
             "app_settings",
+            "book_contents",
             "book_first_events",
             "book_tags",
             "books",
             "bookshelf_items",
             "checked_items",
+            "content_formats",
             "document_images",
             "document_text",
             "drive_sync_state",
@@ -266,7 +270,12 @@ fn resolve_reuse_id_returns_owned_match_only() {
     // book-1: sub-A に所属(暗号化済み) / book-2: 未所属(NULL)
     books::insert(&pool, &mk("book-1")).unwrap();
     books::insert(&pool, &mk("book-2")).unwrap();
-    books::set_owner_sub(&pool, "book-1", Some(thundoku_core::owner::encrypt(&key, "sub-A"))).unwrap();
+    books::set_owner_sub(
+        &pool,
+        "book-1",
+        Some(thundoku_core::owner::encrypt(&key, "sub-A")),
+    )
+    .unwrap();
     // 同一 source + sub-A → book-1 を再利用
     assert_eq!(
         books::resolve_reuse_id(&pool, &key, "techbookfest", "db-1", Some("sub-A")).unwrap(),
@@ -326,8 +335,18 @@ fn owned_book_ids_filters_by_owner() {
     books::insert(&pool, &mk("book-1")).unwrap();
     books::insert(&pool, &mk("book-2")).unwrap();
     books::insert(&pool, &mk("book-3")).unwrap();
-    books::set_owner_sub(&pool, "book-1", Some(thundoku_core::owner::encrypt(&key, "A"))).unwrap();
-    books::set_owner_sub(&pool, "book-3", Some(thundoku_core::owner::encrypt(&key, "B"))).unwrap();
+    books::set_owner_sub(
+        &pool,
+        "book-1",
+        Some(thundoku_core::owner::encrypt(&key, "A")),
+    )
+    .unwrap();
+    books::set_owner_sub(
+        &pool,
+        "book-3",
+        Some(thundoku_core::owner::encrypt(&key, "B")),
+    )
+    .unwrap();
 
     // A ログイン中 → A の本だけ
     let as_a = books::owned_book_ids(&pool, &key, Some("A")).unwrap();
@@ -339,7 +358,10 @@ fn owned_book_ids_filters_by_owner() {
     assert!(as_b.contains("book-3") && !as_b.contains("book-1") && !as_b.contains("book-2"));
     // 未ログイン → 未所属(NULL)だけ
     let logged_out = books::owned_book_ids(&pool, &key, None).unwrap();
-    assert_eq!(logged_out, std::collections::HashSet::from(["book-2".to_string()]));
+    assert_eq!(
+        logged_out,
+        std::collections::HashSet::from(["book-2".to_string()])
+    );
 }
 
 #[test]
@@ -839,13 +861,11 @@ fn drive_sync_state_crud() {
 
 fn column_exists(pool: &thundoku_core::db::SqlitePool, table: &str, column: &str) -> bool {
     thundoku_core::db::block_on(async {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-        )
-        .bind(table)
-        .bind(column)
-        .fetch_one(pool)
-        .await
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2")
+            .bind(table)
+            .bind(column)
+            .fetch_one(pool)
+            .await
     })
     .unwrap()
         > 0
@@ -979,4 +999,98 @@ fn bookshelf_metadata_roundtrip() {
     // upsert の upsert でも roundtrip（コンフリクトで更新）
     bookshelf::upsert(&pool, &item).unwrap();
     assert_eq!(bookshelf::list(&pool, "fanza").unwrap(), vec![item]);
+}
+
+// フェーズ2: コンテンツ（読む単位）とレンディション（切替可能な表示形態）が
+// DB に保存・取得・削除できること。`document_images` が content を指せること。
+#[test]
+fn book_contents_and_formats_roundtrip() {
+    let pool = memory_db();
+    let book = books::Book {
+        id: "book-c".into(),
+        title: "複数コンテンツ本".into(),
+        author: String::new(),
+        circle_name: String::new(),
+        purchase_date: None,
+        file_name: "multi.zip".into(),
+        file_size: 10,
+        opfs_path: "book-c.opfspack".into(),
+        cover_thumbnail: None,
+        tbf_product_id: None,
+        site_id: None,
+        tags_fetched: 1,
+        pack_id: Some("book-c".into()),
+        is_favorite: 0,
+        is_hidden: 0,
+        created_at: "2026-01-01 00:00:00".into(),
+        updated_at: "2026-01-01 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
+    };
+    books::insert(&pool, &book).unwrap();
+
+    // document_images が content / format を参照できる列を持つこと
+    assert!(column_exists(&pool, "document_images", "content_id"));
+    assert!(column_exists(&pool, "document_images", "format_id"));
+
+    let content = contents::BookContent {
+        content_id: "c1".into(),
+        book_id: "book-c".into(),
+        display_name: "本文".into(),
+        media_kind: "image".into(),
+        is_primary: 1,
+        sort_order: 0,
+        created_at: "2026-01-01 00:00:00".into(),
+    };
+    let format = contents::ContentFormat {
+        format_id: "f1".into(),
+        content_id: "c1".into(),
+        label: "画像".into(),
+        format_kind: "image".into(),
+        page_count: 3,
+        pack_entry_prefix: Some("pages".into()),
+        sort_order: 0,
+        created_at: "2026-01-01 00:00:00".into(),
+    };
+    contents::insert_batch(&pool, &[content], &[format]).unwrap();
+
+    let loaded = contents::list_for_book(&pool, "book-c").unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].display_name, "本文");
+    assert_eq!(loaded[0].is_primary, 1);
+    assert_eq!(
+        contents::primary_for_book(&pool, "book-c")
+            .unwrap()
+            .unwrap()
+            .content_id,
+        "c1"
+    );
+    let formats = contents::formats_for_content(&pool, "c1").unwrap();
+    assert_eq!(formats.len(), 1);
+    assert_eq!(formats[0].label, "画像");
+    assert_eq!(formats[0].page_count, 3);
+    assert_eq!(formats[0].pack_entry_prefix.as_deref(), Some("pages"));
+
+    // 別 book のコンテンツは混ざらない
+    assert!(
+        contents::list_for_book(&pool, "book-other")
+            .unwrap()
+            .is_empty()
+    );
+
+    contents::delete_for_book(&pool, "book-c").unwrap();
+    assert!(contents::list_for_book(&pool, "book-c").unwrap().is_empty());
+    assert!(
+        contents::formats_for_content(&pool, "c1")
+            .unwrap()
+            .is_empty()
+    );
 }
