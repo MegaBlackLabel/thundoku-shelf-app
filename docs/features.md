@@ -426,6 +426,23 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
   - 回帰テスト: `apply_site_metadata_writes_author_for_supported_sites` /
     `redownload_keeps_cover_and_queues_while_busy`
 
+- [x] **再取得でカスタム名・進捗が消える／本の削除が無言で失敗する（バグ）**（修正済み）
+  - **再取得でカスタム名が消える**: 取り込みは pack と `book_contents` を作り直すため、
+    ビューアーで付けたコンテンツ名（`display_name`）が元のフォルダ名に戻っていた
+    → 再取り込みでは**前回の `content_id` と表示名を引き継ぐ**（件数とメディア種別が一致する
+    ときだけ。`content_id` を引き継ぐので、`content_id` 紐付けの進捗・ページ毎記録も維持される。
+    ページ行が持つ `content_id` も張り替える）
+  - **再取得でローカルの本を消していた**: `redownload_item` が progress と books 行を削除していた
+    → 削除しない（同じ `book_id` を再利用し、タグ・進捗・閲覧履歴を維持）
+  - **本の削除が無言で失敗**: `books::delete` が単一 DELETE で、`ON DELETE CASCADE` が無い
+    子テーブル（`book_tags` / `imported_documents` / `book_contents`）が残ると FK 制約で失敗し、
+    呼び出し側の `let _ =` に握り潰されていた → 孫 → 子 → 親の順で明示的に消す
+  - **進捗の seed が読書位置を消していた**: 取り込み後の `progress::upsert` が `current_page` を
+    0 で上書きしていた → 既存行があるときは触らない（`seed_progress_if_absent`）
+  - 回帰テスト: `reimport_preserves_custom_content_name_and_id` /
+    `books_delete_removes_dependent_rows` / `redownload_keeps_local_book_row` /
+    `seed_progress_if_absent_keeps_reading_position`
+
 - [x] **閲覧情報を 1 ページ毎の閲覧回数・時間も記録する**（実装済み）
   - 現在の `view_history` は `id, book_id, started_at, ended_at` のみで、書籍単位の
     閲覧セッション（開始・終了時刻）しか記録していない
