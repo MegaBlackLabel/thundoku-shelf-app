@@ -391,6 +391,15 @@ impl BoothClient {
             shop_name,
         })
     }
+
+    /// 商品ページ（公開 HTML）から**作者名**を取得する。
+    ///
+    /// 商品詳細 API が Cloudflare や権限で取れない場合でも、公開ページから
+    /// ショップ情報（`user-avatar` の `title` = ショップページの表示名）を解析して取れる。
+    pub fn item_author(&self, item_id: u64) -> Result<Option<String>, BoothError> {
+        let html = self.get(&format!("https://booth.pm/ja/items/{item_id}"), "text/html")?;
+        Ok(parse_item_author(&html))
+    }
 }
 
 /// ライブラリ HTML から購入品を抽出する。
@@ -475,6 +484,62 @@ fn extract_shop_name(block: &str) -> String {
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
         .unwrap_or_default()
+}
+
+/// 商品ページ HTML から**作者名**（ショップページの表示名）を抽出する。
+///
+/// 商品ページ下部のショップ情報に
+/// `<a href="https://yorimiya.booth.pm/"><div class="user-avatar" ... title="YORIMIYA"></div></a>`
+/// の形でショップへのリンクがあり、`user-avatar` の `title` が**ショップページの表示名 = 作者名**
+/// （実ページ 2026-09-12 / items/7825209 で確認）。
+///
+/// 同じブロックの `div.shop-name` のアンカーテキストは**サークル名**（"YORIMIYA STUDIO"）で
+/// 作者名とは異なるため、フォールバックとしてのみ使う。最後に JSON-LD の `brand.name`。
+pub fn parse_item_author(html: &str) -> Option<String> {
+    let avatar = regex::Regex::new(r#"class="user-avatar"[^>]*title="([^"]+)""#).ok()?;
+    if let Some(name) = first_capture(&avatar, html) {
+        return Some(name);
+    }
+    let shop_name = regex::Regex::new(r#"<div class="shop-name[^"]*">\s*<a[^>]*>([^<]+)</a>"#).ok()?;
+    if let Some(name) = first_capture(&shop_name, html) {
+        return Some(name);
+    }
+    parse_item_brand(html)
+}
+
+/// 正規表現の 1 番目のキャプチャを trim して返す（空文字は `None`）。
+fn first_capture(re: &regex::Regex, haystack: &str) -> Option<String> {
+    re.captures(haystack)
+        .map(|cap| cap[1].trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 商品ページ HTML の JSON-LD（`application/ld+json`）から**作者名**（= ショップ名）を抽出する。
+///
+/// 商品ページには構造化データとして
+/// `"brand": { "@type": "Brand", "name": "YORIMIYA STUDIO", "url": "https://yorimiya.booth.pm/" }`
+/// が埋め込まれている（実ページ 2026-09-12 / items/7825209 で確認）。`brand.name` が作者名で、
+/// 商品ページ内のショップリンク（`{subdomain}.booth.pm`）の表示名でもある。
+/// JSON-LD が無い / `brand` が無い / 壊れている場合は `None`。
+pub fn parse_item_brand(html: &str) -> Option<String> {
+    let re = regex::Regex::new(r#"(?s)<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>"#)
+        .ok()?;
+    for cap in re.captures_iter(html) {
+        // 壊れた JSON-LD はスキップして次の script を見る
+        let Ok(value) = serde_json::from_str::<Value>(cap[1].trim()) else {
+            continue;
+        };
+        if let Some(name) = value
+            .get("brand")
+            .and_then(|brand| brand.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// ファイル名（タイトル直後の min-w-0 break-words ブロック内のテキスト）
@@ -617,6 +682,47 @@ mod tests {
         assert_eq!(orders[0].ordered_at, "2026/01/01 19:36:23");
         assert_eq!(orders[1].item_title, "別の本");
         assert_eq!(orders[1].ordered_at, "2025/05/18 15:22:13");
+    }
+
+    /// 商品ページ HTML の JSON-LD（`brand.name` / `brand.url`）から作者名を抽出する。
+    /// 実ページ（2026-09-12 取得 / items/7825209）の JSON-LD をそのまま使う。
+    /// `brand.url` はショップ URL（`https://yorimiya.booth.pm/`）で、`brand.name` が作者名。
+    #[test]
+    fn parse_item_brand_extracts_shop_name() {
+        let html = r#"<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"【C107】MiYA活動記録① -技術解説本- (電子版)","url":"https://booth.pm/ja/items/7825209","offers":{"priceCurrency":"JPY","availability":"https://schema.org/InStock","@type":"Offer","price":"500"},"brand":{"@type":"Brand","name":"YORIMIYA STUDIO","url":"https://yorimiya.booth.pm/"},"image":"https://booth.pximg.net/x.jpg"}</script></head></html>"#;
+        assert_eq!(parse_item_brand(html).as_deref(), Some("YORIMIYA STUDIO"));
+        // brand が無い / JSON-LD が無いページは None
+        assert_eq!(parse_item_brand("<html></html>"), None);
+        assert_eq!(
+            parse_item_brand(r#"<script type="application/ld+json">{"@type":"Product"}</script>"#),
+            None
+        );
+        // 壊れた JSON-LD はスキップし、前後の空白は trim する
+        let mixed = r#"<script type="application/ld+json">{broken</script><script type="application/ld+json">{"brand":{"name":"  SPACED  "}}</script>"#;
+        assert_eq!(parse_item_brand(mixed).as_deref(), Some("SPACED"));
+    }
+
+    /// 商品ページから**作者名**を抽出する。優先順位:
+    /// 1. ショップ情報の `user-avatar` の `title`（= ショップページの表示名。実ページで `YORIMIYA`）
+    /// 2. `div.shop-name` のアンカーテキスト（ショップ名）
+    /// 3. JSON-LD の `brand.name`
+    #[test]
+    fn parse_item_author_prefers_shop_display_name() {
+        // 実ページ（items/7825209）のショップ情報ブロックと同じ形。
+        // ショップ名アンカーは "YORIMIYA STUDIO" だが、作者名は avatar の title "YORIMIYA"
+        let html = r#"<div class="shop-info flex items-center"><div class="shop-items-owner-info"><a href="https://yorimiya.booth.pm/"><div class="user-avatar" style="background-image: url(https://booth.pximg.net/x.jpg)" title="YORIMIYA"></div></a></div><div class="shop-name overflow-hidden"><a class="nav u-tpg-title2" href="https://yorimiya.booth.pm/">YORIMIYA STUDIO</a></div></div>"#;
+        assert_eq!(parse_item_author(html).as_deref(), Some("YORIMIYA"));
+        // avatar が無ければショップ名アンカー
+        let shop_only = r#"<div class="shop-name overflow-hidden"><a class="nav u-tpg-title2" href="https://x.booth.pm/">カンバスそらりすのbooth</a></div>"#;
+        assert_eq!(
+            parse_item_author(shop_only).as_deref(),
+            Some("カンバスそらりすのbooth")
+        );
+        // どちらも無ければ JSON-LD の brand.name
+        let brand_only =
+            r#"<script type="application/ld+json">{"brand":{"name":"BRAND NAME"}}</script>"#;
+        assert_eq!(parse_item_author(brand_only).as_deref(), Some("BRAND NAME"));
+        assert_eq!(parse_item_author("<html></html>"), None);
     }
 
     #[test]

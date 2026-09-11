@@ -160,6 +160,8 @@ pub struct BookshelfView {
     cover_fetch_retried: bool,
     /// 取り込み確認モーダル（§6.3。曖昧な構造のときだけ出る）
     pending_import: Option<PendingImport>,
+    /// 表紙取得中で開始できなかったダウンロード（取得完了後に実行する）
+    pending_download: Option<bookshelf::BookshelfItem>,
     auto_download_started: bool,
     /// フィルタ済みカードのインデックス（List 仮想化用キャッシュ）
     filtered: Vec<usize>,
@@ -419,6 +421,7 @@ impl BookshelfView {
             fetching_covers: false,
             cover_fetch_retried: false,
             pending_import: None,
+            pending_download: None,
             auto_download_started: false,
             filtered: Vec::new(),
             filtered_dirty: true,
@@ -1110,6 +1113,14 @@ impl BookshelfView {
             log::info!("fetch_remote_covers 完了: 成功 {ok} 件 / 失敗 {fail} 件");
             handle.update(cx, |this, cx| {
                 this.fetching_covers = false;
+                // 表紙取得中に要求された再取得をここで実行する。
+                // 同期中（sync_busy > 0）は download_item が無視するので保留したままにする
+                // （同期後の reload でも表紙取得が走るため、その完了時に実行される）。
+                if this.sync_busy == 0
+                    && let Some(item) = this.pending_download.take()
+                {
+                    this.download_item(cx, item);
+                }
                 // 同期 reload のタイミングで後からカードが増えた場合
                 // （例: BOOTH 完了 → reload → fetch 後に技術書典 307 件が reload される）、
                 // 残っているカードの表紙を取得するため 1 回だけ再実行する
@@ -1736,6 +1747,13 @@ impl BookshelfView {
                     let session =
                         booth_session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
                     let client = BoothClient::new(&session);
+                    // 作者（ショップページの表示名）を商品ページから取得する。
+                    // 商品詳細 API の `shop.name` はサークル名なので使わない（作者名は
+                    // ショップ情報の avatar title）。公開 HTML から取れるので権限・CF にも依存しない。
+                    site_author = product_id
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|id| client.item_author(id).ok().flatten());
                     let url = item.download_url.as_deref().unwrap_or_default().to_string();
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
@@ -1946,6 +1964,16 @@ impl BookshelfView {
                     // 本棚の bookshelf_items.database_id と対応付け、カードを
                     // 「ダウンロード済み」として表示・ビューアーで開けるようにする。
                     let _ = books::set_tbf_product_id(&db, &imported.book.id, &product_id);
+                    // サイト側のメタ（作者名・サークル名・購入日）を反映する。
+                    // PDF 経路にも必要（無いと BOOTH / FANZA / DLsite の PDF で作者が入らない）。
+                    apply_site_metadata(
+                        &db,
+                        &site_id,
+                        &product_id,
+                        &imported.book.id,
+                        &item,
+                        site_author.as_deref(),
+                    );
                     // ダウンロード直後からページ数を表示できるように
                     // reading_progress（未読・総ページ数）を作成する。
                     if imported.document.total_pages > 0 {
@@ -2034,52 +2062,31 @@ impl BookshelfView {
                             let _ = books::set_site_id(&db, &imported.book.id, &site_id);
                         }
                         let _ = books::set_tbf_product_id(&db, &imported.book.id, &product_id);
-                        // FANZA: インポート後にリモートメタ（タイトル/サークル/購入日）を補完する
-                        //（インポートはファイル名由来で作るため空になる）
-                        if site_id == "fanza" {
-                            let _ = books::set_metadata(
-                                &db,
-                                &imported.book.id,
-                                &item.title,
-                                site_author.as_deref().unwrap_or(""),
-                                &item.circle_name,
-                                item.caused_at.clone(),
-                            );
-                            // カードの「作者:」絞り込み用に本棚アイテムへも書く
-                            if let Some(author) = site_author.as_deref() {
-                                let _ =
-                                    bookshelf::update_author(&db, "fanza", &product_id, author);
-                            }
-                            // サイトから取得したジャンルタグを book_tags に保存する
-                            if !genre_tags.is_empty() {
-                                let pairs: Vec<(&str, &str)> = genre_tags
-                                    .iter()
-                                    .map(|t| (t.as_str(), "fanza_genre"))
-                                    .collect();
-                                let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
-                                // 本棚アイテムの tags_json にも書く（owned フィルタで
-                                // local が外れてもカードに表示できるように）
-                                let _ =
-                                    bookshelf::update_tags(&db, "fanza", &product_id, &genre_tags);
-                            }
+                        // BOOTH / FANZA / DLsite: インポート後にサイト側のメタ
+                        //（タイトル・作者名・サークル名・購入日）を反映する
+                        apply_site_metadata(
+                            &db,
+                            &site_id,
+                            &product_id,
+                            &imported.book.id,
+                            &item,
+                            site_author.as_deref(),
+                        );
+                        // FANZA: サイトから取得したジャンルタグを book_tags に保存する
+                        if site_id == "fanza" && !genre_tags.is_empty() {
+                            let pairs: Vec<(&str, &str)> = genre_tags
+                                .iter()
+                                .map(|t| (t.as_str(), "fanza_genre"))
+                                .collect();
+                            let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
+                            // 本棚アイテムの tags_json にも書く（owned フィルタで
+                            // local が外れてもカードに表示できるように）
+                            let _ = bookshelf::update_tags(&db, "fanza", &product_id, &genre_tags);
                         }
                         // DLsite: インポート後に共有メタ列（media_category / ai_type / is_drm /
                         // release_date / maker_id / age_rating / series_name）とカスタムジャンル
                         // （tags_json）を books / book_tags へ反映する。
                         if site_id == "dlsite" {
-                            let _ = books::set_metadata(
-                                &db,
-                                &imported.book.id,
-                                &item.title,
-                                site_author.as_deref().unwrap_or(""),
-                                &item.circle_name,
-                                item.caused_at.clone(),
-                            );
-                            // カードの「作者:」絞り込み用に本棚アイテムへも書く
-                            if let Some(author) = site_author.as_deref() {
-                                let _ =
-                                    bookshelf::update_author(&db, "dlsite", &product_id, author);
-                            }
                             let _ = books::set_source_metadata(
                                 &db,
                                 &imported.book.id,
@@ -2342,28 +2349,17 @@ impl BookshelfView {
             let path = state.packs_dir.join(format!("{}.opfspack", local.book.id));
             let _ = std::fs::remove_file(path);
         }
-        // 表紙キャッシュも破棄して再取得させる（reload の fetch_remote_covers が
-        // thumbnail_url から取り直す）。キャッシュファイル + カードの cover をクリア。
-        if !card.shelf.site_id.is_empty() {
-            let thumbnails_dir = state.data_dir.join("thumbnails");
-            let cache_path = cover_cache_path(
-                &thumbnails_dir,
-                &card.shelf.site_id,
-                &card.shelf.database_id,
-            );
-            let _ = std::fs::remove_file(&cache_path);
-            remove_legacy_cover_cache(
-                &thumbnails_dir,
-                &card.shelf.site_id,
-                &card.shelf.database_id,
-            );
-            if let Some(slot) = self.shelf_cards.iter_mut().find(|c| {
-                c.shelf.site_id == card.shelf.site_id
-                    && c.shelf.database_id == card.shelf.database_id
-            }) {
-                slot.cover = None;
-                slot.cover_fetch_failed = false;
-            }
+        // カードの表紙は**クリアしない**。クリアすると `matches_filter` が
+        // 「ローカル無し + 表紙無し + thumbnail_url あり」でカードを隠すため、
+        // 再取得中にカードが消える（表紙を再取得するまで戻らない）。
+        // 再取得が成功すれば pack の表紙が reload で読み直され、失敗しても元の表紙が残る。
+        //
+        // 表紙取得中・同期中は `download_item` が無視するため、完了後に実行するよう積む。
+        if self.fetching_covers || self.sync_busy > 0 {
+            self.pending_download = Some(card.shelf.clone());
+            self.toast = Some("表紙の取得後に再取得します".into());
+            cx.notify();
+            return;
         }
         self.download_item(cx, card.shelf.clone());
         self.toast = Some("再取得を開始しました".into());
@@ -4911,6 +4907,46 @@ const LIST_COVER_ASPECT: f32 = 3.0 / 2.0;
 /// 表紙が無いときのエリアの下限の高さ（行の高さは通常これより高い）。
 const LIST_COVER_MIN_H: f32 = 108.0;
 
+/// インポート直後に**サイト側のメタ**（タイトル / 作者名 / サークル名 / 購入日）を
+/// `books` と `bookshelf_items` に反映する。
+///
+/// PDF とそれ以外の**両方の取り込み経路**から呼ぶ。PDF 経路にこの処理が無く、
+/// BOOTH / FANZA / DLsite の PDF で作者名が入らない不具合があった。
+/// 対象サイト以外（技術書典など）は何もしない。
+fn apply_site_metadata(
+    db: &db::SqlitePool,
+    site_id: &str,
+    product_id: &str,
+    book_id: &str,
+    item: &bookshelf::BookshelfItem,
+    site_author: Option<&str>,
+) {
+    if !matches!(site_id, "booth" | "fanza" | "dlsite") {
+        return;
+    }
+    // 作者名が取れなかったときは既存の author を残す（空文字で消さない）
+    let author = match site_author {
+        Some(author) => author.to_string(),
+        None => books::get(db, book_id)
+            .ok()
+            .flatten()
+            .map(|book| book.author)
+            .unwrap_or_default(),
+    };
+    let _ = books::set_metadata(
+        db,
+        book_id,
+        &item.title,
+        &author,
+        &item.circle_name,
+        item.caused_at.clone(),
+    );
+    // カードの「作者:」絞り込み用に本棚アイテムへも書く
+    if let Some(author) = site_author {
+        let _ = bookshelf::update_author(db, site_id, product_id, author);
+    }
+}
+
 /// 表紙画像を枠（`box_w` × `box_h`）に比率を保って収めた描画サイズを返す。
 /// 横長は幅いっぱい（高さは比率なり）、縦長は高さいっぱい（幅は比率なり）になる。
 /// 枠に合わせて拡大すると縦長の上下が切れるため、カード / リスト共通で使う。
@@ -5294,6 +5330,124 @@ mod tests {
     use thundoku_core::db::{books, progress};
 
     use super::*;
+
+    /// サイトを指定して本棚アイテムを seed する（`seed_shelf_item` は技術書典固定のため）。
+    fn seed_shelf_item_for_site(
+        cx: &mut TestAppContext,
+        site_id: &str,
+        database_id: &str,
+        title: &str,
+        circle: &str,
+    ) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            bookshelf::upsert(
+                db,
+                &bookshelf::BookshelfItem {
+                    site_id: site_id.into(),
+                    database_id: database_id.into(),
+                    title: title.into(),
+                    circle_name: circle.into(),
+                    author: String::new(),
+                    thumbnail_url: None,
+                    format: "PDF".into(),
+                    caused_at: None,
+                    event_name: None,
+                    event_slug: None,
+                    event_id: None,
+                    file_name: None,
+                    download_url: None,
+                    is_downloadable: 1,
+                    is_checked: 0,
+                    is_purchased: 1,
+                    is_new: 0,
+                    is_active: 1,
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    hidden_at: None,
+                    tags_json: None,
+                    synced_at: "2026-08-21 00:00:00".into(),
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    /// サイト側メタ（作者名）の反映は PDF / それ以外の両経路で同じ関数を通る。
+    /// 以前は PDF 経路に処理が無く、BOOTH / FANZA / DLsite の PDF で作者が入らなかった。
+    #[gpui_kit::test]
+    async fn apply_site_metadata_writes_author_for_supported_sites(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item_for_site(cx, "booth", "7825209", "本1", "YORIMIYA STUDIO");
+        seed_book(cx, "book-1", "本1", "YORIMIYA STUDIO");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            let item = bookshelf::list(db, "booth").unwrap().remove(0);
+            // 作者名が取れたとき: books にも本棚アイテムにも入る
+            apply_site_metadata(db, "booth", "7825209", "book-1", &item, Some("YORIMIYA"));
+            assert_eq!(
+                books::get(db, "book-1").unwrap().unwrap().author,
+                "YORIMIYA",
+                "books.author に作者名が入ること（PDF 経路の不具合の回帰）"
+            );
+            assert_eq!(
+                bookshelf::list(db, "booth").unwrap()[0].author,
+                "YORIMIYA",
+                "本棚カードの author も更新されること"
+            );
+            // 作者名が取れなかったとき: 既存の author を消さない
+            apply_site_metadata(db, "booth", "7825209", "book-1", &item, None);
+            assert_eq!(
+                books::get(db, "book-1").unwrap().unwrap().author,
+                "YORIMIYA",
+                "作者が取れなくても既存を消さない"
+            );
+            // 対象外サイト（技術書典）は何もしない
+            apply_site_metadata(db, "techbookfest", "db-1", "book-1", &item, Some("X"));
+            assert_eq!(books::get(db, "book-1").unwrap().unwrap().author, "YORIMIYA");
+        });
+    }
+
+    /// 再取得は**カードの表紙を消さない**（消すと `matches_filter` が
+    /// 「ローカル無し + 表紙無し + thumbnail_url あり」でカードを隠し、カードが消える）。
+    /// また表紙取得中は `download_item` が無視するため、完了後に実行するようキューに積む。
+    #[gpui_kit::test]
+    async fn redownload_keeps_cover_and_queues_while_busy(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                // 表紙を持たせ、表紙取得中（busy）の状態にする
+                this.shelf_cards[0].cover = Some(test_cover_image(400, 600));
+                this.fetching_covers = true;
+                let card = this.shelf_cards[0].clone();
+                this.redownload_item(cx, &card);
+                assert!(
+                    this.shelf_cards[0].cover.is_some(),
+                    "再取得でカードの表紙を消さない（消すとカードが隠れる）"
+                );
+                assert!(
+                    this.pending_download.is_some(),
+                    "表紙取得中は開始できないのでキューに積む"
+                );
+            });
+        });
+    }
 
     #[test]
     fn sniff_extension_detects_zip_and_pdf() {
