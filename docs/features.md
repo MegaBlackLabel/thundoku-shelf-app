@@ -443,6 +443,14 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
     `books_delete_removes_dependent_rows` / `redownload_keeps_local_book_row` /
     `seed_progress_if_absent_keeps_reading_position`
 
+- [ ] **リスト形式表示の改修**
+  - **縦長画像と横幅画像でガタついて出ているのを直す**
+    （表紙エリアの幅が画像の比率で変わるため、テキストの開始位置が行ごとにずれる）
+  - **未読 / 既読 / お気に入り / ダウンロード済みはサムネイルに載せないで、リストに組み込む**
+    （画像の上に重ねず、行の情報として表示する）
+  - **タグ情報を大きく見やすく出す**
+  - **同一サークル / 同一作者の本について、リンクを出す**（出し方は検討する）
+
 - [x] **閲覧情報を 1 ページ毎の閲覧回数・時間も記録する**（実装済み）
   - 現在の `view_history` は `id, book_id, started_at, ended_at` のみで、書籍単位の
     閲覧セッション（開始・終了時刻）しか記録していない
