@@ -1974,27 +1974,9 @@ impl BookshelfView {
                         &item,
                         site_author.as_deref(),
                     );
-                    // ダウンロード直後からページ数を表示できるように
-                    // reading_progress（未読・総ページ数）を作成する。
-                    if imported.document.total_pages > 0 {
-                        let seeded_content = db::contents::primary_for_book(&db, &imported.book.id)
-                            .ok()
-                            .flatten()
-                            .map(|content| content.content_id)
-                            .unwrap_or_default();
-                        let _ = progress::upsert(
-                            &db,
-                            &progress::ReadingProgress {
-                                book_id: imported.book.id.clone(),
-                                content_id: seeded_content,
-                                current_page: 0,
-                                total_pages: Some(imported.document.total_pages),
-                                finished_at: None,
-                                last_read_at: "2026-01-01 00:00:00".to_string(),
-                                scroll_position: 0.0,
-                            },
-                        );
-                    }
+                    // ダウンロード直後からページ数を表示できるように進捗行を作る
+                    // （既にあるときは触らない = 再取得で読書位置を消さない）
+                    seed_progress_if_absent(&db, &imported.book.id, imported.document.total_pages);
                     // タグ取得が OFF なら自動生成タグを取り除く（Web 版の
                     // disableTagGeneration 相当）。
                     if !tag_fetch_enabled {
@@ -2114,26 +2096,12 @@ impl BookshelfView {
                                 }
                             }
                         }
-                        if imported.document.total_pages > 0 {
-                            let seeded_content =
-                                db::contents::primary_for_book(&db, &imported.book.id)
-                                    .ok()
-                                    .flatten()
-                                    .map(|content| content.content_id)
-                                    .unwrap_or_default();
-                            let _ = progress::upsert(
-                                &db,
-                                &progress::ReadingProgress {
-                                    book_id: imported.book.id.clone(),
-                                    content_id: seeded_content,
-                                    current_page: 0,
-                                    total_pages: Some(imported.document.total_pages),
-                                    finished_at: None,
-                                    last_read_at: "2026-01-01 00:00:00".to_string(),
-                                    scroll_position: 0.0,
-                                },
-                            );
-                        }
+                        // 進捗行は既にあるときは触らない（再取得で読書位置を消さない）
+                        seed_progress_if_absent(
+                            &db,
+                            &imported.book.id,
+                            imported.document.total_pages,
+                        );
                         if !tag_fetch_enabled {
                             let _ = db::tags::delete_generated(&db, &imported.book.id);
                         }
@@ -2339,22 +2307,16 @@ impl BookshelfView {
     }
 
     /// 本を再ダウンロードする（コンテキストメニューの「再取得」）。
-    /// 既にローカルに持っている場合は pack ごと削除してから再取得する。
+    ///
+    /// **ローカルの本は消さない**。取り込みは同じ `book_id` を再利用し、コンテンツの
+    /// `content_id` と名前（カスタム名）・進捗・タグを維持したまま pack とページを作り直す
+    /// （削除してしまうと、その本に紐づくタグ・進捗・閲覧履歴が失われる）。
     pub(crate) fn redownload_item(&mut self, cx: &mut Context<Self>, card: &ShelfCard) {
-        let state = Self::app_state(cx);
-        if let Some(local) = &card.local {
-            let db = &state.db_pool;
-            let _ = progress::delete(db, &local.book.id);
-            let _ = books::delete(db, &local.book.id);
-            let path = state.packs_dir.join(format!("{}.opfspack", local.book.id));
-            let _ = std::fs::remove_file(path);
-        }
-        // カードの表紙は**クリアしない**。クリアすると `matches_filter` が
+        // 表紙は消さない。消すと `matches_filter` が
         // 「ローカル無し + 表紙無し + thumbnail_url あり」でカードを隠すため、
-        // 再取得中にカードが消える（表紙を再取得するまで戻らない）。
-        // 再取得が成功すれば pack の表紙が reload で読み直され、失敗しても元の表紙が残る。
+        // 再取得中にカードが消える（再取得後は pack の表紙が reload で入る）。
         //
-        // 表紙取得中・同期中は `download_item` が無視するため、完了後に実行するよう積む。
+        // 表紙取得中・同期中は `download_item` が無視するので、完了後に実行するよう積む。
         if self.fetching_covers || self.sync_busy > 0 {
             self.pending_download = Some(card.shelf.clone());
             self.toast = Some("表紙の取得後に再取得します".into());
@@ -4947,6 +4909,40 @@ fn apply_site_metadata(
     }
 }
 
+/// ページ数表示用の進捗行を、**まだ無いときだけ**作る。
+///
+/// 再取得（同じ `book_id`・同じ `content_id` を再利用する取り込み）で読書位置を
+/// 消さないため、既存行は上書きしない（`progress::upsert` は `current_page` を上書きする）。
+fn seed_progress_if_absent(db: &db::SqlitePool, book_id: &str, total_pages: i64) {
+    if total_pages <= 0 {
+        return;
+    }
+    let content_id = db::contents::primary_for_book(db, book_id)
+        .ok()
+        .flatten()
+        .map(|content| content.content_id)
+        .unwrap_or_default();
+    if progress::get_for(db, book_id, &content_id)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+    let _ = progress::upsert(
+        db,
+        &progress::ReadingProgress {
+            book_id: book_id.to_string(),
+            content_id,
+            current_page: 0,
+            total_pages: Some(total_pages),
+            finished_at: None,
+            last_read_at: "2026-01-01 00:00:00".to_string(),
+            scroll_position: 0.0,
+        },
+    );
+}
+
 /// 表紙画像を枠（`box_w` × `box_h`）に比率を保って収めた描画サイズを返す。
 /// 横長は幅いっぱい（高さは比率なり）、縦長は高さいっぱい（幅は比率なり）になる。
 /// 枠に合わせて拡大すると縦長の上下が切れるため、カード / リスト共通で使う。
@@ -5446,6 +5442,81 @@ mod tests {
                     "表紙取得中は開始できないのでキューに積む"
                 );
             });
+        });
+    }
+
+    /// 再取得はローカルの本を削除しない（同じ `book_id` を再利用して、タグ・進捗・
+    /// コンテンツの `content_id`・カスタム名を維持する）。
+    #[gpui_kit::test]
+    async fn redownload_keeps_local_book_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "book-1", "本1", "サークルA");
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            // ローカル本と本棚アイテムを紐づける（カードがローカルとして認識される）
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = 'db-1' WHERE id = 'book-1'")
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
+            db::tags::set_for_book(db, "book-1", &[("タグA", "manual")]).unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let card = this.shelf_cards[0].clone();
+                assert!(card.local.is_some(), "ローカル本として認識されること");
+                // 表紙取得中にしておく（ダウンロードは開始せずキューに積む）
+                this.fetching_covers = true;
+                this.redownload_item(cx, &card);
+            });
+        });
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            assert!(
+                books::get(db, "book-1").unwrap().is_some(),
+                "再取得でローカルの本を削除しない"
+            );
+            assert!(
+                !db::tags::list_for_book(db, "book-1").unwrap().is_empty(),
+                "タグも残ること"
+            );
+        });
+    }
+
+    /// 進捗行は**無いときだけ**作る（再取得で読書位置を消さない）。
+    #[gpui_kit::test]
+    async fn seed_progress_if_absent_keeps_reading_position(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "book-1", "本1", "サークルA");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            // 未作成なら作られる
+            seed_progress_if_absent(db, "book-1", 16);
+            let seeded = progress::get_for(db, "book-1", "").unwrap().unwrap();
+            assert_eq!(seeded.current_page, 0);
+            assert_eq!(seeded.total_pages, Some(16));
+            // 読書位置を進める
+            let advanced = progress::ReadingProgress {
+                current_page: 7,
+                last_read_at: "2026-09-12 00:00:00".to_string(),
+                ..seeded
+            };
+            progress::upsert(db, &advanced).unwrap();
+            // 再取得相当（もう一度 seed）でも読書位置は残る
+            seed_progress_if_absent(db, "book-1", 16);
+            assert_eq!(
+                progress::get_for(db, "book-1", "")
+                    .unwrap()
+                    .unwrap()
+                    .current_page,
+                7,
+                "再取得で読書位置を消さない"
+            );
         });
     }
 
