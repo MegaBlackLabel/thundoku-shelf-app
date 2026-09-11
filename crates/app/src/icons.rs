@@ -8,8 +8,8 @@
 
 use std::borrow::Cow;
 
-use gpui_kit::{AssetSource, Result, SharedString};
 use gpui_kit::component::IconNamed;
+use gpui_kit::{AssetSource, Result, SharedString};
 
 /// Web 版で使われている lucide アイコンのうち、gpui-component に無いもの。
 #[derive(Clone, Copy)]
@@ -48,6 +48,8 @@ pub enum AppIcon {
     Monitor,
     /// データベース（DatabaseIcon）
     Database,
+    /// 名前の変更（Pencil）
+    Pencil,
 }
 
 impl IconNamed for AppIcon {
@@ -70,6 +72,7 @@ impl IconNamed for AppIcon {
             Self::Moon => "icons/moon.svg".into(),
             Self::Monitor => "icons/monitor.svg".into(),
             Self::Database => "icons/database.svg".into(),
+            Self::Pencil => "icons/pencil.svg".into(),
         }
     }
 }
@@ -110,6 +113,45 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
         "icons/sun.svg" => Some(include_bytes!("../assets/icons/sun.svg")),
         "icons/moon.svg" => Some(include_bytes!("../assets/icons/moon.svg")),
         "icons/monitor.svg" => Some(include_bytes!("../assets/icons/monitor.svg")),
+        "icons/pencil.svg" => Some(include_bytes!("../assets/icons/pencil.svg")),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// パス文字列（`IconNamed::path`）と `custom_icon` の対応がずれると
+    /// アイコンが無言で出なくなるため、実アセットが引けることを確かめる。
+    #[test]
+    fn every_app_icon_resolves_to_an_asset() {
+        let icons = [
+            AppIcon::BookMarked,
+            AppIcon::LibraryBig,
+            AppIcon::ListChecks,
+            AppIcon::RefreshCw,
+            AppIcon::LayoutGrid,
+            AppIcon::List,
+            AppIcon::CircleUserRound,
+            AppIcon::LogIn,
+            AppIcon::LogOut,
+            AppIcon::Download,
+            AppIcon::Tag,
+            AppIcon::HardDrive,
+            AppIcon::Cloud,
+            AppIcon::Sun,
+            AppIcon::Moon,
+            AppIcon::Monitor,
+            AppIcon::Database,
+            AppIcon::Pencil,
+        ];
+        for icon in icons {
+            let path = icon.path();
+            // アプリ固有のアイコン（custom_icon）と gpui-kit 標準の両方が対象。
+            // 実際の解決経路（AppAssets）で引けることを確かめる。
+            let loaded = AppAssets.load(&path).expect("asset load");
+            assert!(loaded.is_some(), "アセットが引けない: {path}");
+        }
     }
 }

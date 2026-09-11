@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::Focusable as _;
 use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::animation::ease_out_cubic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -25,6 +26,7 @@ use gpui_kit::{
 use thundoku_core::db;
 
 use crate::actions::CloseReader;
+use crate::icons::AppIcon;
 use thundoku_core::db::documents::DocumentImage;
 
 pub const AUTOPLAY_MIN_MS: u64 = 3000;
@@ -599,7 +601,7 @@ impl ImageViewer {
         let input = match self.rename_input.clone() {
             Some(input) => input,
             None => {
-                let input = cx.new(|cx| InputState::new(window, cx).placeholder("名前"));
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("タイトル"));
                 self._rename_subscription = Some(cx.subscribe(
                     &input,
                     |this: &mut Self, _: Entity<InputState>, event: &InputEvent, cx| {
@@ -613,7 +615,9 @@ impl ImageViewer {
             }
         };
         input.update(cx, |state, cx| state.set_value(current, window, cx));
+        // 表示しただけでは入力できない。フォーカスを移して（IME 含む）入力を受け取れるようにする
         self.renaming_content = Some(content_id.to_string());
+        window.focus(&input.read(cx).focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -863,7 +867,7 @@ impl ImageViewer {
                         .child(div().text_xs().child("表示中")),
                 )
             })
-            // 名前（コンテンツ名のカスタム。同じコンテンツの全レンディション行に出る）
+            // 鉛筆（タイトルの変更。同じコンテンツの全レンディション行に出る）
             .when(!content_id.is_empty() && !renaming, |el| {
                 el.child(
                     div()
@@ -889,10 +893,9 @@ impl ImageViewer {
                             });
                         })
                         .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .child("名前"),
+                            Icon::new(AppIcon::Pencil)
+                                .size(px(14.0))
+                                .text_color(cx.theme().muted_foreground),
                         ),
                 )
             })
@@ -1845,7 +1848,15 @@ impl ImageViewer {
 impl Render for ImageViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_panel_states(window, cx);
-        if !self.focus_handle.is_focused(window) {
+        // 入力（タイトル変更・ページ番号）にフォーカスがあるときは奪い返さない。
+        // 毎フレーム奪うと、開いた入力に 1 文字も打てない（次の描画でフォーカスが外れる）。
+        // メニューはビューアーのページ領域とは別のサブツリーに描かれるため、
+        // `contains_focused` では判定できない（トラックしているのはページ領域側）。
+        let input_focused = [self.rename_input.as_ref(), self.page_input.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        if !input_focused && !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
         let total = self.loader.page_count();
@@ -3562,7 +3573,7 @@ mod tests {
         });
         assert!(
             visual.debug_bounds("viewer-switch-rename-0").is_some(),
-            "メニューの行に「名前」ボタンが出ること"
+            "メニューの行に「タイトル変更」ボタンが出ること"
         );
 
         // 編集中は「名前」ボタンが入力に差し替わる
@@ -3579,8 +3590,19 @@ mod tests {
         );
         assert!(
             visual.debug_bounds("viewer-switch-rename-0").is_none(),
-            "編集中は「名前」ボタンを出さないこと"
+            "編集中は「タイトル変更」ボタンを出さないこと"
         );
+        // 開始直後に入力へフォーカスが当たっている（そのまま日本語入力できる）
+        let focused = visual.update(|window, cx| {
+            view.read(cx)
+                .rename_input
+                .as_ref()
+                .expect("rename input")
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(focused, "タイトル変更の入力にフォーカスが当たること");
     }
 
     #[gpui_kit::test]
