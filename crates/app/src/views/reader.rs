@@ -389,36 +389,16 @@ impl ReaderView {
         // 復号 + 再圧縮は重く、UI スレッドを止められないため。
         cx.background_executor()
             .spawn(async move {
-            let Ok(Some(book)) = db::books::get(&db, &book_id) else {
-                return;
-            };
-            let pack_id = book.pack_id.clone().unwrap_or_else(|| book.id.clone());
-            let path = packs_dir.join(format!("{pack_id}.opfspack"));
-            // 未ダウンロードの本は pack が無い（DB の名前だけが正）
-            let Ok(bytes) = std::fs::read(&path) else {
-                return;
-            };
-            // 読み出しと同じ identity（`PackPageLoader` と同じ pack_id = book_id）で復号する
-            let identity = sub.map(|sub| opfspack::Identity {
-                sub,
-                pack_id: book_id.clone(),
-            });
-            match thundoku_core::import::rename_content_in_pack(
-                &bytes,
-                &content_id,
-                &display_name,
-                identity.as_ref(),
-            ) {
-                Ok(Some(rewritten)) => {
-                    if let Err(error) = std::fs::write(&path, &rewritten) {
-                        log::warn!("pack の名前書き換えに失敗: {path:?}: {error}");
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => log::warn!("pack の名前書き換えに失敗: {path:?}: {error}"),
-            }
-        })
-        .detach();
+                rewrite_pack_content_name_sync(
+                    &db,
+                    &packs_dir,
+                    sub,
+                    &book_id,
+                    &content_id,
+                    &display_name,
+                );
+            })
+            .detach();
     }
 
     /// ページ一覧用のコンテンツ一覧を DB から読み直してビューアに渡す。
@@ -510,6 +490,48 @@ impl ReaderView {
                 scroll_position: 0.0,
             },
         );
+    }
+}
+
+/// pack の `metadata.json` に記録された表示名を書き換える（同期・重い処理の本体）。
+///
+/// 全エントリを復号 → 再圧縮して組み直すため、アプリからは背景 executor 経由で呼ぶ。
+/// テストが決定的に検証できるよう、I/O まで含めて関数として切り出している。
+fn rewrite_pack_content_name_sync(
+    db: &thundoku_core::db::SqlitePool,
+    packs_dir: &std::path::Path,
+    sub: Option<String>,
+    book_id: &str,
+    content_id: &str,
+    display_name: &str,
+) {
+    let Ok(Some(book)) = db::books::get(db, book_id) else {
+        return;
+    };
+    let pack_id = book.pack_id.clone().unwrap_or_else(|| book.id.clone());
+    let path = packs_dir.join(format!("{pack_id}.opfspack"));
+    // 未ダウンロードの本は pack が無い（DB の名前だけが正）
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    // 読み出しと同じ identity（`PackPageLoader` と同じ pack_id = book_id）で復号する
+    let identity = sub.map(|sub| opfspack::Identity {
+        sub,
+        pack_id: book_id.to_string(),
+    });
+    match thundoku_core::import::rename_content_in_pack(
+        &bytes,
+        content_id,
+        display_name,
+        identity.as_ref(),
+    ) {
+        Ok(Some(rewritten)) => {
+            if let Err(error) = std::fs::write(&path, &rewritten) {
+                log::warn!("pack の名前書き換えに失敗: {path:?}: {error}");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => log::warn!("pack の名前書き換えに失敗: {path:?}: {error}"),
     }
 }
 
@@ -946,6 +968,19 @@ mod tests {
         let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
         cx.update(|cx| viewer.update(cx, |v, cx| v.rename_content(cx, "c-sub", "続編")));
         cx.run_until_parked();
+        // DB の更新を確認したうえで、pack の書き換え本体を同期で実行する
+        // （アプリでは背景 executor から同じ関数を呼ぶ。待ち合わせで揺れないように）
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            rewrite_pack_content_name_sync(
+                &state.db_pool,
+                &state.packs_dir,
+                None,
+                "b13",
+                "c-sub",
+                "続編",
+            );
+        });
 
         // pack の metadata.json も書き換わっている（Drive 復元で名前が戻らない）
         let bytes = std::fs::read(packs_dir.join("b13.opfspack")).unwrap();
