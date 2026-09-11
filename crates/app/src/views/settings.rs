@@ -25,6 +25,9 @@ use thundoku_core::tbf::UreqTransport;
 
 use crate::actions::OpenAuthProvider;
 use crate::app_state::AppState;
+use crate::views::bookshelf::{
+    cover_cache_path, fetch_cover_bytes, remove_legacy_cover_cache, write_cover_cache,
+};
 
 /// 本棚の表示状態（非表示フラグ等）が変わったことを通知するイベント
 #[derive(Clone, Copy)]
@@ -41,6 +44,8 @@ pub struct SettingsView {
     hidden_items: Vec<thundoku_core::db::bookshelf::BookshelfItem>,
     /// 非表示リストの表紙取得の進行中フラグ（二重実行防止）
     fetch_covers_in_progress: bool,
+    /// 表紙を再取得中のサイト（設定の「表紙更新」。二重実行防止）
+    cover_refresh_site: Option<&'static str>,
     confirm_delete: bool,
     /// 保存先変更で選択された新しいデータディレクトリ（移動確認用）
     pending_data_dir: Option<std::path::PathBuf>,
@@ -91,6 +96,7 @@ impl SettingsView {
             error: None,
             hidden_items: Vec::new(),
             fetch_covers_in_progress: false,
+            cover_refresh_site: None,
             confirm_delete: false,
             pending_data_dir: None,
             confirm_data_dir: false,
@@ -260,6 +266,142 @@ impl SettingsView {
         self.book_count = books.len();
     }
 
+    /// そのサイトの表紙キャッシュを捨てて取り直す（設定の「表紙更新」）。
+    ///
+    /// 本棚の表紙取得と同じ URL 規則（`fetch_cover_bytes`）とキャッシュ形式を使う。
+    /// 取得は 4 並列の専用スレッドで行い、完了したら本棚を読み直して反映する。
+    fn refresh_site_covers(&mut self, site_id: &'static str, cx: &mut Context<Self>) {
+        if self.cover_refresh_site.is_some() {
+            self.show_toast("表紙を取得中です（完了後にもう一度）", cx);
+            return;
+        }
+        let state = AppState::global(cx);
+        let db = state.db_pool.clone();
+        let thumbnails_dir = state.data_dir.join("thumbnails");
+        let booth_session = state.booth_session.lock().clone();
+        let tbf_client = state.tbf.clone();
+        let targets: Vec<(String, String)> = db::bookshelf::list_all(&db)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| {
+                item.site_id == site_id
+                    && item
+                        .thumbnail_url
+                        .as_deref()
+                        .is_some_and(|url| !url.is_empty())
+            })
+            .filter_map(|item| item.thumbnail_url.map(|url| (item.database_id, url)))
+            .collect();
+        if targets.is_empty() {
+            self.show_toast("表紙を持つ本がありません", cx);
+            return;
+        }
+        // このサイトのキャッシュを捨てる（次の取得で作り直す）
+        for (database_id, _) in &targets {
+            let _ = std::fs::remove_file(cover_cache_path(&thumbnails_dir, site_id, database_id));
+            remove_legacy_cover_cache(&thumbnails_dir, site_id, database_id);
+        }
+        self.cover_refresh_site = Some(site_id);
+        self.show_toast(
+            format!("表紙を再取得しています（{} 件）", targets.len()),
+            cx,
+        );
+
+        // 完了後に本棚を読み直すための弱参照（spawn 内では AppState を引けないため先に取る）
+        let workspace = AppState::global(cx).workspace.lock().clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, usize)>();
+        std::thread::spawn(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(5))
+                .timeout_read(std::time::Duration::from_secs(15))
+                .build();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let ok = std::sync::atomic::AtomicUsize::new(0);
+            let failed = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let next = &next;
+                    let agent = &agent;
+                    let targets = &targets;
+                    let ok = &ok;
+                    let failed = &failed;
+                    let thumbnails_dir = &thumbnails_dir;
+                    let booth_session = booth_session.as_ref();
+                    let tbf_client = &tbf_client;
+                    scope.spawn(move || {
+                        loop {
+                            let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let Some((database_id, url)) = targets.get(index) else {
+                                break;
+                            };
+                            let bytes = fetch_cover_bytes(
+                                agent,
+                                site_id,
+                                database_id,
+                                url,
+                                booth_session,
+                                tbf_client,
+                            );
+                            match bytes {
+                                Some(bytes) => {
+                                    write_cover_cache(thumbnails_dir, site_id, database_id, &bytes);
+                                    ok.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                None => {
+                                    failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            let _ = done_tx.send((
+                ok.load(std::sync::atomic::Ordering::SeqCst),
+                failed.load(std::sync::atomic::Ordering::SeqCst),
+            ));
+        });
+
+        cx.spawn(async move |this, cx| {
+            // 完了通知を待つ（UI スレッドはブロックしない）
+            loop {
+                match done_rx.try_recv() {
+                    Ok((ok, failed)) => {
+                        let message = if ok == 0 {
+                            format!("表紙を取得できませんでした（{failed} 件）")
+                        } else {
+                            format!("表紙を更新しました（{ok} 件 / 失敗 {failed} 件）")
+                        };
+                        // 本棚を読み直して新しいキャッシュを反映する
+                        if let Some(ws) = workspace.clone().and_then(|weak| weak.upgrade()) {
+                            ws.update(cx, |ws, cx| {
+                                ws.bookshelf.update(cx, |view, cx| view.reload(cx));
+                            });
+                        }
+                        let _ = this.update(cx, |view, cx| {
+                            view.cover_refresh_site = None;
+                            view.show_toast(message, cx);
+                        });
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(100))
+                            .await;
+                    }
+                    // スレッドが落ちた場合もフラグを戻す
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        let _ = this.update(cx, |view, cx| {
+                            view.cover_refresh_site = None;
+                            cx.notify();
+                        });
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
     /// 表紙キャッシュが無い本の表紙を thumbnail_url からバックグラウンドで取得する。
     fn fetch_missing_covers(&mut self, cx: &mut Context<Self>) {
         if self.fetch_covers_in_progress {
@@ -291,47 +433,25 @@ impl SettingsView {
             return;
         }
         self.fetch_covers_in_progress = true;
+        let booth_session = state.booth_session.lock().clone();
+        let tbf_client = state.tbf.clone();
         let handle = cx.weak_entity();
         cx.spawn(async move |_window, cx| {
             let agent = ureq::Agent::new();
+            let thumbnails_dir = data_dir.join("thumbnails");
+            let _ = std::fs::create_dir_all(&thumbnails_dir);
             for (site_id, database_id, url) in &targets {
-                let url = if url.starts_with("http") {
-                    url.clone()
-                } else {
-                    format!("https://techbookfest.org/{url}")
-                };
-                let Ok(response) = agent
-                    .get(&url)
-                    .set(
-                        "User-Agent",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                    )
-                    .call()
-                else {
-                    continue;
-                };
-                use std::io::Read;
-                let mut buf = Vec::new();
-                if response.into_reader().read_to_end(&mut buf).is_err() {
-                    continue;
-                }
-                // 448px に縮小して PNG 保存（本棚の fetch と同じ形式・同じ解像度）
-                if let Ok(decoded) = image::load_from_memory(&buf) {
-                    let resized = if decoded.width() > 448 {
-                        let scale = 448.0 / decoded.width() as f32;
-                        let w = (decoded.width() as f32 * scale).max(1.0) as u32;
-                        let h = (decoded.height() as f32 * scale).max(1.0) as u32;
-                        decoded.resize(w, h, image::imageops::FilterType::Lanczos3)
-                    } else {
-                        decoded
-                    };
-                    let thumbnails_dir = data_dir.join("thumbnails");
-                    let _ = std::fs::create_dir_all(&thumbnails_dir);
-                    let _ = resized.save(crate::views::bookshelf::cover_cache_path(
-                        &thumbnails_dir,
-                        &site_id,
-                        &database_id,
-                    ));
+                // 本棚と同じ URL 規則・キャッシュ形式で取得する
+                let bytes = fetch_cover_bytes(
+                    &agent,
+                    site_id,
+                    database_id,
+                    url,
+                    booth_session.as_ref(),
+                    &tbf_client,
+                );
+                if let Some(bytes) = bytes {
+                    write_cover_cache(&thumbnails_dir, site_id, database_id, &bytes);
                 }
             }
             let _ = handle.update(cx, |this, cx| {
@@ -1118,8 +1238,351 @@ impl SettingsView {
                                     }),
                             ),
                         ),
+                )
+                // 表紙更新（このサイトの表紙キャッシュを捨てて取り直す）
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("表紙"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .child("このサイトの表紙を取得し直します"),
+                                ),
+                        )
+                        .child({
+                            let handle = handle.clone();
+                            Button::new(SharedString::from(format!(
+                                "site-refresh-covers-{site_id}"
+                            )))
+                            .debug_selector(move || format!("site-refresh-covers-{site_id}"))
+                            .cursor_pointer()
+                            .label("表紙更新")
+                            .outline()
+                            .cursor_pointer()
+                            .on_click(move |_, _window, cx| {
+                                handle
+                                    .update(cx, |this, cx| {
+                                        this.refresh_site_covers(site_id, cx);
+                                    })
+                                    .ok();
+                            })
+                        }),
                 ),
         )
+    }
+    /// アカウント欄（Google / 技術書典 / BOOTH / FANZA / DLsite のログイン状態）。
+    ///
+    /// `render` のスタックフレームを抑えるため別メソッドに切り出している。
+    #[allow(clippy::too_many_arguments)]
+    fn account_settings_card(
+        &self,
+        cx: &Context<Self>,
+        google_profile: Option<thundoku_core::google::GoogleProfile>,
+        google_logged_in: bool,
+        tbf_logged_in: bool,
+        booth_logged_in: bool,
+        fanza_logged_in: bool,
+        dlsite_logged_in: bool,
+    ) -> gpui_kit::AnyElement {
+        let handle = cx.weak_entity();
+        let muted_fg = cx.theme().muted_foreground;
+        self.settings_card(
+            cx,
+            "アカウント",
+            Some("技術書典・Google・BOOTH・FANZA・DLsite のログイン状態"),
+            Icon::new(IconName::CircleUser)
+                .size(px(16.0))
+                .text_color(muted_fg),
+            div()
+                .p_5()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("Google"))
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    match &google_profile {
+                                        Some(profile) if !profile.email.is_empty() => {
+                                            profile.email.clone()
+                                        }
+                                        Some(profile) => profile.name.clone(),
+                                        None if google_logged_in => "ログイン済み".to_string(),
+                                        None => "未ログイン".to_string(),
+                                    },
+                                )),
+                        )
+                        .child(if google_logged_in {
+                            Button::new("logout-google")
+                                .cursor_pointer()
+                                .label("ログアウト")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.logout_google(cx)).ok();
+                                    }
+                                })
+                                .into_any_element()
+                        } else {
+                            Button::new("login-google")
+                                .cursor_pointer()
+                                .label("ログイン")
+                                .cursor_pointer()
+                                .on_click(|_, _window, cx| {
+                                    // 本棚に切り替えてからダイアログ表示（SettingsView を非表示にして
+                                    // WebView 作成時の RefCell 競合を回避する）。
+                                    cx.defer(move |cx| {
+                                        let ws_weak = AppState::global(cx).workspace.lock().clone();
+                                        if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                                            ws.update(cx, |ws, cx| {
+                                                ws.open_auth(cx, AuthProvider::Google);
+                                            });
+                                        }
+                                    });
+                                })
+                                .into_any_element()
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("技術書典"))
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    if tbf_logged_in {
+                                        "ログイン済み"
+                                    } else {
+                                        "未ログイン"
+                                    },
+                                )),
+                        )
+                        .child(if tbf_logged_in {
+                            Button::new("logout-tbf")
+                                .cursor_pointer()
+                                .label("ログアウト")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.logout_tbf(cx)).ok();
+                                    }
+                                })
+                                .into_any_element()
+                        } else {
+                            Button::new("login-tbf")
+                                .cursor_pointer()
+                                .label("ログイン")
+                                .cursor_pointer()
+                                .on_click(|_, _window, cx| {
+                                    // プロバイダ選択画面を経由せず技術書典のログインへ直接進む
+                                    cx.defer(move |cx| {
+                                        cx.dispatch_action(&OpenAuthProvider {
+                                            provider: AuthProvider::TechBookFest,
+                                        })
+                                    });
+                                })
+                                .into_any_element()
+                        }),
+                )
+                // BOOTH 行
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("BOOTH"))
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    if booth_logged_in {
+                                        "ログイン済み"
+                                    } else {
+                                        "未ログイン"
+                                    },
+                                )),
+                        )
+                        .child(if booth_logged_in {
+                            Button::new("logout-booth")
+                                .cursor_pointer()
+                                .label("ログアウト")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.logout_booth(cx)).ok();
+                                    }
+                                })
+                                .into_any_element()
+                        } else {
+                            Button::new("login-booth")
+                                .cursor_pointer()
+                                .label("ログイン")
+                                .cursor_pointer()
+                                .on_click(|_, _window, cx| {
+                                    // アプリ内 WebView で pixiv ログイン（BOOTH）へ直接進む
+                                    cx.defer(move |cx| {
+                                        cx.dispatch_action(&OpenAuthProvider {
+                                            provider: AuthProvider::Booth,
+                                        })
+                                    });
+                                })
+                                .into_any_element()
+                        }),
+                )
+                // FANZA 行
+                .child(
+                    div()
+                        .debug_selector(|| "account-row-fanza".into())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("FANZA"))
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    if fanza_logged_in {
+                                        "ログイン済み"
+                                    } else {
+                                        "未ログイン"
+                                    },
+                                )),
+                        )
+                        .child(if fanza_logged_in {
+                            Button::new("logout-fanza")
+                                .cursor_pointer()
+                                .label("ログアウト")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.logout_fanza(cx)).ok();
+                                    }
+                                })
+                                .into_any_element()
+                        } else {
+                            Button::new("login-fanza")
+                                .cursor_pointer()
+                                .label("ログイン")
+                                .cursor_pointer()
+                                .on_click(|_, _window, cx| {
+                                    // アプリ内 WebView で FANZA のログインへ直接進む
+                                    cx.defer(move |cx| {
+                                        cx.dispatch_action(&OpenAuthProvider {
+                                            provider: AuthProvider::Fanza,
+                                        })
+                                    });
+                                })
+                                .into_any_element()
+                        }),
+                )
+                // DLsite 行
+                .child(
+                    div()
+                        .debug_selector(|| "account-row-dlsite".into())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("DLsite"))
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    if dlsite_logged_in {
+                                        "ログイン済み"
+                                    } else {
+                                        "未ログイン"
+                                    },
+                                )),
+                        )
+                        .child(if dlsite_logged_in {
+                            Button::new("logout-dlsite")
+                                .cursor_pointer()
+                                .label("ログアウト")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.logout_dlsite(cx)).ok();
+                                    }
+                                })
+                                .into_any_element()
+                        } else {
+                            Button::new("login-dlsite")
+                                .cursor_pointer()
+                                .label("ログイン")
+                                .cursor_pointer()
+                                .on_click(|_, _window, cx| {
+                                    // アプリ内 WebView で DLsite のログインへ直接進む
+                                    cx.defer(move |cx| {
+                                        cx.dispatch_action(&OpenAuthProvider {
+                                            provider: AuthProvider::Dlsite,
+                                        })
+                                    });
+                                })
+                                .into_any_element()
+                        }),
+                ),
+        )
+        .into_any_element()
     }
 }
 
@@ -1177,6 +1640,8 @@ impl Render for SettingsView {
         let google_profile = AppState::global(cx).google_profile.lock().clone();
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
+        let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
+        let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
         let data_dir = AppState::global(cx).data_dir.clone();
         let confirm_data_dir = self.confirm_data_dir;
         let confirm_clear_sync = self.confirm_clear_sync;
@@ -1655,181 +2120,15 @@ impl Render for SettingsView {
                     ),
             );
 
-        let account_settings = self.settings_card(
+        let account_settings = self.account_settings_card(
             cx,
-            "アカウント",
-            Some("技術書典・Google・BOOTH のログイン状態"),
-            Icon::new(IconName::CircleUser)
-                .size(px(16.0))
-                .text_color(muted_fg),
-            div()
-                .p_5()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .text_sm()
-                                .child(div().font_weight(FontWeight::MEDIUM).child("Google"))
-                                .child(div().text_xs().text_color(muted_fg).child(
-                                    match &google_profile {
-                                        Some(profile) if !profile.email.is_empty() => {
-                                            profile.email.clone()
-                                        }
-                                        Some(profile) => profile.name.clone(),
-                                        None if google_logged_in => "ログイン済み".to_string(),
-                                        None => "未ログイン".to_string(),
-                                    },
-                                )),
-                        )
-                        .child(if google_logged_in {
-                            Button::new("logout-google")
-                                .cursor_pointer()
-                                .label("ログアウト")
-                                .cursor_pointer()
-                                .on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_google(cx));
-                                    }
-                                })
-                                .into_any_element()
-                        } else {
-                            Button::new("login-google")
-                                .cursor_pointer()
-                                .label("ログイン")
-                                .cursor_pointer()
-                                .on_click(|_, _window, cx| {
-                                    // 本棚に切り替えてからダイアログ表示（SettingsView を非表示にして
-                                    // WebView 作成時の RefCell 競合を回避する）。
-                                    cx.defer(move |cx| {
-                                        let ws_weak = AppState::global(cx).workspace.lock().clone();
-                                        if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
-                                            ws.update(cx, |ws, cx| {
-                                                ws.open_auth(cx, AuthProvider::Google);
-                                            });
-                                        }
-                                    });
-                                })
-                                .into_any_element()
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .text_sm()
-                                .child(div().font_weight(FontWeight::MEDIUM).child("技術書典"))
-                                .child(div().text_xs().text_color(muted_fg).child(
-                                    if tbf_logged_in {
-                                        "ログイン済み"
-                                    } else {
-                                        "未ログイン"
-                                    },
-                                )),
-                        )
-                        .child(if tbf_logged_in {
-                            Button::new("logout-tbf")
-                                .cursor_pointer()
-                                .label("ログアウト")
-                                .cursor_pointer()
-                                .on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_tbf(cx));
-                                    }
-                                })
-                                .into_any_element()
-                        } else {
-                            Button::new("login-tbf")
-                                .cursor_pointer()
-                                .label("ログイン")
-                                .cursor_pointer()
-                                .on_click(|_, _window, cx| {
-                                    // プロバイダ選択画面を経由せず技術書典のログインへ直接進む
-                                    cx.defer(move |cx| {
-                                        cx.dispatch_action(&OpenAuthProvider {
-                                            provider: AuthProvider::TechBookFest,
-                                        })
-                                    });
-                                })
-                                .into_any_element()
-                        }),
-                )
-                // BOOTH 行
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .text_sm()
-                                .child(div().font_weight(FontWeight::MEDIUM).child("BOOTH"))
-                                .child(div().text_xs().text_color(muted_fg).child(
-                                    if booth_logged_in {
-                                        "ログイン済み"
-                                    } else {
-                                        "未ログイン"
-                                    },
-                                )),
-                        )
-                        .child(if booth_logged_in {
-                            Button::new("logout-booth")
-                                .cursor_pointer()
-                                .label("ログアウト")
-                                .cursor_pointer()
-                                .on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_booth(cx));
-                                    }
-                                })
-                                .into_any_element()
-                        } else {
-                            Button::new("login-booth")
-                                .cursor_pointer()
-                                .label("ログイン")
-                                .cursor_pointer()
-                                .on_click(|_, _window, cx| {
-                                    // アプリ内 WebView で pixiv ログイン（BOOTH）へ直接進む
-                                    cx.defer(move |cx| {
-                                        cx.dispatch_action(&OpenAuthProvider {
-                                            provider: AuthProvider::Booth,
-                                        })
-                                    });
-                                })
-                                .into_any_element()
-                        }),
-                ),
+            google_profile,
+            google_logged_in,
+            tbf_logged_in,
+            booth_logged_in,
+            fanza_logged_in,
+            dlsite_logged_in,
         );
-
         div()
             .size_full()
             .flex_1()
@@ -2278,6 +2577,49 @@ mod tests {
             arena_clear.clear(cx);
         });
         // パニックせず描画できれば OK（Web 構成のカード群が描画される）
+    }
+
+    #[gpui_kit::test]
+    async fn account_lists_fanza_and_dlsite_and_each_site_has_cover_refresh(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(SettingsView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+        // アカウント欄に FANZA / DLsite が並ぶ
+        assert!(
+            visual.debug_bounds("account-row-fanza").is_some(),
+            "アカウントに FANZA 行があること"
+        );
+        assert!(
+            visual.debug_bounds("account-row-dlsite").is_some(),
+            "アカウントに DLsite 行があること"
+        );
+        // 各サイトの設定カードに「表紙更新」がある
+        let sites: [(&str, &'static str); 4] = [
+            ("技術書典", "site-refresh-covers-techbookfest"),
+            ("BOOTH", "site-refresh-covers-booth"),
+            ("FANZA", "site-refresh-covers-fanza"),
+            ("DLsite", "site-refresh-covers-dlsite"),
+        ];
+        for (site, selector) in sites {
+            assert!(
+                visual.debug_bounds(selector).is_some(),
+                "{site} の表紙更新ボタンがあること"
+            );
+        }
     }
 
     #[gpui_kit::test]

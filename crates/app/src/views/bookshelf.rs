@@ -883,59 +883,14 @@ impl BookshelfView {
                             } else {
                                 url.clone()
                             };
-                            let bytes = if site_id == "booth" {
-                                // BOOTH の表紙は公開画像（booth.pximg.net — Cookie 不要）。
-                                // 商品ページの共有画像（オリジナル・高解像度）を優先し、
-                                // ライブラリのサムネイル（thumbnail_url）はフォールバック。
-                                let primary = booth_session.as_ref().and_then(|session| {
-                                    let item_id: u64 = database_id.parse().ok()?;
-                                    let detail =
-                                        BoothClient::new(session).item_detail(item_id).ok()?;
-                                    detail.images.into_iter().next()
-                                });
-                                match primary {
-                                    Some(image_url) => fetch_bytes(agent, &image_url)
-                                        .or_else(|| fetch_bytes(agent, &resolved)),
-                                    None => fetch_bytes(agent, &resolved),
-                                }
-                            } else if site_id == "dlsite" {
-                                // DLsite の表紙は公開 CDN（img.dlsite.jp、Cookie 不要）。
-                                // プロトコル相対 URL は上で絶対化済み。TBF クライアントには
-                                // フォールバックしない（誤った経路で失敗するため）。
-                                fetch_bytes(agent, &resolved)
-                            } else if site_id == "fanza" {
-                                // FANZA の表紙は `-200x150` を外した**原寸**を優先する
-                                // （実測 200x150 → 560x420）。原寸が無い作品もあるため、
-                                // 失敗したら保存済みの縮小 URL に戻す。
-                                let full =
-                                    thundoku_core::fanza::sync::full_size_thumb(&resolved);
-                                if full == resolved {
-                                    fetch_bytes(agent, &resolved)
-                                } else {
-                                    match fetch_bytes(agent, &full) {
-                                        Some(bytes) => Some(bytes),
-                                        None => {
-                                            log::warn!(
-                                                "FANZA 原寸表紙を取得できず縮小版にフォールバック: {full}"
-                                            );
-                                            fetch_bytes(agent, &resolved)
-                                        }
-                                    }
-                                }
-                            } else {
-                                // TBF の表紙も公開 URL なら直接取得する（4 並列が機能する）。
-                                // 失敗した場合のみセッション付きクライアントにフォールバック
-                                // （クライアントは Mutex のため直列になるが、まれなケース）。
-                                match fetch_bytes(agent, &resolved) {
-                                    Some(bytes) => Some(bytes),
-                                    None => {
-                                        log::warn!(
-                                            "TBF 表紙を直接取得できずフォールバック: {resolved}"
-                                        );
-                                        tbf_client.lock().download(&resolved).ok()
-                                    }
-                                }
-                            };
+                            let bytes = fetch_cover_bytes(
+                                agent,
+                                site_id,
+                                database_id,
+                                &resolved,
+                                booth_session.as_ref(),
+                                tbf_client,
+                            );
                             let Some(bytes) = bytes else {
                                 fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 log::warn!(
@@ -946,30 +901,9 @@ impl BookshelfView {
                                 let _ = fail_tx.send((site_id.clone(), database_id.clone()));
                                 continue;
                             };
-                            let _ext = match &bytes[..] {
-                                _ if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8 => {
-                                    "jpg"
-                                }
-                                _ if bytes.len() >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" => {
-                                    "png"
-                                }
-                                _ if bytes.len() >= 12
-                                    && &bytes[0..4] == b"RIFF"
-                                    && &bytes[8..12] == b"WEBP" =>
-                                {
-                                    "webp"
-                                }
-                                _ => "jpg",
-                            };
                             // 縮小済みサムネイルを PNG で保存する（reload 時のキャッシュ
-                            // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）。
-                            // カードのヘッダーは最大 ~320px 幅なので、粗くならないよう 448px で持つ。
-                            let cache_path =
-                                cover_cache_path(thumbnails_dir, site_id, database_id);
-                            if let Some(cached) = resize_for_cache(&bytes, 448) {
-                                let _ = std::fs::write(&cache_path, &cached);
-                                remove_legacy_cover_cache(thumbnails_dir, site_id, database_id);
-                            }
+                            // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）
+                            write_cover_cache(thumbnails_dir, site_id, database_id, &bytes);
                             // デコード + 縮小はこのスレッド（4 並列）で行い、UI には
                             // デコード済みサムネイルだけ送る（UI スレッドで 307 枚
                             // デコードすると固まるため）
@@ -1167,51 +1101,6 @@ impl BookshelfView {
                 InputState::new(window, cx).placeholder("検索（タイトル・サークル・著者）")
             }));
         }
-    }
-
-    /// 表紙キャッシュを全部捨てて、全カードの表紙を取り直す。
-    /// 表紙の取得元（URL / 解像度）を変えたときに、既存キャッシュに邪魔されず
-    /// 一括で更新するための導線（Web 版には無い、デスクトップ用の操作）。
-    pub fn refresh_all_covers(&mut self, cx: &mut Context<Self>) {
-        if self.fetching_covers {
-            self.toast = Some("表紙を取得中です（完了後にもう一度）".into());
-            cx.notify();
-            return;
-        }
-        // 1) ディスク上の表紙キャッシュを全部消す（`thumbnails/` は表紙専用）
-        let thumbnails_dir = Self::app_state(cx).data_dir.join("thumbnails");
-        let mut removed = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&thumbnails_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_image = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| matches!(e, "png" | "jpg" | "jpeg" | "webp"));
-                if is_image && std::fs::remove_file(&path).is_ok() {
-                    removed += 1;
-                }
-            }
-        }
-        // 2) メモリ上の表紙も捨てて取得対象に戻す（thumbnail_url を持つカードのみ）
-        let mut pending = 0usize;
-        for card in &mut self.shelf_cards {
-            if card.shelf.thumbnail_url.is_some() {
-                card.cover = None;
-                card.cover_fetch_failed = false;
-                pending += 1;
-            }
-        }
-        self.cover_fetch_retried = false;
-        self.filtered_dirty = true;
-        log::info!("refresh_all_covers: キャッシュ {removed} 件を削除、{pending} 件を再取得");
-        if pending == 0 {
-            self.toast = Some("再取得できる表紙がありません".into());
-            cx.notify();
-            return;
-        }
-        self.toast = Some(format!("表紙を再取得します（{pending} 件）"));
-        self.reload(cx);
     }
 
     /// 同期ボタン: 技術書典の本棚同期に加えて、Google にログイン済みなら
@@ -4360,20 +4249,6 @@ impl Render for BookshelfView {
                             },
                             )
                             .child(
-                                Button::new("bookshelf-refresh-covers").cursor_pointer()
-                                    .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
-                                    .label("表紙更新")
-                                    .loading(self.fetching_covers)
-                                    .on_click({
-                                        let handle = handle.clone();
-                                        move |_, _window, cx| {
-                                            handle.update(cx, |this, cx| {
-                                                this.refresh_all_covers(cx);
-                                            });
-                                        }
-                                    }),
-                            )
-                            .child(
                                 Button::new("bookshelf-sync").cursor_pointer()
                                     .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
                                     .label(if busy { "同期中" } else { "同期" })
@@ -4532,6 +4407,97 @@ impl Render for BookshelfView {
 
 /// Resolve a remote/cached cover for a bookshelf item to a RenderImage.
 /// GPUI の RenderImage は BGRA を期待するため、RGBA から R/B を入れ替える。
+/// サイトごとの表紙画像の取得（URL 規則をここに集約。本棚と設定の両方から使う）。
+///
+/// - BOOTH: 商品ページの共有画像（オリジナル・高解像度）を優先し、保存 URL をフォールバック
+/// - DLsite: 公開 CDN（`img.dlsite.jp`）をそのまま
+/// - FANZA: `-200x150` を外した**原寸**を優先し、失敗したら保存 URL に戻す
+/// - 技術書典: 公開 URL を直接。失敗時のみセッション付きクライアントで再試行
+/// 保存 URL から実際に取得を試す URL の並びを返す（失敗したら次を試す）。
+///
+/// FANZA は `-200x150` を外した**原寸**を先に試し、失敗したら保存 URL に戻す
+/// （実測: `pl-200x150` = 200x150 に対し `pl` = 560x420）。それ以外は保存 URL のまま。
+pub(crate) fn cover_url_candidates(site_id: &str, stored_url: &str) -> Vec<String> {
+    if site_id == "fanza" {
+        let full = thundoku_core::fanza::sync::full_size_thumb(stored_url);
+        if full != stored_url {
+            return vec![full, stored_url.to_string()];
+        }
+    }
+    vec![stored_url.to_string()]
+}
+
+pub(crate) fn fetch_cover_bytes(
+    agent: &ureq::Agent,
+    site_id: &str,
+    database_id: &str,
+    stored_url: &str,
+    booth_session: Option<&thundoku_core::booth::BoothSession>,
+    tbf_client: &parking_lot::Mutex<thundoku_core::tbf::TbfClient>,
+) -> Option<Vec<u8>> {
+    // プロトコル相対（`//img.dlsite.jp/...`）とサイト相対を絶対化する
+    let resolved = if stored_url.starts_with("//") {
+        format!("https:{stored_url}")
+    } else if stored_url.starts_with('/') {
+        format!("https://techbookfest.org{stored_url}")
+    } else {
+        stored_url.to_string()
+    };
+    if site_id == "booth" {
+        // BOOTH の表紙は公開画像（booth.pximg.net — Cookie 不要）
+        let primary = booth_session.and_then(|session| {
+            let item_id: u64 = database_id.parse().ok()?;
+            let detail = BoothClient::new(session).item_detail(item_id).ok()?;
+            detail.images.into_iter().next()
+        });
+        match primary {
+            Some(image_url) => {
+                fetch_bytes(agent, &image_url).or_else(|| fetch_bytes(agent, &resolved))
+            }
+            None => fetch_bytes(agent, &resolved),
+        }
+    } else if site_id == "dlsite" {
+        // TBF クライアントにはフォールバックしない（誤った経路で失敗するため）
+        fetch_bytes(agent, &resolved)
+    } else if site_id == "fanza" {
+        // 原寸 → 縮小の順に試す（原寸が無い作品があるためフォールバックする）
+        let mut bytes = None;
+        for candidate in cover_url_candidates(site_id, &resolved) {
+            bytes = fetch_bytes(agent, &candidate);
+            if bytes.is_some() {
+                break;
+            }
+            log::warn!("表紙 URL で取得できず次を試す: {candidate}");
+        }
+        bytes
+    } else {
+        // TBF の表紙も公開 URL なら直接取得する（4 並列が機能する）。
+        // 失敗した場合のみセッション付きクライアントにフォールバック。
+        match fetch_bytes(agent, &resolved) {
+            Some(bytes) => Some(bytes),
+            None => {
+                log::warn!("TBF 表紙を直接取得できずフォールバック: {resolved}");
+                tbf_client.lock().download(&resolved).ok()
+            }
+        }
+    }
+}
+
+/// 取得した表紙画像を 448px の PNG キャッシュとして保存する（本棚と設定で共通）。
+/// カードのヘッダーは最大 ~320px 幅なので、粗くならないよう 448px で持つ。
+pub(crate) fn write_cover_cache(
+    thumbnails_dir: &std::path::Path,
+    site_id: &str,
+    database_id: &str,
+    bytes: &[u8],
+) {
+    if let Some(cached) = resize_for_cache(bytes, 448) {
+        let path = cover_cache_path(thumbnails_dir, site_id, database_id);
+        let _ = std::fs::write(&path, &cached);
+        remove_legacy_cover_cache(thumbnails_dir, site_id, database_id);
+    }
+}
+
 /// タイムアウト付きで画像をダウンロードする（ハング防止）。
 fn fetch_bytes(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
     use std::io::Read;
@@ -4823,7 +4789,7 @@ fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
 
-    use super::{ImportFailure, ImportOutcome, download_messages};
+    use super::{ImportFailure, ImportOutcome, cover_url_candidates, download_messages};
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
 
@@ -5007,6 +4973,36 @@ mod tests {
             )
             .unwrap();
         });
+    }
+
+    #[test]
+    fn cover_url_candidates_prefers_full_size_for_fanza() {
+        // FANZA はサイズ指定を外した原寸を先に試し、失敗したら保存 URL に戻す
+        assert_eq!(
+            cover_url_candidates(
+                "fanza",
+                "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl-200x150.jpg"
+            ),
+            vec![
+                "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl.jpg".to_string(),
+                "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl-200x150.jpg".to_string(),
+            ]
+        );
+        // サイズ指定が無ければ 1 本だけ
+        assert_eq!(
+            cover_url_candidates("fanza", "https://example.com/cover.jpg"),
+            vec!["https://example.com/cover.jpg".to_string()]
+        );
+        // 他サイトは保存 URL のまま
+        assert_eq!(
+            cover_url_candidates(
+                "dlsite",
+                "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main.jpg"
+            ),
+            vec![
+                "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main.jpg".to_string()
+            ]
+        );
     }
 
     #[test]

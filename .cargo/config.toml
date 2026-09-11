@@ -2,3 +2,9 @@
 # 実行時依存をなくす（Visual C++ Redistributable 未導入の PC でも起動できるように）。
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# GPUI のビューは描画要素のネストが深く、デバッグビルド（テスト）では
+# 1 フレームのスタック消費が大きい。テスト用スレッドのスタックを広げて
+# 設定画面などの大きなビューを描くテストがスタックオーバーフローしないようにする。
+[env]
+RUST_MIN_STACK = "33554432"
