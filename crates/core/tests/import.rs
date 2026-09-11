@@ -776,6 +776,92 @@ fn zip_with_directory_entries_imports_folder_contents() {
     );
 }
 
+/// 再取得相当（同じ book_id で再取り込み）でも、**ユーザーが付けたコンテンツ名と
+/// content_id を引き継ぐ**こと。content_id を引き継ぐことで、content_id に紐づく
+/// 進捗（`reading_progress`）・ページ毎記録（`page_views`）も維持される。
+#[test]
+fn reimport_preserves_custom_content_name_and_id() {
+    let env = TestEnv::new("reimport-rename");
+    let zip_path = env.root.join("multi.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, color) in [("001.jpg", [255, 0, 0]), ("002.jpg", [0, 255, 0])] {
+        zip.start_file(format!("本編/{name}"), options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, color)).unwrap();
+    }
+    zip.start_file("別冊/001.jpg", options).unwrap();
+    {
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, [0, 0, 255])).unwrap();
+    }
+    zip.finish().unwrap();
+    let bytes = std::fs::read(&zip_path).unwrap();
+
+    let first = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "multi.zip",
+        &bytes,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+    let before = db::contents::list_for_book(&env.pool, &first.book.id).unwrap();
+    assert_eq!(before.len(), 2);
+    let primary_before = before.iter().find(|c| c.is_primary == 1).unwrap();
+    let primary_id = primary_before.content_id.clone();
+    assert_eq!(primary_before.display_name, "本編");
+    // ビューアーで「本編」→「総集編」にリネームする（DB 側）
+    assert!(
+        db::contents::rename(&env.pool, &first.book.id, &primary_id, "総集編").unwrap(),
+        "リネームが反映される"
+    );
+
+    // 再取り込み（同じ book_id = 再取得相当）
+    let again = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "multi.zip",
+        &bytes,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        Some(&first.book.id),
+    )
+    .unwrap();
+    assert_eq!(again.book.id, first.book.id);
+
+    let after = db::contents::list_for_book(&env.pool, &first.book.id).unwrap();
+    let primary_after = after.iter().find(|c| c.is_primary == 1).unwrap();
+    assert_eq!(
+        primary_after.display_name, "総集編",
+        "再取り込みでカスタム名が戻らないこと"
+    );
+    assert_eq!(
+        primary_after.content_id, primary_id,
+        "content_id を引き継ぐこと（進捗・ページ毎記録の紐付けを維持）"
+    );
+    let secondary_after = after.iter().find(|c| c.is_primary == 0).unwrap();
+    assert_eq!(secondary_after.display_name, "別冊");
+
+    // pack の metadata.json もカスタム名になっている（Drive 復元でも戻らない）
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", first.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&reader.read_entry("metadata.json", None).unwrap()).unwrap();
+    assert!(
+        meta["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|content| content["displayName"] == "総集編"),
+        "pack の metadata もカスタム名: {meta}"
+    );
+}
+
+/// 再取り込みしてもコンテンツが二重化しない
 #[test]
 fn zip_with_two_folder_contents_persists_structure() {
     // フェーズ2: 解析したコンテンツ／レンディションを DB と pack に保存する。
@@ -877,8 +963,8 @@ fn zip_with_two_folder_contents_persists_structure() {
     let stored_again = db::contents::list_for_book(&env.pool, &imported.book.id).unwrap();
     assert_eq!(stored_again.len(), 2, "再取り込みでコンテンツが増えない");
 
-    // 選択に応じたページ列（フェーズ3）。再取り込みで id が振り直されるため
-    // ここで最新の行を引き直して検証する。
+    // 選択に応じたページ列（フェーズ3）。再取り込みでは content_id を引き継ぐが、
+    // ここは最新の行を引き直して検証する。
     let default_pages =
         db::documents::images_for_selection(&env.pool, &imported.book.id, None, None).unwrap();
     assert_eq!(

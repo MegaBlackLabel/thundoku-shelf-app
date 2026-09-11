@@ -870,6 +870,44 @@ fn finish_import(
     log::info!("finish_import: 開始（{} ページ）", spec.total_pages);
     let save_start = std::time::Instant::now();
 
+    // 再取り込み（同じ book_id の再利用 = 再取得相当）では、**前回の content_id と表示名を
+    // 引き継ぐ**。ビューアーで付けたカスタム名（`book_contents.display_name`）と、
+    // content_id に紐づく進捗（`reading_progress`）・ページ毎記録（`page_views`）を維持するため。
+    // 件数とメディア種別が一致するときだけ引き継ぐ（ソースが変わったときの誤対応を防ぐ）。
+    let mut spec = spec;
+    if reuse_book_id.is_some() {
+        let previous_contents = contents::list_for_book(pool, &book_id).unwrap_or_default();
+        if previous_contents.len() == spec.contents.len() {
+            // 旧 content_id → 引き継ぎ先 content_id（ページ行の張り替えに使う）
+            let mut remap: Vec<(String, String)> = Vec::new();
+            for content in spec.contents.iter_mut() {
+                if let Some(previous_content) = previous_contents
+                    .iter()
+                    .find(|previous| previous.sort_order == content.sort_order)
+                    .filter(|previous| previous.media_kind == content.media_kind.as_str())
+                {
+                    if previous_content.content_id != content.content_id {
+                        remap.push((
+                            content.content_id.clone(),
+                            previous_content.content_id.clone(),
+                        ));
+                    }
+                    content.content_id = previous_content.content_id.clone();
+                    content.display_name = previous_content.display_name.clone();
+                }
+            }
+            // ページ行は content_id を別に持つので、同じく引き継ぎ先へ張り替える。
+            // 張り替えないと削除済みの旧 content_id を参照して FK 違反になる。
+            for row in spec.page_rows.iter_mut() {
+                if let Some(content_id) = row.content_id.as_deref()
+                    && let Some((_, new_id)) = remap.iter().find(|(old_id, _)| old_id == content_id)
+                {
+                    row.content_id = Some(new_id.clone());
+                }
+            }
+        }
+    }
+
     // Build the pack first (metadata + pages), so document.file_hash can
     // reference the real pack bytes.
     let mut builder = PackBuilder::new(chrono::Utc::now().timestamp_millis() as u64);
