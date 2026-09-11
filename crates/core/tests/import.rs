@@ -3,9 +3,11 @@
 
 use std::path::PathBuf;
 
-use opfspack::{Identity, PackReader};
+use opfspack::{Identity, PackBuilder, PackReader};
 use thundoku_core::db;
-use thundoku_core::import::{ImportError, import_file, import_pdf_bytes};
+use thundoku_core::import::{
+    ImportError, MAX_NESTED_ENTRIES, MediaKind, analyze_zip, import_file, import_pdf_bytes,
+};
 use thundoku_core::tags;
 
 const PDF_FIXTURE: &str = concat!(
@@ -379,6 +381,109 @@ fn image_zip_imports_sorted_pages() {
 }
 
 #[test]
+fn zip_with_pdf_reuses_book_id_without_duplicate() {
+    let env = TestEnv::new("zip-pdf-reuse");
+    let zip_path = env.root.join("mixed.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    // 実データ同様、ZIP 内のフォルダに PDF が入っている形
+    zip.start_file("inner/inside.pdf", options).unwrap();
+    {
+        use std::io::Write;
+        zip.write_all(&solid_pdf_with_content(
+            "1 0 0 1 0 0 cm\n0 1 1 0 k\n0 0 200 200 re\nf\n",
+        ))
+        .unwrap();
+    }
+    zip.finish().unwrap();
+    let bytes = std::fs::read(&zip_path).unwrap();
+
+    let first = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "mixed.zip",
+        &bytes,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+    // 題名・file_name は ZIP 内パスではなくファイル名を使う（"inner/inside.pdf" ではなく "inside.pdf"）
+    assert_eq!(first.book.file_name, "inside.pdf");
+    assert_eq!(first.book.title, "inside");
+    // PDF レンディションの表示名は種別名（拡張子は出さない）
+    let stored = db::contents::list_with_formats(&env.pool, &first.book.id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].1[0].label, "PDF");
+
+    db::books::set_favorite(&env.pool, &first.book.id, true).unwrap();
+
+    // 再ダウンロード（同一 book_id の再利用）で重複本を作らない
+    let second = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "mixed.zip",
+        &bytes,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        Some(&first.book.id),
+    )
+    .unwrap();
+    assert_eq!(second.book.id, first.book.id);
+
+    let all = db::books::list(&env.pool).unwrap();
+    assert_eq!(all.len(), 1, "再取り込みで本が増えないこと");
+    assert_eq!(
+        all[0].is_favorite, 1,
+        "ユーザー状態（お気に入り）が維持されること"
+    );
+
+    // ページは置き換わる（旧ドキュメントが残って二重に並ばない）
+    let images = db::documents::images_for_book(&env.pool, &first.book.id).unwrap();
+    let pages = images.iter().filter(|i| i.image_type == "page").count();
+    assert_eq!(pages, 1);
+}
+
+#[test]
+fn zip_entry_names_are_decoded_from_cp932() {
+    let env = TestEnv::new("zip-cp932");
+    let zip_path = env.root.join("cp932.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    // プレースホルダは CP932 の「表紙.epub」と同じ 9 バイトにしておく
+    zip.start_file("zzzz.epub", options).unwrap();
+    {
+        use std::io::Write;
+        zip.write_all(b"epub-bytes").unwrap();
+    }
+    zip.finish().unwrap();
+
+    // 名前バイトを CP932 の「表紙.epub」へ差し替える（長さが同じなのでオフセットも CRC も変わらない）
+    let bytes = std::fs::read(&zip_path).unwrap();
+    let cp932 = [0x95u8, 0x5c, 0x8e, 0x86, 0x2e, 0x65, 0x70, 0x75, 0x62];
+    let mut patched = Vec::with_capacity(bytes.len());
+    let mut hits = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 9 <= bytes.len() && &bytes[i..i + 9] == b"zzzz.epub".as_slice() {
+            patched.extend_from_slice(&cp932);
+            hits += 1;
+            i += 9;
+        } else {
+            patched.push(bytes[i]);
+            i += 1;
+        }
+    }
+    assert!(hits > 0, "placeholder name not found in the zip");
+    std::fs::write(&zip_path, &patched).unwrap();
+
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    // 文字化けせず CP932 の名前が復号されること
+    assert_eq!(imported.book.file_name, "表紙.epub");
+    assert_eq!(imported.book.title, "表紙");
+}
+
+#[test]
 fn single_image_imports_as_one_page_book() {
     let env = TestEnv::new("single-image");
     // BOOTH のダウンロードが画像ファイル（イラスト等）の場合
@@ -402,6 +507,434 @@ fn single_image_imports_as_one_page_book() {
     assert!(paths.contains(&"thumbnail.webp"));
     let page = reader.read_entry("pages/page_0001.webp", None).unwrap();
     assert_eq!(&page[8..12], b"WEBP");
+}
+
+/// 24bit 非圧縮 BMP を組み立てる（テスト用。`image` のエンコーダ機能に依存しない）。
+fn make_bmp(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
+    let row_bytes = width * 3;
+    let padding = (4 - (row_bytes % 4)) % 4;
+    let pixel_len = (row_bytes + padding) * height;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(54 + pixel_len).to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(height as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&pixel_len.to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for _ in 0..height {
+        for _ in 0..width {
+            out.extend_from_slice(&[color[2], color[1], color[0]]);
+        }
+        out.extend(std::iter::repeat_n(0u8, padding as usize));
+    }
+    out
+}
+
+#[test]
+fn bmp_only_zip_imports() {
+    // 実データに `.bmp` のみの作品が存在する（docs/import-patterns.md §2.3 G1）。
+    let env = TestEnv::new("bmp-zip");
+    let zip_path = env.root.join("bmp-book.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, color) in [("1.bmp", [255, 0, 0]), ("2.bmp", [0, 255, 0])] {
+        zip.start_file(name, options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_bmp(64, 96, color)).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    assert_eq!(imported.document.source_type, "image-set");
+    assert_eq!(imported.document.total_pages, 2);
+}
+
+#[test]
+fn image_zip_with_export_text_imports_page_text() {
+    // `_export.txt`（ページ別セリフ本文）を持つ画像セット作品（docs/import-patterns.md §4）。
+    let env = TestEnv::new("export-text-zip");
+    let zip_path = env.root.join("export.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, color) in [("001.jpg", [255, 0, 0]), ("002.jpg", [0, 255, 0])] {
+        zip.start_file(name, options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, color)).unwrap();
+    }
+    zip.start_file("壊れた姉弟と壊れる僕_export.txt", options)
+        .unwrap();
+    {
+        use std::io::Write;
+        zip.write_all(
+            "\u{feff}<<1Page>>\r\n壊れた姉弟と壊れる僕\r\n<<3Page>>\r\n三人目\r\n".as_bytes(),
+        )
+        .unwrap();
+    }
+    zip.finish().unwrap();
+
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    assert_eq!(imported.document.total_pages, 2);
+
+    // マーカーのページ番号がそのまま document_text に入る（2 ページ目は欠番）
+    let rows: Vec<(i64, String)> = thundoku_core::db::block_on(async {
+        sqlx::query_as(
+            "SELECT page_number, text_content FROM document_text \
+             WHERE document_id = ?1 ORDER BY page_number",
+        )
+        .bind(&imported.document.id)
+        .fetch_all(&env.pool)
+        .await
+    })
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "壊れた姉弟と壊れる僕".to_string()),
+            (3, "三人目".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn corrupted_image_is_skipped_with_warning() {
+    // 壊れた画像 1 枚で全体を失敗させない（docs/import-patterns.md §11.1 D6）。
+    let env = TestEnv::new("corrupt-image-zip");
+    let zip_path = env.root.join("corrupt.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, color) in [("001.png", [255, 0, 0]), ("002.png", [0, 255, 0])] {
+        zip.start_file(name, options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, color)).unwrap();
+    }
+    zip.start_file("003.png", options).unwrap();
+    {
+        use std::io::Write;
+        zip.write_all(b"not a png at all").unwrap();
+    }
+    zip.finish().unwrap();
+
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    assert_eq!(imported.document.total_pages, 2);
+    assert_eq!(imported.warnings.len(), 1);
+    assert!(
+        imported.warnings[0].contains("003.png"),
+        "warning should name the broken entry: {:?}",
+        imported.warnings
+    );
+
+    // ページ番号は連番のまま（欠番を作らない）
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    let paths: Vec<&str> = reader.entries().iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"pages/page_0001.webp"));
+    assert!(paths.contains(&"pages/page_0002.webp"));
+    assert!(!paths.contains(&"pages/page_0003.webp"));
+}
+
+#[test]
+fn analyze_zip_plans_without_writing() {
+    let env = TestEnv::new("analyze-no-write");
+    let zip_path = env.root.join("plan.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    {
+        use std::io::Write;
+        for (name, color) in [
+            ("001.jpg", [255, 0, 0]),
+            ("002.jpg", [0, 255, 0]),
+            // 表紙と junk はコンテンツにしない（決定 D4 / junk 判定）
+            ("表紙.jpg", [200, 0, 0]),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(&make_png(64, 96, color)).unwrap();
+        }
+        zip.start_file("Thumbs.db", options).unwrap();
+        zip.write_all(b"junk").unwrap();
+        zip.start_file("本文_export.txt", options).unwrap();
+        zip.write_all("<<1Page>>\n本文\n<<2Page>>\n続き\n".as_bytes())
+            .unwrap();
+    }
+    zip.finish().unwrap();
+
+    let bytes = std::fs::read(&zip_path).unwrap();
+    let plan = analyze_zip(&bytes).unwrap();
+
+    assert_eq!(plan.contents.len(), 1, "表紙と junk はコンテンツにならない");
+    assert_eq!(plan.contents[0].display_name, "本文");
+    assert_eq!(plan.contents[0].media_kind, MediaKind::Image);
+    assert_eq!(plan.contents[0].renditions[0].entries.len(), 2);
+    assert_eq!(plan.export_text.len(), 2, "{plan:#?}");
+    assert!(plan.warnings.is_empty());
+    assert!(plan.skip_reason.is_none());
+
+    // DB には何も書かない
+    let books: i64 = thundoku_core::db::block_on(async {
+        sqlx::query_scalar("SELECT COUNT(*) FROM books")
+            .fetch_one(&env.pool)
+            .await
+    })
+    .unwrap();
+    let documents: i64 = thundoku_core::db::block_on(async {
+        sqlx::query_scalar("SELECT COUNT(*) FROM imported_documents")
+            .fetch_one(&env.pool)
+            .await
+    })
+    .unwrap();
+    assert_eq!((books, documents), (0, 0));
+    // ディスクにも pack を書かない
+    assert_eq!(std::fs::read_dir(env.packs()).unwrap().count(), 0);
+}
+
+#[test]
+fn zip_with_directory_entries_imports_folder_contents() {
+    // 実 ZIP はフォルダエントリを含む。旧実装は「メタ情報の並び」を
+    // アーカイブ索引で引いていたため索引がずれて panic していた。
+    let env = TestEnv::new("zip-dir-entries");
+    let zip_path = env.root.join("folder.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    zip.add_directory("book/", options).unwrap();
+    for (name, color) in [("book/002.jpg", [0, 255, 0]), ("book/001.jpg", [255, 0, 0])] {
+        zip.start_file(name, options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, color)).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let bytes = std::fs::read(&zip_path).unwrap();
+    let plan = analyze_zip(&bytes).unwrap();
+    assert_eq!(plan.contents.len(), 1);
+    assert_eq!(plan.contents[0].display_name, "book");
+    assert_eq!(plan.contents[0].renditions[0].entries.len(), 2);
+
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    assert_eq!(imported.document.source_type, "image-set");
+    assert_eq!(imported.document.total_pages, 2);
+
+    // 名前順に並ぶ（001 が 1 ページ目）
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    assert!(
+        reader
+            .entries()
+            .iter()
+            .any(|e| e.path == "pages/page_0001.webp")
+    );
+}
+
+#[test]
+fn zip_with_two_folder_contents_persists_structure() {
+    // フェーズ2: 解析したコンテンツ／レンディションを DB と pack に保存する。
+    let env = TestEnv::new("multi-content");
+    let zip_path = env.root.join("multi.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, color) in [("001.jpg", [255, 0, 0]), ("002.jpg", [0, 255, 0])] {
+        zip.start_file(format!("本編/{name}"), options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, color)).unwrap();
+    }
+    zip.start_file("別冊/001.jpg", options).unwrap();
+    {
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, [0, 0, 255])).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    // 本編（2 ページ）が既定表示
+    assert_eq!(imported.document.source_type, "image-set");
+    assert_eq!(imported.document.total_pages, 2);
+
+    // 2 コンテンツが保存され、本編が primary
+    let stored = db::contents::list_for_book(&env.pool, &imported.book.id).unwrap();
+    assert_eq!(stored.len(), 2, "2 コンテンツが保存される");
+    let primary = db::contents::primary_for_book(&env.pool, &imported.book.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(primary.display_name, "本編");
+    assert_eq!(primary.is_primary, 1);
+    assert_eq!(primary.media_kind, "image");
+
+    let primary_formats =
+        db::contents::formats_for_content(&env.pool, &primary.content_id).unwrap();
+    assert_eq!(primary_formats.len(), 1);
+    assert_eq!(primary_formats[0].page_count, 2);
+    assert_eq!(
+        primary_formats[0].label, "JPEG",
+        "画像レンディションは拡張子を表示名にする"
+    );
+    assert_eq!(
+        primary_formats[0].pack_entry_prefix.as_deref(),
+        Some("pages")
+    );
+
+    // リーダー向け（images_for_book）は既定表示コンテンツのページだけを返す
+    let images = db::documents::images_for_book(&env.pool, &imported.book.id).unwrap();
+    let pages: Vec<&db::documents::DocumentImage> = images
+        .iter()
+        .filter(|image| image.image_type == "page")
+        .collect();
+    assert_eq!(pages.len(), 2, "別冊のページは混ざらない");
+    assert!(
+        pages
+            .iter()
+            .all(|page| page.content_id.as_deref() == Some(primary.content_id.as_str()))
+    );
+
+    // 別冊のページも pack に入っている（切り替え用）
+    let secondary = stored
+        .iter()
+        .find(|content| content.content_id != primary.content_id)
+        .unwrap();
+    let secondary_formats =
+        db::contents::formats_for_content(&env.pool, &secondary.content_id).unwrap();
+    let prefix = secondary_formats[0].pack_entry_prefix.clone().unwrap();
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    let paths: Vec<&str> = reader.entries().iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"pages/page_0001.webp"));
+    assert!(paths.contains(&format!("{prefix}/page_0001.webp").as_str()));
+
+    // metadata.json に contents が入る（同期復元用）
+    let meta_bytes = reader.read_entry("metadata.json", None).unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+    let meta_contents = meta["contents"].as_array().unwrap();
+    assert_eq!(meta_contents.len(), 2);
+    assert!(
+        meta_contents
+            .iter()
+            .any(|content| content["displayName"] == "本編" && content["isPrimary"] == true)
+    );
+
+    // 再取り込みしてもコンテンツが二重化しない
+    let again = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "multi.zip",
+        &std::fs::read(&zip_path).unwrap(),
+        &env.packs(),
+        None,
+        &mut no_progress,
+        Some(&imported.book.id),
+    )
+    .unwrap();
+    assert_eq!(again.book.id, imported.book.id);
+    let stored_again = db::contents::list_for_book(&env.pool, &imported.book.id).unwrap();
+    assert_eq!(stored_again.len(), 2, "再取り込みでコンテンツが増えない");
+
+    // 選択に応じたページ列（フェーズ3）。再取り込みで id が振り直されるため
+    // ここで最新の行を引き直して検証する。
+    let default_pages =
+        db::documents::images_for_selection(&env.pool, &imported.book.id, None, None).unwrap();
+    assert_eq!(
+        default_pages
+            .iter()
+            .filter(|image| image.image_type == "page")
+            .count(),
+        2,
+        "未指定なら既定表示コンテンツのページ"
+    );
+    let primary_again = db::contents::primary_for_book(&env.pool, &imported.book.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(primary_again.display_name, "本編");
+    let secondary_again = stored_again
+        .iter()
+        .find(|content| content.content_id != primary_again.content_id)
+        .unwrap();
+    assert_eq!(secondary_again.display_name, "別冊");
+    let secondary_formats_again =
+        db::contents::formats_for_content(&env.pool, &secondary_again.content_id).unwrap();
+    let secondary_pages = db::documents::images_for_selection(
+        &env.pool,
+        &imported.book.id,
+        Some(&secondary_again.content_id),
+        None,
+    )
+    .unwrap();
+    let secondary_only: Vec<&db::documents::DocumentImage> = secondary_pages
+        .iter()
+        .filter(|image| image.image_type == "page")
+        .collect();
+    assert_eq!(secondary_only.len(), 1, "別冊は 1 ページ");
+    assert!(
+        secondary_only
+            .iter()
+            .all(|page| page.format_id.as_deref()
+                == Some(secondary_formats_again[0].format_id.as_str())),
+        "別冊の選択で本編のページが混ざらない"
+    );
+    assert!(
+        secondary_pages
+            .iter()
+            .all(|image| image.content_id.as_deref() == Some(secondary_again.content_id.as_str()))
+    );
+}
+
+#[test]
+fn zip_nested_folders_become_separate_contents() {
+    // 実データ（d_614383 尻穴便女 総集編）は「総集編フォルダ / 1.話A / 2.話B …」の形。
+    // **ページを直接含むフォルダ**が読む単位になり、上位フォルダは単位にしない。
+    let env = TestEnv::new("nested-folders");
+    let zip_path = env.root.join("nested.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, color) in [
+        ("総集編/1.話A/001.jpg", [255, 0, 0]),
+        ("総集編/1.話A/002.jpg", [0, 255, 0]),
+        ("総集編/2.話B/001.jpg", [0, 0, 255]),
+        // 形式フォルダを挟む場合は、その上のフォルダ名を採る
+        ("総集編/3.話C/jpg/001.jpg", [255, 255, 0]),
+        ("総集編/4.オマケ漫画/001.jpg", [128, 0, 128]),
+    ] {
+        zip.start_file(name, options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, color)).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let stored = db::contents::list_with_formats(&env.pool, &imported.book.id).unwrap();
+    let names: Vec<&str> = stored
+        .iter()
+        .map(|(content, _)| content.display_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["1.話A", "2.話B", "3.話C", "4.オマケ漫画"],
+        "ページを含むフォルダが単位になる（自然順）"
+    );
+    // 形式フォルダ（jpg）ではなくその上のフォルダ名を使う
+    let talk_c = stored
+        .iter()
+        .find(|(content, _)| content.display_name == "3.話C")
+        .unwrap();
+    assert_eq!(talk_c.1.len(), 1);
+    assert_eq!(talk_c.1[0].page_count, 1);
+    assert_eq!(talk_c.1[0].label, "JPEG");
+    assert_eq!(
+        talk_c.1[0].pack_entry_prefix.as_deref(),
+        Some("contents/2/r0")
+    );
+    // 既定表示はページ数最多（1.話A = 2 ページ）
+    let primary = db::contents::primary_for_book(&env.pool, &imported.book.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(primary.display_name, "1.話A");
+    assert_eq!(imported.document.total_pages, 2);
 }
 
 #[test]
@@ -429,6 +962,7 @@ fn pdf_import_binds_identity_when_provided() {
         &env.packs(),
         Some(&identity),
         &mut no_progress,
+        None,
     )
     .unwrap();
     assert_eq!(imported.book.id, book_id);
@@ -464,5 +998,382 @@ fn tags_generate_falls_back_to_nouns_when_zenn_unavailable() {
     assert!(tags.len() <= 10);
     for tag in &tags {
         assert!(tag.chars().count() <= 20);
+    }
+}
+
+// ---- フェーズ7: 名前カスタム（pack の metadata.json 書き換え） ----
+
+/// 2 コンテンツ（本文 / 別冊）を持つ metadata.json。
+fn metadata_with_two_contents() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "title": "テスト本",
+        "readingProgress": { "currentPage": 0, "totalPages": 1 },
+        "contents": [
+            {
+                "contentId": "c1",
+                "displayName": "本文",
+                "mediaKind": "image",
+                "isPrimary": true,
+                "sortOrder": 0,
+                "formats": []
+            },
+            {
+                "contentId": "c2",
+                "displayName": "別冊",
+                "mediaKind": "pdf",
+                "isPrimary": false,
+                "sortOrder": 1,
+                "formats": []
+            }
+        ]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn rename_content_in_pack_rewrites_only_that_content() {
+    let mut builder = PackBuilder::new(1_700_000_000_000);
+    builder.add_entry(
+        "pages/page_0001.webp",
+        b"page-1".to_vec(),
+        "image/webp",
+        false,
+    );
+    builder.add_entry(
+        "metadata.json",
+        metadata_with_two_contents(),
+        "application/json",
+        false,
+    );
+    let pack = builder.build(None, false).unwrap();
+
+    let renamed = thundoku_core::import::rename_content_in_pack(&pack, "c2", "続編", None)
+        .unwrap()
+        .expect("metadata が変わった pack は Some を返す");
+
+    let reader = PackReader::open(&renamed).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&reader.read_entry("metadata.json", None).unwrap()).unwrap();
+    assert_eq!(meta["contents"][1]["displayName"], "続編");
+    assert_eq!(meta["contents"][0]["displayName"], "本文");
+    assert_eq!(meta["title"], "テスト本");
+    // ページとそれ以外のエントリはそのまま読める
+    assert_eq!(
+        reader.read_entry("pages/page_0001.webp", None).unwrap(),
+        b"page-1"
+    );
+    assert_eq!(reader.entries().len(), 2);
+    // 元の pack は変更しない
+    let original: serde_json::Value = serde_json::from_slice(
+        &PackReader::open(&pack)
+            .unwrap()
+            .read_entry("metadata.json", None)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(original["contents"][1]["displayName"], "別冊");
+}
+
+#[test]
+fn rename_content_in_pack_keeps_identity_binding() {
+    let identity = Identity {
+        sub: "sub-1".into(),
+        pack_id: "b1".into(),
+    };
+    let mut builder = PackBuilder::new(7);
+    builder.add_entry(
+        "pages/page_0001.webp",
+        b"page-1".to_vec(),
+        "image/webp",
+        true,
+    );
+    builder.add_entry(
+        "metadata.json",
+        metadata_with_two_contents(),
+        "application/json",
+        true,
+    );
+    let pack = builder.build(Some(&identity), true).unwrap();
+
+    let renamed =
+        thundoku_core::import::rename_content_in_pack(&pack, "c1", "本編", Some(&identity))
+            .unwrap()
+            .unwrap();
+
+    let reader = PackReader::open(&renamed).unwrap();
+    // 暗号化は維持される（identity 無しでは読めない）
+    assert!(reader.read_entry("pages/page_0001.webp", None).is_err());
+    assert_eq!(
+        reader
+            .read_entry("pages/page_0001.webp", Some(&identity))
+            .unwrap(),
+        b"page-1"
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&reader.read_entry("metadata.json", Some(&identity)).unwrap())
+            .unwrap();
+    assert_eq!(meta["contents"][0]["displayName"], "本編");
+}
+
+#[test]
+fn rename_content_in_pack_returns_none_when_unknown_or_missing() {
+    // 対象の content_id が無ければ None（pack を作り直さない）
+    let mut builder = PackBuilder::new(1);
+    builder.add_entry(
+        "metadata.json",
+        metadata_with_two_contents(),
+        "application/json",
+        false,
+    );
+    let pack = builder.build(None, false).unwrap();
+    assert!(
+        thundoku_core::import::rename_content_in_pack(&pack, "missing", "x", None)
+            .unwrap()
+            .is_none()
+    );
+
+    // metadata.json を持たない pack も None（エラーにしない）
+    let mut bare = PackBuilder::new(1);
+    bare.add_entry("pages/page_0001.webp", b"p".to_vec(), "image/webp", false);
+    let bare = bare.build(None, false).unwrap();
+    assert!(
+        thundoku_core::import::rename_content_in_pack(&bare, "c1", "x", None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ---- フェーズ8（§11.2 R1）: 入れ子アーカイブの上限付き再帰展開 ----
+
+/// ZIP をメモリ上で組み立てる（入れ子アーカイブの fixture 用）。
+fn build_zip(entries: impl IntoIterator<Item = (String, Vec<u8>)>) -> Vec<u8> {
+    use std::io::Write;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, data) in entries {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&data).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn planned_content<'a>(
+    plan: &'a thundoku_core::import::ImportPlan,
+    display_name: &str,
+) -> &'a thundoku_core::import::PlannedContent {
+    plan.contents
+        .iter()
+        .find(|content| content.display_name == display_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "content {display_name:?} not found in {:?}",
+                plan.contents
+                    .iter()
+                    .map(|content| content.display_name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+#[test]
+fn nested_zip_contents_are_imported() {
+    // ZIP の中の ZIP（決定 D5）。入れ子内の画像が 1 コンテンツとして取り込まれる。
+    let env = TestEnv::new("nested-zip-import");
+    let inner = build_zip([
+        ("001.jpg".to_string(), make_png(64, 96, [255, 0, 0])),
+        ("002.jpg".to_string(), make_png(64, 96, [0, 255, 0])),
+    ]);
+    let outer = build_zip([
+        // 表紙はページにならない（決定 D4）。入れ子だけが本文。
+        ("表紙.jpg".to_string(), make_png(64, 96, [10, 10, 10])),
+        ("本編.zip".to_string(), inner),
+    ]);
+
+    let plan = analyze_zip(&outer).unwrap();
+    let content = planned_content(&plan, "本編");
+    assert_eq!(content.media_kind, MediaKind::Image);
+    assert_eq!(content.renditions.len(), 1);
+    assert_eq!(
+        content.renditions[0].entries.len(),
+        2,
+        "入れ子内の画像 2 枚が合流する"
+    );
+    assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+
+    let imported = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "outer.zip",
+        &outer,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+    assert_eq!(imported.document.source_type, "image-set");
+    assert_eq!(imported.document.total_pages, 2);
+    assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+
+    // DB 上も入れ子内の画像がページとして入る
+    let images = db::documents::images_for_book(&env.pool, &imported.book.id).unwrap();
+    let pages: Vec<&db::documents::DocumentImage> = images
+        .iter()
+        .filter(|image| image.image_type == "page")
+        .collect();
+    assert_eq!(pages.len(), 2, "入れ子内の画像が document_images に入る");
+    let stored = db::contents::list_for_book(&env.pool, &imported.book.id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].display_name, "本編");
+    assert_eq!(stored[0].media_kind, "image");
+
+    // pack にもページが入る
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    let paths: Vec<&str> = reader.entries().iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"pages/page_0001.webp"));
+    assert!(paths.contains(&"pages/page_0002.webp"));
+}
+
+#[test]
+fn nested_zip_depth_two_is_not_expanded() {
+    // 深さ 2（ZIP in ZIP in ZIP）は展開しない。1 階層で止まる。
+    let env = TestEnv::new("nested-zip-depth");
+    let deepest = build_zip([("001.jpg".to_string(), make_png(64, 96, [0, 0, 255]))]);
+    let middle = build_zip([
+        ("001.jpg".to_string(), make_png(64, 96, [255, 0, 0])),
+        ("inner.zip".to_string(), deepest),
+    ]);
+    let outer = build_zip([("本編.zip".to_string(), middle)]);
+
+    let plan = analyze_zip(&outer).unwrap();
+    let content = planned_content(&plan, "本編");
+    assert_eq!(
+        content.renditions[0].entries.len(),
+        1,
+        "深さ 2 の画像は合流しない"
+    );
+    assert!(
+        plan.warnings.iter().any(|w| w.contains("depth limit")),
+        "深さ上限の警告が入る: {:?}",
+        plan.warnings
+    );
+
+    let imported = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "outer.zip",
+        &outer,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+    assert_eq!(imported.document.total_pages, 1);
+}
+
+#[test]
+fn nested_zip_over_entry_limit_is_skipped_with_warning() {
+    // エントリ数上限を超える入れ子はスキップし、警告に理由を積む（取り込みは続行）。
+    let env = TestEnv::new("nested-zip-limit");
+    let nested = build_zip(
+        (0..MAX_NESTED_ENTRIES + 1)
+            .map(|index| (format!("{index:05}.jpg"), make_png(8, 8, [255, 0, 0]))),
+    );
+    let outer = build_zip([
+        ("本文/001.jpg".to_string(), make_png(64, 96, [0, 0, 255])),
+        ("同梱.zip".to_string(), nested),
+    ]);
+
+    let imported = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "outer.zip",
+        &outer,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        imported.document.total_pages, 1,
+        "上限超過の入れ子は取り込まれない"
+    );
+    assert!(
+        imported
+            .warnings
+            .iter()
+            .any(|w| w.contains("同梱.zip") && w.contains("limit")),
+        "上限超過が warnings に入る: {:?}",
+        imported.warnings
+    );
+    let stored = db::contents::list_for_book(&env.pool, &imported.book.id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].display_name, "本文");
+}
+
+#[test]
+fn zip_without_readable_content_is_not_a_readable_work() {
+    // 読めるコンテンツ（画像 / PDF / EPUB）が無い ZIP は型付きで返す（R3）。
+    let env = TestEnv::new("not-readable-zip");
+    let bytes = build_zip([("readme.txt".to_string(), b"hello".to_vec())]);
+    let error = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "text.zip",
+        &bytes,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ImportError::NotAReadableWork),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn image_pages_keep_their_order_with_parallel_rendering() {
+    // 並列変換でもページの対応がずれないこと（ページ N の画像が N 枚目に入る）
+    let env = TestEnv::new("parallel-order");
+    let zip_path = env.root.join("ordered.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    let count = 12u8;
+    for page in 0..count {
+        zip.start_file(format!("本編/{:02}.png", page + 1), options)
+            .unwrap();
+        // ページごとに違う色の PNG（赤成分 = 20 * page）
+        let image = image::RgbImage::from_pixel(20, 30, image::Rgb([20 * page, 40, 60]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::io::Write::write_all(&mut zip, &png).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let mut no_progress = |_p: f32| {};
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    assert_eq!(imported.document.total_pages, count as i64);
+
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    for page in 1..=count as i64 {
+        let data = reader
+            .read_entry(&format!("pages/page_{page:04}.webp"), None)
+            .unwrap();
+        let decoded = image::load_from_memory(&data).unwrap().to_rgb8();
+        let red = decoded.get_pixel(0, 0).0[0] as i32;
+        let expected = 20 * (page as i32 - 1);
+        // webp は不可逆なので色は多少ずれる。隣のページとは 20 差なので、
+        // 許容 8 でも「順序がずれた」ことは検出できる。
+        assert!(
+            (red - expected).abs() <= 8,
+            "ページ {page} の赤が {red}（期待 {expected} 前後）。並列処理で順序がずれた可能性"
+        );
     }
 }

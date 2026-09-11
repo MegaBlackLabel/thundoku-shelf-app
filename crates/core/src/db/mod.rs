@@ -9,6 +9,7 @@ pub mod backup;
 pub mod books;
 pub mod bookshelf;
 pub mod checklist;
+pub mod contents;
 pub mod documents;
 pub mod page_views;
 pub mod progress;
@@ -65,19 +66,123 @@ async fn ensure_column(
     column: &str,
     definition: &str,
 ) -> Result<(), sqlx::Error> {
-    let exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-    )
-    .bind(table)
-    .bind(column)
-    .fetch_one(&mut *conn)
-    .await?;
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2")
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *conn)
+            .await?;
     if exists == 0 {
         sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
             .execute(&mut *conn)
             .await?;
     }
     Ok(())
+}
+
+/// テーブルに列があるか（`PRAGMA table_info`）。
+async fn has_column(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool, sqlx::Error> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2")
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(count > 0)
+}
+
+/// `reading_progress` / `page_views` を**コンテンツ単位**に作り替えるデータ移行。
+///
+/// PK 変更は `ALTER TABLE` でできないため、新テーブルへ `INSERT ... SELECT` して
+/// 入れ替える。既存行の `content_id` は「その本の優先コンテンツ」、無ければ `''`
+/// （旧データ / 単一コンテンツ）。`content_id` 列の有無で判定するので何度でも安全。
+pub(crate) async fn migrate_progress_content_id(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<u64, sqlx::Error> {
+    let mut moved = 0u64;
+
+    if !has_column(&mut *conn, "reading_progress", "content_id").await? {
+        sqlx::query("ALTER TABLE reading_progress RENAME TO reading_progress_old")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE reading_progress (               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               content_id TEXT NOT NULL DEFAULT '',               current_page INTEGER NOT NULL DEFAULT 0,               total_pages INTEGER,               finished_at TEXT,               last_read_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               scroll_position REAL NOT NULL DEFAULT 0,               PRIMARY KEY (book_id, content_id)             )",
+        )
+        .execute(&mut *conn)
+        .await?;
+        moved += sqlx::query(
+            "INSERT INTO reading_progress (book_id, content_id, current_page, total_pages, \
+             finished_at, last_read_at, scroll_position) \
+             SELECT old.book_id, \
+                    COALESCE((SELECT content_id FROM book_contents WHERE book_id = old.book_id \
+                              ORDER BY is_primary DESC, sort_order, content_id LIMIT 1), ''), \
+                    old.current_page, old.total_pages, old.finished_at, old.last_read_at, \
+                    old.scroll_position \
+             FROM reading_progress_old old",
+        )
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        sqlx::query("DROP TABLE reading_progress_old")
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    if !has_column(&mut *conn, "page_views", "content_id").await? {
+        sqlx::query("ALTER TABLE page_views RENAME TO page_views_old")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE page_views (               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               content_id TEXT NOT NULL DEFAULT '',               page_number INTEGER NOT NULL,               view_count INTEGER NOT NULL DEFAULT 0,               total_seconds REAL NOT NULL DEFAULT 0,               last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               PRIMARY KEY (book_id, content_id, page_number)             )",
+        )
+        .execute(&mut *conn)
+        .await?;
+        moved += sqlx::query(
+            "INSERT INTO page_views (book_id, content_id, page_number, view_count, total_seconds, \
+             last_viewed_at) \
+             SELECT old.book_id, \
+                    COALESCE((SELECT content_id FROM book_contents WHERE book_id = old.book_id \
+                              ORDER BY is_primary DESC, sort_order, content_id LIMIT 1), ''), \
+                    old.page_number, old.view_count, old.total_seconds, old.last_viewed_at \
+             FROM page_views_old old",
+        )
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        sqlx::query("DROP TABLE page_views_old")
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    // ページテキスト・形態素解析にもコンテンツを紐づける（列追加のみ）
+    ensure_column(
+        &mut *conn,
+        "document_text",
+        "content_id",
+        "content_id TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    ensure_column(
+        &mut *conn,
+        "token_analysis",
+        "content_id",
+        "content_id TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+
+    Ok(moved)
+}
+
+/// テスト・ワンショット用の同期ラッパー。
+pub fn run_progress_content_migration(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    block_on(async {
+        let mut conn = pool.acquire().await?;
+        migrate_progress_content_id(&mut conn).await
+    })
 }
 
 /// Apply pending migrations. Idempotent; tracked in the `_sqlx_migrations`
@@ -172,10 +277,51 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         // マイグレーションファイルは checksum 管理されるため変更せず、IF NOT EXISTS で
         // 冪等に適用する。1 冊 × 1 ページの累計表示回数・累計滞在秒数を持つ集計表）
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS page_views (               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               page_number INTEGER NOT NULL,               view_count INTEGER NOT NULL DEFAULT 0,               total_seconds REAL NOT NULL DEFAULT 0,               last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               PRIMARY KEY (book_id, page_number)             );             CREATE INDEX IF NOT EXISTS idx_page_views_book ON page_views(book_id)",
+            "CREATE TABLE IF NOT EXISTS page_views (               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               content_id TEXT NOT NULL DEFAULT '',               page_number INTEGER NOT NULL,               view_count INTEGER NOT NULL DEFAULT 0,               total_seconds REAL NOT NULL DEFAULT 0,               last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               PRIMARY KEY (book_id, content_id, page_number)             );             CREATE INDEX IF NOT EXISTS idx_page_views_book ON page_views(book_id)",
         )
         .execute(&mut *conn)
         .await?;
+        // コンテンツ（読む単位）とレンディション（切替可能な表示形態）。1 冊に複数の
+        // 本文・別冊・PDF版/画像版を持たせるための構造（docs/import-patterns.md §3.3）。
+        // 開発中のためマイグレーションファイルは作らず、他の後発テーブルと同様に
+        // IF NOT EXISTS で冪等に適用する。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS book_contents (               content_id TEXT PRIMARY KEY,               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               display_name TEXT NOT NULL,               media_kind TEXT NOT NULL,               is_primary INTEGER NOT NULL DEFAULT 0,               sort_order INTEGER NOT NULL DEFAULT 0,               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP             );             CREATE INDEX IF NOT EXISTS idx_book_contents_book ON book_contents(book_id)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS content_formats (               format_id TEXT PRIMARY KEY,               content_id TEXT NOT NULL REFERENCES book_contents(content_id) ON DELETE CASCADE,               label TEXT NOT NULL,               format_kind TEXT NOT NULL,               page_count INTEGER NOT NULL DEFAULT 0,               pack_entry_prefix TEXT,               sort_order INTEGER NOT NULL DEFAULT 0,               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP             );             CREATE INDEX IF NOT EXISTS idx_content_formats_content ON content_formats(content_id)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        // `document_images` にコンテンツ / レンディションへの参照を追加する
+        // （NULL = フェーズ2以前に取り込んだ旧データ。単一コンテンツ扱い）。
+        ensure_column(
+            &mut conn,
+            "document_images",
+            "content_id",
+            "content_id TEXT REFERENCES book_contents(content_id)",
+        )
+        .await?;
+        ensure_column(
+            &mut conn,
+            "document_images",
+            "format_id",
+            "format_id TEXT REFERENCES content_formats(format_id)",
+        )
+        .await?;
+        // フェーズ2以前の旧ラベル（画像 / PDF / EPUB）を実データに合わせて書き換える
+        // （データ移行。対象が無ければ何もしない）
+        let migrated_labels = contents::migrate_legacy_labels(&mut conn).await?;
+        if migrated_labels > 0 {
+            log::info!("migrate: content_formats.label を {migrated_labels} 件更新");
+        }
+        // 進捗・ページ毎記録をコンテンツ単位に作り替える（旧スキーマのときだけ実行）
+        let migrated_progress = migrate_progress_content_id(&mut conn).await?;
+        if migrated_progress > 0 {
+            log::info!("migrate: 進捗を {migrated_progress} 件コンテンツ単位へ移行");
+        }
         // 共有ソースメタ列（FANZA同人 / DLsite）。開発中のためマイグレーションファイルは
         // 作らず、既存 runtime DDL（hidden_at / owner_sub 等）と同様に冪等に適用する。
         {
@@ -240,6 +386,8 @@ pub fn clear_owner_model_if_first_run(
         "token_analysis",
         "document_text",
         "document_images",
+        "content_formats",
+        "book_contents",
         "imported_documents",
         "book_tags",
         "reading_progress",

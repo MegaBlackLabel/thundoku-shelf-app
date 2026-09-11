@@ -101,6 +101,7 @@ fn import_book(
     pack_id: &str,
     identity_sub: Option<&str>,
     file_size: i64,
+    pack_bytes: &[u8],
 ) -> Result<(), SyncError> {
     let mut title = pack_id.to_string();
     let mut author = String::new();
@@ -166,6 +167,13 @@ fn import_book(
             series_name: None,
         },
     )?;
+    // pack から取り込み状態（ドキュメント・コンテンツ・ページ行）を再構築する。
+    // DB だけ失った / 別端末での復元用。すでに取り込み済みなら何もしない。
+    if let Err(error) =
+        crate::import::rebuild_from_pack(pool, pack_id, pack_bytes, identity.as_ref())
+    {
+        log::warn!("drive restore: pack からの再構築に失敗 ({pack_id}): {error}");
+    }
     Ok(())
 }
 
@@ -246,7 +254,14 @@ pub fn sync(
         let temp = downloads_dir.join(format!("{pack_id}.{PACK_EXTENSION}"));
         std::fs::write(&temp, &bytes)?;
         std::fs::write(&local_path, &bytes)?;
-        import_book(pool, &reader, pack_id, identity_sub, bytes.len() as i64)?;
+        import_book(
+            pool,
+            &reader,
+            pack_id,
+            identity_sub,
+            bytes.len() as i64,
+            &bytes,
+        )?;
         // ダウンロードした pack は現在 sub の所有として記録する（フォルダ分離前提で帰属を信頼）。
         if let (Some(sub), Some(key)) = (identity_sub, owner_key) {
             books::set_owner_sub(pool, pack_id, Some(crate::owner::encrypt(key, sub)))?;
@@ -601,6 +616,7 @@ mod tests {
             &src,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 42,
                 total_pages: Some(200),
                 finished_at: None,
@@ -684,6 +700,7 @@ mod tests {
             &src,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 42,
                 total_pages: Some(200),
                 finished_at: None,
@@ -735,6 +752,7 @@ mod tests {
             &same,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 42,
                 total_pages: Some(200),
                 finished_at: None,
@@ -784,6 +802,7 @@ mod tests {
             &same,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 100,
                 total_pages: Some(200),
                 finished_at: None,
@@ -842,6 +861,7 @@ mod tests {
             &local,
             &ReadingProgress {
                 book_id: "book-1".into(),
+                content_id: String::new(),
                 current_page: 42,
                 total_pages: Some(200),
                 finished_at: None,

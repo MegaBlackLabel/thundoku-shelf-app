@@ -4,6 +4,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::Focusable as _;
+use gpui_kit::base::{Transition, transition};
+use gpui_kit::component::animation::ease_out_cubic;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::slider::{Slider, SliderState};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _};
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
     AppContext as _, InteractiveElement as _, ReadGlobal as _, ScrollHandle,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
@@ -13,18 +22,10 @@ use gpui_kit::{
     Context, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
     SharedString, Window, div, img, px,
 };
-use gpui_kit::base::{Transition, transition};
-use gpui_kit::component::animation::ease_out_cubic;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::slider::{Slider, SliderState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _};
-use gpui_kit::component::{Icon, IconName};
 use thundoku_core::db;
 
 use crate::actions::CloseReader;
+use crate::icons::AppIcon;
 use thundoku_core::db::documents::DocumentImage;
 
 pub const AUTOPLAY_MIN_MS: u64 = 3000;
@@ -36,6 +37,19 @@ const OVERLAY_HIDE_MS: u64 = 5000;
 /// ウィンドウカスタムタイトルバーの高さ（px）。リーダーはタイトルバーを残すため、
 /// 画像のフィット計算でウィンドウ全体の高さから差し引く（Windows のみ。Mac は 0）。
 #[cfg(windows)]
+/// ページ一覧に出すサムネイルの幅（px）。表示用のフル解像度ページとは別に持つ。
+const PAGE_THUMB_WIDTH: f32 = 200.0;
+/// ページ一覧で同時に保持するサムネイル数（超えたら古い順に捨てる）。
+/// 1 枚 ≒ 0.2MB なので 120 枚で 24MB 程度に収まる。
+const MAX_PAGE_THUMBS: usize = 120;
+/// ページ一覧のタイル幅 + gap（列数の計算に使う）。
+const PAGE_TILE_WIDTH: f32 = 108.0;
+/// ページ一覧の高さ（トップバー下に出るパネル）。
+const PAGE_LIST_HEIGHT: f32 = 420.0;
+/// ページ一覧の 1 行の高さ（固定）。`measure_all` は全行を測定のために構築するため
+/// 使わない（行の構築でサムネイル読み込みを起こすので、全ページ読んでしまう）。
+const PAGE_LIST_ROW_HEIGHT: f32 = 196.0;
+
 const WIN_TITLE_BAR_HEIGHT: f32 = 36.0;
 #[cfg(not(windows))]
 const WIN_TITLE_BAR_HEIGHT: f32 = 0.0;
@@ -46,6 +60,82 @@ pub trait PageLoader: Send + Sync + 'static {
     fn page_size(&self, index: usize) -> Option<(u32, u32)>;
     /// Blocking decode; called on the background executor.
     fn load(&self, index: usize) -> Result<Arc<RenderImage>, String>;
+
+    /// ページ一覧に出すサムネイル。既定は [`Self::load`] の結果を縮小する。
+    ///
+    /// ページ一覧は全ページ分を保持しうるため、フル解像度（実測 1 ページ 45MB）を
+    /// 貯めない経路を必ず通す（`PAGE_THUMB_WIDTH`）。
+    fn load_thumb(&self, index: usize) -> Result<Arc<RenderImage>, String> {
+        let image = self.load(index)?;
+        Ok(downscale_render_image(&image, PAGE_THUMB_WIDTH))
+    }
+}
+
+/// RenderImage（BGRA のまま）を幅 `max_width` に縮小した新しい RenderImage を返す。
+/// チャンネル順は触らない（縮小は色に依存しない）。すでに小さければそのまま返す。
+fn downscale_render_image(image: &Arc<RenderImage>, max_width: f32) -> Arc<RenderImage> {
+    let size = image.size(0);
+    let (width, height) = (size.width.0.max(1) as u32, size.height.0.max(1) as u32);
+    if width as f32 <= max_width {
+        return image.clone();
+    }
+    let Some(bytes) = image.as_bytes(0) else {
+        return image.clone();
+    };
+    let Some(source) = image::RgbaImage::from_raw(width, height, bytes.to_vec()) else {
+        return image.clone();
+    };
+    let scale = max_width / width as f32;
+    let resized = image::imageops::resize(
+        &source,
+        ((width as f32 * scale).max(1.0)) as u32,
+        ((height as f32 * scale).max(1.0)) as u32,
+        image::imageops::FilterType::Triangle,
+    );
+    Arc::new(RenderImage::new([image::Frame::new(resized)]))
+}
+
+/// ページ一覧に出すコンテンツ 1 行（UI 表示用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentEntry {
+    pub content_id: String,
+    pub display_name: String,
+    pub media_kind: String,
+    pub is_primary: bool,
+    pub formats: Vec<FormatEntry>,
+}
+
+/// レンディション（切替可能な表示形態）1 行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatEntry {
+    pub format_id: String,
+    pub label: String,
+    pub page_count: i64,
+    /// `image` / `pdf` / `epub` / `audio` / `video`
+    pub format_kind: String,
+}
+
+/// ページ一覧の切替行（コンテンツ or レンディション）。
+struct SwitchRow {
+    content_index: usize,
+    format_index: usize,
+    title: String,
+    subtitle: String,
+    /// `image` / `pdf` / `epub` / `audio` / `video`
+    kind: String,
+    is_current: bool,
+}
+
+/// 切替行の補足（`画像 48ファイル` / `PDF 16ページ`）。
+fn format_subtitle(format: &FormatEntry) -> String {
+    match format.format_kind.as_str() {
+        "image" => format!("画像 {}ファイル", format.page_count),
+        "pdf" => format!("PDF {}ページ", format.page_count),
+        "epub" => "EPUB ドキュメント".to_string(),
+        "audio" => format!("音声 {}ファイル", format.page_count),
+        "video" => format!("動画 {}ファイル", format.page_count),
+        _ => format!("{} ページ", format.page_count),
+    }
 }
 
 /// Loads pages from a book's `.opfspack` (via `document_images`).
@@ -281,6 +371,22 @@ pub struct ImageViewer {
     last_zoom_toggle: Option<std::time::Instant>,
     active_panel: Option<PanelView>,
     page_input: Option<Entity<InputState>>,
+    /// ページ一覧のサムネイル（**縮小**して保持。表示用の `images` とは別）。
+    /// ページ一覧を開いてもフル解像度ページを貯めないための分離（R6）。
+    thumbs: Vec<Option<Arc<RenderImage>>>,
+    thumbs_loading: std::collections::HashSet<usize>,
+    /// サムネイルを読み込んだ順（古い順に捨てて保持数を有界にする）。
+    thumb_order: std::collections::VecDeque<usize>,
+    /// ページ一覧の仮想化（可視行のみ構築・読み込み）。
+    page_list_state: gpui_kit::ListState,
+    /// 名前を編集中のコンテンツ id（空 = 編集していない）。
+    renaming_content: Option<String>,
+    /// 名前入力（メニューの切替行にインライン表示する。1 つを使い回す）。
+    rename_input: Option<Entity<InputState>>,
+    _rename_subscription: Option<Subscription>,
+    /// 確定した名前の変更 `(content_id, display_name)`。
+    /// DB と pack への反映は親（`ReaderView`）が `take_rename` で拾って行う。
+    pending_rename: Option<(String, String)>,
     autoplay_slider: Option<Entity<SliderState>>,
     /// ページ移動用スライダー（ボトムドック）。
     page_slider: Option<Entity<SliderState>>,
@@ -299,6 +405,15 @@ pub struct ImageViewer {
     /// スクロールモードで最後に反映した表示中ページ（render での
     /// ポーリングの再入防止用）
     last_scroll_page: usize,
+    /// ページ一覧に出すコンテンツ（`ReaderView` が DB から設定する）。
+    contents: Vec<ContentEntry>,
+    /// 現在表示中のコンテンツ／レンディション（未指定 = 旧データ / 単一コンテンツ）。
+    current_content_id: Option<String>,
+    current_format_id: Option<String>,
+    /// 切替操作の保留（`(content_id, format_id)`。`ReaderView` が `take_action` で拾う）。
+    pending_action: Option<(String, Option<String>)>,
+    /// ページ画像を読めなかった理由（pack 欠損・破損など）。0 件なら `None`。
+    load_error: Option<String>,
 }
 
 impl ImageViewer {
@@ -338,7 +453,11 @@ impl ImageViewer {
                 Some("scroll") => ViewMode::Scroll,
                 Some(_) => ViewMode::Single,
                 // 未設定のときのデフォルト: FANZA / DLsite は見開き。
-                None if site_id.as_deref() == Some("fanza") || site_id.as_deref() == Some("dlsite") => ViewMode::Spread,
+                None if site_id.as_deref() == Some("fanza")
+                    || site_id.as_deref() == Some("dlsite") =>
+                {
+                    ViewMode::Spread
+                }
                 None => ViewMode::Single,
             }
         };
@@ -383,7 +502,13 @@ impl ImageViewer {
             page_turn_right_to_left,
             autoplay_interval_ms: saved_autoplay_interval,
             last_scroll_page: initial,
+            contents: Vec::new(),
+            current_content_id: None,
+            current_format_id: None,
+            pending_action: None,
+            load_error: None,
             images: (0..page_count).map(|_| None).collect(),
+            thumbs: (0..page_count).map(|_| None).collect(),
             overlay_visible: true,
             hovering_ui: false,
             hide_generation: 0,
@@ -401,6 +526,17 @@ impl ImageViewer {
             last_zoom_toggle: None,
             active_panel: None,
             page_input: None,
+            thumbs_loading: std::collections::HashSet::new(),
+            thumb_order: std::collections::VecDeque::new(),
+            page_list_state: gpui_kit::ListState::new(
+                0,
+                gpui_kit::ListAlignment::Top,
+                gpui_kit::px(PAGE_LIST_ROW_HEIGHT),
+            ),
+            renaming_content: None,
+            rename_input: None,
+            _rename_subscription: None,
+            pending_rename: None,
             autoplay_slider: None,
             page_slider: None,
             _page_slider_subscription: None,
@@ -445,6 +581,604 @@ impl ImageViewer {
 
     pub fn mode(&self) -> ViewMode {
         self.mode
+    }
+
+    /// ローダー（コンテンツ／レンディション）を差し替え、ページ列と表示位置を作り直す。
+    /// フェーズ3: 複数コンテンツの切り替えはこの 1 点に集約する。
+    pub fn set_loader(
+        &mut self,
+        cx: &mut Context<Self>,
+        loader: Arc<dyn PageLoader>,
+        initial_page: usize,
+    ) {
+        let page_count = loader.page_count();
+        self.loader = loader;
+        self.images = (0..page_count).map(|_| None).collect();
+        self.loading.clear();
+        self.thumbs = (0..page_count).map(|_| None).collect();
+        self.thumbs_loading.clear();
+        self.thumb_order.clear();
+        self.current_page = initial_page.min(page_count.saturating_sub(1));
+        self.scroll_top_initialized = false;
+        self.last_scroll_page = self.current_page;
+        self.page_turn_count = 0;
+        self.overlay_visible = true;
+        self.zoomed = false;
+        self.zoom_scale = 1.5;
+        self.pan_offset = gpui_kit::Point::new(0.0, 0.0);
+        self.pan_velocity = gpui_kit::Point::new(0.0, 0.0);
+        self.pan_max = gpui_kit::Point::new(0.0, 0.0);
+        self.drag_start = None;
+        self.load_error = None;
+        // 新しいページ列の**表示に必要な分を読み込む**（切替直後に白いページを出さない。
+        // ここで読み込まないと、ページ送りをするまで表示が更新されない）。
+        if self.mode == ViewMode::Scroll {
+            for index in 0..self.images.len() {
+                self.ensure_loaded(cx, index);
+            }
+            self.scroll_handle.scroll_to_item(self.current_page);
+        } else {
+            // 現在ページ + 隣接ページ（見開きで片方が読み込み中のままになるのを防ぐ）
+            self.ensure_loaded(cx, self.current_page);
+            let next = (self.current_page + 1).min(page_count.saturating_sub(1));
+            self.ensure_loaded(cx, next);
+        }
+        // ページ一覧を開いたまま切り替えた場合はサムネイルを読み直す
+        cx.notify();
+    }
+
+    // -- page list (contents) -----------------------------------------------
+
+    /// ページ一覧に出すコンテンツ一覧と、現在表示中の選択を設定する（`ReaderView` から）。
+    pub fn set_contents(
+        &mut self,
+        cx: &mut Context<Self>,
+        contents: Vec<ContentEntry>,
+        current_content_id: Option<String>,
+        current_format_id: Option<String>,
+    ) {
+        self.contents = contents;
+        self.current_content_id = current_content_id;
+        self.current_format_id = current_format_id;
+        cx.notify();
+    }
+
+    /// 名前の変更を確定する（親が `take_rename` で拾って DB と pack に書く）。
+    /// 入力の確定（Enter / フォーカス外れ）とテストから同じ経路で呼ぶ。
+    pub fn rename_content(&mut self, cx: &mut Context<Self>, content_id: &str, display_name: &str) {
+        self.renaming_content = None;
+        self.pending_rename = Some((content_id.to_string(), display_name.to_string()));
+        cx.notify();
+    }
+
+    /// 名前の編集を開始する（今の名前を入れてフォーカスする）。
+    pub fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>, content_id: &str) {
+        let Some(current) = self
+            .contents
+            .iter()
+            .find(|content| content.content_id == content_id)
+            .map(|content| content.display_name.clone())
+        else {
+            return;
+        };
+        let input = match self.rename_input.clone() {
+            Some(input) => input,
+            None => {
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("タイトル"));
+                self._rename_subscription = Some(cx.subscribe(
+                    &input,
+                    |this: &mut Self, _: Entity<InputState>, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                            this.commit_rename(cx);
+                        }
+                    },
+                ));
+                self.rename_input = Some(input.clone());
+                input
+            }
+        };
+        input.update(cx, |state, cx| state.set_value(current, window, cx));
+        // 表示しただけでは入力できない。フォーカスを移して（IME 含む）入力を受け取れるようにする
+        self.renaming_content = Some(content_id.to_string());
+        window.focus(&input.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// 編集中の名前を確定する（入力の Enter / フォーカス外れから呼ぶ）。
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(content_id) = self.renaming_content.clone() else {
+            return;
+        };
+        let Some(input) = self.rename_input.clone() else {
+            return;
+        };
+        let value = input.read(cx).value().to_string();
+        self.rename_content(cx, &content_id, &value);
+    }
+
+    /// 名前の編集を取り消す（入力はそのまま残す）。
+    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming_content = None;
+        cx.notify();
+    }
+
+    /// 確定した名前の変更を取り出す（親が DB と pack に反映する）。
+    pub fn take_rename(&mut self) -> Option<(String, String)> {
+        self.pending_rename.take()
+    }
+
+    /// 切替操作を取り出す（`(content_id, format_id)`。`ReaderView` が反映する）。
+    pub fn take_action(&mut self) -> Option<(String, Option<String>)> {
+        self.pending_action.take()
+    }
+
+    /// ページ一覧に出すコンテンツ（テスト・UI 用）。
+    pub fn contents(&self) -> &[ContentEntry] {
+        &self.contents
+    }
+
+    /// 現在表示中のコンテンツ／レンディション。
+    pub fn current_selection(&self) -> (Option<String>, Option<String>) {
+        (
+            self.current_content_id.clone(),
+            self.current_format_id.clone(),
+        )
+    }
+
+    /// ページ一覧を開く。コンテンツが複数なら一覧、単一ならサムネイルグリッドを直接出す。
+    /// ページ一覧を開く。切替（コンテンツ / レンディション）があれば
+    /// パネルの一番上に並べ、その下に現在のページのサムネイルを出す。
+    /// ページ一覧を開く（サムネイル。切替行はトップバーのメニュー側に出す）。
+    pub fn open_page_list(&mut self, cx: &mut Context<Self>) {
+        self.active_panel = Some(PanelView::PageList);
+        self.restart_hide_timer(cx);
+        cx.notify();
+    }
+
+    /// レンディションを切り替える（同じコンテンツの別形式・別バリアント）。
+    /// ページ一覧（サムネイル）を開くのは「一覧 ›」ボタンの役目。
+    pub fn page_list_select_format(
+        &mut self,
+        cx: &mut Context<Self>,
+        content_index: usize,
+        format_index: usize,
+    ) {
+        let Some(content) = self.contents.get(content_index) else {
+            return;
+        };
+        let Some(format) = content.formats.get(format_index) else {
+            return;
+        };
+        if format.format_id.is_empty() {
+            // 旧データ（コンテンツ情報なし）は切替不要。ページ一覧だけ開く
+            self.open_page_list(cx);
+            return;
+        }
+        self.pending_action = Some((content.content_id.clone(), Some(format.format_id.clone())));
+        // `ReaderView` の observer が拾えるように通知する（メニューの「表示中」も更新される）
+        cx.notify();
+    }
+
+    /// ページ一覧のサムネイルを（必要なら）読み込む。
+    ///
+    /// ページ一覧は行単位で仮想化されていて、**可視行のタイルだけ**がこれを呼ぶ。
+    /// 以前はページ一覧を開いた時点で全ページのフル解像度画像を読んでいたため、
+    /// 実測で 192 ページ本 = 142 秒 / 8.7GB、3,321 ページ本 = 41 分 / 146GB 相当に
+    /// なっていた（R6）。サムネイルは縮小して保持し、保持数も上限を設ける。
+    fn ensure_thumb_loaded(&mut self, cx: &mut Context<Self>, index: usize) {
+        if index >= self.thumbs.len()
+            || self.thumbs[index].is_some()
+            || self.thumbs_loading.contains(&index)
+        {
+            return;
+        }
+        self.thumbs_loading.insert(index);
+        let loader = self.loader.clone();
+        let handle = cx.entity();
+        let task = cx
+            .background_executor()
+            .spawn(async move { loader.load_thumb(index) });
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle.update(cx, |this, cx| {
+                this.thumbs_loading.remove(&index);
+                if index < this.thumbs.len() {
+                    match result {
+                        Ok(image) => {
+                            this.thumbs[index] = Some(image);
+                            this.thumb_order.push_back(index);
+                            this.evict_thumbs();
+                        }
+                        // 壊れたページ 1 枚でページ一覧全体を止めない（枠だけ出す）
+                        Err(error) => {
+                            log::warn!("ページ {index} のサムネイルを読めません: {error}")
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// サムネイルの保持数を上限に収める（読み込んだ順に古いものから捨てる）。
+    fn evict_thumbs(&mut self) {
+        while self.thumb_order.len() > MAX_PAGE_THUMBS {
+            let Some(oldest) = self.thumb_order.pop_front() else {
+                break;
+            };
+            if let Some(slot) = self.thumbs.get_mut(oldest) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// トップバーのメニューに出す切替行（コンテンツ × レンディションを平坦に並べる）。
+    /// レンディションが 1 つだけの本でも 1 行出す（`PDF` / `JPEG` など）。
+    /// トップバーのメニューに出す切替行（コンテンツ × レンディションを平坦に並べる）。
+    ///
+    /// - 行のクリック = その形式に切り替える（＝そのコンテンツが既定表示になる）
+    /// - 右端の「一覧 ›」= その形式のページ一覧（サムネイル）を開く
+    fn switch_rows(&self) -> Vec<SwitchRow> {
+        let mut rows = Vec::new();
+        for (content_index, content) in self.contents.iter().enumerate() {
+            // 直下の画像セットは合成名（`本文`）。旧データは表示名なし。
+            // どちらもレンディション名（`JPEG` / `PDF`）を出す。
+            let named = !content.display_name.is_empty() && content.display_name != "本文";
+            for (format_index, format) in content.formats.iter().enumerate() {
+                // 名前は内容名だけ。形式はアイコンと補足（`画像 48ファイル` / `PDF 16ページ`）で分かる
+                let title = if named {
+                    content.display_name.clone()
+                } else {
+                    format.label.clone()
+                };
+                rows.push(SwitchRow {
+                    content_index,
+                    format_index,
+                    title,
+                    subtitle: format_subtitle(format),
+                    kind: format.format_kind.clone(),
+                    is_current: self.current_format_id.as_deref()
+                        == Some(format.format_id.as_str()),
+                });
+            }
+        }
+        rows
+    }
+
+    /// メニューに出す切替行の見出し（テスト・UI 用）。
+    pub fn menu_row_titles(&self) -> Vec<String> {
+        self.switch_rows()
+            .into_iter()
+            .map(|row| row.title)
+            .collect()
+    }
+
+    /// メニューに出す切替行の補足（テスト・UI 用）。
+    pub fn menu_row_subtitles(&self) -> Vec<String> {
+        self.switch_rows()
+            .into_iter()
+            .map(|row| row.subtitle)
+            .collect()
+    }
+
+    /// 切替行 1 つ（アイコン + 名前 + 種別。右端に「表示中」と「一覧 ›」）。
+    fn switch_row_element(
+        &self,
+        row: SwitchRow,
+        handle: &Entity<ImageViewer>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let open_handle = handle.clone();
+        let list_handle = handle.clone();
+        let rename_handle = handle.clone();
+        let content_index = row.content_index;
+        let format_index = row.format_index;
+        // この行のコンテンツ（旧データは content_id が空で名前を持たない）
+        let content_id = self
+            .contents
+            .get(content_index)
+            .map(|content| content.content_id.clone())
+            .unwrap_or_default();
+        let renaming =
+            !content_id.is_empty() && self.renaming_content.as_deref() == Some(&content_id);
+        let rename_input = self.rename_input.clone();
+        let is_folder = row.kind == "image";
+        let icon = if is_folder {
+            IconName::FolderOpen
+        } else {
+            IconName::FileText
+        };
+        let icon_color = if is_folder {
+            gpui_kit::rgb(0xf5c451).into()
+        } else if row.kind == "pdf" {
+            gpui_kit::rgb(0xdc2626).into()
+        } else {
+            cx.theme().muted_foreground
+        };
+        div()
+            .id(SharedString::from(format!(
+                "viewer-switch-{content_index}-{format_index}"
+            )))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().muted)
+            // 行本体: アイコン + 名前 + 種別（クリックで切替）
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "viewer-switch-open-{content_index}-{format_index}"
+                    )))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .flex_grow(1.0)
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
+                        open_handle.update(cx, |this, cx| {
+                            this.page_list_select_format(cx, content_index, format_index);
+                        });
+                    })
+                    .child(Icon::new(icon).size(px(24.0)).text_color(icon_color))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_grow(1.0)
+                            .child(if renaming {
+                                // 名前のインライン編集（Enter / フォーカス外れで確定）。
+                                // 行クリックの切替に伝播させない
+                                let input = rename_input.clone();
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "viewer-rename-open-{content_index}"
+                                    )))
+                                    .debug_selector(|| "viewer-rename-input".into())
+                                    .on_click(|_, _window, cx| cx.stop_propagation())
+                                    .children(input.map(|input| {
+                                        Input::new(&input).cursor_text().text_sm().w_full()
+                                    }))
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .child(row.title)
+                                    .into_any_element()
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(row.subtitle),
+                            ),
+                    ),
+            )
+            // 表示中（緑のチェック付き）
+            .when(row.is_current, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .text_color(gpui_kit::rgb(0x16a34a))
+                        .child(Icon::new(IconName::CircleCheck).size(px(14.0)))
+                        .child(div().text_xs().child("表示中")),
+                )
+            })
+            // 鉛筆（タイトルの変更。同じコンテンツの全レンディション行に出る）
+            .when(!content_id.is_empty() && !renaming, |el| {
+                el.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "viewer-switch-rename-{content_index}"
+                        )))
+                        .debug_selector(move || format!("viewer-switch-rename-{content_index}"))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().muted)
+                        .hover(|style| style.bg(cx.theme().muted))
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            let content_id = content_id.clone();
+                            rename_handle.update(cx, |this, cx| {
+                                this.start_rename(window, cx, &content_id);
+                            });
+                        })
+                        .child(
+                            Icon::new(AppIcon::Pencil)
+                                .size(px(14.0))
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                )
+            })
+            // 一覧 ›（その形式のページ一覧を開く）
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "viewer-switch-list-{content_index}-{format_index}"
+                    )))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().muted)
+                    .hover(|style| style.bg(cx.theme().muted))
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
+                        list_handle.update(cx, |this, cx| {
+                            this.page_list_select_format(cx, content_index, format_index);
+                            this.open_page_list(cx);
+                        });
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .child("一覧"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("›"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn menu_switch_elements(
+        &self,
+        handle: &Entity<ImageViewer>,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui_kit::AnyElement> {
+        self.switch_rows()
+            .into_iter()
+            .map(|row| self.switch_row_element(row, handle, cx))
+            .collect()
+    }
+
+    /// ページ一覧パネル: サムネイルグリッド（切替はトップバーのメニュー側）。
+    ///
+    /// **仮想化**: 行単位の `List` で可視行だけを構築し、サムネイルも可視行だけ読む。
+    /// 全ページを一度に構築・読み込みすると肥大作品（数千ページ）で破綻するため（R6）。
+    fn page_list_panel(
+        &self,
+        handle: &Entity<ImageViewer>,
+        total: usize,
+        panel_width: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let columns = (((panel_width - 24.0) / PAGE_TILE_WIDTH).floor() as usize).max(1);
+        let rows = total.div_ceil(columns);
+        let list_state = self.page_list_state.clone();
+        if list_state.item_count() != rows {
+            list_state.reset(rows);
+        }
+        let list_handle = handle.clone();
+        let grid = gpui_kit::list(list_state, move |row_ix, _window, cx| {
+            let start = row_ix * columns;
+            let end = (start + columns).min(total);
+            // 可視行のサムネイルだけ読み込む（読み込みは背景で走る）
+            list_handle.update(cx, |this, cx| {
+                for index in start..end {
+                    this.ensure_thumb_loaded(cx, index);
+                }
+            });
+            let (thumbs, current_page) = {
+                let view = list_handle.read(cx);
+                (
+                    (start..end)
+                        .map(|index| view.thumbs.get(index).cloned().flatten())
+                        .collect::<Vec<_>>(),
+                    view.current_page,
+                )
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .p_2()
+                .h(px(PAGE_LIST_ROW_HEIGHT))
+                .children(thumbs.into_iter().enumerate().map(|(offset, image)| {
+                    let index = start + offset;
+                    let handle = list_handle.clone();
+                    let is_current = index == current_page;
+                    div()
+                        .id(SharedString::from(format!("viewer-thumb-{index}")))
+                        .debug_selector(move || format!("viewer-thumb-{index}"))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .p_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if is_current {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted
+                        })
+                        .hover(|style| style.bg(cx.theme().muted))
+                        .cursor_pointer()
+                        .on_click(move |_, _window, cx| {
+                            handle.update(cx, |this, cx| {
+                                this.set_page(cx, index);
+                            });
+                        })
+                        .child(
+                            div()
+                                .w(px(100.0))
+                                .aspect_ratio(100.0 / 141.0)
+                                .rounded_sm()
+                                .bg(gpui_kit::white())
+                                .overflow_hidden()
+                                .child(match image {
+                                    Some(image) => img(image)
+                                        .size_full()
+                                        .object_fit(gpui_kit::ObjectFit::Contain)
+                                        .into_any_element(),
+                                    None => div().size_full().into_any_element(),
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{}", index + 1)),
+                        )
+                        .child(if is_current {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("現在")
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        })
+                }))
+                .into_any_element()
+        })
+        .h(px(PAGE_LIST_HEIGHT))
+        .w_full();
+        div()
+            .flex()
+            .flex_col()
+            .when_some(self.load_error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(cx.theme().danger)
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(format!(
+                            "ページ画像を読み込めませんでした: {error}（再ダウンロードしてください）"
+                        )),
+                )
+            })
+            .child(grid)
+            .child(self.panel_back(handle, cx))
+            .into_any_element()
     }
 
     // -- page navigation ----------------------------------------------------
@@ -580,7 +1314,12 @@ impl ImageViewer {
                 if index < this.images.len() {
                     match result {
                         Ok(image) => this.images[index] = Some(image),
-                        Err(_) => this.images[index] = None,
+                        Err(error) => {
+                            this.images[index] = None;
+                            if this.load_error.is_none() {
+                                this.load_error = Some(error);
+                            }
+                        }
                     }
                 }
                 cx.notify();
@@ -910,15 +1649,12 @@ impl ImageViewer {
 
     /// パネルビューを開く（Web 版の `openPanel(view)` 相当）。
     fn open_panel(&mut self, cx: &mut Context<Self>, view: PanelView) {
-        self.active_panel = Some(view);
         if view == PanelView::PageList {
-            // Web 版はサムネイルを遅延ロード。デスクトップは images キャッシュを
-            // 使うため、開いた時点で全ページのサムネイル読み込みを開始する。
-            let count = self.loader.page_count();
-            for index in 0..count {
-                self.ensure_loaded(cx, index);
-            }
+            // コンテンツが複数なら一覧、単一ならサムネイルグリッドを直接出す
+            self.open_page_list(cx);
+            return;
         }
+        self.active_panel = Some(view);
         self.restart_hide_timer(cx);
         cx.notify();
     }
@@ -1206,16 +1942,39 @@ impl ImageViewer {
                         .into_any_element()
                 }
             }
-            None => div()
-                .size_full()
-                .bg(viewer_bg())
-                .flex()
-                .items_center()
-                .justify_center()
+            None => match self.load_error.clone() {
+                // 読めない理由が分かっているときは、白画面ではなく説明を出す
+                // （pack が無い / 壊れている = 再ダウンロードが必要）
+                Some(error) => div()
+                    .size_full()
+                    .bg(viewer_bg())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .child("ページ画像を読み込めませんでした"),
+                    )
+                    .child(div().text_xs().text_color(_muted_foreground).child(
+                        "パック（.opfspack）が無いか壊れています。再ダウンロードしてください",
+                    ))
+                    .child(div().text_xs().text_color(_muted_foreground).child(error))
+                    .into_any_element(),
                 // 開いた直後などの読み込み待ちはスピナーを表示して
                 // 「止まってる感じ」を出さない（数十 ms で画像に差し替わる）
-                .child(gpui_kit::component::spinner::Spinner::new())
-                .into_any_element(),
+                None => div()
+                    .size_full()
+                    .bg(viewer_bg())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(gpui_kit::component::spinner::Spinner::new())
+                    .into_any_element(),
+            },
         }
     }
 }
@@ -1223,7 +1982,15 @@ impl ImageViewer {
 impl Render for ImageViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_panel_states(window, cx);
-        if !self.focus_handle.is_focused(window) {
+        // 入力（タイトル変更・ページ番号）にフォーカスがあるときは奪い返さない。
+        // 毎フレーム奪うと、開いた入力に 1 文字も打てない（次の描画でフォーカスが外れる）。
+        // メニューはビューアーのページ領域とは別のサブツリーに描かれるため、
+        // `contains_focused` では判定できない（トラックしているのはページ領域側）。
+        let input_focused = [self.rename_input.as_ref(), self.page_input.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        if !input_focused && !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
         let total = self.loader.page_count();
@@ -1358,7 +2125,9 @@ impl Render for ImageViewer {
                         .justify_center()
                         .child(
                             div()
-                                .w(gpui_kit::Length::Definite(gpui_kit::DefiniteLength::Fraction(0.8)))
+                                .w(gpui_kit::Length::Definite(
+                                    gpui_kit::DefiniteLength::Fraction(0.8),
+                                ))
                                 .aspect_ratio(aspect)
                                 .bg(viewer_bg())
                                 .overflow_hidden()
@@ -1465,8 +2234,10 @@ impl Render for ImageViewer {
                 .on_mouse_down(gpui_kit::MouseButton::Left, {
                     let handle = handle.clone();
                     move |event, _window, cx| {
-                        let position =
-                            gpui_kit::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
+                        let position = gpui_kit::Point::new(
+                            event.position.x.as_f32(),
+                            event.position.y.as_f32(),
+                        );
                         let now = std::time::Instant::now();
                         let is_double = handle
                             .read(cx)
@@ -1830,7 +2601,7 @@ impl Render for ImageViewer {
                         .absolute()
                         .top(px(12.0 - 32.0 * (1.0 - overlay_progress)))
                         .left_3()
-                        .w(px(380.0))
+                        .w(px(460.0))
                         .opacity(overlay_progress)
                         .when(overlay_progress < 0.01, |this| this.invisible())
                         .bg(panel_bg)
@@ -1891,14 +2662,16 @@ impl Render for ImageViewer {
                         .border_t_1()
                         .border_color(cx.theme().muted)
                         .child(match view {
-                            PanelView::Menu => div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .p_3()
-                                .child(
+                            PanelView::Menu => {
+                                let switch_rows = self.menu_switch_elements(&handle, cx);
+                                let has_switch = !switch_rows.is_empty();
+                                let menu_row = |id: &'static str,
+                                                label: &'static str,
+                                                view: PanelView,
+                                                handle: &Entity<ImageViewer>| {
+                                    let handle = handle.clone();
                                     div()
-                                        .id("viewer-menu-page-list")
+                                        .id(id)
                                         .flex()
                                         .flex_row()
                                         .items_center()
@@ -1910,173 +2683,59 @@ impl Render for ImageViewer {
                                         .border_color(cx.theme().muted)
                                         .hover(|style| style.bg(cx.theme().muted))
                                         .cursor_pointer()
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                handle.update(cx, |this, cx| {
-                                                    this.open_panel(cx, PanelView::PageList);
-                                                });
-                                            }
+                                        .on_click(move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| this.open_panel(cx, view));
                                         })
                                         .child(
                                             div()
                                                 .text_sm()
                                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .child("ページ一覧"),
+                                                .child(label),
                                         )
                                         .child(
                                             div()
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child("›"),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id("viewer-menu-shortcuts")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(cx.theme().muted)
-                                        .hover(|style| style.bg(cx.theme().muted))
-                                        .cursor_pointer()
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                handle.update(cx, |this, cx| {
-                                                    this.open_panel(cx, PanelView::Shortcuts);
-                                                });
-                                            }
-                                        })
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .child("ショートカット"),
                                         )
-                                        .child(
-                                            div()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("›"),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id("viewer-menu-autoplay")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(cx.theme().muted)
-                                        .hover(|style| style.bg(cx.theme().muted))
-                                        .cursor_pointer()
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                handle.update(cx, |this, cx| {
-                                                    this.open_panel(
-                                                        cx,
-                                                        PanelView::AutoplaySettings,
-                                                    );
-                                                });
-                                            }
-                                        })
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                                .child("自動再生設定"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child("›"),
-                                        ),
-                                ),
-                            PanelView::PageList => div()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .p_3()
-                                        .h(px(420.0))
-                                        .overflow_y_scrollbar()
-                                        .children((0..total).map(|index| {
-                                            let handle = handle.clone();
-                                            let image = self.images.get(index).cloned().flatten();
-                                            let is_current = index == self.current_page;
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "viewer-thumb-{index}"
-                                                )))
-                                                .flex()
-                                                .flex_col()
-                                                .items_center()
-                                                .gap_1()
-                                                .p_1()
-                                                .rounded_md()
-                                                .border_1()
-                                                .border_color(if is_current {
-                                                    cx.theme().primary
-                                                } else {
-                                                    cx.theme().muted
-                                                })
-                                                .hover(|style| style.bg(cx.theme().muted))
-                                                .cursor_pointer()
-                                                .on_click(move |_, _window, cx| {
-                                                    handle.update(cx, |this, cx| {
-                                                        this.set_page(cx, index);
-                                                    });
-                                                })
-                                                .child(
-                                                    div()
-                                                        .w(px(100.0))
-                                                        .aspect_ratio(100.0 / 141.0)
-                                                        .rounded_sm()
-                                                        .bg(gpui_kit::white())
-                                                        .overflow_hidden()
-                                                        .child(match image {
-                                                            Some(image) => img(image)
-                                                                .size_full()
-                                                                .object_fit(
-                                                                    gpui_kit::ObjectFit::Contain,
-                                                                )
-                                                                .into_any_element(),
-                                                            None => {
-                                                                div().size_full().into_any_element()
-                                                            }
-                                                        }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child(format!("{}", index + 1)),
-                                                )
-                                                .child(if is_current {
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child("現在")
-                                                        .into_any_element()
-                                                } else {
-                                                    div().into_any_element()
-                                                })
-                                        })),
-                                )
-                                .child(self.panel_back(&handle, cx)),
+                                };
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .p_3()
+                                    // 切替行（形式ごとのページ一覧）。レンディションが
+                                    // 無い本（旧データ）は「ページ一覧」にフォールバック。
+                                    .children(switch_rows)
+                                    .when(!has_switch, |el| {
+                                        el.child(menu_row(
+                                            "viewer-menu-page-list",
+                                            "ページ一覧",
+                                            PanelView::PageList,
+                                            &handle,
+                                        ))
+                                    })
+                                    .child(menu_row(
+                                        "viewer-menu-shortcuts",
+                                        "ショートカット",
+                                        PanelView::Shortcuts,
+                                        &handle,
+                                    ))
+                                    .child(menu_row(
+                                        "viewer-menu-autoplay",
+                                        "自動再生設定",
+                                        PanelView::AutoplaySettings,
+                                        &handle,
+                                    ))
+                            }
+                            PanelView::PageList => {
+                                let panel_width = window.bounds().size.width.as_f32();
+                                div().child(self.page_list_panel(
+                                    &handle,
+                                    total,
+                                    panel_width,
+                                    cx,
+                                ))
+                            }
                             PanelView::Shortcuts => {
                                 let kbd = |stroke: &str| Kbd::new(gpui_kit::Keystroke::parse(stroke).unwrap());
                                 let row = |label: String, strokes: Vec<&str>| {
@@ -2191,6 +2850,10 @@ impl Render for ImageViewer {
                     .justify_center()
                     .opacity(overlay_progress)
                     .when(overlay_progress < 0.01, |this| this.invisible())
+                    // ドック内のクリックを下の層へ伝えない（トップパネルと同じ）
+                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .on_hover({
                         let handle = handle.clone();
                         move |hovered, _window, cx| {
@@ -2218,6 +2881,7 @@ impl Render for ImageViewer {
                             .child(
                                 Button::new("viewer-back")
                                     .cursor_pointer()
+                                    .debug_selector(|| "viewer-back".into())
                                     .label("戻る")
                                     .cursor_pointer()
                                     .on_click(|_, _window, cx| {
@@ -2672,11 +3336,254 @@ mod tests {
         assert!(view.read_with(cx, |v, _| v.overlay_visible));
     }
 
+    /// 実 pack（opfspack）を使った再現テスト: 画像だけの本（1 コンテンツ + 1 レンディション）
+    /// でページ一覧のサムネイルが読み込めること。`pack_entry_path` が実在しないと
+    /// 空タイルになるため、実際に pack を書いて検証する。
     #[gpui_kit::test]
-    async fn page_list_loads_all_thumbnails(cx: &mut TestAppContext) {
+    async fn page_list_thumbnails_load_from_real_pack(cx: &mut TestAppContext) {
+        use thundoku_core::db;
+
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        let (db_pool, packs_dir) = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            (state.db_pool.clone(), state.packs_dir.clone())
+        });
+
+        let book_id = "real-pack-book";
+        let content_id = "real-pack-content";
+        let format_id = "real-pack-format";
+        let stamp = "2026-09-11 00:00:00";
+
+        // 実 pack を作る（ページ 3 枚の PNG）
+        let mut builder = opfspack::PackBuilder::new(1);
+        for page in 1..=3 {
+            builder.add_entry(
+                &format!("pages/page_{page:04}.png"),
+                make_png(60, 80),
+                "image/png",
+                false,
+            );
+        }
+        let pack = builder.build(None, true).unwrap();
+        std::fs::create_dir_all(&packs_dir).unwrap();
+        std::fs::write(packs_dir.join(format!("{book_id}.opfspack")), &pack).unwrap();
+
+        // DB 行（画像だけの本 = 1 コンテンツ + 1 レンディション）
+        db::books::insert(
+            &db_pool,
+            &db::books::Book {
+                id: book_id.into(),
+                title: "画像だけの本".into(),
+                author: String::new(),
+                circle_name: String::new(),
+                purchase_date: None,
+                file_name: "images.zip".into(),
+                file_size: 1,
+                opfs_path: format!("{book_id}.opfspack"),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 1,
+                pack_id: Some(book_id.into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: stamp.into(),
+                updated_at: stamp.into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
+            },
+        )
+        .unwrap();
+        db::documents::insert_document(
+            &db_pool,
+            &db::documents::ImportedDocument {
+                id: format!("{book_id}-doc"),
+                book_id: book_id.into(),
+                source_type: "image-set".into(),
+                file_hash: "h".into(),
+                total_pages: 3,
+                metadata: None,
+                status: "completed".into(),
+                created_at: stamp.into(),
+                updated_at: stamp.into(),
+            },
+        )
+        .unwrap();
+        db::contents::insert_batch(
+            &db_pool,
+            &[db::contents::BookContent {
+                content_id: content_id.into(),
+                book_id: book_id.into(),
+                display_name: "mhszplum".into(),
+                media_kind: "image".into(),
+                is_primary: 1,
+                sort_order: 0,
+                created_at: stamp.into(),
+            }],
+            &[db::contents::ContentFormat {
+                format_id: format_id.into(),
+                content_id: content_id.into(),
+                label: "JPEG".into(),
+                format_kind: "image".into(),
+                page_count: 3,
+                pack_entry_prefix: Some("pages".into()),
+                sort_order: 0,
+                created_at: stamp.into(),
+            }],
+        )
+        .unwrap();
+        for page in 1..=3 {
+            db::documents::insert_image(
+                &db_pool,
+                &db::documents::DocumentImage {
+                    id: format!("{book_id}-img{page}"),
+                    document_id: format!("{book_id}-doc"),
+                    content_id: Some(content_id.into()),
+                    format_id: Some(format_id.into()),
+                    page_number: page,
+                    image_type: "page".into(),
+                    opfs_path: format!("{book_id}.opfspack"),
+                    width: 60,
+                    height: 80,
+                    mime_type: "image/png".into(),
+                    file_size: 1,
+                    extracted_text: None,
+                    pack_entry_path: Some(format!("pages/page_{page:04}.png")),
+                    created_at: stamp.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        // レンディションを選んだ状態のローダー（= メニューで選んだあと）
+        let images = db::documents::images_for_selection(
+            &db_pool,
+            book_id,
+            Some(content_id),
+            Some(format_id),
+        )
+        .unwrap();
+        let loader = Arc::new(PackPageLoader {
+            images,
+            packs_dir,
+            db: db_pool,
+            identity: None,
+            pack_bytes: std::sync::OnceLock::new(),
+            pack_key: std::sync::OnceLock::new(),
+        });
+        let view = cx.new(|cx| ImageViewer::new(cx, loader, "画像だけの本", 0, None));
+
+        // ページ一覧を開くとサムネイルが読める（可視タイルのみ）
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        cx.update(|cx| view.update(cx, |v, cx| v.open_page_list(cx)));
+        cx.run_until_parked();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.thumbs.iter().all(|thumb| thumb.is_some())),
+            "real pack からサムネイルが読めること"
+        );
+    }
+
+    /// pack が無い / 壊れている本は、白画面ではなく理由を出す（再ダウンロード導線）。
+    #[gpui_kit::test]
+    async fn missing_pack_surfaces_load_error(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| {
+            if cx.try_global::<crate::app_state::AppState>().is_none() {
+                crate::app_state::AppState::init_test(cx);
+            }
+        });
+        let (db_pool, packs_dir) = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            (state.db_pool.clone(), state.packs_dir.clone())
+        });
+        // 実在しない pack を指す 1 ページ（壊れた重複本と同じ状態）
+        let loader = Arc::new(PackPageLoader {
+            images: vec![DocumentImage {
+                id: "missing-img1".into(),
+                document_id: "missing-doc".into(),
+                content_id: None,
+                format_id: None,
+                page_number: 1,
+                image_type: "page".into(),
+                opfs_path: "missing.opfspack".into(),
+                width: 60,
+                height: 80,
+                mime_type: "image/png".into(),
+                file_size: 1,
+                extracted_text: None,
+                pack_entry_path: Some("pages/page_0001.png".into()),
+                created_at: "2026-01-01 00:00:00".into(),
+            }],
+            packs_dir,
+            db: db_pool,
+            identity: None,
+            pack_bytes: std::sync::OnceLock::new(),
+            pack_key: std::sync::OnceLock::new(),
+        });
+        let view = cx.new(|cx| ImageViewer::new(cx, loader, "欠損本", 0, None));
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.load_error.is_some()),
+            "pack を読めないときは理由を保持する"
+        );
+    }
+
+    /// ローダー差し替え（コンテンツ切替）直後に現在ページが読み込まれること。
+    /// 読み込まれないと切り替え直後が白いページになり、ページ送りで初めて表示される。
+    #[gpui_kit::test]
+    async fn set_loader_loads_the_current_page(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         let view = viewer(cx, 3);
+        cx.run_until_parked();
+
+        // 別コンテンツ相当のローダーへ差し替える
+        let loader = Arc::new(FakeLoader {
+            count: 2,
+            png: make_png(100, 140),
+        });
+        cx.update(|cx| view.update(cx, |v, cx| v.set_loader(cx, loader, 0)));
+        cx.run_until_parked();
+
+        assert!(
+            view.read_with(cx, |v, _| v.images.iter().all(|image| image.is_some())),
+            "切替直後に表示に必要なページ（現在 + 隣接）が読み込まれること"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn page_list_loads_only_visible_thumbnails(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        // 200 ページ（肥大作品相当）。ページ一覧を開いても**可視分だけ**読む
+        let view = viewer(cx, 200);
         assert!(!view.read_with(cx, |v, _| v.active_panel.is_some()));
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         cx.update(|cx| {
             view.update(cx, |this, cx| this.open_panel(cx, PanelView::PageList));
         });
@@ -2685,10 +3592,28 @@ mod tests {
             Some(PanelView::PageList)
         );
         cx.run_until_parked();
-        // Web 版と同様に全ページのサムネイルが読み込まれる
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        // 可視行のタイルが実際に描画されている（仮想化しても中身が出る）
         assert!(
-            view.read_with(cx, |v, _| v.images.iter().all(|image| image.is_some())),
-            "all page thumbnails should load when the page list opens"
+            visual.debug_bounds("viewer-thumb-0").is_some(),
+            "先頭のタイルが描画されること"
+        );
+        let loaded = view.read_with(cx, |v, _| {
+            v.thumbs.iter().filter(|thumb| thumb.is_some()).count()
+        });
+        assert!(loaded > 0, "可視タイルのサムネイルは読む");
+        assert!(loaded < 40, "可視分だけで止まる（実際 {loaded} 枚）");
+        // 表示用のフル解像度ページは読まない（ページ一覧がメモリを食う経路を復活させない）
+        let full = view.read_with(cx, |v, _| {
+            v.images.iter().filter(|image| image.is_some()).count()
+        });
+        assert!(
+            full <= 5,
+            "ページ一覧はフル解像度を読まない（実際 {full} 枚）"
         );
     }
 
@@ -2782,6 +3707,163 @@ mod tests {
         assert_eq!(min, AUTOPLAY_MIN_MS as f32);
         assert_eq!(max, AUTOPLAY_MAX_MS as f32);
         assert_eq!(value, SliderValue::Single(AUTOPLAY_DEFAULT_MS as f32));
+    }
+
+    #[gpui_kit::test]
+    async fn menu_shows_rename_affordance(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 3);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_contents(
+                    cx,
+                    vec![ContentEntry {
+                        content_id: "c1".into(),
+                        display_name: "本編".into(),
+                        media_kind: "image".into(),
+                        is_primary: true,
+                        formats: vec![FormatEntry {
+                            format_id: "f1".into(),
+                            label: "JPEG".into(),
+                            page_count: 3,
+                            format_kind: "image".into(),
+                        }],
+                    }],
+                    Some("c1".into()),
+                    None,
+                )
+            })
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // メニューを開く（切替行が出る）
+        cx.update(|cx| view.update(cx, |this, cx| this.open_panel(cx, PanelView::Menu)));
+        cx.run_until_parked();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            visual.debug_bounds("viewer-switch-rename-0").is_some(),
+            "メニューの行に「タイトル変更」ボタンが出ること"
+        );
+
+        // 編集中は「名前」ボタンが入力に差し替わる
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| this.start_rename(window, cx, "c1"));
+        });
+        cx.run_until_parked();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            visual.debug_bounds("viewer-rename-input").is_some(),
+            "編集中はインライン入力が出ること"
+        );
+        assert!(
+            visual.debug_bounds("viewer-switch-rename-0").is_none(),
+            "編集中は「タイトル変更」ボタンを出さないこと"
+        );
+        // 開始直後に入力へフォーカスが当たっている（そのまま日本語入力できる）
+        let focused = visual.update(|window, cx| {
+            view.read(cx)
+                .rename_input
+                .as_ref()
+                .expect("rename input")
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(focused, "タイトル変更の入力にフォーカスが当たること");
+    }
+
+    #[gpui_kit::test]
+    async fn rename_prefills_current_name_and_commits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 3);
+        // 2 コンテンツ（本編 / 別冊）を渡す
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_contents(
+                    cx,
+                    vec![
+                        ContentEntry {
+                            content_id: "c1".into(),
+                            display_name: "本編".into(),
+                            media_kind: "image".into(),
+                            is_primary: true,
+                            formats: vec![FormatEntry {
+                                format_id: "f1".into(),
+                                label: "JPEG".into(),
+                                page_count: 3,
+                                format_kind: "image".into(),
+                            }],
+                        },
+                        ContentEntry {
+                            content_id: "c2".into(),
+                            display_name: "別冊".into(),
+                            media_kind: "pdf".into(),
+                            is_primary: false,
+                            formats: vec![FormatEntry {
+                                format_id: "f2".into(),
+                                label: "PDF".into(),
+                                page_count: 2,
+                                format_kind: "pdf".into(),
+                            }],
+                        },
+                    ],
+                    Some("c1".into()),
+                    None,
+                )
+            })
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        cx.update_window(*window, |_root, window, cx| {
+            view.update(cx, |this, cx| this.start_rename(window, cx, "c2"));
+        })
+        .unwrap();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.renaming_content.clone()),
+            Some("c2".to_string())
+        );
+        // 今の名前（別冊）が入っている
+        let prefilled = view.read_with(cx, |v, cx| {
+            v.rename_input
+                .as_ref()
+                .expect("rename input")
+                .read(cx)
+                .value()
+                .to_string()
+        });
+        assert_eq!(prefilled, "別冊");
+
+        // 入力して確定する（Enter / フォーカス外れ相当）
+        cx.update_window(*window, |_root, window, cx| {
+            view.update(cx, |this, cx| {
+                let input = this.rename_input.clone().expect("rename input");
+                input.update(cx, |state, cx| state.set_value("続編", window, cx));
+                this.commit_rename(cx);
+            });
+        })
+        .unwrap();
+
+        assert_eq!(
+            cx.update(|cx| view.update(cx, |v, _| v.take_rename())),
+            Some(("c2".to_string(), "続編".to_string()))
+        );
+        // 編集状態は解除される（行が入力のまま残らない）
+        assert_eq!(view.read_with(cx, |v, _| v.renaming_content.clone()), None);
     }
 
     #[test]

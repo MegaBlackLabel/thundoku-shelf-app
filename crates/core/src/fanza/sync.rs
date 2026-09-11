@@ -5,8 +5,8 @@
 //! 動画は保存しない（カードに出さない）。DRM 判定はダウンロード時（`details`）に行うため、
 //! ここではメディア種別でのみ絞る。
 
-use crate::db::bookshelf::{self, BookshelfItem};
 use crate::db::SqlitePool;
+use crate::db::bookshelf::{self, BookshelfItem};
 use crate::fanza::client::{FanzaClient, FanzaError};
 use crate::fanza::{ai_to_str, classify, is_viewable_included, media_to_str};
 
@@ -20,6 +20,30 @@ fn now() -> String {
 /// （`pl-200x150`、詳細 API の `imagePath` で確認済み）に差し替える。
 fn widen_thumb(url: &str) -> String {
     url.replace("pl-100x75", "pl-200x150")
+}
+
+/// サムネイル URL から**サイズ指定を外して原寸**にする（`..._pl-200x150.jpg` → `..._pl.jpg`）。
+///
+/// DMM の画像は `-幅x高` を付けると縮小版が返る。実測（2026-09-11）:
+/// `d_815503pl-200x150.jpg` = 200x150 (13KB) → `d_815503pl.jpg` = **560x420** (71KB)、
+/// `d_100588pl-200x150.jpg` = 107x150 (5KB) → `d_100588pl.jpg` = **290x408** (23KB)。
+/// カードの表紙に使うので、取得時に原寸へ差し替える（失敗したら保存済み URL に戻す）。
+pub fn full_size_thumb(url: &str) -> String {
+    let Some((base, extension)) = url.rsplit_once('.') else {
+        return url.to_string();
+    };
+    let Some((stem, size)) = base.rsplit_once('-') else {
+        return url.to_string();
+    };
+    let Some((width, height)) = size.split_once('x') else {
+        return url.to_string();
+    };
+    let digits = |value: &str| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit());
+    if digits(width) && digits(height) {
+        format!("{stem}.{extension}")
+    } else {
+        url.to_string()
+    }
 }
 
 /// 購入済み作品のうち画像系（comic / cg）だけを `bookshelf_items(site_id='fanza')` に
@@ -80,10 +104,42 @@ pub fn save_purchases(pool: &SqlitePool, client: &mut FanzaClient) -> Result<usi
 mod tests {
     use super::*;
     use crate::fanza::client::FanzaSession;
-    use crate::tbf::transport::{RequestSpec, ResponseSpec};
     use crate::tbf::TbfError;
+    use crate::tbf::transport::{RequestSpec, ResponseSpec};
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn widen_thumb_uses_the_larger_listing_variant() {
+        assert_eq!(
+            widen_thumb("https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl-100x75.jpg"),
+            "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl-200x150.jpg"
+        );
+    }
+
+    #[test]
+    fn full_size_thumb_drops_the_size_suffix() {
+        assert_eq!(
+            full_size_thumb("https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl-200x150.jpg"),
+            "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl.jpg"
+        );
+        // サイズ指定が無い / 数字でないものはそのまま
+        assert_eq!(
+            full_size_thumb("https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl.jpg"),
+            "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl.jpg"
+        );
+        // DLsite の `_240x240` はアンダースコア区切りなので触らない（work_image = 原寸を使う）
+        assert_eq!(
+            full_size_thumb(
+                "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main_240x240.webp"
+            ),
+            "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main_240x240.webp"
+        );
+        assert_eq!(
+            full_size_thumb("https://example.com/no-extension"),
+            "https://example.com/no-extension"
+        );
+    }
 
     struct MockTransport {
         handler: Box<dyn FnMut(RequestSpec) -> Result<ResponseSpec, TbfError> + Send>,
@@ -127,7 +183,13 @@ mod tests {
             purchase("d_6", "動画", "video"),
         ]));
         let transport = MockTransport {
-            handler: Box::new(move |_| Ok(ResponseSpec { status: 200, headers: vec![], body: body.clone() })),
+            handler: Box::new(move |_| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: body.clone(),
+                })
+            }),
         };
         let session = FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]));
         let mut client = FanzaClient::with_transport(Box::new(transport), session);

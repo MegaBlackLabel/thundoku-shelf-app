@@ -94,11 +94,15 @@ Drive 同期設定など）。
 
 ### reading_progress
 
-読書進捗（1 書籍 1 行）。
+読書進捗（**1 書籍 × 1 コンテンツ = 1 行**）。複数コンテンツ（本文 / 別冊 等）や
+レンディション違いは**コンテンツ単位**で持ち、レンディション間では共有する
+（`docs/import-patterns.md` §8）。読み出しは `progress::get`（= 優先コンテンツの行）/
+`progress::get_for(book_id, content_id)`（リーダーの再開位置）。
 
 | カラム | 型 | 説明 |
 |---|---|---|
-| book_id | TEXT PK FK→books | |
+| book_id | TEXT PK FK→books (ON DELETE CASCADE) | |
+| content_id | TEXT PK | `book_contents.content_id`。`''` = 未指定（旧データ / 単一コンテンツ） |
 | current_page | INTEGER | **1-indexed**（0 は未読扱い） |
 | total_pages | INTEGER | 全ページ数 |
 | finished_at | TEXT | 読了日時。一度セットすると戻っても維持 |
@@ -130,12 +134,13 @@ Drive 同期設定など）。
 | カラム | 型 | 説明 |
 |---|---|---|
 | book_id | TEXT PK FK→books (ON DELETE CASCADE) | 本 |
+| content_id | TEXT PK | コンテンツ（`''` = 未指定 / 旧データ） |
 | page_number | INTEGER PK | **1-indexed**（表示ページ番号） |
 | view_count | INTEGER | そのページが表示された累計回数 |
 | total_seconds | REAL | そのページでの累計滞在秒数 |
 | last_viewed_at | TEXT | 最終表示時刻 |
 
-- `page_views::record_view(book_id, page)` で表示回数を +1（単一表示は 1 ページ、見開きは左右両ページ）
+- `page_views::record_view(book_id, content_id, page)` で表示回数を +1（単一表示は 1 ページ、見開きは左右両ページ）
 - `page_views::add_dwell(book_id, page, secs)` で滞在秒数を加算
 - `page_views::for_book(book_id)` でページ毎の記録を取得
 
@@ -150,6 +155,45 @@ Drive 同期設定など）。
 | memo | TEXT | メモ |
 | price | INTEGER | 価格 |
 | is_purchased | INTEGER | 購入済みフラグ |
+
+### book_contents / content_formats
+
+1 冊に複数の「コンテンツ（読む単位）」と「レンディション（切替可能な表示形態）」を
+持たせるための表（`docs/import-patterns.md` §3.3）。**マイグレーションファイルではなく
+`migrate()` 内の冪等 DDL で作成**。
+
+`book_contents`:
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| content_id | TEXT PK | コンテンツ ID（UUID） |
+| book_id | TEXT FK→books (ON DELETE CASCADE) | |
+| display_name | TEXT | 表示名（`本文` / `本編` / フォルダ名 / 別冊 等） |
+| media_kind | TEXT | `image` / `pdf` / `epub` / `audio` / `video` |
+| is_primary | INTEGER | 既定表示にするコンテンツ（0/1） |
+| sort_order | INTEGER | 表示順（ZIP 内の並び） |
+| created_at | TEXT | |
+
+`content_formats`（同じ内容の別形式・別バリアント。`PDF版` / `画像版` 等）:
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| format_id | TEXT PK | レンディション ID（UUID） |
+| content_id | TEXT FK→book_contents (ON DELETE CASCADE) | |
+| label | TEXT | 切替 UI に出す名前（`画像` / `PDF`） |
+| format_kind | TEXT | `image` / `pdf` / `epub` / `audio` / `video` |
+| page_count | INTEGER | ページ数 |
+| pack_entry_prefix | TEXT | pack 内の接頭辞（`pages` / `contents/1/r0`） |
+| sort_order | INTEGER | 表示順（先頭が主レンディション） |
+| created_at | TEXT | |
+
+- 表紙・裏表紙はコンテンツにしない（カバー画像として `thumbnail.webp` / `cover.webp` に置く）
+- `import_zip_bytes` は**全コンテンツ × 全レンディション**を実体化して保存する
+  （既定表示コンテンツの第 1 レンディションだけ pack 内パスが従来どおり `pages/...`）
+- pack の `metadata.json` にも `contents` を書き出して同期復元用にする
+- `display_name` は**ユーザーが変更できる**（ビューアーのトップメニュー「名前」）。
+  変更時は DB と同時に pack の `metadata.json` の `displayName` も書き換える
+  （`import::rename_content_in_pack`。Drive 復元で名前が戻らないようにする）
 
 ### imported_documents
 
@@ -172,11 +216,17 @@ Drive 同期設定など）。
 | カラム | 型 | 説明 |
 |---|---|---|
 | document_id | TEXT FK→imported_documents | |
-| image_type | TEXT | page / thumbnail / cover |
+| content_id | TEXT FK→book_contents | 所属コンテンツ（NULL = 旧データ） |
+| format_id | TEXT FK→content_formats | 所属レンディション（NULL = 旧データ） |
+| image_type | TEXT | page / thumbnail |
 | pack_entry_path | TEXT | pack 内のパス（例: `pages/page_0001.webp`） |
 | width / height | INTEGER | 表示サイズ（ズーム範囲計算に使用） |
 | mime_type / file_size | TEXT/INT | |
 | created_at | TEXT | |
+
+`images_for_book` は**既定表示コンテンツの第 1 レンディションのページ**（と
+`content_id IS NULL` の旧データ）だけを返す。コンテンツを切り替えるページ一覧 UI は
+フェーズ4で対応する。
 
 ### document_text / token_analysis
 
@@ -207,9 +257,17 @@ Zenn のタグメタデータ（`https://zenn.dev/api/tags` 相当から取得�
 ## マイグレーション
 
 - `crates/core/migrations/0001_init.sql`: 初期スキーマ（`sqlx::migrate!` で
-  チェックサム管理）
-- `view_history`: `migrate()` 内の `CREATE TABLE IF NOT EXISTS` で適用
+  チェックサム管理。**変更すると既存 DB が VersionMismatch で開けなくなる**）
+- `view_history` / `page_views` / `book_contents` / `content_formats`、
+  `document_images.content_id` / `format_id`: `migrate()` 内の
+  `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN` で適用
   （新しいマイグレーションファイルは作らない方針）
+- `content_formats.label` の旧値（`画像` / `PDF` / `EPUB`）は `migrate()` 内の
+  データ移行（`contents::migrate_legacy_labels`）で実データに合わせて書き換える
+  （画像 = 拡張子名、PDF/EPUB = 種別名）
+- `reading_progress` / `page_views` は `migrate()` 内のデータ移行
+  （`db::migrate_progress_content_id`）で**コンテンツ単位の PK**に作り替える
+  （PK 変更は ALTER 不可のため新テーブルへ INSERT SELECT。既存行は優先コンテンツの行として引き継ぐ）
 - テスト用には `test_pool()`（インメモリ + 全マイグレーション適用）を使用
 
 ## データの流れ

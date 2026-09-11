@@ -5,6 +5,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use gpui_kit::StyledImage as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::theme::Colorize as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AppContext as _, InteractiveElement as _, ReadGlobal as _,
@@ -14,12 +21,6 @@ use gpui_kit::{
     App, Context, Entity, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
     SharedString, Window, div, img, px,
 };
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::ContextMenuExt as _;
-use gpui_kit::component::popover::Popover;
-use gpui_kit::component::theme::Colorize as _;
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::booth::BoothClient;
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, documents, progress};
@@ -128,6 +129,8 @@ pub struct BookshelfView {
     fetching_covers: bool,
     /// 表紙取得の再実行済みフラグ（同期 reload で後から増えたカード分を 1 回だけ再取得）
     cover_fetch_retried: bool,
+    /// 取り込み確認モーダル（§6.3。曖昧な構造のときだけ出る）
+    pending_import: Option<PendingImport>,
     auto_download_started: bool,
     /// フィルタ済みカードのインデックス（List 仮想化用キャッシュ）
     filtered: Vec<usize>,
@@ -147,6 +150,157 @@ pub struct BookshelfView {
     selected_index: Option<usize>,
     error: Option<String>,
     toast: Option<String>,
+}
+
+/// 取り込みの成功結果（読み飛ばしたエントリの警告付き）。
+struct ImportOutcome {
+    title: String,
+    warnings: Vec<String>,
+}
+
+/// 取り込み確認モーダルの内容（§6.3）。
+///
+/// ダウンロード済みの bytes は worker スレッドが保持したまま `reply` を待つ
+/// （モーダル側は要約だけを持つ）。
+struct PendingImport {
+    /// 本のタイトル（見出しに出す）
+    title: String,
+    /// コンテンツごとの要約
+    choices: Vec<ImportChoice>,
+    /// 選択中の添字（初期値は計画の既定表示）
+    selected: usize,
+    /// 選択（`None` = キャンセル）を返す先。worker が `recv` で待っている。
+    reply: std::sync::mpsc::Sender<Option<usize>>,
+}
+
+/// 確認モーダルに出す 1 コンテンツ分の要約。
+#[derive(Clone)]
+struct ImportChoice {
+    display_name: String,
+    /// `画像` / `PDF` / `EPUB` / `音声` / `動画`
+    kind: String,
+    /// `画像 48ファイル / PDF 1ファイル` のようなレンディションの要約
+    detail: String,
+}
+
+/// 確認モーダルを出すか（§6.3: 形式が複数 / コンテンツが複数 / 差分セット）。
+fn import_needs_confirmation(plan: &thundoku_core::import::ImportPlan) -> bool {
+    let renditions: usize = plan
+        .contents
+        .iter()
+        .map(|content| content.renditions.len())
+        .sum();
+    plan.contents.len() > 1 || renditions > 1
+}
+
+/// 計画から確認モーダルの要約を作る。
+fn import_choices(plan: &thundoku_core::import::ImportPlan) -> Vec<ImportChoice> {
+    plan.contents
+        .iter()
+        .map(|content| ImportChoice {
+            display_name: content.display_name.clone(),
+            kind: content.media_kind.label().to_string(),
+            detail: content
+                .renditions
+                .iter()
+                .map(|rendition| {
+                    // PDF / EPUB はページ数が展開するまで不明なのでファイル数で示す
+                    format!("{} {}ファイル", rendition.label, rendition.entries.len())
+                })
+                .collect::<Vec<_>>()
+                .join(" / "),
+        })
+        .collect()
+}
+
+/// 取り込み確認モーダルを出して選択を待つ（worker スレッドをブロックする。UI は動く）。
+///
+/// 戻り値: `Some(index)` = 選ばれた既定表示 / `None` = キャンセル（UI が閉じた場合も含む）。
+/// ダウンロード済みの `bytes` はこの間 worker が保持し続ける（モーダルは要約だけ持つ）。
+fn ask_import_confirmation(
+    prompt_tx: &std::sync::mpsc::Sender<PendingImport>,
+    title: &str,
+    plan: &thundoku_core::import::ImportPlan,
+) -> Option<usize> {
+    let (reply, answer) = std::sync::mpsc::channel();
+    let request = PendingImport {
+        title: title.to_string(),
+        choices: import_choices(plan),
+        selected: plan.primary,
+        reply,
+    };
+    if prompt_tx.send(request).is_err() {
+        return None;
+    }
+    answer.recv().ok().flatten()
+}
+
+/// 取り込みの失敗。UI 文言を出し分けるために型で持つ。
+enum ImportFailure {
+    /// 読めるコンテンツが無い（txt のみ / ゲーム / HTML 閲覧型など）
+    NotAReadable,
+    /// 取り込み確認モーダルでキャンセルされた
+    Cancelled,
+    /// それ以外（DRM・通信・解析失敗など）。文言はそのまま出す
+    Message(String),
+}
+
+impl From<String> for ImportFailure {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// 取り込みエラーを UI 用の失敗種別に変換する（`NotAReadableWork` だけ特別扱い）。
+fn import_failure(error: thundoku_core::import::ImportError) -> ImportFailure {
+    match error {
+        thundoku_core::import::ImportError::NotAReadableWork => ImportFailure::NotAReadable,
+        other => ImportFailure::Message(other.to_string()),
+    }
+}
+
+/// 取り込み結果を (トースト, 赤いエラー行) に変換する。
+/// I/O と切り離した純粋関数にして文言を試せるようにしている。
+fn download_messages(
+    result: &Result<ImportOutcome, ImportFailure>,
+) -> (Option<String>, Option<String>) {
+    match result {
+        Ok(outcome) if outcome.warnings.is_empty() => (
+            Some(format!("「{}」をダウンロードしました", outcome.title)),
+            None,
+        ),
+        Ok(outcome) => {
+            // 壊れた画像などで読み飛ばした分は件数と先頭 2 件を出す
+            let head: Vec<&str> = outcome
+                .warnings
+                .iter()
+                .take(2)
+                .map(|warning| warning.as_str())
+                .collect();
+            let rest = outcome.warnings.len().saturating_sub(head.len());
+            let detail = if rest > 0 {
+                format!("{} ほか {rest} 件", head.join(" / "))
+            } else {
+                head.join(" / ")
+            };
+            (
+                Some(format!(
+                    "「{}」をダウンロードしました（一部を読み飛ばし: {detail}）",
+                    outcome.title
+                )),
+                None,
+            )
+        }
+        Err(ImportFailure::NotAReadable) => (
+            None,
+            Some(
+                "取り込めるコンテンツがありません（txt のみ・ゲーム・HTML 閲覧型など）。この作品はビューアーで読めません"
+                    .to_string(),
+            ),
+        ),
+        Err(ImportFailure::Cancelled) => (Some("取り込みをキャンセルしました".to_string()), None),
+        Err(ImportFailure::Message(message)) => (None, Some(message.clone())),
+    }
 }
 
 impl BookshelfView {
@@ -233,12 +387,17 @@ impl BookshelfView {
             sync_busy: 0,
             fetching_covers: false,
             cover_fetch_retried: false,
+            pending_import: None,
             auto_download_started: false,
             filtered: Vec::new(),
             filtered_dirty: true,
             last_search: String::new(),
-            list_state: gpui_kit::ListState::new(0, gpui_kit::ListAlignment::Top, gpui_kit::px(100.0))
-                .measure_all(),
+            list_state: gpui_kit::ListState::new(
+                0,
+                gpui_kit::ListAlignment::Top,
+                gpui_kit::px(100.0),
+            )
+            .measure_all(),
             scroll_handle: gpui_kit::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
@@ -404,13 +563,10 @@ impl BookshelfView {
     /// 本棚カードの表示に使うキャッシュ（`entries`）の値を返す。テストからも参照する。
     #[cfg(test)]
     pub(crate) fn progress_for_book(&self, book_id: &str) -> Option<(i64, Option<i64>, bool)> {
-        self.entries
-            .iter()
-            .find(|e| e.book.id == book_id)
-            .map(|e| {
-                let (current, total) = e.progress.unwrap_or((0, None));
-                (current, total, e.is_read)
-            })
+        self.entries.iter().find(|e| e.book.id == book_id).map(|e| {
+            let (current, total) = e.progress.unwrap_or((0, None));
+            (current, total, e.is_read)
+        })
     }
 
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
@@ -432,12 +588,10 @@ impl BookshelfView {
                     // ログイン中だが key が無い → 復号不能なので表示しない。
                     (Some(_), None) => std::collections::HashSet::new(),
                     // 未ログイン → 未所属(NULL)。NULL 判定は key を使わないのでダミーで良い。
-                    (None, key) => db::books::owned_book_ids(
-                        db,
-                        key.as_ref().unwrap_or(&[0u8; 32]),
-                        None,
-                    )
-                    .unwrap_or_default(),
+                    (None, key) => {
+                        db::books::owned_book_ids(db, key.as_ref().unwrap_or(&[0u8; 32]), None)
+                            .unwrap_or_default()
+                    }
                 }
             };
             let mut entries = Vec::new();
@@ -593,18 +747,11 @@ impl BookshelfView {
                 let local = entries.iter().find(|entry| {
                     entry.book.tbf_product_id.as_deref() == Some(shelf.database_id.as_str())
                 });
-                let cover = if shelf.site_id == "fanza" || shelf.site_id == "dlsite" {
-                    // FANZA / DLsite はダウンロード後のパック表紙に差し替えず、同期時の
-                    // サムネイル（thumbnail_url 由来のキャッシュ）を維持する。
-                    load_cached_cover(&thumbnails_dir, shelf)
-                        .or_else(|| local.and_then(|entry| entry.cover.clone()))
-                        .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
-                } else {
-                    local
-                        .and_then(|entry| entry.cover.clone())
-                        .or_else(|| load_cached_cover(&thumbnails_dir, shelf))
-                        .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name))
-                };
+                // カードの表紙は**サイトから取得した画像**（同期時のサムネイル）を優先する。
+                // 取得できていないときだけ pack の表紙（ローカル取り込み）へ落とす。
+                let cover = load_cached_cover(&thumbnails_dir, shelf)
+                    .or_else(|| local.and_then(|entry| entry.cover.clone()))
+                    .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name));
                 let tags = if shelf.site_id == "fanza" || shelf.site_id == "dlsite" {
                     // FANZA / DLsite: タグは shelf.tags_json を正とする（book_tags は重複本で
                     // 分かれるため）。保存/ジャンル取得で両方に書くが、表示は安定。
@@ -820,40 +967,14 @@ impl BookshelfView {
                             } else {
                                 url.clone()
                             };
-                            let bytes = if site_id == "booth" {
-                                // BOOTH の表紙は公開画像（booth.pximg.net — Cookie 不要）。
-                                // 商品ページの共有画像（オリジナル・高解像度）を優先し、
-                                // ライブラリのサムネイル（thumbnail_url）はフォールバック。
-                                let primary = booth_session.as_ref().and_then(|session| {
-                                    let item_id: u64 = database_id.parse().ok()?;
-                                    let detail =
-                                        BoothClient::new(session).item_detail(item_id).ok()?;
-                                    detail.images.into_iter().next()
-                                });
-                                match primary {
-                                    Some(image_url) => fetch_bytes(agent, &image_url)
-                                        .or_else(|| fetch_bytes(agent, &resolved)),
-                                    None => fetch_bytes(agent, &resolved),
-                                }
-                            } else if site_id == "dlsite" {
-                                // DLsite の表紙は公開 CDN（img.dlsite.jp、Cookie 不要）。
-                                // プロトコル相対 URL は上で絶対化済み。TBF クライアントには
-                                // フォールバックしない（誤った経路で失敗するため）。
-                                fetch_bytes(agent, &resolved)
-                            } else {
-                                // TBF の表紙も公開 URL なら直接取得する（4 並列が機能する）。
-                                // 失敗した場合のみセッション付きクライアントにフォールバック
-                                // （クライアントは Mutex のため直列になるが、まれなケース）。
-                                match fetch_bytes(agent, &resolved) {
-                                    Some(bytes) => Some(bytes),
-                                    None => {
-                                        log::warn!(
-                                            "TBF 表紙を直接取得できずフォールバック: {resolved}"
-                                        );
-                                        tbf_client.lock().download(&resolved).ok()
-                                    }
-                                }
-                            };
+                            let bytes = fetch_cover_bytes(
+                                agent,
+                                site_id,
+                                database_id,
+                                &resolved,
+                                booth_session.as_ref(),
+                                tbf_client,
+                            );
                             let Some(bytes) = bytes else {
                                 fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 log::warn!(
@@ -864,32 +985,13 @@ impl BookshelfView {
                                 let _ = fail_tx.send((site_id.clone(), database_id.clone()));
                                 continue;
                             };
-                            let _ext = match &bytes[..] {
-                                _ if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8 => {
-                                    "jpg"
-                                }
-                                _ if bytes.len() >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n" => {
-                                    "png"
-                                }
-                                _ if bytes.len() >= 12
-                                    && &bytes[0..4] == b"RIFF"
-                                    && &bytes[8..12] == b"WEBP" =>
-                                {
-                                    "webp"
-                                }
-                                _ => "jpg",
-                            };
                             // 縮小済みサムネイルを PNG で保存する（reload 時のキャッシュ
                             // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）
-                            let cache_path =
-                                thumbnails_dir.join(format!("{site_id}_{database_id}.png"));
-                            if let Some(cached) = resize_for_cache(&bytes, 288) {
-                                let _ = std::fs::write(&cache_path, &cached);
-                            }
+                            write_cover_cache(thumbnails_dir, site_id, database_id, &bytes);
                             // デコード + 縮小はこのスレッド（4 並列）で行い、UI には
                             // デコード済みサムネイルだけ送る（UI スレッドで 307 枚
                             // デコードすると固まるため）
-                            let Some(image) = decode_and_resize(&bytes, 288) else {
+                            let Some(image) = decode_and_resize(&bytes, 448) else {
                                 fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 log::warn!("表紙のデコード失敗: {site_id} / {database_id}");
                                 let _ = fail_tx.send((site_id.clone(), database_id.clone()));
@@ -1354,8 +1456,7 @@ impl BookshelfView {
         let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
         std::thread::spawn(move || {
             let result = (|| -> Result<usize, String> {
-                let session =
-                    session.ok_or_else(|| "FANZA セッションがありません".to_string())?;
+                let session = session.ok_or_else(|| "FANZA セッションがありません".to_string())?;
                 let mut client =
                     FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
                 thundoku_core::fanza::sync::save_purchases(&db, &mut client)
@@ -1386,7 +1487,8 @@ impl BookshelfView {
                     Err(message) => {
                         log::error!("sync_fanza failed: {message}");
                         this.error = Some(message.clone());
-                        if message.contains("not logged in") || message.contains("セッション") {
+                        if message.contains("not logged in") || message.contains("セッション")
+                        {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&OpenAuthProvider {
                                     provider: crate::views::auth::AuthProvider::Fanza,
@@ -1425,8 +1527,7 @@ impl BookshelfView {
         let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
         std::thread::spawn(move || {
             let result = (|| -> Result<usize, String> {
-                let session =
-                    session.ok_or_else(|| "DLsite セッションがありません".to_string())?;
+                let session = session.ok_or_else(|| "DLsite セッションがありません".to_string())?;
                 let mut client =
                     DlsiteClient::with_transport(Box::new(UreqTransport::new()), session);
                 thundoku_core::dlsite::sync::save_purchases(&db, &mut client)
@@ -1457,7 +1558,8 @@ impl BookshelfView {
                     Err(message) => {
                         log::error!("sync_dlsite failed: {message}");
                         this.error = Some(message.clone());
-                        if message.contains("not logged in") || message.contains("セッション") {
+                        if message.contains("not logged in") || message.contains("セッション")
+                        {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&OpenAuthProvider {
                                     provider: crate::views::auth::AuthProvider::Dlsite,
@@ -1573,12 +1675,15 @@ impl BookshelfView {
         // UI がカードの再描画（表紙 307 件の反映など）で忙しいと取り込みが
         // 数分ストールする原因になるため、unbounded の channel を使う。
         let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(String, DownloadState)>();
+        // 取り込み確認モーダル（§6.3）を UI に依頼するチャネルと、選択を返すチャネル
+        let (prompt_tx, prompt_rx) = std::sync::mpsc::channel::<PendingImport>();
         // ダウンロード + インポート（レンダリング含む）は GPUI のワーカーを
         // 数分ブロックすると他の処理（表紙取得など）が止まってビジーになるため、
         // 専用スレッドで実行して結果をチャネルで受け取る。
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<ImportOutcome, ImportFailure>>();
         std::thread::spawn(move || {
-            let result = (|| -> Result<String, String> {
+            let result = (|| -> Result<ImportOutcome, ImportFailure> {
                 // ダウンロード（サイトで分岐）:
                 // - BOOTH: セッション Cookie で downloadables/{id} を GET → 302 の
                 //   Location（署名付き S3 URL）を自動追跡してファイル本体を取得
@@ -1614,7 +1719,9 @@ impl BookshelfView {
                         FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
                     let detail = client.detail(&product_id).map_err(|e| e.to_string())?;
                     if detail.is_drm {
-                        return Err("DRM 付き作品は取り込めません".to_string());
+                        return Err(ImportFailure::Message(
+                            "DRM 付き作品は取り込めません".to_string(),
+                        ));
                     }
                     let url = detail
                         .download_link
@@ -1657,9 +1764,7 @@ impl BookshelfView {
                             metas
                                 .get(&product_id)
                                 .and_then(|m| m.down_url.clone())
-                                .ok_or_else(|| {
-                                    "DLsite ダウンロード URL がありません".to_string()
-                                })?
+                                .ok_or_else(|| "DLsite ダウンロード URL がありません".to_string())?
                         }
                     };
                     let download_tx = progress_tx.clone();
@@ -1745,15 +1850,10 @@ impl BookshelfView {
                 let identity = google_sub.as_deref().and_then(|sub| {
                     let key = db_key.as_ref()?;
                     // (source, owner) で既存の所属行を再利用（P5）。無ければ新規 UUID。
-                    let reuse_id = books::resolve_reuse_id(
-                        &db,
-                        key,
-                        &site_id,
-                        &product_id,
-                        Some(sub),
-                    )
-                    .ok()
-                    .flatten();
+                    let reuse_id =
+                        books::resolve_reuse_id(&db, key, &site_id, &product_id, Some(sub))
+                            .ok()
+                            .flatten();
                     let pack_id = reuse_id
                         .clone()
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1772,15 +1872,9 @@ impl BookshelfView {
                                 .ok()
                                 .flatten()
                         }
-                        _ => books::resolve_reuse_id(
-                            &db,
-                            &[0u8; 32],
-                            &site_id,
-                            &product_id,
-                            None,
-                        )
-                        .ok()
-                        .flatten(),
+                        _ => books::resolve_reuse_id(&db, &[0u8; 32], &site_id, &product_id, None)
+                            .ok()
+                            .flatten(),
                     }
                 };
                 let imported = if extension == "pdf" {
@@ -1797,8 +1891,9 @@ impl BookshelfView {
                         pages,
                         &packs_dir,
                         identity.as_ref(),
+                        reuse_book_id.as_deref(),
                     )
-                    .map_err(|e| e.to_string())?;
+                    .map_err(import_failure)?;
                     // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
                     if !site_id.is_empty() {
                         let _ = books::set_site_id(&db, &imported.book.id, &site_id);
@@ -1809,10 +1904,16 @@ impl BookshelfView {
                     // ダウンロード直後からページ数を表示できるように
                     // reading_progress（未読・総ページ数）を作成する。
                     if imported.document.total_pages > 0 {
+                        let seeded_content = db::contents::primary_for_book(&db, &imported.book.id)
+                            .ok()
+                            .flatten()
+                            .map(|content| content.content_id)
+                            .unwrap_or_default();
                         let _ = progress::upsert(
                             &db,
                             &progress::ReadingProgress {
                                 book_id: imported.book.id.clone(),
+                                content_id: seeded_content,
                                 current_page: 0,
                                 total_pages: Some(imported.document.total_pages),
                                 finished_at: None,
@@ -1834,25 +1935,47 @@ impl BookshelfView {
                             Some(thundoku_core::owner::encrypt(key, sub)),
                         );
                     }
-                    Ok::<_, String>(imported)
+                    Ok::<_, ImportFailure>(imported)
                 } else {
                     let imported = match extension.as_str() {
                         "epub" => thundoku_core::import::import_epub_bytes(
-                            &db, &file_name, &bytes, &packs_dir, identity.as_ref(),
-                        ),
-                        "zip" => thundoku_core::import::import_zip_bytes(
                             &db,
                             &file_name,
                             &bytes,
                             &packs_dir,
                             identity.as_ref(),
-                            &mut on_import,
                             reuse_book_id.as_deref(),
                         ),
+                        "zip" => {
+                            // §6.3: 曖昧な構造（コンテンツが複数 / 形式が複数）は
+                            // サマリー付きモーダルで既定表示を選んでもらってから取り込む
+                            let mut plan = thundoku_core::import::analyze_zip(&bytes)
+                                .map_err(import_failure)?;
+                            if import_needs_confirmation(&plan) {
+                                match ask_import_confirmation(&prompt_tx, &item.title, &plan) {
+                                    Some(index) => plan.primary = index,
+                                    None => return Err(ImportFailure::Cancelled),
+                                }
+                            }
+                            thundoku_core::import::commit_zip(
+                                &db,
+                                &file_name,
+                                &bytes,
+                                &packs_dir,
+                                identity.as_ref(),
+                                &mut on_import,
+                                reuse_book_id.as_deref(),
+                                &plan,
+                            )
+                        }
                         // BOOTH は PDF だけでなく画像ファイル（イラスト等）もある
                         "jpg" | "jpeg" | "png" | "webp" | "gif" => {
                             thundoku_core::import::import_image_bytes(
-                                &db, &file_name, &bytes, &packs_dir, identity.as_ref(),
+                                &db,
+                                &file_name,
+                                &bytes,
+                                &packs_dir,
+                                identity.as_ref(),
                             )
                         }
                         other => Err(thundoku_core::import::ImportError::UnsupportedType(
@@ -1885,12 +2008,8 @@ impl BookshelfView {
                                 let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
                                 // 本棚アイテムの tags_json にも書く（owned フィルタで
                                 // local が外れてもカードに表示できるように）
-                                let _ = bookshelf::update_tags(
-                                    &db,
-                                    "fanza",
-                                    &product_id,
-                                    &genre_tags,
-                                );
+                                let _ =
+                                    bookshelf::update_tags(&db, "fanza", &product_id, &genre_tags);
                             }
                         }
                         // DLsite: インポート後に共有メタ列（media_category / ai_type / is_drm /
@@ -1926,20 +2045,24 @@ impl BookshelfView {
                                             .iter()
                                             .map(|t| (t.as_str(), "dlsite_genre"))
                                             .collect();
-                                        let _ = db::tags::set_for_book(
-                                            &db,
-                                            &imported.book.id,
-                                            &pairs,
-                                        );
+                                        let _ =
+                                            db::tags::set_for_book(&db, &imported.book.id, &pairs);
                                     }
                                 }
                             }
                         }
                         if imported.document.total_pages > 0 {
+                            let seeded_content =
+                                db::contents::primary_for_book(&db, &imported.book.id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|content| content.content_id)
+                                    .unwrap_or_default();
                             let _ = progress::upsert(
                                 &db,
                                 &progress::ReadingProgress {
                                     book_id: imported.book.id.clone(),
+                                    content_id: seeded_content,
                                     current_page: 0,
                                     total_pages: Some(imported.document.total_pages),
                                     finished_at: None,
@@ -1960,11 +2083,12 @@ impl BookshelfView {
                             );
                         }
                     }
-                    imported.map_err(|e| e.to_string())
+                    imported.map_err(import_failure)
                 };
-                imported
-                    .map(|imported| imported.book.title)
-                    .map_err(|e| e.to_string())
+                imported.map(|imported| ImportOutcome {
+                    title: imported.book.title,
+                    warnings: imported.warnings,
+                })
             })();
             let _ = result_tx.send(result);
         });
@@ -1991,6 +2115,13 @@ impl BookshelfView {
                         }
                     }
                 }
+                // 取り込み確認モーダルの依頼（§6.3）
+                if let Ok(request) = prompt_rx.try_recv() {
+                    progress_handle.update(cx, |this, cx| {
+                        this.pending_import = Some(request);
+                        cx.notify();
+                    });
+                }
                 if let Some((id, state)) = pending.take() {
                     // 状態（Downloading → Processing）が変わったら必ず再描画する。
                     // % が同じ間は間引く（16ms ごとの notify はカード 307 件の
@@ -2012,22 +2143,24 @@ impl BookshelfView {
                         .await;
                 }
             }
-            let result = result_rx
-                .try_recv()
-                .unwrap_or_else(|_| Err("ダウンロード処理が結果を返しませんでした".into()));
+            let result = result_rx.try_recv().unwrap_or_else(|_| {
+                Err(ImportFailure::Message(
+                    "ダウンロード処理が結果を返しませんでした".to_string(),
+                ))
+            });
             log::info!("download_item: スレッド完了、UI 反映開始");
             let complete_start = std::time::Instant::now();
             handle.update(cx, |this, cx| {
                 this.download_states.remove(&database_id);
-                match result {
-                    Ok(title) => {
-                        this.toast = Some(format!("「{title}」をダウンロードしました"));
-                        this.reload(cx);
-                    }
-                    Err(error) => {
-                        log::warn!("download_item: 失敗しました: {error}");
-                        this.error = Some(error);
-                    }
+                let (toast, error) = download_messages(&result);
+                let succeeded = result.is_ok();
+                this.toast = toast;
+                this.error = error;
+                if let Some(error) = &this.error {
+                    log::warn!("download_item: 失敗しました: {error}");
+                }
+                if succeeded {
+                    this.reload(cx);
                 }
                 cx.notify();
             });
@@ -2156,11 +2289,18 @@ impl BookshelfView {
         // 表紙キャッシュも破棄して再取得させる（reload の fetch_remote_covers が
         // thumbnail_url から取り直す）。キャッシュファイル + カードの cover をクリア。
         if !card.shelf.site_id.is_empty() {
-            let cache_path = state.data_dir.join("thumbnails").join(format!(
-                "{}_{}.png",
-                card.shelf.site_id, card.shelf.database_id
-            ));
+            let thumbnails_dir = state.data_dir.join("thumbnails");
+            let cache_path = cover_cache_path(
+                &thumbnails_dir,
+                &card.shelf.site_id,
+                &card.shelf.database_id,
+            );
             let _ = std::fs::remove_file(&cache_path);
+            remove_legacy_cover_cache(
+                &thumbnails_dir,
+                &card.shelf.site_id,
+                &card.shelf.database_id,
+            );
             if let Some(slot) = self.shelf_cards.iter_mut().find(|c| {
                 c.shelf.site_id == card.shelf.site_id
                     && c.shelf.database_id == card.shelf.database_id
@@ -2176,6 +2316,30 @@ impl BookshelfView {
 
     /// タグ取得 ON/OFF トグル（Web 版の `handleToggleTagFetch` 相当）。
     /// OFF の間はダウンロード時にタグを自動生成しない。
+    /// 取り込み確認モーダルで既定表示を選ぶ（§6.3）。
+    fn select_pending_import(&mut self, cx: &mut Context<Self>, index: usize) {
+        if let Some(pending) = self.pending_import.as_mut() {
+            pending.selected = index;
+        }
+        cx.notify();
+    }
+
+    /// 取り込み確認モーダルを確定する（worker が待っている選択を返す）。
+    fn confirm_pending_import(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_import.take() {
+            let _ = pending.reply.send(Some(pending.selected));
+        }
+        cx.notify();
+    }
+
+    /// 取り込み確認モーダルをキャンセルする（worker は取り込みを中止する）。
+    fn cancel_pending_import(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_import.take() {
+            let _ = pending.reply.send(None);
+        }
+        cx.notify();
+    }
+
     /// 表示モードを切り替える（Web の viewMode トグル相当）。
     fn toggle_view_mode(&mut self, cx: &mut Context<Self>) {
         self.view_mode = match self.view_mode {
@@ -2238,7 +2402,11 @@ impl BookshelfView {
                 db::tags::list_for_book(db, &local_id)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|tag| tag.source == "manual" || tag.source == "fanza_genre" || tag.source == "dlsite_genre")
+                    .filter(|tag| {
+                        tag.source == "manual"
+                            || tag.source == "fanza_genre"
+                            || tag.source == "dlsite_genre"
+                    })
                     .map(|tag| tag.tag_name)
                     .collect::<Vec<_>>()
             } else {
@@ -2254,36 +2422,39 @@ impl BookshelfView {
             // FANZA のお気に入りタグが出ないように。サイト不明なら全表示）。
             let mut suggestions = vec!["後で読む".to_string()];
             let favorites = db::tags::list_favorites(db).unwrap_or_default();
-            let book_site: Option<String> = if let Some(local_id) =
-                Self::resolve_local_book_id(db, book_id)
-            {
-                books::get(db, &local_id).ok().flatten().and_then(|b| b.site_id)
-            } else {
-                bookshelf::list_all(db)
-                    .ok()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|i| i.database_id == book_id)
-                    .map(|i| i.site_id)
-            };
-            let allowed: Option<std::collections::HashSet<String>> = book_site.as_deref().map(|site| {
-                let mut set = std::collections::HashSet::new();
-                for item in bookshelf::list_all(db).ok().unwrap_or_default() {
-                    if item.site_id == site {
-                        for t in bookshelf::tags_of(&item) {
-                            set.insert(t);
+            let book_site: Option<String> =
+                if let Some(local_id) = Self::resolve_local_book_id(db, book_id) {
+                    books::get(db, &local_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|b| b.site_id)
+                } else {
+                    bookshelf::list_all(db)
+                        .ok()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|i| i.database_id == book_id)
+                        .map(|i| i.site_id)
+                };
+            let allowed: Option<std::collections::HashSet<String>> =
+                book_site.as_deref().map(|site| {
+                    let mut set = std::collections::HashSet::new();
+                    for item in bookshelf::list_all(db).ok().unwrap_or_default() {
+                        if item.site_id == site {
+                            for t in bookshelf::tags_of(&item) {
+                                set.insert(t);
+                            }
                         }
                     }
-                }
-                for b in books::list(db).ok().unwrap_or_default() {
-                    if b.site_id.as_deref() == Some(site) {
-                        for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
-                            set.insert(t.tag_name);
+                    for b in books::list(db).ok().unwrap_or_default() {
+                        if b.site_id.as_deref() == Some(site) {
+                            for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
+                                set.insert(t.tag_name);
+                            }
                         }
                     }
-                }
-                set
-            });
+                    set
+                });
             for tag in favorites {
                 if allowed.as_ref().map_or(true, |s| s.contains(&tag))
                     && !suggestions.contains(&tag)
@@ -2376,7 +2547,10 @@ impl BookshelfView {
                 );
                 // FANZA / DLsite: reload の owned フィルタで local が外れるとカードは
                 // shelf.tags_json を読むため、book_tags に加えて本棚アイテムにも書く。
-                if matches!(self.editing_site_id.as_deref(), Some("fanza") | Some("dlsite")) {
+                if matches!(
+                    self.editing_site_id.as_deref(),
+                    Some("fanza") | Some("dlsite")
+                ) {
                     let site = self.editing_site_id.as_deref().unwrap_or("fanza");
                     let shelf_res = bookshelf::update_tags(db, site, &book_id, &tags);
                     log::info!(
@@ -2536,10 +2710,7 @@ impl BookshelfView {
         let event_text = event.unwrap_or_else(|| "イベント不明".to_string());
         // 購入日（caused_at "2026/01/01 19:36:23" → "2026/01/01"）。BOOTH はイベント名が
         // ないため、イベント名の代わりに購入日を表示する
-        let purchase_date = shelf
-            .caused_at
-            .as_deref()
-            .map(format_purchase_date);
+        let purchase_date = shelf.caused_at.as_deref().map(format_purchase_date);
         let database_id = shelf.database_id.clone();
         let cover = card.cover.clone().or_else(|| {
             if card.cover_fetch_failed {
@@ -2563,69 +2734,76 @@ impl BookshelfView {
         let delete_id = local.map(|e| e.book.id.clone());
         let _ = window;
 
-        // -- 表紙: 画像 + 未読/既読バッジ + ダウンロード状態アイコン + 進捗リング --
-        // 枠の高さを画像のアスペクト比に合わせる（自然比率を保つ＝クロップ/レターボックスなし）。
-        // バッジ（未読/♡/↓）は枠=画像に乗る。FANZA は横長（4:3）サムネ等のため枠高さが変わる。
-        let cover_h: f32 = match &cover {
-            Some(render) => {
-                let size = render.size(0);
-                let w = size.width.0 as f32;
-                let h = size.height.0 as f32;
-                (144.0 * (h / w.max(1.0))).clamp(80.0, 420.0)
-            }
-            None => 192.0,
+        // -- 表紙（カードのヘッダー）: カード幅いっぱい + 4:3 の枠 --
+        // 画像は**比率を保って枠に収める**。横長は幅いっぱい（高さは比率なり）、
+        // **縦長は高さいっぱい**（幅は比率なり）にして中央に置く。カード幅に合わせて
+        // 縦長を拡大すると上下が切れて表紙の一部しか見えなくなるため。
+        // 角はカードと同じ丸み（`rounded_lg`）を上辺に付ける（GPUI の overflow_hidden は
+        // 矩形マスクなので、角丸のクリップは各要素側で指定する必要がある）。
+        let cover_h: f32 = (card_width * 0.75).clamp(120.0, 320.0);
+        let draw_size = |render: &Arc<RenderImage>| -> (f32, f32) {
+            let size = render.size(0);
+            let (image_w, image_h) = (size.width.0.max(1) as f32, size.height.0.max(1) as f32);
+            let scale = (card_width / image_w).min(cover_h / image_h);
+            ((image_w * scale).max(1.0), (image_h * scale).max(1.0))
         };
-        let image: gpui_kit::AnyElement = match &cover {
-            Some(render) => div()
-                .w(px(144.0))
-                .h(px(cover_h))
-                .overflow_hidden()
-                .child(
-                    img(render.clone())
-                        .w_full()
-                        .h_full()
-                        .object_fit(gpui_kit::ObjectFit::Cover),
-                )
-                .into_any_element(),
-            None => div()
-                .w(px(144.0))
-                .h(px(cover_h))
-                .bg(theme.muted)
-                .into_any_element(),
+        // バッジ（未読/♡/↓）とオーバーレイは、枠ではなく**この画像の矩形**を基準に置く。
+        // 縦長の表紙は左右にバーが出るため、枠基準だとバッジが画像の外に浮いてしまう。
+        let (draw_w, draw_h) = match &cover {
+            Some(render) => draw_size(render),
+            None => (card_width, cover_h),
         };
-
-        let mut cover_el = div()
-            .relative()
-            .w(px(144.0))
-            .h(px(cover_h))
-            .child(image)
+        // 上辺の角丸は**カード幅いっぱいのときだけ**（横長の表紙はカードの角に接するため
+        // 丸みを合わせる）。縦長は画像が中央に浮いてカードの角に接しないので、画像にも
+        // バッジにも丸みを付けない。
+        let fits_width = draw_w >= card_width - 0.5;
+        let mut cover_el = div().relative().w(px(draw_w)).h(px(draw_h)).flex_shrink_0();
+        if fits_width {
+            cover_el = cover_el.rounded_t_lg();
+        }
+        cover_el = cover_el
+            .child(match &cover {
+                Some(render) => {
+                    let mut el = img(render.clone()).w_full().h_full();
+                    if fits_width {
+                        el = el.rounded_t_lg();
+                    }
+                    el.into_any_element()
+                }
+                None => {
+                    let mut el = div().w_full().h_full().bg(theme.muted);
+                    if fits_width {
+                        el = el.rounded_t_lg();
+                    }
+                    el.into_any_element()
+                }
+            })
             // 左上: 未読/既読バッジ（Web の statusText と同じ）
-            .child(if is_read {
-                div()
+            .child({
+                let mut badge = div()
                     .absolute()
                     .left_0()
                     .top_0()
                     .rounded_br_md()
                     .px_1()
-                    .py_0p5()
-                    .bg(gpui_kit::rgb(0xd1fae5))
-                    .text_color(gpui_kit::rgb(0x047857))
-                    .text_xs()
-                    .child("読了")
-                    .into_any_element()
-            } else {
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .rounded_br_md()
-                    .px_1()
-                    .py_0p5()
-                    .bg(gpui_kit::rgb(0xfef3c7))
-                    .text_color(gpui_kit::rgb(0xb45309))
-                    .text_xs()
-                    .child("未読")
-                    .into_any_element()
+                    .py_0p5();
+                if fits_width {
+                    badge = badge.rounded_tl_lg();
+                }
+                if is_read {
+                    badge
+                        .bg(gpui_kit::rgb(0xd1fae5))
+                        .text_color(gpui_kit::rgb(0x047857))
+                        .text_xs()
+                        .child("読了")
+                } else {
+                    badge
+                        .bg(gpui_kit::rgb(0xfef3c7))
+                        .text_color(gpui_kit::rgb(0xb45309))
+                        .text_xs()
+                        .child("未読")
+                }
+                .into_any_element()
             })
             // 右上: お気に入りハート（クリックでトグル）
             .child(
@@ -2707,43 +2885,58 @@ impl BookshelfView {
             let fraction = state.fraction();
             let percentage = (fraction * 100.0).round() as u32;
             let ring = progress_ring_image(fraction);
+            let mut overlay = div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui_kit::rgba(0x00000080));
+            if fits_width {
+                overlay = overlay.rounded_t_lg();
+            }
             cover_el = cover_el.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui_kit::rgba(0x00000080))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_1()
-                            .child(img(ring).w(px(72.0)).h(px(72.0)))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_color(gpui_kit::white())
-                                            .text_xs()
-                                            .child(state.label()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(gpui_kit::white())
-                                            .text_sm()
-                                            .font_weight(gpui_kit::FontWeight::BOLD)
-                                            .child(format!("{percentage}%")),
-                                    ),
-                            ),
-                    ),
+                overlay.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .child(img(ring).w(px(72.0)).h(px(72.0)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_color(gpui_kit::white())
+                                        .text_xs()
+                                        .child(state.label()),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(gpui_kit::white())
+                                        .text_sm()
+                                        .font_weight(gpui_kit::FontWeight::BOLD)
+                                        .child(format!("{percentage}%")),
+                                ),
+                        ),
+                ),
             );
         }
+
+        // 枠（カード幅 × 4:3）に表紙を中央寄せする。余りは theme.secondary（バー）。
+        let image: gpui_kit::AnyElement = div()
+            .w_full()
+            .h(px(cover_h))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_t_lg()
+            .bg(theme.secondary)
+            .child(cover_el)
+            .into_any_element();
 
         let mut card_el = div()
             .id(SharedString::from(format!(
@@ -2753,9 +2946,8 @@ impl BookshelfView {
             .w(px(card_width))
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
             .rounded_lg()
+            .overflow_hidden()
             .border_1()
             .border_color(if selected {
                 // ダークモードでは枠の明るさを少し落として目立ちすぎないように
@@ -2799,68 +2991,72 @@ impl BookshelfView {
         });
 
         card_el = card_el
-            // 表紙は中央寄せ（Web の mx-auto 相当）
+            // 表紙（カードのヘッダー）: 端まで出す。読了は少し薄く表示する
+            .child(if is_read {
+                div().opacity(0.75).child(image)
+            } else {
+                div().child(image)
+            })
+            // 以降はパディング付きの内容ブロック（ヘッダーだけ端まで）
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(if is_read {
-                        div().opacity(0.75).child(cover_el)
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    // タイトル（Web の BookInfo: line-clamp-2 font-semibold）
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    // イベント名 or 購入日（BOOTH はイベントがないため購入日を表示）
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            // Web の formatEventLabel と同じ: イベント不明のときは
+                            // 「イベント不明」を表示
+                            .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
+                                ("booth", Some(date))
+                                | ("fanza", Some(date))
+                                | ("dlsite", Some(date)) => format!("購入日: {date}"),
+                                _ => event_text.clone(),
+                            }),
+                    )
+                    // サークル名（非空のときだけ表示）
+                    .child(if !circle_name.is_empty() {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("サークル: {circle_name}"))
+                            .into_any_element()
                     } else {
-                        div().child(cover_el)
+                        div().into_any_element()
+                    })
+                    // 作者名（BOOTH 等。空でなければ表示。技術書典は author が空なので出ない）
+                    .child(if !author.is_empty() {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("作者: {author}"))
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(match progress_text.as_deref() {
+                        Some(text) => div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(text.to_string())
+                            .into_any_element(),
+                        None => div().into_any_element(),
                     }),
-            )
-            // タイトル（Web の BookInfo: line-clamp-2 font-semibold）
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            // イベント名 or 購入日（BOOTH はイベントがないため購入日を表示）
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    // Web の formatEventLabel と同じ: イベント不明のときは
-                    // 「イベント不明」を表示
-                    .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
-                        ("booth", Some(date)) | ("fanza", Some(date)) | ("dlsite", Some(date)) => format!("購入日: {date}"),
-                        _ => event_text.clone(),
-                    }),
-            )
-            // サークル名（非空のときだけ表示）
-            .child(if !circle_name.is_empty() {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("サークル: {circle_name}"))
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            // 作者名（BOOTH 等。空でなければ表示。技術書典は author が空なので出ない）
-            .child(if !author.is_empty() {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("作者: {author}"))
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            .child(match progress_text.as_deref() {
-                Some(text) => div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(text.to_string())
-                    .into_any_element(),
-                None => div().into_any_element(),
-            });
+            );
 
         // タグ行: 編集中なら Web の TagsInput 風エディタを表示
-        card_el = card_el.child(if editing {
+        card_el = card_el.child(div().px_3().pb_3().child(if editing {
             BookshelfView::render_tag_editor(
                 window,
                 theme,
@@ -2896,7 +3092,7 @@ impl BookshelfView {
                     &database_id,
                 ))
                 .into_any_element()
-        });
+        }));
 
         card_el.context_menu({
             let has_local = delete_id.is_some();
@@ -3148,22 +3344,24 @@ impl BookshelfView {
                             // 保存ボタンの右に配置する。
                             .when(show_refetch, |this| {
                                 this.child(
-                                    div().debug_selector(|| "tag-edit-refetch-btn".into()).child(
-                                        Button::new("tag-edit-refetch")
-                                            .cursor_pointer()
-                                            .outline()
-                                            .label("再取得")
-                                            .cursor_pointer()
-                                            .on_click({
-                                                let handle = handle.clone();
-                                                move |_, _window, cx| {
-                                                    cx.stop_propagation();
-                                                    handle.update(cx, |this, cx| {
-                                                        this.refetch_genre_tags(cx);
-                                                    });
-                                                }
-                                            }),
-                                    ),
+                                    div()
+                                        .debug_selector(|| "tag-edit-refetch-btn".into())
+                                        .child(
+                                            Button::new("tag-edit-refetch")
+                                                .cursor_pointer()
+                                                .outline()
+                                                .label("再取得")
+                                                .cursor_pointer()
+                                                .on_click({
+                                                    let handle = handle.clone();
+                                                    move |_, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        handle.update(cx, |this, cx| {
+                                                            this.refetch_genre_tags(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        ),
                                 )
                             })
                             .child(
@@ -3184,7 +3382,7 @@ impl BookshelfView {
                                         }),
                                 ),
                             ),
-                    )
+                    ),
             )
             // サジェスチョン（Web の suggestions 相当: 後で読む + お気に入りタグ）
             // カード（グリッドの List 行）にはみ出して後続カードに上書きされるのを避けるため、
@@ -3207,8 +3405,7 @@ impl BookshelfView {
                         move |suggestion| {
                             let handle = handle.clone();
                             let suggestion_id = suggestion.clone();
-                            let suggestion_selector =
-                                format!("edit-suggestion-{suggestion_id}");
+                            let suggestion_selector = format!("edit-suggestion-{suggestion_id}");
                             div()
                                 .id(SharedString::from(format!(
                                     "edit-suggestion-{suggestion_id}"
@@ -3298,10 +3495,7 @@ impl BookshelfView {
             .clone()
             .map(|name| format_event_label(&name));
         let event_text = event.unwrap_or_else(|| "イベント不明".to_string());
-        let purchase_date = shelf
-            .caused_at
-            .as_deref()
-            .map(format_purchase_date);
+        let purchase_date = shelf.caused_at.as_deref().map(format_purchase_date);
         let database_id = shelf.database_id.clone();
         let cover = card.cover.clone().or_else(|| {
             if card.cover_fetch_failed {
@@ -3499,7 +3693,9 @@ impl BookshelfView {
                         // Web の formatEventLabel と同じ: イベント不明のときは
                         // 「イベント不明」を表示
                         .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
-                            ("booth", Some(date)) | ("fanza", Some(date)) | ("dlsite", Some(date)) => {
+                            ("booth", Some(date))
+                            | ("fanza", Some(date))
+                            | ("dlsite", Some(date)) => {
                                 format!("購入日: {date}")
                             }
                             _ => event_text.clone(),
@@ -3717,6 +3913,14 @@ impl Render for BookshelfView {
         let busy = self.sync_busy > 0;
         let toast = self.toast.clone();
         let error = self.error.clone();
+        // 取り込み確認モーダル（§6.3）: 要約だけなので clone して描画に使う
+        let pending_import = self.pending_import.as_ref().map(|pending| {
+            (
+                pending.title.clone(),
+                pending.choices.clone(),
+                pending.selected,
+            )
+        });
         let handle = cx.entity();
 
         div()
@@ -4336,11 +4540,221 @@ impl Render for BookshelfView {
             } else {
                 div().into_any_element()
             })
+            // 取り込み確認モーダル（§6.3: 曖昧な構造のときだけ）
+            .child(
+                if let Some((title, choices, selected)) = pending_import {
+                    let handle = handle.clone();
+                    let content_handle = handle.clone();
+                    Dialog::new(cx)
+                        .title(div().child("取り込み内容の確認"))
+                        .content(move |content, _window, cx| {
+                            let mut list = content.child(div().text_sm().child(format!(
+                                "「{title}」には複数のコンテンツが含まれています。既定で表示するものを選んでください。"
+                            )));
+                            for (index, choice) in choices.iter().enumerate() {
+                                let handle = content_handle.clone();
+                                let is_selected = index == selected;
+                                list = list.child(
+                                    div()
+                                        .id(SharedString::from(format!("import-choice-{index}")))
+                                        .debug_selector(move || {
+                                            format!("import-choice-{index}")
+                                        })
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .py_1()
+                                        .cursor_pointer()
+                                        .on_click(move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.select_pending_import(cx, index);
+                                            });
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .w(px(16.0))
+                                                .h(px(16.0))
+                                                .rounded_full()
+                                                .border_1()
+                                                .border_color(if is_selected {
+                                                    cx.theme().primary
+                                                } else {
+                                                    cx.theme().border
+                                                })
+                                                .child(if is_selected {
+                                                    div()
+                                                        .w(px(8.0))
+                                                        .h(px(8.0))
+                                                        .rounded_full()
+                                                        .bg(cx.theme().primary)
+                                                } else {
+                                                    div()
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                        .child(choice.display_name.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(format!(
+                                                            "{} ・ {}",
+                                                            choice.kind, choice.detail
+                                                        )),
+                                                ),
+                                        ),
+                                );
+                            }
+                            list
+                        })
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    Button::new("import-confirm-cancel")
+                                        .cursor_pointer()
+                                        .label("キャンセル")
+                                        .cursor_pointer()
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.cancel_pending_import(cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("import-confirm-ok")
+                                        .cursor_pointer()
+                                        .primary()
+                                        .label("この内容で取り込む")
+                                        .cursor_pointer()
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.confirm_pending_import(cx);
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                },
+            )
     }
 }
 
 /// Resolve a remote/cached cover for a bookshelf item to a RenderImage.
 /// GPUI の RenderImage は BGRA を期待するため、RGBA から R/B を入れ替える。
+/// サイトごとの表紙画像の取得（URL 規則をここに集約。本棚と設定の両方から使う）。
+///
+/// - BOOTH: 商品ページの共有画像（オリジナル・高解像度）を優先し、保存 URL をフォールバック
+/// - DLsite: 公開 CDN（`img.dlsite.jp`）をそのまま
+/// - FANZA: `-200x150` を外した**原寸**を優先し、失敗したら保存 URL に戻す
+/// - 技術書典: 公開 URL を直接。失敗時のみセッション付きクライアントで再試行
+/// 保存 URL から実際に取得を試す URL の並びを返す（失敗したら次を試す）。
+///
+/// FANZA は `-200x150` を外した**原寸**を先に試し、失敗したら保存 URL に戻す
+/// （実測: `pl-200x150` = 200x150 に対し `pl` = 560x420）。それ以外は保存 URL のまま。
+pub(crate) fn cover_url_candidates(site_id: &str, stored_url: &str) -> Vec<String> {
+    if site_id == "fanza" {
+        let full = thundoku_core::fanza::sync::full_size_thumb(stored_url);
+        if full != stored_url {
+            return vec![full, stored_url.to_string()];
+        }
+    }
+    vec![stored_url.to_string()]
+}
+
+pub(crate) fn fetch_cover_bytes(
+    agent: &ureq::Agent,
+    site_id: &str,
+    database_id: &str,
+    stored_url: &str,
+    booth_session: Option<&thundoku_core::booth::BoothSession>,
+    tbf_client: &parking_lot::Mutex<thundoku_core::tbf::TbfClient>,
+) -> Option<Vec<u8>> {
+    // プロトコル相対（`//img.dlsite.jp/...`）とサイト相対を絶対化する
+    let resolved = if stored_url.starts_with("//") {
+        format!("https:{stored_url}")
+    } else if stored_url.starts_with('/') {
+        format!("https://techbookfest.org{stored_url}")
+    } else {
+        stored_url.to_string()
+    };
+    if site_id == "booth" {
+        // BOOTH の表紙は公開画像（booth.pximg.net — Cookie 不要）
+        let primary = booth_session.and_then(|session| {
+            let item_id: u64 = database_id.parse().ok()?;
+            let detail = BoothClient::new(session).item_detail(item_id).ok()?;
+            detail.images.into_iter().next()
+        });
+        match primary {
+            Some(image_url) => {
+                fetch_bytes(agent, &image_url).or_else(|| fetch_bytes(agent, &resolved))
+            }
+            None => fetch_bytes(agent, &resolved),
+        }
+    } else if site_id == "dlsite" {
+        // TBF クライアントにはフォールバックしない（誤った経路で失敗するため）
+        fetch_bytes(agent, &resolved)
+    } else if site_id == "fanza" {
+        // 原寸 → 縮小の順に試す（原寸が無い作品があるためフォールバックする）
+        let mut bytes = None;
+        for candidate in cover_url_candidates(site_id, &resolved) {
+            bytes = fetch_bytes(agent, &candidate);
+            if bytes.is_some() {
+                break;
+            }
+            log::warn!("表紙 URL で取得できず次を試す: {candidate}");
+        }
+        bytes
+    } else {
+        // TBF の表紙も公開 URL なら直接取得する（4 並列が機能する）。
+        // 失敗した場合のみセッション付きクライアントにフォールバック。
+        match fetch_bytes(agent, &resolved) {
+            Some(bytes) => Some(bytes),
+            None => {
+                log::warn!("TBF 表紙を直接取得できずフォールバック: {resolved}");
+                tbf_client.lock().download(&resolved).ok()
+            }
+        }
+    }
+}
+
+/// 取得した表紙画像を 448px の PNG キャッシュとして保存する（本棚と設定で共通）。
+/// カードのヘッダーは最大 ~320px 幅なので、粗くならないよう 448px で持つ。
+pub(crate) fn write_cover_cache(
+    thumbnails_dir: &std::path::Path,
+    site_id: &str,
+    database_id: &str,
+    bytes: &[u8],
+) {
+    if let Some(cached) = resize_for_cache(bytes, 448) {
+        let path = cover_cache_path(thumbnails_dir, site_id, database_id);
+        let _ = std::fs::write(&path, &cached);
+        remove_legacy_cover_cache(thumbnails_dir, site_id, database_id);
+    }
+}
+
 /// タイムアウト付きで画像をダウンロードする（ハング防止）。
 fn fetch_bytes(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
     use std::io::Read;
@@ -4377,7 +4791,7 @@ fn resize_for_cache(data: &[u8], max_width: u32) -> Option<Vec<u8>> {
         let scale = max_width as f32 / w as f32;
         let nw = (w as f32 * scale).max(1.0) as u32;
         let nh = (h as f32 * scale).max(1.0) as u32;
-        img.resize(nw, nh, image::imageops::FilterType::Triangle)
+        img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
     } else {
         img
     };
@@ -4396,7 +4810,7 @@ fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
         let scale = max_width as f32 / w as f32;
         let nw = (w as f32 * scale).max(1.0) as u32;
         let nh = (h as f32 * scale).max(1.0) as u32;
-        decoded.resize(nw, nh, image::imageops::FilterType::Triangle)
+        decoded.resize(nw, nh, image::imageops::FilterType::Lanczos3)
     } else {
         decoded
     };
@@ -4411,23 +4825,37 @@ fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
 
 fn decode_bytes_to_render_image(data: &[u8]) -> Option<Arc<RenderImage>> {
     // カード枠比（0.75）へのクロップを全経路（キャッシュ・ローカル本）に適用する
-    decode_and_resize(data, 288)
+    decode_and_resize(data, 448)
 }
 
-/// `thumbnails/{site_id}_{database_id}.{ext}` cache file -> RenderImage.
+/// 表紙キャッシュのパス。**解像度をファイル名に埋め込む**ことで、縮小サイズを
+/// 変えたときに古い低解像度キャッシュを自動的に無効化する（`_448` = 最大 448px 幅）。
+pub(crate) fn cover_cache_path(
+    thumbnails_dir: &std::path::Path,
+    site_id: &str,
+    database_id: &str,
+) -> std::path::PathBuf {
+    thumbnails_dir.join(format!("{site_id}_{database_id}_448.png"))
+}
+
+/// 旧解像度のキャッシュ（`{site}_{db}.png`）を消す。パス変更前の残骸で、
+/// 二度と読まれないファイルがディスクに残るのを防ぐ。
+pub(crate) fn remove_legacy_cover_cache(
+    thumbnails_dir: &std::path::Path,
+    site_id: &str,
+    database_id: &str,
+) {
+    let _ = std::fs::remove_file(thumbnails_dir.join(format!("{site_id}_{database_id}.png")));
+}
+
+/// `thumbnails/{site_id}_{database_id}_448.png` キャッシュ -> RenderImage。
 fn load_cached_cover(
     thumbnails_dir: &std::path::Path,
     shelf: &bookshelf::BookshelfItem,
 ) -> Option<Arc<RenderImage>> {
-    for ext in ["png", "jpg", "jpeg", "webp"] {
-        let path = thumbnails_dir.join(format!("{}_{}.{ext}", shelf.site_id, shelf.database_id));
-        if let Ok(data) = std::fs::read(&path)
-            && let Some(image) = decode_bytes_to_render_image(&data)
-        {
-            return Some(image);
-        }
-    }
-    None
+    let path = cover_cache_path(thumbnails_dir, &shelf.site_id, &shelf.database_id);
+    let data = std::fs::read(&path).ok()?;
+    decode_bytes_to_render_image(&data)
 }
 
 /// Web-style placeholder SVG (`data:image/svg+xml;utf8,...`) rasterized to a
@@ -4447,7 +4875,9 @@ pub fn app_logo_image() -> Option<Arc<RenderImage>> {
         for pixel in rgba.chunks_exact_mut(4) {
             pixel.swap(0, 2);
         }
-        Some(Arc::new(gpui_kit::RenderImage::new([image::Frame::new(rgba)])))
+        Some(Arc::new(gpui_kit::RenderImage::new([image::Frame::new(
+            rgba,
+        )])))
     });
     LOGO.clone()
 }
@@ -4568,7 +4998,11 @@ fn format_purchase_date(raw: &str) -> String {
     let s = raw.trim();
     if s.contains('年') {
         let y = s.split('年').next().unwrap_or("");
-        let m = s.split('年').nth(1).and_then(|p| p.split('月').next()).unwrap_or("");
+        let m = s
+            .split('年')
+            .nth(1)
+            .and_then(|p| p.split('月').next())
+            .unwrap_or("");
         let d = s
             .split('月')
             .nth(1)
@@ -4611,8 +5045,14 @@ fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    use super::{
+        ImportChoice, ImportFailure, ImportOutcome, PendingImport, cover_url_candidates,
+        download_messages, import_choices, import_needs_confirmation,
+    };
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
+    use thundoku_core::import::{ImportPlan, MediaKind, PlannedContent, PlannedRendition};
 
     use thundoku_core::db::{books, progress};
 
@@ -4784,6 +5224,7 @@ mod tests {
                 db,
                 &progress::ReadingProgress {
                     book_id: id.into(),
+                    content_id: String::new(),
                     current_page: current,
                     total_pages: total,
                     finished_at: None,
@@ -4793,6 +5234,208 @@ mod tests {
             )
             .unwrap();
         });
+    }
+
+    /// テスト用の計画を組み立てる（`analyze_zip` を通さずに直接作る）。
+    fn plan_of(contents: Vec<(&str, MediaKind, Vec<(&str, usize)>)>) -> ImportPlan {
+        ImportPlan {
+            contents: contents
+                .into_iter()
+                .map(|(name, kind, renditions)| PlannedContent {
+                    display_name: name.to_string(),
+                    media_kind: kind,
+                    renditions: renditions
+                        .into_iter()
+                        .map(|(label, files)| PlannedRendition {
+                            label: label.to_string(),
+                            kind,
+                            entries: (0..files).collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            primary: 0,
+            export_text: Vec::new(),
+            warnings: Vec::new(),
+            skip_reason: None,
+        }
+    }
+
+    #[test]
+    fn import_confirmation_is_needed_only_for_ambiguous_structures() {
+        // 形式 1 つ・コンテンツ 1 つ → 自動取り込み
+        let simple = plan_of(vec![("本文", MediaKind::Image, vec![("画像", 12)])]);
+        assert!(!import_needs_confirmation(&simple));
+        // コンテンツが複数 → 確認する
+        let multi = plan_of(vec![
+            ("本編", MediaKind::Image, vec![("画像", 48)]),
+            ("別冊", MediaKind::Pdf, vec![("PDF", 1)]),
+        ]);
+        assert!(import_needs_confirmation(&multi));
+        // 形式（レンディション）が複数 → 確認する
+        let two_formats = plan_of(vec![(
+            "本編",
+            MediaKind::Image,
+            vec![("画像", 48), ("PDF", 1)],
+        )]);
+        assert!(import_needs_confirmation(&two_formats));
+    }
+
+    #[test]
+    fn import_choices_summarize_each_content() {
+        let plan = plan_of(vec![
+            ("本編", MediaKind::Image, vec![("画像", 48)]),
+            ("別冊", MediaKind::Pdf, vec![("PDF", 1), ("画像", 3)]),
+        ]);
+        let choices = import_choices(&plan);
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].display_name, "本編");
+        assert_eq!(choices[0].kind, "画像");
+        assert_eq!(choices[0].detail, "画像 48ファイル");
+        assert_eq!(choices[1].display_name, "別冊");
+        assert_eq!(choices[1].kind, "PDF");
+        assert_eq!(choices[1].detail, "PDF 1ファイル / 画像 3ファイル");
+    }
+
+    #[gpui_kit::test]
+    async fn import_confirmation_modal_returns_the_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        // モーダルを開いた状態にする（worker が待っている想定のチャネル）
+        let (reply, answer) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_import = Some(PendingImport {
+                    title: "総集編".into(),
+                    choices: vec![
+                        ImportChoice {
+                            display_name: "本編".into(),
+                            kind: "画像".into(),
+                            detail: "画像 48ファイル".into(),
+                        },
+                        ImportChoice {
+                            display_name: "別冊".into(),
+                            kind: "PDF".into(),
+                            detail: "PDF 1ファイル".into(),
+                        },
+                    ],
+                    selected: 0,
+                    reply,
+                });
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+        // 選択肢が描画されている
+        assert!(
+            visual.debug_bounds("import-choice-0").is_some(),
+            "選択肢がモーダルに出ること"
+        );
+        assert!(
+            visual.debug_bounds("import-choice-1").is_some(),
+            "2 つ目の選択肢も出ること"
+        );
+
+        // 別冊を選んで確定すると、その添字が worker に返る
+        cx.update(|cx| view.update(cx, |this, cx| this.select_pending_import(cx, 1)));
+        cx.update(|cx| view.update(cx, |this, cx| this.confirm_pending_import(cx)));
+        assert_eq!(answer.recv().unwrap(), Some(1));
+        assert!(
+            view.read_with(cx, |this, _| this.pending_import.is_none()),
+            "確定したらモーダルは閉じる"
+        );
+
+        // キャンセルは None を返す
+        let (reply, answer) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            view.update(cx, |this, _| {
+                this.pending_import = Some(PendingImport {
+                    title: "総集編".into(),
+                    choices: Vec::new(),
+                    selected: 0,
+                    reply,
+                });
+            });
+        });
+        cx.update(|cx| view.update(cx, |this, cx| this.cancel_pending_import(cx)));
+        assert_eq!(answer.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn cover_url_candidates_prefers_full_size_for_fanza() {
+        // FANZA はサイズ指定を外した原寸を先に試し、失敗したら保存 URL に戻す
+        assert_eq!(
+            cover_url_candidates(
+                "fanza",
+                "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl-200x150.jpg"
+            ),
+            vec![
+                "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl.jpg".to_string(),
+                "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl-200x150.jpg".to_string(),
+            ]
+        );
+        // サイズ指定が無ければ 1 本だけ
+        assert_eq!(
+            cover_url_candidates("fanza", "https://example.com/cover.jpg"),
+            vec!["https://example.com/cover.jpg".to_string()]
+        );
+        // 他サイトは保存 URL のまま
+        assert_eq!(
+            cover_url_candidates(
+                "dlsite",
+                "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main.jpg"
+            ),
+            vec![
+                "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main.jpg".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn download_messages_reports_skips_and_unreadable_works() {
+        // 成功（警告なし）
+        let (toast, error) = download_messages(&Ok(ImportOutcome {
+            title: "本".into(),
+            warnings: Vec::new(),
+        }));
+        assert_eq!(toast.as_deref(), Some("「本」をダウンロードしました"));
+        assert!(error.is_none());
+
+        // 一部を読み飛ばした（件数と先頭 2 件を出す）
+        let (toast, error) = download_messages(&Ok(ImportOutcome {
+            title: "本".into(),
+            warnings: vec![
+                "a.png: 壊れている".into(),
+                "b.png: 壊れている".into(),
+                "c.png: 壊れている".into(),
+            ],
+        }));
+        let toast = toast.expect("toast");
+        assert!(toast.contains("a.png"), "{toast}");
+        assert!(toast.contains("ほか 1 件"), "{toast}");
+        assert!(error.is_none());
+
+        // 読めるコンテンツが無い（txt のみ / ゲーム等）は理由を出す
+        let (toast, error) = download_messages(&Err(ImportFailure::NotAReadable));
+        assert!(toast.is_none());
+        let error = error.expect("error");
+        assert!(error.contains("txt のみ"), "{error}");
+
+        // それ以外の失敗はそのまま出す
+        let (_, error) = download_messages(&Err(ImportFailure::Message("通信に失敗".into())));
+        assert_eq!(error.as_deref(), Some("通信に失敗"));
     }
 
     #[gpui_kit::test]

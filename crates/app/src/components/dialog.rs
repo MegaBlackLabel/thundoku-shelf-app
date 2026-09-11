@@ -7,13 +7,13 @@
 
 use std::time::Duration;
 
-use gpui_kit::{
-    App, BoxShadow, IntoElement, ParentElement, Styled as _, anchored, div, hsla, point,
-    prelude::FluentBuilder as _, px,
-};
 use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::animation::ease_out_cubic;
+use gpui_kit::{
+    App, BoxShadow, InteractiveElement as _, IntoElement, ParentElement, Styled as _, anchored,
+    div, hsla, point, prelude::FluentBuilder as _, px,
+};
 
 /// ダイアログを表示する。`open` が `true` の間、中央にフェードイン表示する。
 /// `content` にはダイアログ本体（`dialog_surface` で構築したサーフェス）を渡す。
@@ -41,6 +41,11 @@ pub fn fade_dialog(
                 .items_center()
                 .justify_center()
                 .bg(overlay)
+                // ダイアログの外側（背景）のクリックを下の層へ伝えない。
+                // これが無いと、下にある本棚のカードなどが同時に反応してしまう。
+                .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
                 .opacity(progress)
                 .when(progress < 0.01, |this| this.invisible())
                 .child(content),

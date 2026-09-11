@@ -231,6 +231,51 @@ fn downloads_new_pack_and_imports_book_with_metadata() {
     // sync state row
     let state = db::sync_state::get(&env.pool, "pack-1").unwrap().unwrap();
     assert_eq!(state.md5, format!("{:x}", md5::compute(&bytes)));
+
+    // pack から取り込み状態（document / contents / ページ行）が再構築される
+    let document = db::documents::get_document_by_book_id(&env.pool, "pack-1")
+        .unwrap()
+        .expect("document 行が復元される");
+    assert_eq!(document.total_pages, 1);
+    let contents = db::contents::list_with_formats(&env.pool, "pack-1").unwrap();
+    assert_eq!(contents.len(), 1, "1 コンテンツとして復元される");
+    assert_eq!(contents[0].0.display_name, "メタ本");
+    assert_eq!(contents[0].1[0].page_count, 1);
+    let images = db::documents::images_for_book(&env.pool, "pack-1").unwrap();
+    let pages: Vec<&db::documents::DocumentImage> = images
+        .iter()
+        .filter(|image| image.image_type == "page")
+        .collect();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(
+        pages[0].pack_entry_path.as_deref(),
+        Some("pages/page_0001.webp")
+    );
+}
+
+// pack からの再構築は、すでに行があるときは何もしない（ローカルの取り込みを壊さない）。
+#[test]
+fn pack_rebuild_is_idempotent_and_skips_existing_rows() {
+    let mut env = TestEnv::new("pack-rebuild");
+    let mut drive = FakeDrive::new();
+    let bytes = metadata_pack("本", "", "", "2026-08-21");
+    drive.seed("pack-1.opfspack", &bytes);
+    // sync（pack 復元）で book + 取り込み状態が作られる
+    sync_env(&mut env, &mut drive).unwrap();
+
+    // 2 回目の再構築は何もしない（既存の取り込みを壊さない）
+    assert!(
+        !thundoku_core::import::rebuild_from_pack(&env.pool, "pack-1", &bytes, None).unwrap(),
+        "既に行があれば何もしない"
+    );
+    let images = db::documents::images_for_book(&env.pool, "pack-1").unwrap();
+    assert_eq!(images.len(), 1, "二重に作られない");
+    assert!(
+        db::documents::get_document_by_book_id(&env.pool, "pack-1")
+            .unwrap()
+            .is_some(),
+        "document は 1 件のまま"
+    );
 }
 
 #[test]
