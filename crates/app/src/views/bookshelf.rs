@@ -19,7 +19,7 @@ use gpui_kit::{
 };
 use gpui_kit::{
     App, Context, Entity, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
-    SharedString, Window, div, img, px,
+    SharedString, Window, div, img, px, relative,
 };
 use thundoku_core::booth::BoothClient;
 use thundoku_core::db;
@@ -2865,9 +2865,12 @@ impl BookshelfView {
         let cover_h: f32 = (card_width * 0.75).clamp(120.0, 320.0);
         let draw_size = |render: &Arc<RenderImage>| -> (f32, f32) {
             let size = render.size(0);
-            let (image_w, image_h) = (size.width.0.max(1) as f32, size.height.0.max(1) as f32);
-            let scale = (card_width / image_w).min(cover_h / image_h);
-            ((image_w * scale).max(1.0), (image_h * scale).max(1.0))
+            fit_cover_size(
+                size.width.0.max(1) as f32,
+                size.height.0.max(1) as f32,
+                card_width,
+                cover_h,
+            )
         };
         // バッジ（未読/♡/↓）とオーバーレイは、枠ではなく**この画像の矩形**を基準に置く。
         // 縦長の表紙は左右にバーが出るため、枠基準だとバッジが画像の外に浮いてしまう。
@@ -3682,30 +3685,62 @@ impl BookshelfView {
         let delete_id = local.map(|e| e.book.id.clone());
         let _ = window;
 
-        // 表紙（Web の h-24 w-20 = 80x96 相当）
+        // 表紙: 表示エリアは**全行で同じ比率**（3:2）。高さは行の高さに追従する。
+        // 画像はエリアに対する**実寸（%）を明示指定**して比率を保つ。`object_fit` に頼らないので
+        // 切り抜きは起き得ない（縦長は左右、横長は上下に余白ができる）。
+        let image_aspect = match &cover {
+            Some(render) => {
+                let size = render.size(0);
+                size.width.0.max(1) as f32 / size.height.0.max(1) as f32
+            }
+            None => LIST_COVER_ASPECT,
+        };
+        // 縦長（エリアより縦長）は高さいっぱい、横長は幅いっぱいに合わせる
+        let (img_w, img_h) = if image_aspect <= LIST_COVER_ASPECT {
+            (
+                relative(image_aspect / LIST_COVER_ASPECT),
+                relative(1.0),
+            )
+        } else {
+            (
+                relative(1.0),
+                relative(LIST_COVER_ASPECT / image_aspect),
+            )
+        };
+        let img_selector = format!("list-cover-img-{database_id}");
         let image: gpui_kit::AnyElement = match &cover {
             Some(render) => div()
-                .w(px(64.0))
-                .h(px(90.0))
-                .overflow_hidden()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
                 .child(
-                    img(render.clone())
-                        .w_full()
-                        .h_full()
-                        .object_fit(gpui_kit::ObjectFit::Cover),
+                    div()
+                        .w(img_w)
+                        .h(img_h)
+                        .debug_selector(move || img_selector.clone())
+                        .child(
+                            img(render.clone())
+                                .w_full()
+                                .h_full()
+                                .object_fit(gpui_kit::ObjectFit::Fill),
+                        ),
                 )
                 .into_any_element(),
-            None => div()
-                .w(px(64.0))
-                .h(px(90.0))
-                .bg(cx.theme().muted)
-                .into_any_element(),
+            None => div().absolute().inset_0().into_any_element(),
         };
 
+        let cover_selector = format!("list-cover-{database_id}");
         let mut cover_el = div()
             .relative()
-            .w(px(64.0))
-            .h(px(90.0))
+            .h_full()
+            .aspect_ratio(LIST_COVER_ASPECT)
+            .flex_shrink_0()
+            .overflow_hidden()
+            // 縦長表紙で余る左右の余白を周囲と馴染ませる
+            .bg(cx.theme().muted)
+            .debug_selector(move || cover_selector.clone())
             .child(image)
             .child(if is_read {
                 div()
@@ -3805,12 +3840,18 @@ impl BookshelfView {
             );
         }
 
+        let row_selector = format!("book-list-{database_id}");
         let mut row = div()
-            .id(SharedString::from(format!("book-list-{database_id}")))
+            .id(SharedString::from(row_selector.clone()))
+            .debug_selector(move || row_selector.clone())
             .flex()
             .flex_row()
+            // スクロール領域（flex_col）内で行が圧縮されないようにする
+            .flex_shrink_0()
             .gap_3()
             .p_2()
+            // 行の高さをサムネイル枠の下限以上にして、表紙が行に収まって見えるようにする
+            .min_h(px(LIST_COVER_MIN_H + 16.0))
             .border_b_1()
             .border_color(cx.theme().border)
             .when(selected, |style| style.bg(cx.theme().secondary))
@@ -4679,8 +4720,13 @@ impl Render for BookshelfView {
                         }
                           ViewMode::List => div()
                               .id("bookshelf-list")
+                              .debug_selector(|| "bookshelf-list".into())
                               .flex()
                               .flex_col()
+                              // 高さを親（bookshelf-grid = flex_1 + min_h_0）に合わせて束縛する。
+                              // 指定しないと内容高さまで伸び、overflow_y_scroll が効かずスクロールできない。
+                              .h_full()
+                              .min_h_0()
                               .rounded_lg()
                               .border_1()
                               .border_color(cx.theme().border)
@@ -4852,6 +4898,29 @@ pub(crate) fn cover_url_candidates(site_id: &str, stored_url: &str) -> Vec<Strin
     vec![stored_url.to_string()]
 }
 
+/// リスト表示のサムネイル**表示エリア**の比率（幅 ÷ 高さ）。**全行で一定**（3:2）。
+///
+/// 実データの表紙比率は縦長 0.7 が最多（609 件中 310 件）、横長は FANZA の 1.3〜1.43。
+/// エリアを 3:2 にすると:
+/// - 横長（〜1.43）は**高さいっぱい**に収まる → 下に余白が出ない
+/// - 縦長（0.7）は左右に余白ができる（要望どおり）
+///
+/// 画像は比率を保ってこのエリアに縮小して収める（切り抜きは起きない）。
+/// 高さは行の高さに追従するため、サムネイルの高さは常に行の高さと一致する。
+const LIST_COVER_ASPECT: f32 = 3.0 / 2.0;
+/// 表紙が無いときのエリアの下限の高さ（行の高さは通常これより高い）。
+const LIST_COVER_MIN_H: f32 = 108.0;
+
+/// 表紙画像を枠（`box_w` × `box_h`）に比率を保って収めた描画サイズを返す。
+/// 横長は幅いっぱい（高さは比率なり）、縦長は高さいっぱい（幅は比率なり）になる。
+/// 枠に合わせて拡大すると縦長の上下が切れるため、カード / リスト共通で使う。
+fn fit_cover_size(image_w: f32, image_h: f32, box_w: f32, box_h: f32) -> (f32, f32) {
+    let image_w = image_w.max(1.0);
+    let image_h = image_h.max(1.0);
+    let scale = (box_w / image_w).min(box_h / image_h);
+    ((image_w * scale).max(1.0), (image_h * scale).max(1.0))
+}
+
 pub(crate) fn fetch_cover_bytes(
     agent: &ureq::Agent,
     site_id: &str,
@@ -4969,8 +5038,8 @@ fn resize_for_cache(data: &[u8], max_width: u32) -> Option<Vec<u8>> {
 }
 
 /// 画像を縮小（最大幅 max_width px）して BGRA の RenderImage に変換する。
-/// 元画像のアスペクト比を保つ（クロップしない）。カード側で object_fit(Contain) により
-/// はみ出さず比率のまま表示する（FANZA 等はサムネの比率がバラバラのため）。
+/// 元画像のアスペクト比を保つ（クロップしない）。表示側（カード / リスト）で
+/// `fit_cover_size` により枠内に比率のまま収める（FANZA 等はサムネの比率がバラバラのため）。
 fn decode_and_resize(data: &[u8], max_width: u32) -> Option<Arc<RenderImage>> {
     let decoded = image::load_from_memory(data).ok()?;
     let (w, h) = (decoded.width(), decoded.height());
@@ -5594,6 +5663,211 @@ mod tests {
         });
         cx.update(|cx| view.update(cx, |this, cx| this.cancel_pending_import(cx)));
         assert_eq!(answer.recv().unwrap(), None);
+    }
+
+    /// 表紙を枠に比率を保って収めた描画サイズを返す（カード / リスト共通）。
+    /// 横長は幅いっぱい、縦長は高さいっぱいになり、どちらも枠からはみ出さない。
+    #[test]
+    fn cover_fit_size_preserves_aspect_and_fits_box() {
+        // 横長 (FANZA の原寸 560x420) は 4:3 の枠にそのまま収まる
+        let (w, h) = fit_cover_size(560.0, 420.0, 120.0, 90.0);
+        assert!((w - 120.0).abs() < 0.01 && (h - 90.0).abs() < 0.01, "{w}x{h}");
+        // 縦長 (DLsite 290x408) は高さいっぱい・幅は比率なり
+        let (w, h) = fit_cover_size(290.0, 408.0, 120.0, 90.0);
+        assert!((h - 90.0).abs() < 0.01, "縦長は高さいっぱい: {w}x{h}");
+        assert!((w - 90.0 * 290.0 / 408.0).abs() < 0.01, "比率を保つ: {w}x{h}");
+        assert!(w <= 120.0, "枠の幅を超えない: {w}");
+        // 極端な横長も枠内に収まり比率を保つ
+        let (w, h) = fit_cover_size(1000.0, 100.0, 120.0, 90.0);
+        assert!((w - 120.0).abs() < 0.01, "横長は幅いっぱい: {w}x{h}");
+        assert!((h - 120.0 * 100.0 / 1000.0).abs() < 0.01, "比率を保つ: {w}x{h}");
+        assert!(h <= 90.0);
+        // 壊れた画像（0）でも 0 除算しない
+        let (w, h) = fit_cover_size(0.0, 0.0, 120.0, 90.0);
+        assert!(w >= 1.0 && h >= 1.0, "{w}x{h}");
+    }
+
+    /// リスト表示のスクロール領域は親（`bookshelf-grid`）の高さに束縛されること。
+    /// 束縛しないと内容高さまで伸び、`overflow_y_scroll` が効かずスクロールできない。
+    #[gpui_kit::test]
+    async fn list_view_scroll_area_is_bounded_by_viewport(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 画面（600px）に収まりきらない件数（1 行 ≒ 106px）を用意する
+        for i in 0..30 {
+            seed_shelf_item(cx, &format!("db-{i}"), &format!("本{i}"), "サークルA", None);
+        }
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let list = visual
+            .debug_bounds("bookshelf-list")
+            .expect("リストが描画されている");
+        assert!(
+            list.size.height < gpui_kit::px(600.0),
+            "スクロール領域が内容高さまで伸びている（スクロール不可）: {list:?}"
+        );
+        assert!(
+            list.size.height > gpui_kit::px(200.0),
+            "スクロール領域が潰れている: {list:?}"
+        );
+    }
+
+    /// エリアの比率（3:2）は、横長の最多ケース（FANZA 448x315 = 1.42）が
+    /// **高さいっぱい**に収まる幅であること（エリアが縦長すぎると下に余白が出る）。
+    /// あわせて縦長（448x651 = 0.69）より横長＝左右に余白ができることも固定する。
+    #[test]
+    fn list_cover_area_fits_widest_common_cover() {
+        // 定数同士の比較なのでコンパイル時に検証する
+        const _: () = assert!(
+            LIST_COVER_ASPECT >= 448.0 / 315.0,
+            "FANZA の表紙が高さいっぱいに収まらない（下に余白が出る）"
+        );
+        const _: () = assert!(
+            LIST_COVER_ASPECT > 448.0 / 651.0,
+            "縦長の表紙に左右の余白ができない"
+        );
+    }
+
+    /// テスト用の単色 RenderImage（表紙の比率を固定して検証するため）。
+    fn test_cover_image(w: u32, h: u32) -> Arc<RenderImage> {
+        let rgba = image::RgbaImage::from_pixel(w, h, image::Rgba([30, 60, 90, 255]));
+        Arc::new(RenderImage::new([image::Frame::new(rgba)]))
+    }
+
+    /// 縦長の表紙（400x600 = 0.667）は**切り抜かれず**、エリアの高さいっぱいに縮小されて
+    /// 中央に置かれること（左右に余白ができる）。
+    #[gpui_kit::test]
+    async fn portrait_cover_is_letterboxed_not_cropped(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                // 表紙を縦長（400x600）に固定する（取得経路に依存せず検証するため）
+                this.shelf_cards[0].cover = Some(test_cover_image(400, 600));
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let area = visual
+            .debug_bounds("list-cover-db-1")
+            .expect("表紙エリアが描画されている");
+        let img = visual
+            .debug_bounds("list-cover-img-db-1")
+            .expect("表紙画像が描画されている");
+        let (area_w, area_h) = (area.size.width.as_f32(), area.size.height.as_f32());
+        let (img_w, img_h) = (img.size.width.as_f32(), img.size.height.as_f32());
+        // 高さはエリアいっぱい（＝切り抜かず縮小して収めている）
+        assert!(
+            (img_h - area_h).abs() < 1.5,
+            "画像がエリアの高さいっぱいになっていない: img_h={img_h} area_h={area_h}"
+        );
+        // 幅はエリアより狭い（＝左右に余白がある。切り抜きなら幅いっぱいになる）
+        assert!(
+            img_w < area_w - 1.0,
+            "画像がエリアの幅いっぱい（切り抜きの疑い）: img_w={img_w} area_w={area_w}"
+        );
+        // 元画像の比率を保っている（400x600 = 0.667）
+        let ratio = img_w / img_h;
+        assert!(
+            (ratio - 400.0 / 600.0).abs() < 0.05,
+            "画像の比率が変わっている: {ratio}"
+        );
+    }
+
+    /// リスト表示のサムネイルは**行の内容高さいっぱい**に広がること（上下に余白が残らない）。
+    #[gpui_kit::test]
+    async fn list_thumbnail_fills_row_height(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        // タグ行がある分だけ行が高くなる（実データに近い状態）。枠がそれに追従すること。
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            bookshelf::update_tags(db, "techbookfest", "db-1", &["タグA".into(), "タグB".into()])
+                .unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let row = visual
+            .debug_bounds("book-list-db-1")
+            .expect("行が描画されている");
+        let cover = visual
+            .debug_bounds("list-cover-db-1")
+            .expect("サムネイルが描画されている");
+        // 行は p_2（上下 8px ずつ）なので内容高さ = 行の高さ - 16
+        let content_h = row.size.height.as_f32() - 16.0;
+        assert!(
+            (cover.size.height.as_f32() - content_h).abs() < 1.5,
+            "サムネイルの高さが行の内容高さと一致しない: cover={} row={}",
+            cover.size.height.as_f32(),
+            row.size.height.as_f32()
+        );
+        assert!(
+            cover.size.height.as_f32() >= 90.0,
+            "サムネイルの下限 90px を下回る: {}",
+            cover.size.height.as_f32()
+        );
+        // エリアの幅は高さ × 3:2（全行で一定）
+        let expected_w = cover.size.height.as_f32() * LIST_COVER_ASPECT;
+        assert!(
+            (cover.size.width.as_f32() - expected_w).abs() < 1.5,
+            "サムネイル表示エリアの幅が比率どおりでない: width={} expected={expected_w}",
+            cover.size.width.as_f32()
+        );
     }
 
     #[test]
