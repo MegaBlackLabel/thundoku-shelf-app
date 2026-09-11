@@ -1976,6 +1976,7 @@ impl BookshelfView {
                                 &bytes,
                                 &packs_dir,
                                 identity.as_ref(),
+                                reuse_book_id.as_deref(),
                             )
                         }
                         other => Err(thundoku_core::import::ImportError::UnsupportedType(

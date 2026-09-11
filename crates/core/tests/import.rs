@@ -494,6 +494,7 @@ fn single_image_imports_as_one_page_book() {
         &png,
         &env.packs(),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(imported.document.source_type, "image");
@@ -507,6 +508,47 @@ fn single_image_imports_as_one_page_book() {
     assert!(paths.contains(&"thumbnail.webp"));
     let page = reader.read_entry("pages/page_0001.webp", None).unwrap();
     assert_eq!(&page[8..12], b"WEBP");
+}
+
+#[test]
+fn image_reuses_book_id_without_duplicate() {
+    let env = TestEnv::new("image-reuse");
+    let png = make_png(64, 96, [200, 100, 50]);
+
+    let first = thundoku_core::import::import_image_bytes(
+        &env.pool,
+        "illust.png",
+        &png,
+        &env.packs(),
+        None,
+        None,
+    )
+    .unwrap();
+    db::books::set_favorite(&env.pool, &first.book.id, true).unwrap();
+
+    // 再ダウンロード（同一 book_id の再利用）で重複本を作らない
+    let second = thundoku_core::import::import_image_bytes(
+        &env.pool,
+        "illust.png",
+        &png,
+        &env.packs(),
+        None,
+        Some(&first.book.id),
+    )
+    .unwrap();
+    assert_eq!(second.book.id, first.book.id);
+
+    let all = db::books::list(&env.pool).unwrap();
+    assert_eq!(all.len(), 1, "再取り込みで本が増えないこと");
+    assert_eq!(
+        all[0].is_favorite, 1,
+        "ユーザー状態（お気に入り）が維持されること"
+    );
+
+    // ページは置き換わる（旧ドキュメントが残って二重に並ばない）
+    let images = db::documents::images_for_book(&env.pool, &first.book.id).unwrap();
+    let pages = images.iter().filter(|i| i.image_type == "page").count();
+    assert_eq!(pages, 1);
 }
 
 /// 24bit 非圧縮 BMP を組み立てる（テスト用。`image` のエンコーダ機能に依存しない）。

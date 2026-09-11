@@ -259,8 +259,13 @@ Google アカウントが変わりました
       （各アカウントのライブラリ + 未所属）。
       - ※ 未所属（NULL）の本をログイン中に再DLしても、**NULL 行は更新されない**（未所属→所属の
         自動変換はしない）。所属行が別途追加され、両方が共存する（両方管理できる）。
-  - （実装メモ）`(source, owner)` の重複抑止には、INSERT 前に `site_id + tbf_product_id` で既存行を
-    lookup し、owner（復号比較）で更新/追加を分岐する必要がある（現在の `download_item` では未実装）。
+  - （実装）`(source, owner)` の重複抑止は**実装済み**。`books::find_by_source`
+    （`site_id + tbf_product_id` で既存行を取得）と `books::resolve_reuse_id`（owner を復号比較し、
+    同一 owner の行 id のみ返す。別 owner / 未所属 NULL は対象外）で再利用 id を決め、
+    `download_item` から各取り込み関数へ `reuse_book_id` として渡す
+    （PDF / EPUB / ZIP / 画像の全経路。画像は `import_image_bytes` にも配線済み）。
+    再利用時は同じ book id のまま `books::upsert` で置き換えるため、book_id 紐付けの
+    進捗・タグ・閲覧履歴は維持される。
 - **フィルタ（表示・アップロード判定）**：`owner_sub` を復号して比較するため、ログイン時に
   `book_id → sub` の**メモリキャッシュ**を作る（起動時1回。本棚300件での毎復号を避ける）。
 - **切替（別アカウントでログイン）**：前アカウントのデータは**削除しない**・属性付けたまま
@@ -348,3 +353,6 @@ Google アカウントが変わりました
 - **既存更新**（source + owner 一致）：**既存の book id** を `identity.pack_id` にして更新。
 - `book_id_for(Some(identity))` が `identity.pack_id` を返す仕組みと噛み合わせる。
 - **未所属（NULL）行は更新しない**（自動変換なし）。所属行を別途追加する。
+- **実装**: `download_item` が `books::resolve_reuse_id`（`site_id + tbf_product_id` の lookup +
+  owner 復号比較）で `reuse_book_id` を求め、各取り込み関数（`import_image_bytes` を含む）へ渡す。
+  `import::book_id_for` は `reuse_book_id` を最優先、無ければ `identity.pack_id`、最後に新規 UUID。

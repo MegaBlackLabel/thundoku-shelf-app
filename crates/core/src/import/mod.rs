@@ -2026,6 +2026,7 @@ pub fn import_image_bytes(
     bytes: &[u8],
     packs_dir: &Path,
     identity: Option<&Identity>,
+    reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     let decoded = image::load_from_memory(bytes).map_err(|e| ImportError::Image(e.to_string()))?;
     // 元画像が小さい場合は Lanczos3 で 1000px 幅まで拡大してから保存する
@@ -2073,7 +2074,7 @@ pub fn import_image_bytes(
             source_type: "image".to_string(),
             total_pages: 1,
         },
-        None,
+        reuse_book_id,
     )
 }
 
