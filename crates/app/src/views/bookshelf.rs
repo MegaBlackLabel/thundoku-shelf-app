@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 
 use gpui_kit::StyledImage as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::popover::Popover;
@@ -128,6 +129,8 @@ pub struct BookshelfView {
     fetching_covers: bool,
     /// 表紙取得の再実行済みフラグ（同期 reload で後から増えたカード分を 1 回だけ再取得）
     cover_fetch_retried: bool,
+    /// 取り込み確認モーダル（§6.3。曖昧な構造のときだけ出る）
+    pending_import: Option<PendingImport>,
     auto_download_started: bool,
     /// フィルタ済みカードのインデックス（List 仮想化用キャッシュ）
     filtered: Vec<usize>,
@@ -155,10 +158,89 @@ struct ImportOutcome {
     warnings: Vec<String>,
 }
 
+/// 取り込み確認モーダルの内容（§6.3）。
+///
+/// ダウンロード済みの bytes は worker スレッドが保持したまま `reply` を待つ
+/// （モーダル側は要約だけを持つ）。
+struct PendingImport {
+    /// 本のタイトル（見出しに出す）
+    title: String,
+    /// コンテンツごとの要約
+    choices: Vec<ImportChoice>,
+    /// 選択中の添字（初期値は計画の既定表示）
+    selected: usize,
+    /// 選択（`None` = キャンセル）を返す先。worker が `recv` で待っている。
+    reply: std::sync::mpsc::Sender<Option<usize>>,
+}
+
+/// 確認モーダルに出す 1 コンテンツ分の要約。
+#[derive(Clone)]
+struct ImportChoice {
+    display_name: String,
+    /// `画像` / `PDF` / `EPUB` / `音声` / `動画`
+    kind: String,
+    /// `画像 48ファイル / PDF 1ファイル` のようなレンディションの要約
+    detail: String,
+}
+
+/// 確認モーダルを出すか（§6.3: 形式が複数 / コンテンツが複数 / 差分セット）。
+fn import_needs_confirmation(plan: &thundoku_core::import::ImportPlan) -> bool {
+    let renditions: usize = plan
+        .contents
+        .iter()
+        .map(|content| content.renditions.len())
+        .sum();
+    plan.contents.len() > 1 || renditions > 1
+}
+
+/// 計画から確認モーダルの要約を作る。
+fn import_choices(plan: &thundoku_core::import::ImportPlan) -> Vec<ImportChoice> {
+    plan.contents
+        .iter()
+        .map(|content| ImportChoice {
+            display_name: content.display_name.clone(),
+            kind: content.media_kind.label().to_string(),
+            detail: content
+                .renditions
+                .iter()
+                .map(|rendition| {
+                    // PDF / EPUB はページ数が展開するまで不明なのでファイル数で示す
+                    format!("{} {}ファイル", rendition.label, rendition.entries.len())
+                })
+                .collect::<Vec<_>>()
+                .join(" / "),
+        })
+        .collect()
+}
+
+/// 取り込み確認モーダルを出して選択を待つ（worker スレッドをブロックする。UI は動く）。
+///
+/// 戻り値: `Some(index)` = 選ばれた既定表示 / `None` = キャンセル（UI が閉じた場合も含む）。
+/// ダウンロード済みの `bytes` はこの間 worker が保持し続ける（モーダルは要約だけ持つ）。
+fn ask_import_confirmation(
+    prompt_tx: &std::sync::mpsc::Sender<PendingImport>,
+    title: &str,
+    plan: &thundoku_core::import::ImportPlan,
+) -> Option<usize> {
+    let (reply, answer) = std::sync::mpsc::channel();
+    let request = PendingImport {
+        title: title.to_string(),
+        choices: import_choices(plan),
+        selected: plan.primary,
+        reply,
+    };
+    if prompt_tx.send(request).is_err() {
+        return None;
+    }
+    answer.recv().ok().flatten()
+}
+
 /// 取り込みの失敗。UI 文言を出し分けるために型で持つ。
 enum ImportFailure {
     /// 読めるコンテンツが無い（txt のみ / ゲーム / HTML 閲覧型など）
     NotAReadable,
+    /// 取り込み確認モーダルでキャンセルされた
+    Cancelled,
     /// それ以外（DRM・通信・解析失敗など）。文言はそのまま出す
     Message(String),
 }
@@ -216,6 +298,7 @@ fn download_messages(
                     .to_string(),
             ),
         ),
+        Err(ImportFailure::Cancelled) => (Some("取り込みをキャンセルしました".to_string()), None),
         Err(ImportFailure::Message(message)) => (None, Some(message.clone())),
     }
 }
@@ -304,6 +387,7 @@ impl BookshelfView {
             sync_busy: 0,
             fetching_covers: false,
             cover_fetch_retried: false,
+            pending_import: None,
             auto_download_started: false,
             filtered: Vec::new(),
             filtered_dirty: true,
@@ -1591,6 +1675,8 @@ impl BookshelfView {
         // UI がカードの再描画（表紙 307 件の反映など）で忙しいと取り込みが
         // 数分ストールする原因になるため、unbounded の channel を使う。
         let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(String, DownloadState)>();
+        // 取り込み確認モーダル（§6.3）を UI に依頼するチャネルと、選択を返すチャネル
+        let (prompt_tx, prompt_rx) = std::sync::mpsc::channel::<PendingImport>();
         // ダウンロード + インポート（レンダリング含む）は GPUI のワーカーを
         // 数分ブロックすると他の処理（表紙取得など）が止まってビジーになるため、
         // 専用スレッドで実行して結果をチャネルで受け取る。
@@ -1860,15 +1946,28 @@ impl BookshelfView {
                             identity.as_ref(),
                             reuse_book_id.as_deref(),
                         ),
-                        "zip" => thundoku_core::import::import_zip_bytes(
-                            &db,
-                            &file_name,
-                            &bytes,
-                            &packs_dir,
-                            identity.as_ref(),
-                            &mut on_import,
-                            reuse_book_id.as_deref(),
-                        ),
+                        "zip" => {
+                            // §6.3: 曖昧な構造（コンテンツが複数 / 形式が複数）は
+                            // サマリー付きモーダルで既定表示を選んでもらってから取り込む
+                            let mut plan = thundoku_core::import::analyze_zip(&bytes)
+                                .map_err(import_failure)?;
+                            if import_needs_confirmation(&plan) {
+                                match ask_import_confirmation(&prompt_tx, &item.title, &plan) {
+                                    Some(index) => plan.primary = index,
+                                    None => return Err(ImportFailure::Cancelled),
+                                }
+                            }
+                            thundoku_core::import::commit_zip(
+                                &db,
+                                &file_name,
+                                &bytes,
+                                &packs_dir,
+                                identity.as_ref(),
+                                &mut on_import,
+                                reuse_book_id.as_deref(),
+                                &plan,
+                            )
+                        }
                         // BOOTH は PDF だけでなく画像ファイル（イラスト等）もある
                         "jpg" | "jpeg" | "png" | "webp" | "gif" => {
                             thundoku_core::import::import_image_bytes(
@@ -2015,6 +2114,13 @@ impl BookshelfView {
                             break;
                         }
                     }
+                }
+                // 取り込み確認モーダルの依頼（§6.3）
+                if let Ok(request) = prompt_rx.try_recv() {
+                    progress_handle.update(cx, |this, cx| {
+                        this.pending_import = Some(request);
+                        cx.notify();
+                    });
                 }
                 if let Some((id, state)) = pending.take() {
                     // 状態（Downloading → Processing）が変わったら必ず再描画する。
@@ -2210,6 +2316,30 @@ impl BookshelfView {
 
     /// タグ取得 ON/OFF トグル（Web 版の `handleToggleTagFetch` 相当）。
     /// OFF の間はダウンロード時にタグを自動生成しない。
+    /// 取り込み確認モーダルで既定表示を選ぶ（§6.3）。
+    fn select_pending_import(&mut self, cx: &mut Context<Self>, index: usize) {
+        if let Some(pending) = self.pending_import.as_mut() {
+            pending.selected = index;
+        }
+        cx.notify();
+    }
+
+    /// 取り込み確認モーダルを確定する（worker が待っている選択を返す）。
+    fn confirm_pending_import(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_import.take() {
+            let _ = pending.reply.send(Some(pending.selected));
+        }
+        cx.notify();
+    }
+
+    /// 取り込み確認モーダルをキャンセルする（worker は取り込みを中止する）。
+    fn cancel_pending_import(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_import.take() {
+            let _ = pending.reply.send(None);
+        }
+        cx.notify();
+    }
+
     /// 表示モードを切り替える（Web の viewMode トグル相当）。
     fn toggle_view_mode(&mut self, cx: &mut Context<Self>) {
         self.view_mode = match self.view_mode {
@@ -3783,6 +3913,14 @@ impl Render for BookshelfView {
         let busy = self.sync_busy > 0;
         let toast = self.toast.clone();
         let error = self.error.clone();
+        // 取り込み確認モーダル（§6.3）: 要約だけなので clone して描画に使う
+        let pending_import = self.pending_import.as_ref().map(|pending| {
+            (
+                pending.title.clone(),
+                pending.choices.clone(),
+                pending.selected,
+            )
+        });
         let handle = cx.entity();
 
         div()
@@ -4402,6 +4540,125 @@ impl Render for BookshelfView {
             } else {
                 div().into_any_element()
             })
+            // 取り込み確認モーダル（§6.3: 曖昧な構造のときだけ）
+            .child(
+                if let Some((title, choices, selected)) = pending_import {
+                    let handle = handle.clone();
+                    let content_handle = handle.clone();
+                    Dialog::new(cx)
+                        .title(div().child("取り込み内容の確認"))
+                        .content(move |content, _window, cx| {
+                            let mut list = content.child(div().text_sm().child(format!(
+                                "「{title}」には複数のコンテンツが含まれています。既定で表示するものを選んでください。"
+                            )));
+                            for (index, choice) in choices.iter().enumerate() {
+                                let handle = content_handle.clone();
+                                let is_selected = index == selected;
+                                list = list.child(
+                                    div()
+                                        .id(SharedString::from(format!("import-choice-{index}")))
+                                        .debug_selector(move || {
+                                            format!("import-choice-{index}")
+                                        })
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .py_1()
+                                        .cursor_pointer()
+                                        .on_click(move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.select_pending_import(cx, index);
+                                            });
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .w(px(16.0))
+                                                .h(px(16.0))
+                                                .rounded_full()
+                                                .border_1()
+                                                .border_color(if is_selected {
+                                                    cx.theme().primary
+                                                } else {
+                                                    cx.theme().border
+                                                })
+                                                .child(if is_selected {
+                                                    div()
+                                                        .w(px(8.0))
+                                                        .h(px(8.0))
+                                                        .rounded_full()
+                                                        .bg(cx.theme().primary)
+                                                } else {
+                                                    div()
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                        .child(choice.display_name.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(format!(
+                                                            "{} ・ {}",
+                                                            choice.kind, choice.detail
+                                                        )),
+                                                ),
+                                        ),
+                                );
+                            }
+                            list
+                        })
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    Button::new("import-confirm-cancel")
+                                        .cursor_pointer()
+                                        .label("キャンセル")
+                                        .cursor_pointer()
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.cancel_pending_import(cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("import-confirm-ok")
+                                        .cursor_pointer()
+                                        .primary()
+                                        .label("この内容で取り込む")
+                                        .cursor_pointer()
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.confirm_pending_import(cx);
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                },
+            )
     }
 }
 
@@ -4789,9 +5046,13 @@ fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
 
-    use super::{ImportFailure, ImportOutcome, cover_url_candidates, download_messages};
+    use super::{
+        ImportChoice, ImportFailure, ImportOutcome, PendingImport, cover_url_candidates,
+        download_messages, import_choices, import_needs_confirmation,
+    };
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
+    use thundoku_core::import::{ImportPlan, MediaKind, PlannedContent, PlannedRendition};
 
     use thundoku_core::db::{books, progress};
 
@@ -4973,6 +5234,143 @@ mod tests {
             )
             .unwrap();
         });
+    }
+
+    /// テスト用の計画を組み立てる（`analyze_zip` を通さずに直接作る）。
+    fn plan_of(contents: Vec<(&str, MediaKind, Vec<(&str, usize)>)>) -> ImportPlan {
+        ImportPlan {
+            contents: contents
+                .into_iter()
+                .map(|(name, kind, renditions)| PlannedContent {
+                    display_name: name.to_string(),
+                    media_kind: kind,
+                    renditions: renditions
+                        .into_iter()
+                        .map(|(label, files)| PlannedRendition {
+                            label: label.to_string(),
+                            kind,
+                            entries: (0..files).collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            primary: 0,
+            export_text: Vec::new(),
+            warnings: Vec::new(),
+            skip_reason: None,
+        }
+    }
+
+    #[test]
+    fn import_confirmation_is_needed_only_for_ambiguous_structures() {
+        // 形式 1 つ・コンテンツ 1 つ → 自動取り込み
+        let simple = plan_of(vec![("本文", MediaKind::Image, vec![("画像", 12)])]);
+        assert!(!import_needs_confirmation(&simple));
+        // コンテンツが複数 → 確認する
+        let multi = plan_of(vec![
+            ("本編", MediaKind::Image, vec![("画像", 48)]),
+            ("別冊", MediaKind::Pdf, vec![("PDF", 1)]),
+        ]);
+        assert!(import_needs_confirmation(&multi));
+        // 形式（レンディション）が複数 → 確認する
+        let two_formats = plan_of(vec![(
+            "本編",
+            MediaKind::Image,
+            vec![("画像", 48), ("PDF", 1)],
+        )]);
+        assert!(import_needs_confirmation(&two_formats));
+    }
+
+    #[test]
+    fn import_choices_summarize_each_content() {
+        let plan = plan_of(vec![
+            ("本編", MediaKind::Image, vec![("画像", 48)]),
+            ("別冊", MediaKind::Pdf, vec![("PDF", 1), ("画像", 3)]),
+        ]);
+        let choices = import_choices(&plan);
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].display_name, "本編");
+        assert_eq!(choices[0].kind, "画像");
+        assert_eq!(choices[0].detail, "画像 48ファイル");
+        assert_eq!(choices[1].display_name, "別冊");
+        assert_eq!(choices[1].kind, "PDF");
+        assert_eq!(choices[1].detail, "PDF 1ファイル / 画像 3ファイル");
+    }
+
+    #[gpui_kit::test]
+    async fn import_confirmation_modal_returns_the_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        // モーダルを開いた状態にする（worker が待っている想定のチャネル）
+        let (reply, answer) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_import = Some(PendingImport {
+                    title: "総集編".into(),
+                    choices: vec![
+                        ImportChoice {
+                            display_name: "本編".into(),
+                            kind: "画像".into(),
+                            detail: "画像 48ファイル".into(),
+                        },
+                        ImportChoice {
+                            display_name: "別冊".into(),
+                            kind: "PDF".into(),
+                            detail: "PDF 1ファイル".into(),
+                        },
+                    ],
+                    selected: 0,
+                    reply,
+                });
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+        // 選択肢が描画されている
+        assert!(
+            visual.debug_bounds("import-choice-0").is_some(),
+            "選択肢がモーダルに出ること"
+        );
+        assert!(
+            visual.debug_bounds("import-choice-1").is_some(),
+            "2 つ目の選択肢も出ること"
+        );
+
+        // 別冊を選んで確定すると、その添字が worker に返る
+        cx.update(|cx| view.update(cx, |this, cx| this.select_pending_import(cx, 1)));
+        cx.update(|cx| view.update(cx, |this, cx| this.confirm_pending_import(cx)));
+        assert_eq!(answer.recv().unwrap(), Some(1));
+        assert!(
+            view.read_with(cx, |this, _| this.pending_import.is_none()),
+            "確定したらモーダルは閉じる"
+        );
+
+        // キャンセルは None を返す
+        let (reply, answer) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            view.update(cx, |this, _| {
+                this.pending_import = Some(PendingImport {
+                    title: "総集編".into(),
+                    choices: Vec::new(),
+                    selected: 0,
+                    reply,
+                });
+            });
+        });
+        cx.update(|cx| view.update(cx, |this, cx| this.cancel_pending_import(cx)));
+        assert_eq!(answer.recv().unwrap(), None);
     }
 
     #[test]

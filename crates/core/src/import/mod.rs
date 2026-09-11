@@ -636,8 +636,8 @@ fn rendition_label(kind: EntryKind, ordinals: &[usize], metas: &[EntryMeta]) -> 
 }
 
 impl MediaKind {
-    /// 切替 UI に出す名前。
-    fn label(self) -> &'static str {
+    /// 切替 UI・取り込み確認に出す名前。
+    pub fn label(self) -> &'static str {
         match self {
             MediaKind::Image => "画像",
             MediaKind::Pdf => "PDF",
