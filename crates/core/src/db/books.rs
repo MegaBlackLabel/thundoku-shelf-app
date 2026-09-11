@@ -355,12 +355,34 @@ pub fn resolve_reuse_id(
     Ok(None)
 }
 
+/// 本を削除する。
+///
+/// `book_tags` / `imported_documents`（およびその孫の `document_images` /
+/// `document_text` / `token_analysis`）/ `book_contents`（孫の `content_formats`）は
+/// `ON DELETE CASCADE` が無い（または既存 DB で付いていない）ため、**先に消す**。
+/// これをしないと FK 制約で DELETE が失敗し、本が消えない
+/// （呼び出し側が `let _ =` で握り潰すと無言で失敗する）。
 pub fn delete(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query("DELETE FROM books WHERE id = ?1")
-            .bind(id)
-            .execute(pool)
-            .await?;
+        let mut tx = pool.begin().await?;
+        // 孫 → 子 → 親 の順で消す
+        for sql in [
+            "DELETE FROM document_images WHERE document_id IN \
+             (SELECT id FROM imported_documents WHERE book_id = ?1)",
+            "DELETE FROM document_text WHERE document_id IN \
+             (SELECT id FROM imported_documents WHERE book_id = ?1)",
+            "DELETE FROM token_analysis WHERE document_id IN \
+             (SELECT id FROM imported_documents WHERE book_id = ?1)",
+            "DELETE FROM imported_documents WHERE book_id = ?1",
+            "DELETE FROM content_formats WHERE content_id IN \
+             (SELECT content_id FROM book_contents WHERE book_id = ?1)",
+            "DELETE FROM book_contents WHERE book_id = ?1",
+            "DELETE FROM book_tags WHERE book_id = ?1",
+            "DELETE FROM books WHERE id = ?1",
+        ] {
+            sqlx::query(sql).bind(id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     })
 }

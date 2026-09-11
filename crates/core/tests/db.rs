@@ -1128,6 +1128,130 @@ fn book_metadata_roundtrip() {
     assert_eq!(books::get(&pool, "book-meta").unwrap().unwrap(), book);
 }
 
+/// 本の削除は `ON DELETE CASCADE` が無い子テーブル（`book_tags` / ドキュメント /
+/// コンテンツ）も一緒に消すこと。これをしないと FK 制約で DELETE が失敗し、本が消えない
+/// （アプリ側は `let _ =` で握り潰すため無言で失敗する）。
+#[test]
+fn books_delete_removes_dependent_rows() {
+    use thundoku_core::db::documents;
+    let pool = memory_db();
+    let stamp = "2026-09-12 00:00:00";
+    books::insert(
+        &pool,
+        &books::Book {
+            id: "book-del".into(),
+            title: "削除する本".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "b.zip".into(),
+            file_size: 100,
+            opfs_path: "book-del.opfspack".into(),
+            cover_thumbnail: None,
+            tbf_product_id: Some("7825209".into()),
+            site_id: Some("booth".into()),
+            tags_fetched: 1,
+            pack_id: Some("book-del".into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: stamp.into(),
+            updated_at: stamp.into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+    // CASCADE が無い子テーブルを一通り用意する
+    tags::set_for_book(&pool, "book-del", &[("タグA", "manual")]).unwrap();
+    documents::insert_document(
+        &pool,
+        &documents::ImportedDocument {
+            id: "doc-1".into(),
+            book_id: "book-del".into(),
+            source_type: "image".into(),
+            file_hash: "hash".into(),
+            total_pages: 1,
+            metadata: None,
+            status: "completed".into(),
+            created_at: stamp.into(),
+            updated_at: stamp.into(),
+        },
+    )
+    .unwrap();
+    documents::insert_images_batch(
+        &pool,
+        &[documents::DocumentImage {
+            id: "img-1".into(),
+            document_id: "doc-1".into(),
+            content_id: None,
+            format_id: None,
+            page_number: 1,
+            image_type: "page".into(),
+            opfs_path: "book-del.opfspack".into(),
+            width: 10,
+            height: 10,
+            mime_type: "image/webp".into(),
+            file_size: 1,
+            extracted_text: None,
+            pack_entry_path: None,
+            created_at: stamp.into(),
+        }],
+    )
+    .unwrap();
+    contents::insert_batch(
+        &pool,
+        &[contents::BookContent {
+            content_id: "c-1".into(),
+            book_id: "book-del".into(),
+            display_name: "本文".into(),
+            media_kind: "image".into(),
+            is_primary: 1,
+            sort_order: 0,
+            created_at: stamp.into(),
+        }],
+        &[contents::ContentFormat {
+            format_id: "f-1".into(),
+            content_id: "c-1".into(),
+            label: "JPEG".into(),
+            format_kind: "image".into(),
+            page_count: 1,
+            pack_entry_prefix: Some("pages".into()),
+            sort_order: 0,
+            created_at: stamp.into(),
+        }],
+    )
+    .unwrap();
+
+    books::delete(&pool, "book-del").unwrap();
+
+    assert!(
+        books::get(&pool, "book-del").unwrap().is_none(),
+        "本が消えること"
+    );
+    assert!(
+        tags::list_for_book(&pool, "book-del").unwrap().is_empty(),
+        "タグも消えること"
+    );
+    assert!(
+        contents::list_for_book(&pool, "book-del").unwrap().is_empty(),
+        "コンテンツも消えること"
+    );
+    assert!(
+        documents::images_for_book(&pool, "book-del")
+            .unwrap()
+            .is_empty(),
+        "ページ行も消えること"
+    );
+}
+
 // FANZA同人 / DLsite の共有ソースメタ列が BookshelfItem に入出力（upsert/list）で
 // roundtrip することを検証する。
 #[test]
