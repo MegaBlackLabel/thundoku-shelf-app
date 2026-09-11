@@ -2547,15 +2547,25 @@ mod tests {
             |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
         );
         let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
-        // 開閉アニメーション（200ms）を完了させてから測る。
-        // アニメーション未完了だと max_h が途中値になり、正しい実装でも切れて見える。
-        for _ in 0..12 {
+        // 開閉アニメーション（200ms）が完了するまで描画する。
+        // 「高さが変わらなくなったら完了」とみなす（回数固定だと進み具合がぶれて不安定になる）。
+        let mut prev_height = gpui_kit::px(-1.0);
+        for _ in 0..20 {
             cx.executor()
                 .advance_clock(std::time::Duration::from_millis(50));
             visual.update(|window, cx| {
                 let arena_clear = window.draw(cx);
                 arena_clear.clear(cx);
             });
+            let height = visual
+                .debug_bounds("bookshelf-submenu")
+                .map(|b| b.size.height);
+            if height == Some(prev_height) {
+                break;
+            }
+            if let Some(height) = height {
+                prev_height = height;
+            }
         }
         let wrap = visual
             .debug_bounds("bookshelf-submenu")
