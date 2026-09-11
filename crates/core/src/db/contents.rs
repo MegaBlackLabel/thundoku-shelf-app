@@ -164,6 +164,52 @@ pub fn set_primary(pool: &SqlitePool, book_id: &str, content_id: &str) -> Result
     })
 }
 
+/// 表示名の最大文字数（1 行に出すため。バイト数ではなく**文字数**）。
+pub const MAX_DISPLAY_NAME_CHARS: usize = 60;
+
+/// ユーザーが入力した表示名を整える。空白だけなら `None`（＝変更しない）。
+///
+/// - 前後の空白を落とす
+/// - 連続する空白（改行・タブ含む）は 1 個の半角スペースに畳む（1 行表示のため）
+/// - [`MAX_DISPLAY_NAME_CHARS`] 文字で切る（日本語を壊さないよう文字単位）
+fn normalize_display_name(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let out: String = collapsed.chars().take(MAX_DISPLAY_NAME_CHARS).collect();
+    // 末尾が空白で終わらないように（切り詰めで語間の空白が残るのを防ぐ）
+    let out = out.trim_end().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// コンテンツの表示名を書き換える（ユーザーによる名前カスタム）。
+///
+/// 実際に値が変わったときだけ `true` を返す（空名・存在しないコンテンツ・
+/// 同名への変更は `false`。呼び出し側が pack の書き換えを省けるようにするため）。
+pub fn rename(
+    pool: &SqlitePool,
+    book_id: &str,
+    content_id: &str,
+    display_name: &str,
+) -> Result<bool, sqlx::Error> {
+    let Some(name) = normalize_display_name(display_name) else {
+        return Ok(false);
+    };
+    crate::db::block_on(async {
+        let result = sqlx::query(
+            "UPDATE book_contents SET display_name = ?1 \
+             WHERE book_id = ?2 AND content_id = ?3 AND display_name <> ?1",
+        )
+        .bind(&name)
+        .bind(book_id)
+        .bind(content_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    })
+}
+
 /// ファイル名や拡張子から画像の表示名（`JPEG` / `PNG` …）を推定する。
 /// 実データ（FANZA 290 件）では画像セットは JPEG が主流。
 pub fn image_label_for_extension(extension: &str) -> Option<&'static str> {
@@ -253,4 +299,70 @@ pub fn delete_for_book(pool: &SqlitePool, book_id: &str) -> Result<(), sqlx::Err
             .await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 名前カスタムのテスト用に本 1 冊 + コンテンツ 1 件を作る。
+    fn seed(pool: &SqlitePool) {
+        crate::db::block_on(async {
+            sqlx::query(
+                "INSERT INTO books (id, title, file_name, file_size, opfs_path) \
+                 VALUES ('b1', 't', 't.pdf', 1, 'b1.opfspack')",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+        });
+        insert_batch(
+            pool,
+            &[BookContent {
+                content_id: "c1".into(),
+                book_id: "b1".into(),
+                display_name: "本文".into(),
+                media_kind: "image".into(),
+                is_primary: 1,
+                sort_order: 0,
+                created_at: "2026-09-11 00:00:00".into(),
+            }],
+            &[],
+        )
+        .unwrap();
+    }
+
+    fn display_name(pool: &SqlitePool) -> String {
+        list_for_book(pool, "b1").unwrap()[0].display_name.clone()
+    }
+
+    #[test]
+    fn rename_trims_and_collapses_whitespace() {
+        let pool = crate::db::test_pool();
+        seed(&pool);
+        assert!(rename(&pool, "b1", "c1", "  本編\n   改訂版  ").unwrap());
+        assert_eq!(display_name(&pool), "本編 改訂版");
+    }
+
+    #[test]
+    fn rename_ignores_blank_names_and_unknown_contents() {
+        let pool = crate::db::test_pool();
+        seed(&pool);
+        // 空白だけの名前は変更しない（既存の名前を壊さない）
+        assert!(!rename(&pool, "b1", "c1", " \t\n ").unwrap());
+        // 存在しないコンテンツも変更なし
+        assert!(!rename(&pool, "b1", "missing", "別冊").unwrap());
+        assert_eq!(display_name(&pool), "本文");
+    }
+
+    #[test]
+    fn rename_is_idempotent_and_caps_length() {
+        let pool = crate::db::test_pool();
+        seed(&pool);
+        // 同じ名前への変更は「変わっていない」を返す
+        assert!(!rename(&pool, "b1", "c1", "本文").unwrap());
+        let long = "あ".repeat(MAX_DISPLAY_NAME_CHARS + 20);
+        assert!(rename(&pool, "b1", "c1", &long).unwrap());
+        assert_eq!(display_name(&pool).chars().count(), MAX_DISPLAY_NAME_CHARS);
+    }
 }

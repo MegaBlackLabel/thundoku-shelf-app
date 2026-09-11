@@ -7,7 +7,7 @@ use std::time::Duration;
 use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::animation::ease_out_cubic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderState};
@@ -324,6 +324,14 @@ pub struct ImageViewer {
     last_zoom_toggle: Option<std::time::Instant>,
     active_panel: Option<PanelView>,
     page_input: Option<Entity<InputState>>,
+    /// 名前を編集中のコンテンツ id（空 = 編集していない）。
+    renaming_content: Option<String>,
+    /// 名前入力（メニューの切替行にインライン表示する。1 つを使い回す）。
+    rename_input: Option<Entity<InputState>>,
+    _rename_subscription: Option<Subscription>,
+    /// 確定した名前の変更 `(content_id, display_name)`。
+    /// DB と pack への反映は親（`ReaderView`）が `take_rename` で拾って行う。
+    pending_rename: Option<(String, String)>,
     autoplay_slider: Option<Entity<SliderState>>,
     /// ページ移動用スライダー（ボトムドック）。
     page_slider: Option<Entity<SliderState>>,
@@ -462,6 +470,10 @@ impl ImageViewer {
             last_zoom_toggle: None,
             active_panel: None,
             page_input: None,
+            renaming_content: None,
+            rename_input: None,
+            _rename_subscription: None,
+            pending_rename: None,
             autoplay_slider: None,
             page_slider: None,
             _page_slider_subscription: None,
@@ -564,6 +576,68 @@ impl ImageViewer {
         self.current_content_id = current_content_id;
         self.current_format_id = current_format_id;
         cx.notify();
+    }
+
+    /// 名前の変更を確定する（親が `take_rename` で拾って DB と pack に書く）。
+    /// 入力の確定（Enter / フォーカス外れ）とテストから同じ経路で呼ぶ。
+    pub fn rename_content(&mut self, cx: &mut Context<Self>, content_id: &str, display_name: &str) {
+        self.renaming_content = None;
+        self.pending_rename = Some((content_id.to_string(), display_name.to_string()));
+        cx.notify();
+    }
+
+    /// 名前の編集を開始する（今の名前を入れてフォーカスする）。
+    pub fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>, content_id: &str) {
+        let Some(current) = self
+            .contents
+            .iter()
+            .find(|content| content.content_id == content_id)
+            .map(|content| content.display_name.clone())
+        else {
+            return;
+        };
+        let input = match self.rename_input.clone() {
+            Some(input) => input,
+            None => {
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("名前"));
+                self._rename_subscription = Some(cx.subscribe(
+                    &input,
+                    |this: &mut Self, _: Entity<InputState>, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                            this.commit_rename(cx);
+                        }
+                    },
+                ));
+                self.rename_input = Some(input.clone());
+                input
+            }
+        };
+        input.update(cx, |state, cx| state.set_value(current, window, cx));
+        self.renaming_content = Some(content_id.to_string());
+        cx.notify();
+    }
+
+    /// 編集中の名前を確定する（入力の Enter / フォーカス外れから呼ぶ）。
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(content_id) = self.renaming_content.clone() else {
+            return;
+        };
+        let Some(input) = self.rename_input.clone() else {
+            return;
+        };
+        let value = input.read(cx).value().to_string();
+        self.rename_content(cx, &content_id, &value);
+    }
+
+    /// 名前の編集を取り消す（入力はそのまま残す）。
+    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming_content = None;
+        cx.notify();
+    }
+
+    /// 確定した名前の変更を取り出す（親が DB と pack に反映する）。
+    pub fn take_rename(&mut self) -> Option<(String, String)> {
+        self.pending_rename.take()
     }
 
     /// 切替操作を取り出す（`(content_id, format_id)`。`ReaderView` が反映する）。
@@ -687,8 +761,18 @@ impl ImageViewer {
     ) -> gpui_kit::AnyElement {
         let open_handle = handle.clone();
         let list_handle = handle.clone();
+        let rename_handle = handle.clone();
         let content_index = row.content_index;
         let format_index = row.format_index;
+        // この行のコンテンツ（旧データは content_id が空で名前を持たない）
+        let content_id = self
+            .contents
+            .get(content_index)
+            .map(|content| content.content_id.clone())
+            .unwrap_or_default();
+        let renaming =
+            !content_id.is_empty() && self.renaming_content.as_deref() == Some(&content_id);
+        let rename_input = self.rename_input.clone();
         let is_folder = row.kind == "image";
         let icon = if is_folder {
             IconName::FolderOpen
@@ -737,12 +821,27 @@ impl ImageViewer {
                             .flex()
                             .flex_col()
                             .flex_grow(1.0)
-                            .child(
+                            .child(if renaming {
+                                // 名前のインライン編集（Enter / フォーカス外れで確定）。
+                                // 行クリックの切替に伝播させない
+                                let input = rename_input.clone();
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "viewer-rename-open-{content_index}"
+                                    )))
+                                    .debug_selector(|| "viewer-rename-input".into())
+                                    .on_click(|_, _window, cx| cx.stop_propagation())
+                                    .children(input.map(|input| {
+                                        Input::new(&input).cursor_text().text_sm().w_full()
+                                    }))
+                                    .into_any_element()
+                            } else {
                                 div()
                                     .text_sm()
                                     .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                    .child(row.title),
-                            )
+                                    .child(row.title)
+                                    .into_any_element()
+                            })
                             .child(
                                 div()
                                     .text_xs()
@@ -762,6 +861,39 @@ impl ImageViewer {
                         .text_color(gpui_kit::rgb(0x16a34a))
                         .child(Icon::new(IconName::CircleCheck).size(px(14.0)))
                         .child(div().text_xs().child("表示中")),
+                )
+            })
+            // 名前（コンテンツ名のカスタム。同じコンテンツの全レンディション行に出る）
+            .when(!content_id.is_empty() && !renaming, |el| {
+                el.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "viewer-switch-rename-{content_index}"
+                        )))
+                        .debug_selector(move || format!("viewer-switch-rename-{content_index}"))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().muted)
+                        .hover(|style| style.bg(cx.theme().muted))
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            let content_id = content_id.clone();
+                            rename_handle.update(cx, |this, cx| {
+                                this.start_rename(window, cx, &content_id);
+                            });
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .child("名前"),
+                        ),
                 )
             })
             // 一覧 ›（その形式のページ一覧を開く）
@@ -3387,6 +3519,152 @@ mod tests {
         assert_eq!(min, AUTOPLAY_MIN_MS as f32);
         assert_eq!(max, AUTOPLAY_MAX_MS as f32);
         assert_eq!(value, SliderValue::Single(AUTOPLAY_DEFAULT_MS as f32));
+    }
+
+    #[gpui_kit::test]
+    async fn menu_shows_rename_affordance(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 3);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_contents(
+                    cx,
+                    vec![ContentEntry {
+                        content_id: "c1".into(),
+                        display_name: "本編".into(),
+                        media_kind: "image".into(),
+                        is_primary: true,
+                        formats: vec![FormatEntry {
+                            format_id: "f1".into(),
+                            label: "JPEG".into(),
+                            page_count: 3,
+                            format_kind: "image".into(),
+                        }],
+                    }],
+                    Some("c1".into()),
+                    None,
+                )
+            })
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // メニューを開く（切替行が出る）
+        cx.update(|cx| view.update(cx, |this, cx| this.open_panel(cx, PanelView::Menu)));
+        cx.run_until_parked();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            visual.debug_bounds("viewer-switch-rename-0").is_some(),
+            "メニューの行に「名前」ボタンが出ること"
+        );
+
+        // 編集中は「名前」ボタンが入力に差し替わる
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| this.start_rename(window, cx, "c1"));
+        });
+        cx.run_until_parked();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(
+            visual.debug_bounds("viewer-rename-input").is_some(),
+            "編集中はインライン入力が出ること"
+        );
+        assert!(
+            visual.debug_bounds("viewer-switch-rename-0").is_none(),
+            "編集中は「名前」ボタンを出さないこと"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn rename_prefills_current_name_and_commits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 3);
+        // 2 コンテンツ（本編 / 別冊）を渡す
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_contents(
+                    cx,
+                    vec![
+                        ContentEntry {
+                            content_id: "c1".into(),
+                            display_name: "本編".into(),
+                            media_kind: "image".into(),
+                            is_primary: true,
+                            formats: vec![FormatEntry {
+                                format_id: "f1".into(),
+                                label: "JPEG".into(),
+                                page_count: 3,
+                                format_kind: "image".into(),
+                            }],
+                        },
+                        ContentEntry {
+                            content_id: "c2".into(),
+                            display_name: "別冊".into(),
+                            media_kind: "pdf".into(),
+                            is_primary: false,
+                            formats: vec![FormatEntry {
+                                format_id: "f2".into(),
+                                label: "PDF".into(),
+                                page_count: 2,
+                                format_kind: "pdf".into(),
+                            }],
+                        },
+                    ],
+                    Some("c1".into()),
+                    None,
+                )
+            })
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        cx.update_window(*window, |_root, window, cx| {
+            view.update(cx, |this, cx| this.start_rename(window, cx, "c2"));
+        })
+        .unwrap();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.renaming_content.clone()),
+            Some("c2".to_string())
+        );
+        // 今の名前（別冊）が入っている
+        let prefilled = view.read_with(cx, |v, cx| {
+            v.rename_input
+                .as_ref()
+                .expect("rename input")
+                .read(cx)
+                .value()
+                .to_string()
+        });
+        assert_eq!(prefilled, "別冊");
+
+        // 入力して確定する（Enter / フォーカス外れ相当）
+        cx.update_window(*window, |_root, window, cx| {
+            view.update(cx, |this, cx| {
+                let input = this.rename_input.clone().expect("rename input");
+                input.update(cx, |state, cx| state.set_value("続編", window, cx));
+                this.commit_rename(cx);
+            });
+        })
+        .unwrap();
+
+        assert_eq!(
+            cx.update(|cx| view.update(cx, |v, _| v.take_rename())),
+            Some(("c2".to_string(), "続編".to_string()))
+        );
+        // 編集状態は解除される（行が入力のまま残らない）
+        assert_eq!(view.read_with(cx, |v, _| v.renaming_content.clone()), None);
     }
 
     #[test]

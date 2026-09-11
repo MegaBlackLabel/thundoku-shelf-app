@@ -191,6 +191,9 @@ Drive 同期設定など）。
 - `import_zip_bytes` は**全コンテンツ × 全レンディション**を実体化して保存する
   （既定表示コンテンツの第 1 レンディションだけ pack 内パスが従来どおり `pages/...`）
 - pack の `metadata.json` にも `contents` を書き出して同期復元用にする
+- `display_name` は**ユーザーが変更できる**（ビューアーのトップメニュー「名前」）。
+  変更時は DB と同時に pack の `metadata.json` の `displayName` も書き換える
+  （`import::rename_content_in_pack`。Drive 復元で名前が戻らないようにする）
 
 ### imported_documents
 

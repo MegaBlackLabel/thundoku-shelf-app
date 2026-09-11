@@ -498,6 +498,65 @@ fn metadata_entry(
     )
 }
 
+/// pack の `metadata.json` に記録された 1 コンテンツの表示名を書き換えた
+/// **新しい pack のバイト列**を返す（フェーズ7: 名前カスタム）。
+///
+/// 名前は DB（`book_contents.display_name`）と pack の両方に書く。pack を直さないと
+/// Drive から復元したとき（[`rebuild_from_pack`]）に取り込み時の名前に戻ってしまう。
+///
+/// 変更が無いときは `None` を返す（`content_id` が無い / `metadata.json` が無い /
+/// JSON が壊れている）。元の pack は変更しない。
+pub fn rename_content_in_pack(
+    pack_bytes: &[u8],
+    content_id: &str,
+    display_name: &str,
+    identity: Option<&Identity>,
+) -> Result<Option<Vec<u8>>, ImportError> {
+    let reader = opfspack::PackReader::open(pack_bytes)?;
+    let Ok(raw) = reader.read_entry("metadata.json", identity) else {
+        return Ok(None);
+    };
+    let Ok(mut metadata) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return Ok(None);
+    };
+    let Some(contents) = metadata
+        .get_mut("contents")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    for content in contents.iter_mut() {
+        if content.get("contentId").and_then(|value| value.as_str()) == Some(content_id) {
+            content["displayName"] = serde_json::Value::String(display_name.to_string());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+
+    // 全エントリを読み直して組み直す（index は path 順・offset は再計算されるため、
+    // metadata.json のサイズが変わっても整合する）。暗号化・圧縮の設定は元の pack に合わせる。
+    let header = reader.header();
+    let encrypted = header.flags & opfspack::pack_flags::ENCRYPTED != 0;
+    let mut builder = opfspack::PackBuilder::new(header.created_at);
+    for entry in reader.entries() {
+        let data = if entry.path == "metadata.json" {
+            serde_json::to_vec(&metadata).map_err(|e| ImportError::Image(e.to_string()))?
+        } else {
+            reader.read_entry(&entry.path, identity)?
+        };
+        let compress = entry.flags & opfspack::entry_flags::COMPRESSED != 0;
+        builder.add_entry(&entry.path, data, &entry.mime_type, compress);
+    }
+    let identity = if encrypted { identity } else { None };
+    Ok(Some(builder.build(
+        identity,
+        header.flags & opfspack::pack_flags::COMPRESSED != 0,
+    )?))
+}
+
 /// `book_contents` に書く 1 コンテンツ分の行。
 #[derive(Clone)]
 struct ContentSpec {

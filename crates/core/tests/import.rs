@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use opfspack::{Identity, PackReader};
+use opfspack::{Identity, PackBuilder, PackReader};
 use thundoku_core::db;
 use thundoku_core::import::{ImportError, MediaKind, analyze_zip, import_file, import_pdf_bytes};
 use thundoku_core::tags;
@@ -997,4 +997,147 @@ fn tags_generate_falls_back_to_nouns_when_zenn_unavailable() {
     for tag in &tags {
         assert!(tag.chars().count() <= 20);
     }
+}
+
+// ---- フェーズ7: 名前カスタム（pack の metadata.json 書き換え） ----
+
+/// 2 コンテンツ（本文 / 別冊）を持つ metadata.json。
+fn metadata_with_two_contents() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "title": "テスト本",
+        "readingProgress": { "currentPage": 0, "totalPages": 1 },
+        "contents": [
+            {
+                "contentId": "c1",
+                "displayName": "本文",
+                "mediaKind": "image",
+                "isPrimary": true,
+                "sortOrder": 0,
+                "formats": []
+            },
+            {
+                "contentId": "c2",
+                "displayName": "別冊",
+                "mediaKind": "pdf",
+                "isPrimary": false,
+                "sortOrder": 1,
+                "formats": []
+            }
+        ]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn rename_content_in_pack_rewrites_only_that_content() {
+    let mut builder = PackBuilder::new(1_700_000_000_000);
+    builder.add_entry(
+        "pages/page_0001.webp",
+        b"page-1".to_vec(),
+        "image/webp",
+        false,
+    );
+    builder.add_entry(
+        "metadata.json",
+        metadata_with_two_contents(),
+        "application/json",
+        false,
+    );
+    let pack = builder.build(None, false).unwrap();
+
+    let renamed = thundoku_core::import::rename_content_in_pack(&pack, "c2", "続編", None)
+        .unwrap()
+        .expect("metadata が変わった pack は Some を返す");
+
+    let reader = PackReader::open(&renamed).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&reader.read_entry("metadata.json", None).unwrap()).unwrap();
+    assert_eq!(meta["contents"][1]["displayName"], "続編");
+    assert_eq!(meta["contents"][0]["displayName"], "本文");
+    assert_eq!(meta["title"], "テスト本");
+    // ページとそれ以外のエントリはそのまま読める
+    assert_eq!(
+        reader.read_entry("pages/page_0001.webp", None).unwrap(),
+        b"page-1"
+    );
+    assert_eq!(reader.entries().len(), 2);
+    // 元の pack は変更しない
+    let original: serde_json::Value = serde_json::from_slice(
+        &PackReader::open(&pack)
+            .unwrap()
+            .read_entry("metadata.json", None)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(original["contents"][1]["displayName"], "別冊");
+}
+
+#[test]
+fn rename_content_in_pack_keeps_identity_binding() {
+    let identity = Identity {
+        sub: "sub-1".into(),
+        pack_id: "b1".into(),
+    };
+    let mut builder = PackBuilder::new(7);
+    builder.add_entry(
+        "pages/page_0001.webp",
+        b"page-1".to_vec(),
+        "image/webp",
+        true,
+    );
+    builder.add_entry(
+        "metadata.json",
+        metadata_with_two_contents(),
+        "application/json",
+        true,
+    );
+    let pack = builder.build(Some(&identity), true).unwrap();
+
+    let renamed =
+        thundoku_core::import::rename_content_in_pack(&pack, "c1", "本編", Some(&identity))
+            .unwrap()
+            .unwrap();
+
+    let reader = PackReader::open(&renamed).unwrap();
+    // 暗号化は維持される（identity 無しでは読めない）
+    assert!(reader.read_entry("pages/page_0001.webp", None).is_err());
+    assert_eq!(
+        reader
+            .read_entry("pages/page_0001.webp", Some(&identity))
+            .unwrap(),
+        b"page-1"
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&reader.read_entry("metadata.json", Some(&identity)).unwrap())
+            .unwrap();
+    assert_eq!(meta["contents"][0]["displayName"], "本編");
+}
+
+#[test]
+fn rename_content_in_pack_returns_none_when_unknown_or_missing() {
+    // 対象の content_id が無ければ None（pack を作り直さない）
+    let mut builder = PackBuilder::new(1);
+    builder.add_entry(
+        "metadata.json",
+        metadata_with_two_contents(),
+        "application/json",
+        false,
+    );
+    let pack = builder.build(None, false).unwrap();
+    assert!(
+        thundoku_core::import::rename_content_in_pack(&pack, "missing", "x", None)
+            .unwrap()
+            .is_none()
+    );
+
+    // metadata.json を持たない pack も None（エラーにしない）
+    let mut bare = PackBuilder::new(1);
+    bare.add_entry("pages/page_0001.webp", b"p".to_vec(), "image/webp", false);
+    let bare = bare.build(None, false).unwrap();
+    assert!(
+        thundoku_core::import::rename_content_in_pack(&bare, "c1", "x", None)
+            .unwrap()
+            .is_none()
+    );
 }

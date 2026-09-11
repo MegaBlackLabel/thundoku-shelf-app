@@ -318,6 +318,12 @@ impl ReaderView {
         if let Some((content_id, format_id)) = viewer.update(cx, |viewer, _| viewer.take_action()) {
             self.apply_switch(content_id, format_id, cx);
         }
+        // コンテンツ名のカスタムを DB と pack に反映する（フェーズ7）
+        if let Some((content_id, display_name)) =
+            viewer.update(cx, |viewer, _| viewer.take_rename())
+        {
+            self.apply_rename(content_id, display_name, cx);
+        }
         self.record_page_view(viewer.clone(), cx);
         self.save_progress(viewer, cx);
     }
@@ -335,6 +341,84 @@ impl ReaderView {
             let _ = db::contents::set_primary(&state.db_pool, &book_id, &content_id);
         }
         self.switch_selection(cx, Some(content_id), format_id);
+    }
+
+    /// コンテンツ名のカスタムを DB と pack の両方へ反映する。
+    ///
+    /// DB を正とし（空名・同名は [`db::contents::rename`] が弾く）、pack は
+    /// Drive から復元したときに取り込み時の名前へ戻らないよう書き換える。
+    fn apply_rename(&mut self, content_id: String, display_name: String, cx: &mut Context<Self>) {
+        let Some(book_id) = self.book_id.clone() else {
+            return;
+        };
+        let changed = {
+            let state = AppState::global(cx);
+            db::contents::rename(&state.db_pool, &book_id, &content_id, &display_name)
+                .unwrap_or(false)
+        };
+        if changed {
+            self.rewrite_pack_content_name(&book_id, &content_id, &display_name, cx);
+        }
+        // メニューの表示名を保存後の名前（トリム済み）に更新する
+        let viewer = self.viewer.clone();
+        self.refresh_contents(&viewer, cx);
+    }
+
+    /// pack の `metadata.json` に記録された表示名を書き換える。
+    /// 全エントリを復号 → 再圧縮して組み直すため重い（背景スレッドで実行する）。
+    /// pack が無い本（未ダウンロード）や読み取りに失敗した場合は何もしない。
+    fn rewrite_pack_content_name(
+        &self,
+        book_id: &str,
+        content_id: &str,
+        display_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let state = AppState::global(cx);
+        let db = state.db_pool.clone();
+        let packs_dir = state.packs_dir.clone();
+        let sub = state
+            .google_profile
+            .lock()
+            .as_ref()
+            .map(|profile| profile.sub.clone());
+        let book_id = book_id.to_string();
+        let content_id = content_id.to_string();
+        let display_name = display_name.to_string();
+        // 背景（ページ画像のデコードと同じ executor）で実行する — 全エントリの
+        // 復号 + 再圧縮は重く、UI スレッドを止められないため。
+        cx.background_executor()
+            .spawn(async move {
+            let Ok(Some(book)) = db::books::get(&db, &book_id) else {
+                return;
+            };
+            let pack_id = book.pack_id.clone().unwrap_or_else(|| book.id.clone());
+            let path = packs_dir.join(format!("{pack_id}.opfspack"));
+            // 未ダウンロードの本は pack が無い（DB の名前だけが正）
+            let Ok(bytes) = std::fs::read(&path) else {
+                return;
+            };
+            // 読み出しと同じ identity（`PackPageLoader` と同じ pack_id = book_id）で復号する
+            let identity = sub.map(|sub| opfspack::Identity {
+                sub,
+                pack_id: book_id.clone(),
+            });
+            match thundoku_core::import::rename_content_in_pack(
+                &bytes,
+                &content_id,
+                &display_name,
+                identity.as_ref(),
+            ) {
+                Ok(Some(rewritten)) => {
+                    if let Err(error) = std::fs::write(&path, &rewritten) {
+                        log::warn!("pack の名前書き換えに失敗: {path:?}: {error}");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => log::warn!("pack の名前書き換えに失敗: {path:?}: {error}"),
+            }
+        })
+        .detach();
     }
 
     /// ページ一覧用のコンテンツ一覧を DB から読み直してビューアに渡す。
@@ -824,6 +908,93 @@ mod tests {
         // 切替は起きず、ページ一覧だけが開く
         cx.update(|cx| viewer.update(cx, |v, cx| v.page_list_select_format(cx, 0, 0)));
         assert_eq!(viewer.read_with(cx, |v, _| v.page_count()), 2);
+    }
+
+    #[gpui_kit::test]
+    async fn renaming_rewrites_the_pack_metadata(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book_with_two_contents(cx, "b13");
+        // 実 pack（metadata.json + ページ 1 枚）を置く
+        let packs_dir = cx.update(|cx| crate::app_state::AppState::global(cx).packs_dir.clone());
+        let mut builder = opfspack::PackBuilder::new(1);
+        builder.add_entry(
+            "metadata.json",
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "title": "複数コンテンツ本",
+                "contents": [
+                    { "contentId": "c-main", "displayName": "本編", "formats": [] },
+                    { "contentId": "c-sub", "displayName": "別冊", "formats": [] }
+                ]
+            }))
+            .unwrap(),
+            "application/json",
+            false,
+        );
+        builder.add_entry(
+            "pages/page_0001.webp",
+            b"page-1".to_vec(),
+            "image/webp",
+            false,
+        );
+        let pack = builder.build(None, false).unwrap();
+        std::fs::create_dir_all(&packs_dir).unwrap();
+        std::fs::write(packs_dir.join("b13.opfspack"), &pack).unwrap();
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b13".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        cx.update(|cx| viewer.update(cx, |v, cx| v.rename_content(cx, "c-sub", "続編")));
+        cx.run_until_parked();
+
+        // pack の metadata.json も書き換わっている（Drive 復元で名前が戻らない）
+        let bytes = std::fs::read(packs_dir.join("b13.opfspack")).unwrap();
+        let reader = opfspack::PackReader::open(&bytes).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&reader.read_entry("metadata.json", None).unwrap()).unwrap();
+        assert_eq!(meta["contents"][1]["displayName"], "続編");
+        assert_eq!(meta["contents"][0]["displayName"], "本編");
+        // ページは壊れていない
+        assert_eq!(
+            reader.read_entry("pages/page_0001.webp", None).unwrap(),
+            b"page-1"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn renaming_a_content_updates_the_menu_and_the_db(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book_with_two_contents(cx, "b12");
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b12".to_string()));
+        let viewer = reader.read_with(cx, |r, _| r.viewer.clone());
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec!["本編".to_string(), "別冊".to_string()]
+        );
+
+        // 名前を変更すると（＝入力の確定と同じ経路）、親が DB に保存して一覧を更新する
+        cx.update(|cx| viewer.update(cx, |v, cx| v.rename_content(cx, "c-sub", " 続編 ")));
+        cx.run_until_parked();
+
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec!["本編".to_string(), "続編".to_string()]
+        );
+        let stored = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            db::contents::list_for_book(&state.db_pool, "b12").unwrap()
+        });
+        assert_eq!(stored[1].display_name, "続編");
+
+        // 空白だけの名前では何も変わらない（既存の名前を壊さない）
+        cx.update(|cx| viewer.update(cx, |v, cx| v.rename_content(cx, "c-sub", "   ")));
+        cx.run_until_parked();
+        assert_eq!(
+            viewer.read_with(cx, |v, _| v.menu_row_titles()),
+            vec!["本編".to_string(), "続編".to_string()]
+        );
     }
 
     #[gpui_kit::test]
