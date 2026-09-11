@@ -364,18 +364,41 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
   - 本棚カード（グリッド / リスト）にサークル名（`circle_name`）と作者名（`author`）を表示
   - `bookshelf_items` に `author` カラムを追加（プログラム的マイグレーション / `ALTER TABLE`）
   - 技術書典は author を持たないため空のまま非表示。BOOTH 等は shop（作成者）を author に格納
-  -（残: クリック絞り込み + 戻る導線 → 下記の TODO へ分割）
+  -（実装済み: クリック絞り込み + 戻る導線 → 下記 2 項目）
 
-- [ ] **サークル名 / 作者名クリック → 絞り込み（リンク化）**
-  - サークル名・作者名を**リンク化**し、クリックするとその作者 / サークルのデータのみを表示できるようにする
-    （例: 作者名クリック → その作者の書籍だけに絞り込む）
-  - `matches_filter` に `circle_filter` / `author_filter` を追加（既存の site / search / event / tag フィルタと同様）
+- [x] **サークル名 / 作者名クリック → 絞り込み（リンク化）**（実装済み）
+  - サークル名・作者名を**リンク化**（下線 + リンクカーソル）し、クリックするとその作者 / サークルのデータのみを表示する
+  - `matches_filter` に `circle_filter` / `author_filter` を追加（既存の site / search / event / tag フィルタと AND）
+  - 同じリンクの再クリックでその絞り込みを解除
   - `bookshelf_items.author` は BOOTH 等のみ。技術書典は author が空のため author 絞り込みは対象が限られる（サークル名絞り込みは `circle_name` で全サイト可）
-  - 絞り込み中の解除ボタン（× で個別解除 / 全解除）も合わせて検討
+  - **作者名の供給元**: BOOTH は shop 名。**FANZA / DLsite はダウンロード時に作品ページから取得**
+    （FANZA `<dt class="informationList__ttl">作者</dt>` / DLsite `<th>作者</th>`）し、
+    `books.author`（`set_metadata`）と `bookshelf_items.author`（`bookshelf::update_author`）へ保存する。
+    反映はダウンロード後（既DLの本は「再取得」で入る）
+  - **同期で消えないこと**: `bookshelf::upsert` は `tags_json = None` / `author = ""` のとき
+    既存値を保持する（同期は作品ページ由来の値を持たないため。`is_favorite` / `is_hidden` と同じ扱い）
 
-- [ ] **絞り込み後の「戻る」導線**
-  - サークル名 / 作者名で絞り込んだ一覧から元の一覧に戻る導線をどうするか
-  - 絞り込み中は上部に「サークル: X / 作者: Y」バッジ + 解除導線を表示する案を検討
+- [x] **絞り込み後の「戻る」導線**（実装済み）
+  - 「全項目」ボタンが、いずれかの絞り込み中は「絞込中」表示（警告色）になる
+  - 「絞込中」をクリックすると全選択に戻り、絞り込みを解除する
+    （検索 / イベント / タグ / サークル / 作者 / 既読モード / サイト）
+  - タグ絞り込みでも同じ挙動
+
+- [x] **サイドバーのサイト一覧の下が切れる（バグ）**（修正済み）
+  - 「本棚」のサイト一覧サブメニューの高さが固定 150px だったため、ログイン中のサイトが
+    増えると最終行（DLsite）が欠けて表示されていた
+  - 表示行数（すべての本 + ログイン中のサイト）から高さを算出するよう修正（`workspace.rs`）。
+    回帰テスト `bookshelf_submenu_fits_all_rows` が固定値に戻すと Fail する
+
+- [x] **同期すると取得済みのジャンル・作者が消える（バグ）**（修正済み）
+  - `bookshelf::upsert` の `ON CONFLICT DO UPDATE` が `tags_json` / `author` を無条件に
+    上書きしていたため、同期（`save_purchases`）が値を持たない `None` / 空文字を送ると、
+    ダウンロード時に作品ページから取得したジャンル・作者が消えていた
+  - 同期が値を持たないときは既存値を保持するよう修正（`COALESCE` / 空文字ガード。
+    `is_favorite` / `is_hidden` と同じ扱い）。回帰テストは
+    `bookshelf_upsert_preserves_local_tags_and_author` /
+    `bookshelf_upsert_preserves_local_favorite_and_hidden`
+  - ⚠ 既に消えたジャンルは FANZA は「再取得」、DLsite は次回同期で復活する
 
 - [x] **閲覧情報を 1 ページ毎の閲覧回数・時間も記録する**（実装済み）
   - 現在の `view_history` は `id, book_id, started_at, ended_at` のみで、書籍単位の
@@ -412,6 +435,7 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
   - 同じ作者・同じタグなどの**紐づけ（関連性）**を調査しているときに、操作によって
     その関連データのみに絞り込んで表示してくれる機能を検討する
     - 例: 作者名・サークル名をクリック → その作者 / サークルの書籍だけに絞り込み
+      （**サークル名 / 作者名のクリック絞り込みは実装済み**。タグクリック・関連書籍導線は未着手）
     - 例: タグをクリック → そのタグの書籍だけに絞り込み
     - 例: 書籍詳細から関連書籍（同シリーズ・同サークル・共通タグ）への導線
   - 絞り込み後の「戻る」導線も検討する（絞り込み一覧から元の状態に戻る方法）

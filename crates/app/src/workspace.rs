@@ -1996,6 +1996,16 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// 本棚サブメニューの高さ上限（px）。
+    /// 固定値にするとログイン中のサイトが増えたときに下の行が切れるため、行数から求める。
+    /// 1 行 = `text_xs`(12px) + `py_1p5`(上下 6px) に余裕を足した値。
+    fn bookshelf_submenu_height(rows: usize) -> f32 {
+        const ROW_H: f32 = 34.0;
+        const GAP: f32 = 2.0; // gap_0p5
+        const TOP: f32 = 4.0; // mt_1
+        TOP + rows as f32 * ROW_H + rows.saturating_sub(1) as f32 * GAP
+    }
+
     fn bookshelf_submenu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.bookshelf_submenu_open;
         let theme = cx.theme().clone();
@@ -2005,6 +2015,13 @@ impl Workspace {
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
         let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
+        // 「すべての本」+ ログイン中のサイトの行数ぶんの高さを確保する
+        let submenu_height = Self::bookshelf_submenu_height(
+            1 + usize::from(tbf_logged_in)
+                + usize::from(booth_logged_in)
+                + usize::from(fanza_logged_in)
+                + usize::from(dlsite_logged_in),
+        );
 
         div()
             .id("bookshelf-submenu-wrap")
@@ -2151,6 +2168,7 @@ impl Workspace {
                         this.child(
                             div()
                                 .id("bookshelf-site-dlsite")
+                                .debug_selector(|| "bookshelf-site-dlsite".into())
                                 .flex()
                                 .items_center()
                                 .gap_2()
@@ -2188,7 +2206,11 @@ impl Workspace {
                             .with_easing(gpui_kit::ease_in_out),
                         move |this, t| {
                             let t = t.clamp(0.0, 1.0);
-                            let height = if open { 150.0 * t } else { 150.0 * (1.0 - t) };
+                            let height = if open {
+                                submenu_height * t
+                            } else {
+                                submenu_height * (1.0 - t)
+                            };
                             let opacity = if open { t } else { 1.0 - t };
                             this.max_h(px(height)).opacity(opacity.clamp(0.0, 1.0))
                         },
@@ -2498,6 +2520,53 @@ mod tests {
         let ws = setup(cx);
         let open = ws.read_with(cx, |w, _| w.sidebar_open);
         assert!(!open, "sidebar はデフォルトで閉じた状態");
+    }
+
+    /// 本棚サブメニューは、ログイン中のサイトが増えても全行が収まる高さになること。
+    /// 高さが固定 150px だったときは 5 行目（4 サイト目 = DLsite）が切れていた。
+    #[gpui_kit::test]
+    async fn bookshelf_submenu_fits_all_rows(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            *state.tbf_logged_in.lock() = true;
+            *state.booth_logged_in.lock() = true;
+            *state.fanza_logged_in.lock() = true;
+            *state.dlsite_logged_in.lock() = true;
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                w.bookshelf_submenu_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // 開閉アニメーション（200ms）を完了させてから測る。
+        // アニメーション未完了だと max_h が途中値になり、正しい実装でも切れて見える。
+        for _ in 0..12 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let wrap = visual
+            .debug_bounds("bookshelf-submenu")
+            .expect("サブメニューが描画されている");
+        let last = visual
+            .debug_bounds("bookshelf-site-dlsite")
+            .expect("最終行 (DLsite) が描画されている");
+        assert!(
+            last.origin.y + last.size.height <= wrap.origin.y + wrap.size.height + gpui_kit::px(1.0),
+            "サブメニューの高さが足りず最終行が切れている: wrap={wrap:?} last={last:?}"
+        );
     }
 
     #[gpui_kit::test]
