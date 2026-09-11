@@ -112,9 +112,15 @@ impl FanzaDetail {
 pub struct FanzaProductPage {
     /// ジャンルタグ（`拘束`、`触手` などの複数）。
     pub genre_tags: Vec<String>,
+    /// 作者（作品情報の「作者」行。行が無い / 空の作品は `None`）。
+    pub author: Option<String>,
 }
 
-/// 作品ページ HTML からジャンルタグ（`genreTag__txt`）を抽出する。
+/// 作品情報の「作者」行（`<dt class="informationList__ttl">作者</dt>` の次の `<a>` テキスト）。
+/// 実機 HTML（2026-09-11 / d_818290）で検証済み。
+const AUTHOR_RE: &str = r#"(?s)<dt class="informationList__ttl">\s*作者\s*</dt>\s*<dd class="informationList__txt">\s*<a[^>]*>([^<]*)</a>"#;
+
+/// 作品ページ HTML からジャンルタグ（`genreTag__txt`）と作者（`作者` 行）を抽出する。
 pub fn parse_product_page(html: &str) -> FanzaProductPage {
     let mut genre_tags = Vec::new();
     let re = regex::Regex::new(r#"class="genreTag__txt"[^>]*>([^<]+)</a>"#).unwrap();
@@ -124,7 +130,15 @@ pub fn parse_product_page(html: &str) -> FanzaProductPage {
             genre_tags.push(tag);
         }
     }
-    FanzaProductPage { genre_tags }
+    let author = regex::Regex::new(AUTHOR_RE)
+        .ok()
+        .and_then(|re| re.captures(html))
+        .map(|cap| cap[1].trim().to_string())
+        .filter(|author| !author.is_empty());
+    FanzaProductPage {
+        genre_tags,
+        author,
+    }
 }
 
 /// FANZA 同人クライアント（`tbf::transport` を再利用、`Transport` でモック可能）。
@@ -601,6 +615,25 @@ mod tests {
             page.genre_tags,
             vec!["拘束".to_string(), "触手".to_string(), "ファンタジー".to_string()]
         );
+    }
+
+    /// 作品ページ HTML の「作者」行（`informationList__ttl`）を抽出する。
+    /// 実機の HTML（2026-09-11 取得 / d_818290）と同じ整形で検証する。
+    #[test]
+    fn parse_product_page_extracts_author() {
+        let html = r#"<div class="productInformation__item">
+        <dl class="informationList">
+            <dt class="informationList__ttl">作者</dt>
+            <dd class="informationList__txt"><a href="https://www.dmm.co.jp/dc/doujin/-/list/=/article=creator/id=e90603bd-64d3-11f0-ba33-0242ac160002/section=mens/">Ash横島</a></dd>
+        </dl>
+    </div>"#;
+        let page = parse_product_page(html);
+        assert_eq!(page.author.as_deref(), Some("Ash横島"));
+        // 作者行が無い作品は None
+        assert_eq!(parse_product_page("<div></div>").author, None);
+        // 作者行はあるが空のときも None
+        let empty = r#"<dt class="informationList__ttl">作者</dt><dd class="informationList__txt"><a href="/x"></a></dd>"#;
+        assert_eq!(parse_product_page(empty).author, None);
     }
 
     /// 実機プローブ: `UreqTransport` 経由で CDN ダウンロードが 200 になるか確認する。

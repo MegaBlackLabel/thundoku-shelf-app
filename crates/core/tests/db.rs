@@ -682,6 +682,180 @@ fn bookshelf_update_tags_writes_tags_json() {
 }
 
 #[test]
+fn bookshelf_update_author_writes_author_for_matching_item() {
+    let pool = memory_db();
+    let item = bookshelf::BookshelfItem {
+        site_id: "fanza".into(),
+        database_id: "d_818290".into(),
+        title: "本".into(),
+        circle_name: "横島んち。".into(),
+        author: String::new(),
+        thumbnail_url: None,
+        format: "ZIP".into(),
+        caused_at: None,
+        event_name: None,
+        event_slug: None,
+        event_id: None,
+        file_name: None,
+        download_url: None,
+        is_downloadable: 1,
+        is_checked: 0,
+        is_purchased: 1,
+        is_new: 0,
+        is_active: 1,
+        is_favorite: 0,
+        is_hidden: 0,
+        hidden_at: None,
+        tags_json: None,
+        synced_at: "2026-08-21 00:00:00".into(),
+        created_at: "2026-08-21 00:00:00".into(),
+        updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
+    };
+    bookshelf::upsert(&pool, &item).unwrap();
+    bookshelf::update_author(&pool, "fanza", "d_818290", "Ash横島").unwrap();
+    let list = bookshelf::list(&pool, "fanza").unwrap();
+    assert_eq!(list[0].author, "Ash横島");
+    // site_id / database_id が一致しない行には書き込まれない
+    bookshelf::update_author(&pool, "other-site", "d_818290", "x").unwrap();
+    bookshelf::update_author(&pool, "fanza", "d_999", "y").unwrap();
+    let list = bookshelf::list(&pool, "fanza").unwrap();
+    assert_eq!(list[0].author, "Ash横島");
+}
+
+/// 同期（`save_purchases`）はジャンル・作者を持たない `None` / `""` で upsert する。
+/// そのとき、ダウンロード時に取得して保存したローカル値（tags_json / author）を
+/// 消してはいけない。一方で同期が値を提供したときは更新する。
+#[test]
+fn bookshelf_upsert_preserves_local_tags_and_author() {
+    let pool = memory_db();
+    let mk = |author: &str, tags: Option<&str>| bookshelf::BookshelfItem {
+        site_id: "fanza".into(),
+        database_id: "d_818290".into(),
+        title: "本".into(),
+        circle_name: "横島んち。".into(),
+        author: author.into(),
+        thumbnail_url: None,
+        format: "ZIP".into(),
+        caused_at: None,
+        event_name: None,
+        event_slug: None,
+        event_id: None,
+        file_name: None,
+        download_url: None,
+        is_downloadable: 1,
+        is_checked: 0,
+        is_purchased: 1,
+        is_new: 0,
+        is_active: 1,
+        is_favorite: 0,
+        is_hidden: 0,
+        hidden_at: None,
+        tags_json: tags.map(String::from),
+        synced_at: "2026-08-21 00:00:00".into(),
+        created_at: "2026-08-21 00:00:00".into(),
+        updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
+    };
+
+    bookshelf::upsert(&pool, &mk("", None)).unwrap();
+    // ダウンロード時に取得したジャンル（作品ページ）と作者を保存
+    bookshelf::update_tags(&pool, "fanza", "d_818290", &["拘束".into(), "触手".into()]).unwrap();
+    bookshelf::update_author(&pool, "fanza", "d_818290", "Ash横島").unwrap();
+
+    // 同期と同じく「値なし」で upsert してもローカル値を消さない
+    bookshelf::upsert(&pool, &mk("", None)).unwrap();
+    let list = bookshelf::list(&pool, "fanza").unwrap();
+    assert_eq!(
+        bookshelf::tags_of(&list[0]),
+        vec!["拘束", "触手"],
+        "同期でジャンルが消えないこと"
+    );
+    assert_eq!(list[0].author, "Ash横島", "同期で作者が消えないこと");
+
+    // 同期が値を提供したときは更新する
+    bookshelf::upsert(&pool, &mk("別の作者", Some(r#"["新しいタグ"]"#))).unwrap();
+    let list = bookshelf::list(&pool, "fanza").unwrap();
+    assert_eq!(bookshelf::tags_of(&list[0]), vec!["新しいタグ"]);
+    assert_eq!(list[0].author, "別の作者");
+}
+
+/// 同期の upsert はユーザーのローカル状態（お気に入り / 非表示）も上書きしない。
+/// `save_purchases` は `is_favorite: 0` / `is_hidden: 0` を送ってくるため、
+/// これらを DO UPDATE に含めると同期のたびに解除されてしまう。
+#[test]
+fn bookshelf_upsert_preserves_local_favorite_and_hidden() {
+    let pool = memory_db();
+    let mk = |favorite: i64, hidden: i64, hidden_at: Option<&str>| bookshelf::BookshelfItem {
+        site_id: "fanza".into(),
+        database_id: "d_818290".into(),
+        title: "本".into(),
+        circle_name: "横島んち。".into(),
+        author: String::new(),
+        thumbnail_url: None,
+        format: "ZIP".into(),
+        caused_at: None,
+        event_name: None,
+        event_slug: None,
+        event_id: None,
+        file_name: None,
+        download_url: None,
+        is_downloadable: 1,
+        is_checked: 0,
+        is_purchased: 1,
+        is_new: 0,
+        is_active: 1,
+        is_favorite: favorite,
+        is_hidden: hidden,
+        hidden_at: hidden_at.map(String::from),
+        tags_json: None,
+        synced_at: "2026-08-21 00:00:00".into(),
+        created_at: "2026-08-21 00:00:00".into(),
+        updated_at: "2026-08-21 00:00:00".into(),
+        media_category: None,
+        ai_type: None,
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
+    };
+
+    bookshelf::upsert(&pool, &mk(1, 1, Some("2026-09-01 00:00:00"))).unwrap();
+    // 同期と同じく 0 / None で upsert してもローカル状態を消さない
+    bookshelf::upsert(&pool, &mk(0, 0, None)).unwrap();
+    let list = bookshelf::list(&pool, "fanza").unwrap();
+    assert_eq!(list[0].is_favorite, 1, "同期でお気に入りが解除されないこと");
+    assert_eq!(list[0].is_hidden, 1, "同期で非表示が解除されないこと");
+    assert_eq!(
+        list[0].hidden_at.as_deref(),
+        Some("2026-09-01 00:00:00"),
+        "非表示日時も保持されること"
+    );
+}
+
+#[test]
 fn checklist_events_items_and_toggle() {
     let pool = memory_db();
     let event = checklist::TbfEvent {

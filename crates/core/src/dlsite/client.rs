@@ -209,6 +209,15 @@ impl DlsiteClient {
         Ok(out)
     }
 
+    /// 作品ページ（`/maniax/work/=/product_id/{id}.html`）の「作者」行を取得する。
+    /// DLsite は store を跨いでも作品ページが解決されるため maniax 固定でよい
+    /// （`product_info` も maniax 固定）。作者行が無い作品は `None`。
+    pub fn work_page_author(&mut self, content_id: &str) -> Result<Option<String>, DlsiteError> {
+        let url = format!("https://www.dlsite.com/maniax/work/=/product_id/{content_id}.html");
+        let html = self.get_html(&url)?;
+        Ok(parse_work_page_author(&html))
+    }
+
     /// `down_url` を 302 追跡して `download.dlsite.com` の実 ZIP を取得する。
     /// 302 の Set-Cookie で `jwt` を捕捉し、CDN へ直接（署名 Cookie 付き）取得する。
     pub fn download_with_progress(
@@ -375,6 +384,15 @@ fn parse_row(s: &str) -> Option<DlsitePurchase> {
     })
 }
 
+/// 作品ページ HTML の「作者」行（`<th>作者</th>` の直後の `<a>` テキスト）を抽出する。
+/// 実機 HTML（2026-09-11 / RJ01412386）で検証済み。行が無い / 空の作品は `None`。
+pub fn parse_work_page_author(html: &str) -> Option<String> {
+    let re = regex::Regex::new(r"(?s)<th>\s*作者\s*</th>.*?<a[^>]*>\s*([^<]*?)\s*</a>").ok()?;
+    re.captures(html)
+        .map(|cap| cap[1].trim().to_string())
+        .filter(|author| !author.is_empty())
+}
+
 /// 作品ページ HTML の `product/info/ajax` レスポンス（JSON）を解析する。
 pub fn parse_product_info(json: &str) -> HashMap<String, DlsiteWorkMeta> {
     let v: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
@@ -493,6 +511,27 @@ mod tests {
         assert!(rows[0].thumbnail_url.as_deref().unwrap().ends_with("RJ01234567_img_main_240x240.webp"));
         assert_eq!(rows[1].work_type, "ICG");
         assert_eq!(last, Some(3));
+    }
+
+    /// 作品ページ HTML の「作者」行を抽出する（実機 HTML 2026-09-11 / RJ01412386 と同じ整形）。
+    #[test]
+    fn parse_work_page_author_extracts_author() {
+        let html = r#"<table cellspacing="0" id="work_outline">
+    <tr>
+    <th>販売日</th>
+    <td><a href="/x">2025年06月17日</a></td>  </tr>
+
+<tr>
+  <th>作者</th>
+    <td>
+          <a
+                  href="https://www.dlsite.com/home/fsr/=/keyword_creater/%22%E3%81%A8%E3%81%A8%E3%81%AD%E3%82%8D%22/ana_flg/all"
+              >ととねろ</a>        </td>
+</tr>
+</table>"#;
+        assert_eq!(parse_work_page_author(html).as_deref(), Some("ととねろ"));
+        // 作者行が無い作品は None
+        assert_eq!(parse_work_page_author("<table></table>"), None);
     }
 
     /// `product/info/ajax` JSON をフィールドへマップする。

@@ -53,6 +53,11 @@ const COLUMNS: &str = "site_id, database_id, title, circle_name, author, thumbna
      description, theme, maker_id, page_count, age_rating, series_name";
 
 /// Upsert by (site_id, database_id).
+///
+/// 同期（`save_purchases` 等）は作品ページ由来の値を持たないため、
+/// `tags_json = None` / `author = ""` を送ってくる。これを素通しすると
+/// ダウンロード時に取得したジャンル・作者が消えるので、値が無いときは
+/// 既存値を保持する（`is_favorite` / `is_hidden` と同じ扱い）。
 pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query(&format!(
@@ -78,7 +83,11 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
                is_active = excluded.is_active,
                is_hidden = bookshelf_items.is_hidden,
                hidden_at = bookshelf_items.hidden_at,
-               tags_json = excluded.tags_json,
+               tags_json = COALESCE(excluded.tags_json, bookshelf_items.tags_json),
+               author = CASE
+                 WHEN excluded.author = '' THEN bookshelf_items.author
+                 ELSE excluded.author
+               END,
                synced_at = excluded.synced_at,
                updated_at = excluded.updated_at,
                media_category = excluded.media_category,
@@ -193,6 +202,27 @@ pub fn update_tags(
              WHERE site_id = ?2 AND database_id = ?3",
         )
         .bind(json)
+        .bind(site_id)
+        .bind(database_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+}
+
+/// Set the author name of a bookshelf item（取得元 = サイトの作品ページ）。
+pub fn update_author(
+    pool: &SqlitePool,
+    site_id: &str,
+    database_id: &str,
+    author: &str,
+) -> Result<(), sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query(
+            "UPDATE bookshelf_items SET author = ?1, updated_at = CURRENT_TIMESTAMP \
+             WHERE site_id = ?2 AND database_id = ?3",
+        )
+        .bind(author)
         .bind(site_id)
         .bind(database_id)
         .execute(pool)

@@ -42,6 +42,31 @@ pub enum ReadFilter {
     Favorite,
 }
 
+/// サークル名 / 作者名リンクの種別（表示ラベルと絞り込み対象）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntityLink {
+    Circle,
+    Author,
+}
+
+impl EntityLink {
+    /// リンクの手前のラベル（値だけに下線を引くため、ラベルと分離する）。
+    fn prefix(self) -> &'static str {
+        match self {
+            EntityLink::Circle => "サークル:",
+            EntityLink::Author => "作者:",
+        }
+    }
+
+    /// カード内で一意になる要素 id（クリック判定・テストからの検索に使う）。
+    fn element_id(self, database_id: &str) -> String {
+        match self {
+            EntityLink::Circle => format!("circle-link-{database_id}"),
+            EntityLink::Author => format!("author-link-{database_id}"),
+        }
+    }
+}
+
 /// 本棚の表示モード（Web の viewMode 相当）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ViewMode {
@@ -108,6 +133,10 @@ pub struct BookshelfView {
     available_events: Vec<String>,
     /// サイトフィルタ（None = すべての本、Some(site_id) = そのサイトのみ）
     site_filter: Option<String>,
+    /// サークル名での絞り込み（None = なし）。カードのサークル名クリックで設定
+    circle_filter: Option<String>,
+    /// 作者名での絞り込み（None = なし）。カードの作者名クリックで設定
+    author_filter: Option<String>,
     /// インラインタグ編集中の本（Web の TagList 編集モード相当）
     editing_book_id: Option<String>,
     /// 編集中の本のサイト id（FANZA ジャンル再取得ボタン/保存先の判定用）
@@ -374,6 +403,8 @@ impl BookshelfView {
             all_tags: Vec::new(),
             selected_events: Vec::new(),
             site_filter: Self::read_site_filter(cx),
+            circle_filter: None,
+            author_filter: None,
             available_events: Vec::new(),
             editing_book_id: None,
             editing_site_id: None,
@@ -1164,6 +1195,16 @@ impl BookshelfView {
                 return false;
             }
         }
+        if let Some(circle) = &self.circle_filter
+            && shelf.circle_name != *circle
+        {
+            return false;
+        }
+        if let Some(author) = &self.author_filter
+            && shelf.author != *author
+        {
+            return false;
+        }
         match self.read_filter {
             ReadFilter::All => true,
             ReadFilter::Unread => !card.local.as_ref().is_some_and(|e| e.is_read),
@@ -1689,6 +1730,8 @@ impl BookshelfView {
                 //   Location（署名付き S3 URL）を自動追跡してファイル本体を取得
                 // - 技術書典: GraphQL の downloadURL を resolve して取得
                 let mut genre_tags: Vec<String> = Vec::new();
+                // 作者（作品ページから取得。FANZA / DLsite のみ）
+                let mut site_author: Option<String> = None;
                 let bytes = if site_id == "booth" {
                     let session =
                         booth_session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
@@ -1726,11 +1769,11 @@ impl BookshelfView {
                     let url = detail
                         .download_link
                         .ok_or_else(|| "FANZA ダウンロード URL がありません".to_string())?;
-                    // ジャンルタグ（作品ページから。取得失敗してもダウンロードは続行）
-                    genre_tags = client
-                        .product_page(&product_id)
-                        .map(|p| p.genre_tags)
-                        .unwrap_or_default();
+                    // ジャンルタグと作者（作品ページから。取得失敗してもダウンロードは続行）
+                    if let Ok(page) = client.product_page(&product_id) {
+                        genre_tags = page.genre_tags;
+                        site_author = page.author;
+                    }
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
@@ -1767,6 +1810,8 @@ impl BookshelfView {
                                 .ok_or_else(|| "DLsite ダウンロード URL がありません".to_string())?
                         }
                     };
+                    // 作者（作品ページから。取得失敗してもダウンロードは続行）
+                    site_author = client.work_page_author(&product_id).unwrap_or_default();
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
@@ -1996,10 +2041,15 @@ impl BookshelfView {
                                 &db,
                                 &imported.book.id,
                                 &item.title,
-                                "",
+                                site_author.as_deref().unwrap_or(""),
                                 &item.circle_name,
                                 item.caused_at.clone(),
                             );
+                            // カードの「作者:」絞り込み用に本棚アイテムへも書く
+                            if let Some(author) = site_author.as_deref() {
+                                let _ =
+                                    bookshelf::update_author(&db, "fanza", &product_id, author);
+                            }
                             // サイトから取得したジャンルタグを book_tags に保存する
                             if !genre_tags.is_empty() {
                                 let pairs: Vec<(&str, &str)> = genre_tags
@@ -2021,10 +2071,15 @@ impl BookshelfView {
                                 &db,
                                 &imported.book.id,
                                 &item.title,
-                                "",
+                                site_author.as_deref().unwrap_or(""),
                                 &item.circle_name,
                                 item.caused_at.clone(),
                             );
+                            // カードの「作者:」絞り込み用に本棚アイテムへも書く
+                            if let Some(author) = site_author.as_deref() {
+                                let _ =
+                                    bookshelf::update_author(&db, "dlsite", &product_id, author);
+                            }
                             let _ = books::set_source_metadata(
                                 &db,
                                 &imported.book.id,
@@ -2373,6 +2428,72 @@ impl BookshelfView {
             self.selected_tags.retain(|t| t != tag);
         } else {
             self.selected_tags.push(tag.to_string());
+        }
+        self.filtered_dirty = true;
+        cx.notify();
+    }
+
+    /// サークル名リンクのクリック: そのサークルで絞り込む（同じ値の再クリックで解除）。
+    fn toggle_circle_filter(&mut self, cx: &mut Context<Self>, circle: &str) {
+        if self.circle_filter.as_deref() == Some(circle) {
+            self.circle_filter = None;
+        } else {
+            self.circle_filter = Some(circle.to_string());
+        }
+        self.filtered_dirty = true;
+        cx.notify();
+    }
+
+    /// 作者名リンクのクリック: その作者で絞り込む（同じ値の再クリックで解除）。
+    fn toggle_author_filter(&mut self, cx: &mut Context<Self>, author: &str) {
+        if self.author_filter.as_deref() == Some(author) {
+            self.author_filter = None;
+        } else {
+            self.author_filter = Some(author.to_string());
+        }
+        self.filtered_dirty = true;
+        cx.notify();
+    }
+
+    /// いずれかの絞り込み（サイト / 検索 / イベント / タグ / サークル / 作者 / 既読モード）が
+    /// 効いているか。全項目ボタンの「絞込中」表示に使う。
+    fn is_filtering(&self, cx: &App) -> bool {
+        self.site_filter.is_some()
+            || self.current_search(cx).is_some()
+            || !self.selected_events.is_empty()
+            || !self.selected_tags.is_empty()
+            || self.circle_filter.is_some()
+            || self.author_filter.is_some()
+            || self.read_filter != ReadFilter::All
+    }
+
+    /// 全項目ボタンのラベル。絞り込み中は「絞込中」。
+    fn filter_all_label(&self, cx: &App) -> &'static str {
+        if self.is_filtering(cx) {
+            "絞込中"
+        } else {
+            "全項目"
+        }
+    }
+
+    /// 全項目ボタン: すべての絞り込みを解除して全件表示に戻す。
+    fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.circle_filter = None;
+        self.author_filter = None;
+        self.selected_tags.clear();
+        self.selected_events.clear();
+        self.read_filter = ReadFilter::All;
+        if let Some(state) = self.search_state.clone() {
+            state.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        if self.site_filter.is_some() {
+            self.site_filter = None;
+            // 次回起動時の復元用に「すべての本」も保存する
+            let _ = db::settings::set(
+                &Self::app_state(cx).db_pool,
+                "bookshelf.site_filter",
+                "all",
+            );
         }
         self.filtered_dirty = true;
         cx.notify();
@@ -3026,26 +3147,21 @@ impl BookshelfView {
                                 _ => event_text.clone(),
                             }),
                     )
-                    // サークル名（非空のときだけ表示）
-                    .child(if !circle_name.is_empty() {
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("サークル: {circle_name}"))
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
-                    // 作者名（BOOTH 等。空でなければ表示。技術書典は author が空なので出ない）
-                    .child(if !author.is_empty() {
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("作者: {author}"))
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
+                    // サークル名 / 作者名（下線リンク。クリックでその値に絞り込む）
+                    .child(BookshelfView::render_entity_link(
+                        theme,
+                        &handle,
+                        EntityLink::Circle,
+                        &circle_name,
+                        &database_id,
+                    ))
+                    .child(BookshelfView::render_entity_link(
+                        theme,
+                        &handle,
+                        EntityLink::Author,
+                        &author,
+                        &database_id,
+                    ))
                     .child(match progress_text.as_deref() {
                         Some(text) => div()
                             .text_xs()
@@ -3145,6 +3261,51 @@ impl BookshelfView {
                 menu
             }
         })
+    }
+
+    /// サークル名 / 作者名のリンク行。
+    /// ラベル（`サークル:` / `作者:`）は下線もクリックもせず、**値だけ**をリンクにする。
+    fn render_entity_link(
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
+        kind: EntityLink,
+        value: &str,
+        database_id: &str,
+    ) -> gpui_kit::AnyElement {
+        if value.is_empty() {
+            return div().into_any_element();
+        }
+        let value = value.to_string();
+        let selector = kind.element_id(database_id);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_0p5()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(kind.prefix())
+            .child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .underline()
+                    .cursor_pointer()
+                    .on_click({
+                        let handle = handle.clone();
+                        let value = value.clone();
+                        move |_, _, cx| {
+                            // カード / 行のクリック（開く・ダウンロード）を発火させない
+                            cx.stop_propagation();
+                            handle.update(cx, |this, cx| match kind {
+                                EntityLink::Circle => this.toggle_circle_filter(cx, &value),
+                                EntityLink::Author => this.toggle_author_filter(cx, &value),
+                            });
+                        }
+                    })
+                    .child(value),
+            )
+            .into_any_element()
     }
 
     /// タグチップ行（Web の TagList 相当: お気に入りは ♥ + ピンク）。
@@ -3702,26 +3863,21 @@ impl BookshelfView {
                             _ => event_text.clone(),
                         }),
                 )
-                // サークル名（非空のときだけ表示）
-                .child(if !circle_name.is_empty() {
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("サークル: {circle_name}"))
-                        .into_any_element()
-                } else {
-                    div().into_any_element()
-                })
-                // 作者名（BOOTH 等。空でなければ表示。技術書典は author が空なので出ない）
-                .child(if !author.is_empty() {
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("作者: {author}"))
-                        .into_any_element()
-                } else {
-                    div().into_any_element()
-                })
+                // サークル名 / 作者名（下線リンク。クリックでその値に絞り込む）
+                .child(BookshelfView::render_entity_link(
+                    cx.theme(),
+                    &handle,
+                    EntityLink::Circle,
+                    &circle_name,
+                    &database_id,
+                ))
+                .child(BookshelfView::render_entity_link(
+                    cx.theme(),
+                    &handle,
+                    EntityLink::Author,
+                    &author,
+                    &database_id,
+                ))
                 .child(match progress_text.as_deref() {
                     Some(text) => div()
                         .text_xs()
@@ -3988,20 +4144,31 @@ impl Render for BookshelfView {
                                     .child(format!("{visible_count}件")),
                             )
                             .child(
-                                {
-                                    let mut button = Button::new("filter-all").cursor_pointer().label("全項目");
-                                    if read_filter == ReadFilter::All {
-                                        button = button.primary();
-                                    }
-                                    button
-                                }.cursor_pointer().on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| {
-                                            this.set_read_filter(cx, ReadFilter::All)
-                                        });
-                                    }
-                                }),
+                                div()
+                                    .id("filter-all-btn")
+                                    .debug_selector(|| "filter-all-btn".into())
+                                    .cursor_pointer()
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.clear_filters(window, cx)
+                                            });
+                                        }
+                                    })
+                                    .child({
+                                        let mut button = Button::new("filter-all")
+                                            .cursor_pointer()
+                                            .label(self.filter_all_label(cx));
+                                        // 絞り込み中は「絞り込みしてます」を表す警告色、
+                                        // 未絞り込み（= 全項目が選択中）は選択色
+                                        button = if self.is_filtering(cx) {
+                                            button.warning()
+                                        } else {
+                                            button.primary()
+                                        };
+                                        button
+                                    }),
                             )
                             .child(
                                 {
@@ -5128,6 +5295,61 @@ mod tests {
                     circle_name: circle.into(),
                     author: String::new(),
                     thumbnail_url: thumbnail_url.map(String::from),
+                    format: "PDF".into(),
+                    caused_at: None,
+                    event_name: None,
+                    event_slug: None,
+                    event_id: None,
+                    file_name: None,
+                    download_url: None,
+                    is_downloadable: 1,
+                    is_checked: 0,
+                    is_purchased: 1,
+                    is_new: 0,
+                    is_active: 1,
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    hidden_at: None,
+                    tags_json: None,
+                    synced_at: "2026-08-21 00:00:00".into(),
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    /// 作者名つきの本棚アイテムを seed する（作者絞り込みテスト用）。
+    fn seed_shelf_item_with_author(
+        cx: &mut TestAppContext,
+        database_id: &str,
+        title: &str,
+        circle: &str,
+        author: &str,
+    ) {
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let db = &state.db_pool;
+            bookshelf::upsert(
+                db,
+                &bookshelf::BookshelfItem {
+                    site_id: "booth".into(),
+                    database_id: database_id.into(),
+                    title: title.into(),
+                    circle_name: circle.into(),
+                    author: author.into(),
+                    thumbnail_url: None,
                     format: "PDF".into(),
                     caused_at: None,
                     event_name: None,
@@ -6462,6 +6684,162 @@ mod tests {
                 .selected_tags
                 .contains(&"react".to_string())),
             "clicking the selected tag chip must deselect it"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn clicking_circle_link_filters_and_all_button_clears(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルB", None);
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        // サークル名リンクをクリック → そのサークルの本だけになる
+        let link = visual
+            .debug_bounds("circle-link-db-1")
+            .expect("circle link rendered");
+        visual.simulate_click(link.center(), gpui_kit::Modifiers::default());
+        let visible = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(visible, vec!["db-1".to_string()], "サークル絞り込みが効く");
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "絞込中",
+            "絞り込み中は全項目ボタンが絞込中になる"
+        );
+
+        // 全項目ボタン → 絞り込み解除で全件に戻る
+        let all = visual
+            .debug_bounds("filter-all-btn")
+            .expect("filter-all button rendered");
+        visual.simulate_click(all.center(), gpui_kit::Modifiers::default());
+        let visible = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            visible,
+            vec!["db-1".to_string(), "db-2".to_string()],
+            "全項目で解除される"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "全項目"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn clicking_author_link_filters_by_author(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item_with_author(cx, "db-1", "本1", "サークルA", "作者X");
+        seed_shelf_item_with_author(cx, "db-2", "本2", "サークルB", "作者Y");
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        let link = visual
+            .debug_bounds("author-link-db-1")
+            .expect("author link rendered");
+        visual.simulate_click(link.center(), gpui_kit::Modifiers::default());
+        let visible = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(visible, vec!["db-1".to_string()], "作者絞り込みが効く");
+
+        // 同じリンクの再クリックで解除
+        visual.simulate_click(link.center(), gpui_kit::Modifiers::default());
+        let visible = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(visible.len(), 2, "再クリックで解除される");
+    }
+
+    #[gpui_kit::test]
+    async fn all_filter_button_shows_refining_and_clears_tag_filter(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本1", "サークルA");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::tags::set_for_book(db, "b1", &[("react", "manual")]).unwrap();
+            db::tags::set_favorite(db, "react", true).unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| this.toggle_tag(cx, "react"));
+        });
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "絞込中",
+            "タグ絞り込み中も絞込中になる"
+        );
+
+        let all = visual
+            .debug_bounds("filter-all-btn")
+            .expect("filter-all button rendered");
+        visual.simulate_click(all.center(), gpui_kit::Modifiers::default());
+        assert!(
+            view.read_with(cx, |this, _| this.selected_tags.is_empty()),
+            "全項目でタグ絞り込みが解除される"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "全項目"
         );
     }
 
