@@ -1104,6 +1104,7 @@ impl ImageViewer {
                     let is_current = index == current_page;
                     div()
                         .id(SharedString::from(format!("viewer-thumb-{index}")))
+                        .debug_selector(move || format!("viewer-thumb-{index}"))
                         .flex()
                         .flex_col()
                         .items_center()
@@ -3596,6 +3597,11 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // 可視行のタイルが実際に描画されている（仮想化しても中身が出る）
+        assert!(
+            visual.debug_bounds("viewer-thumb-0").is_some(),
+            "先頭のタイルが描画されること"
+        );
         let loaded = view.read_with(cx, |v, _| {
             v.thumbs.iter().filter(|thumb| thumb.is_some()).count()
         });
