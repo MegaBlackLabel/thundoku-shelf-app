@@ -400,6 +400,17 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
     `bookshelf_upsert_preserves_local_favorite_and_hidden`
   - ⚠ 既に消えたジャンルは FANZA は「再取得」、DLsite は次回同期で復活する
 
+- [x] **リスト表示のサムネイルが切り取られる・スクロールできない（バグ）**（修正済み）
+  - **スクロール**: リストのスクロール領域に高さ制約が無く、内容高さ（実測 3677px）まで
+    伸びて `overflow_y_scroll` が効かなかった → `h_full` + `min_h_0` を付与
+  - **サムネイル**: 表示エリアを**全行一定の 3:2** にし、画像は**エリアに対する実寸（%）を
+    明示計算**して比率を保って収める。`object_fit` 任せだと要素サイズが効かず原寸で描画され、
+    `overflow_hidden` で切り取られることがあった。縦長は左右に余白、横長は下に余白が出ない
+    （実データ: 縦長 0.7 が 609 件中 310 件・FANZA 1.42 が 245 件）。エリアの高さは行の高さに一致
+  - 回帰テスト: `list_view_scroll_area_is_bounded_by_viewport` /
+    `list_thumbnail_fills_row_height` / `portrait_cover_is_letterboxed_not_cropped` /
+    `list_cover_area_fits_widest_common_cover`
+
 - [x] **閲覧情報を 1 ページ毎の閲覧回数・時間も記録する**（実装済み）
   - 現在の `view_history` は `id, book_id, started_at, ended_at` のみで、書籍単位の
     閲覧セッション（開始・終了時刻）しか記録していない
