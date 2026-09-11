@@ -10,7 +10,6 @@ use gpui_kit::component::animation::ease_out_cubic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _};
 use gpui_kit::component::{Icon, IconName};
@@ -38,6 +37,19 @@ const OVERLAY_HIDE_MS: u64 = 5000;
 /// ウィンドウカスタムタイトルバーの高さ（px）。リーダーはタイトルバーを残すため、
 /// 画像のフィット計算でウィンドウ全体の高さから差し引く（Windows のみ。Mac は 0）。
 #[cfg(windows)]
+/// ページ一覧に出すサムネイルの幅（px）。表示用のフル解像度ページとは別に持つ。
+const PAGE_THUMB_WIDTH: f32 = 200.0;
+/// ページ一覧で同時に保持するサムネイル数（超えたら古い順に捨てる）。
+/// 1 枚 ≒ 0.2MB なので 120 枚で 24MB 程度に収まる。
+const MAX_PAGE_THUMBS: usize = 120;
+/// ページ一覧のタイル幅 + gap（列数の計算に使う）。
+const PAGE_TILE_WIDTH: f32 = 108.0;
+/// ページ一覧の高さ（トップバー下に出るパネル）。
+const PAGE_LIST_HEIGHT: f32 = 420.0;
+/// ページ一覧の 1 行の高さ（固定）。`measure_all` は全行を測定のために構築するため
+/// 使わない（行の構築でサムネイル読み込みを起こすので、全ページ読んでしまう）。
+const PAGE_LIST_ROW_HEIGHT: f32 = 196.0;
+
 const WIN_TITLE_BAR_HEIGHT: f32 = 36.0;
 #[cfg(not(windows))]
 const WIN_TITLE_BAR_HEIGHT: f32 = 0.0;
@@ -48,6 +60,39 @@ pub trait PageLoader: Send + Sync + 'static {
     fn page_size(&self, index: usize) -> Option<(u32, u32)>;
     /// Blocking decode; called on the background executor.
     fn load(&self, index: usize) -> Result<Arc<RenderImage>, String>;
+
+    /// ページ一覧に出すサムネイル。既定は [`Self::load`] の結果を縮小する。
+    ///
+    /// ページ一覧は全ページ分を保持しうるため、フル解像度（実測 1 ページ 45MB）を
+    /// 貯めない経路を必ず通す（`PAGE_THUMB_WIDTH`）。
+    fn load_thumb(&self, index: usize) -> Result<Arc<RenderImage>, String> {
+        let image = self.load(index)?;
+        Ok(downscale_render_image(&image, PAGE_THUMB_WIDTH))
+    }
+}
+
+/// RenderImage（BGRA のまま）を幅 `max_width` に縮小した新しい RenderImage を返す。
+/// チャンネル順は触らない（縮小は色に依存しない）。すでに小さければそのまま返す。
+fn downscale_render_image(image: &Arc<RenderImage>, max_width: f32) -> Arc<RenderImage> {
+    let size = image.size(0);
+    let (width, height) = (size.width.0.max(1) as u32, size.height.0.max(1) as u32);
+    if width as f32 <= max_width {
+        return image.clone();
+    }
+    let Some(bytes) = image.as_bytes(0) else {
+        return image.clone();
+    };
+    let Some(source) = image::RgbaImage::from_raw(width, height, bytes.to_vec()) else {
+        return image.clone();
+    };
+    let scale = max_width / width as f32;
+    let resized = image::imageops::resize(
+        &source,
+        ((width as f32 * scale).max(1.0)) as u32,
+        ((height as f32 * scale).max(1.0)) as u32,
+        image::imageops::FilterType::Triangle,
+    );
+    Arc::new(RenderImage::new([image::Frame::new(resized)]))
 }
 
 /// ページ一覧に出すコンテンツ 1 行（UI 表示用）。
@@ -326,6 +371,14 @@ pub struct ImageViewer {
     last_zoom_toggle: Option<std::time::Instant>,
     active_panel: Option<PanelView>,
     page_input: Option<Entity<InputState>>,
+    /// ページ一覧のサムネイル（**縮小**して保持。表示用の `images` とは別）。
+    /// ページ一覧を開いてもフル解像度ページを貯めないための分離（R6）。
+    thumbs: Vec<Option<Arc<RenderImage>>>,
+    thumbs_loading: std::collections::HashSet<usize>,
+    /// サムネイルを読み込んだ順（古い順に捨てて保持数を有界にする）。
+    thumb_order: std::collections::VecDeque<usize>,
+    /// ページ一覧の仮想化（可視行のみ構築・読み込み）。
+    page_list_state: gpui_kit::ListState,
     /// 名前を編集中のコンテンツ id（空 = 編集していない）。
     renaming_content: Option<String>,
     /// 名前入力（メニューの切替行にインライン表示する。1 つを使い回す）。
@@ -455,6 +508,7 @@ impl ImageViewer {
             pending_action: None,
             load_error: None,
             images: (0..page_count).map(|_| None).collect(),
+            thumbs: (0..page_count).map(|_| None).collect(),
             overlay_visible: true,
             hovering_ui: false,
             hide_generation: 0,
@@ -472,6 +526,13 @@ impl ImageViewer {
             last_zoom_toggle: None,
             active_panel: None,
             page_input: None,
+            thumbs_loading: std::collections::HashSet::new(),
+            thumb_order: std::collections::VecDeque::new(),
+            page_list_state: gpui_kit::ListState::new(
+                0,
+                gpui_kit::ListAlignment::Top,
+                gpui_kit::px(PAGE_LIST_ROW_HEIGHT),
+            ),
             renaming_content: None,
             rename_input: None,
             _rename_subscription: None,
@@ -534,6 +595,9 @@ impl ImageViewer {
         self.loader = loader;
         self.images = (0..page_count).map(|_| None).collect();
         self.loading.clear();
+        self.thumbs = (0..page_count).map(|_| None).collect();
+        self.thumbs_loading.clear();
+        self.thumb_order.clear();
         self.current_page = initial_page.min(page_count.saturating_sub(1));
         self.scroll_top_initialized = false;
         self.last_scroll_page = self.current_page;
@@ -560,7 +624,6 @@ impl ImageViewer {
             self.ensure_loaded(cx, next);
         }
         // ページ一覧を開いたまま切り替えた場合はサムネイルを読み直す
-        self.load_page_list_thumbnails(cx);
         cx.notify();
     }
 
@@ -668,7 +731,6 @@ impl ImageViewer {
     /// ページ一覧を開く（サムネイル。切替行はトップバーのメニュー側に出す）。
     pub fn open_page_list(&mut self, cx: &mut Context<Self>) {
         self.active_panel = Some(PanelView::PageList);
-        self.load_page_list_thumbnails(cx);
         self.restart_hide_timer(cx);
         cx.notify();
     }
@@ -697,13 +759,57 @@ impl ImageViewer {
         cx.notify();
     }
 
-    /// サムネイルを読み込む（ページ一覧を開いている間だけ）。
-    fn load_page_list_thumbnails(&mut self, cx: &mut Context<Self>) {
-        if self.active_panel != Some(PanelView::PageList) {
+    /// ページ一覧のサムネイルを（必要なら）読み込む。
+    ///
+    /// ページ一覧は行単位で仮想化されていて、**可視行のタイルだけ**がこれを呼ぶ。
+    /// 以前はページ一覧を開いた時点で全ページのフル解像度画像を読んでいたため、
+    /// 実測で 192 ページ本 = 142 秒 / 8.7GB、3,321 ページ本 = 41 分 / 146GB 相当に
+    /// なっていた（R6）。サムネイルは縮小して保持し、保持数も上限を設ける。
+    fn ensure_thumb_loaded(&mut self, cx: &mut Context<Self>, index: usize) {
+        if index >= self.thumbs.len()
+            || self.thumbs[index].is_some()
+            || self.thumbs_loading.contains(&index)
+        {
             return;
         }
-        for index in 0..self.loader.page_count() {
-            self.ensure_loaded(cx, index);
+        self.thumbs_loading.insert(index);
+        let loader = self.loader.clone();
+        let handle = cx.entity();
+        let task = cx
+            .background_executor()
+            .spawn(async move { loader.load_thumb(index) });
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle.update(cx, |this, cx| {
+                this.thumbs_loading.remove(&index);
+                if index < this.thumbs.len() {
+                    match result {
+                        Ok(image) => {
+                            this.thumbs[index] = Some(image);
+                            this.thumb_order.push_back(index);
+                            this.evict_thumbs();
+                        }
+                        // 壊れたページ 1 枚でページ一覧全体を止めない（枠だけ出す）
+                        Err(error) => {
+                            log::warn!("ページ {index} のサムネイルを読めません: {error}")
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// サムネイルの保持数を上限に収める（読み込んだ順に古いものから捨てる）。
+    fn evict_thumbs(&mut self) {
+        while self.thumb_order.len() > MAX_PAGE_THUMBS {
+            let Some(oldest) = self.thumb_order.pop_front() else {
+                break;
+            };
+            if let Some(slot) = self.thumbs.get_mut(oldest) {
+                *slot = None;
+            }
         }
     }
 
@@ -950,74 +1056,108 @@ impl ImageViewer {
     }
 
     /// ページ一覧パネル: サムネイルグリッド（切替はトップバーのメニュー側）。
+    ///
+    /// **仮想化**: 行単位の `List` で可視行だけを構築し、サムネイルも可視行だけ読む。
+    /// 全ページを一度に構築・読み込みすると肥大作品（数千ページ）で破綻するため（R6）。
     fn page_list_panel(
         &self,
         handle: &Entity<ImageViewer>,
         total: usize,
+        panel_width: f32,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let grid = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap_2()
-            .p_3()
-            .children((0..total).map(|index| {
-                let handle = handle.clone();
-                let image = self.images.get(index).cloned().flatten();
-                let is_current = index == self.current_page;
-                div()
-                    .id(SharedString::from(format!("viewer-thumb-{index}")))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_1()
-                    .p_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if is_current {
-                        cx.theme().primary
-                    } else {
-                        cx.theme().muted
-                    })
-                    .hover(|style| style.bg(cx.theme().muted))
-                    .cursor_pointer()
-                    .on_click(move |_, _window, cx| {
-                        handle.update(cx, |this, cx| {
-                            this.set_page(cx, index);
-                        });
-                    })
-                    .child(
-                        div()
-                            .w(px(100.0))
-                            .aspect_ratio(100.0 / 141.0)
-                            .rounded_sm()
-                            .bg(gpui_kit::white())
-                            .overflow_hidden()
-                            .child(match image {
-                                Some(image) => img(image)
-                                    .size_full()
-                                    .object_fit(gpui_kit::ObjectFit::Contain)
-                                    .into_any_element(),
-                                None => div().size_full().into_any_element(),
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{}", index + 1)),
-                    )
-                    .child(if is_current {
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("現在")
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
-            }));
+        let columns = (((panel_width - 24.0) / PAGE_TILE_WIDTH).floor() as usize).max(1);
+        let rows = total.div_ceil(columns);
+        let list_state = self.page_list_state.clone();
+        if list_state.item_count() != rows {
+            list_state.reset(rows);
+        }
+        let list_handle = handle.clone();
+        let grid = gpui_kit::list(list_state, move |row_ix, _window, cx| {
+            let start = row_ix * columns;
+            let end = (start + columns).min(total);
+            // 可視行のサムネイルだけ読み込む（読み込みは背景で走る）
+            list_handle.update(cx, |this, cx| {
+                for index in start..end {
+                    this.ensure_thumb_loaded(cx, index);
+                }
+            });
+            let (thumbs, current_page) = {
+                let view = list_handle.read(cx);
+                (
+                    (start..end)
+                        .map(|index| view.thumbs.get(index).cloned().flatten())
+                        .collect::<Vec<_>>(),
+                    view.current_page,
+                )
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .p_2()
+                .h(px(PAGE_LIST_ROW_HEIGHT))
+                .children(thumbs.into_iter().enumerate().map(|(offset, image)| {
+                    let index = start + offset;
+                    let handle = list_handle.clone();
+                    let is_current = index == current_page;
+                    div()
+                        .id(SharedString::from(format!("viewer-thumb-{index}")))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .p_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if is_current {
+                            cx.theme().primary
+                        } else {
+                            cx.theme().muted
+                        })
+                        .hover(|style| style.bg(cx.theme().muted))
+                        .cursor_pointer()
+                        .on_click(move |_, _window, cx| {
+                            handle.update(cx, |this, cx| {
+                                this.set_page(cx, index);
+                            });
+                        })
+                        .child(
+                            div()
+                                .w(px(100.0))
+                                .aspect_ratio(100.0 / 141.0)
+                                .rounded_sm()
+                                .bg(gpui_kit::white())
+                                .overflow_hidden()
+                                .child(match image {
+                                    Some(image) => img(image)
+                                        .size_full()
+                                        .object_fit(gpui_kit::ObjectFit::Contain)
+                                        .into_any_element(),
+                                    None => div().size_full().into_any_element(),
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{}", index + 1)),
+                        )
+                        .child(if is_current {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("現在")
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        })
+                }))
+                .into_any_element()
+        })
+        .h(px(PAGE_LIST_HEIGHT))
+        .w_full();
         div()
             .flex()
             .flex_col()
@@ -1035,14 +1175,7 @@ impl ImageViewer {
                         )),
                 )
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .h(px(420.0))
-                    .overflow_y_scrollbar()
-                    .child(grid),
-            )
+            .child(grid)
             .child(self.panel_back(handle, cx))
             .into_any_element()
     }
@@ -2593,11 +2726,15 @@ impl Render for ImageViewer {
                                         &handle,
                                     ))
                             }
-                            PanelView::PageList => div().child(self.page_list_panel(
-                                &handle,
-                                total,
-                                cx,
-                            )),
+                            PanelView::PageList => {
+                                let panel_width = window.bounds().size.width.as_f32();
+                                div().child(self.page_list_panel(
+                                    &handle,
+                                    total,
+                                    panel_width,
+                                    cx,
+                                ))
+                            }
                             PanelView::Shortcuts => {
                                 let kbd = |stroke: &str| Kbd::new(gpui_kit::Keystroke::parse(stroke).unwrap());
                                 let row = |label: String, strokes: Vec<&str>| {
@@ -3344,11 +3481,23 @@ mod tests {
         });
         let view = cx.new(|cx| ImageViewer::new(cx, loader, "画像だけの本", 0, None));
 
-        // ページ一覧を開くと全サムネイルが読める
+        // ページ一覧を開くとサムネイルが読める（可視タイルのみ）
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         cx.update(|cx| view.update(cx, |v, cx| v.open_page_list(cx)));
         cx.run_until_parked();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
         assert!(
-            view.read_with(cx, |v, _| v.images.iter().all(|image| image.is_some())),
+            view.read_with(cx, |v, _| v.thumbs.iter().all(|thumb| thumb.is_some())),
             "real pack からサムネイルが読めること"
         );
     }
@@ -3421,10 +3570,19 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn page_list_loads_all_thumbnails(cx: &mut TestAppContext) {
+    async fn page_list_loads_only_visible_thumbnails(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
-        let view = viewer(cx, 3);
+        // 200 ページ（肥大作品相当）。ページ一覧を開いても**可視分だけ**読む
+        let view = viewer(cx, 200);
         assert!(!view.read_with(cx, |v, _| v.active_panel.is_some()));
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         cx.update(|cx| {
             view.update(cx, |this, cx| this.open_panel(cx, PanelView::PageList));
         });
@@ -3433,10 +3591,23 @@ mod tests {
             Some(PanelView::PageList)
         );
         cx.run_until_parked();
-        // Web 版と同様に全ページのサムネイルが読み込まれる
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let loaded = view.read_with(cx, |v, _| {
+            v.thumbs.iter().filter(|thumb| thumb.is_some()).count()
+        });
+        assert!(loaded > 0, "可視タイルのサムネイルは読む");
+        assert!(loaded < 40, "可視分だけで止まる（実際 {loaded} 枚）");
+        // 表示用のフル解像度ページは読まない（ページ一覧がメモリを食う経路を復活させない）
+        let full = view.read_with(cx, |v, _| {
+            v.images.iter().filter(|image| image.is_some()).count()
+        });
         assert!(
-            view.read_with(cx, |v, _| v.images.iter().all(|image| image.is_some())),
-            "all page thumbnails should load when the page list opens"
+            full <= 5,
+            "ページ一覧はフル解像度を読まない（実際 {full} 枚）"
         );
     }
 

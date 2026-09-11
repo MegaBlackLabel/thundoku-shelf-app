@@ -55,6 +55,21 @@ const COVER_SUBSTRINGS: &[&str] = &["表紙"];
 /// （`discover` を `cover` と誤判定しないため）。
 const COVER_TOKENS: &[&str] = &["cover", "omote", "ura", "back"];
 
+/// 入れ子アーカイブ（ZIP）として展開対象にする名前か（決定 D5）。
+///
+/// [`classify_entry`] は ZIP 単体を [`EntryKind::Junk`] のまま扱う（そのままでは
+/// 読めないため）。取り込み側はこの関数で `.zip` エントリを検出し、
+/// 1 階層だけ展開して中のエントリを合流させる。
+pub fn is_nested_archive(path: &str) -> bool {
+    let components: Vec<&str> = path.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+    if components.contains(&"__MACOSX") {
+        return false;
+    }
+    let base = components.last().copied().unwrap_or(path);
+    base.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("zip"))
+}
+
 /// ZIP エントリ名（パス）から種別を判定する。
 pub fn classify_entry(path: &str) -> EntryKind {
     let components: Vec<&str> = path.split(['/', '\\']).filter(|c| !c.is_empty()).collect();

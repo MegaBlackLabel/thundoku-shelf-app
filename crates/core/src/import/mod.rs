@@ -12,6 +12,7 @@ use classify::{EntryKind, classify_entry, is_readable_kind};
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use opfspack::{Identity, PackBuilder};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,10 @@ pub enum ImportError {
     Zip(String),
     #[error("empty archive")]
     EmptyArchive,
+    /// 読めるコンテンツ（画像 / PDF / EPUB）が 1 件も無い ZIP。
+    /// アプリ側が出し分けるための識別子（文言は UI が決める。§11.2 R3）。
+    #[error("not a readable work")]
+    NotAReadableWork,
 }
 
 fn now() -> String {
@@ -107,6 +112,54 @@ fn render_page_image(data: &[u8]) -> Result<(Vec<u8>, u32, u32), ImportError> {
     Ok((encode_webp(&decoded, 88)?, width, height))
 }
 
+/// 取り込み時に並列で扱うページ数（1 チャンク分の圧縮バイトを保持する）。
+/// 1 ページ約 0.5MB なので 64 ページで 30MB 程度。
+const PAGE_RENDER_CHUNK: usize = 64;
+
+/// ページ変換（デコード + webp 再圧縮）に使うワーカー数。
+/// 1 ページあたり実測 0.8 秒（release）で、重いのはほぼ webp 再圧縮。
+/// 逐次だと 3,000 ページ級で 40 分を超えるため並列化する。デコード済み画像は
+/// 1 枚 数十 MB あるため、ワーカー数は 8 で頭打ちにする（メモリ保護）。
+fn page_render_workers(page_count: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4);
+    cores.min(8).min(page_count.max(1))
+}
+
+/// ページ画像を**入力順**で変換する（デコード + webp 再圧縮を並列実行）。
+/// 失敗したページは `Err(理由)` を返す（呼び出し側が警告に積んでスキップする）。
+fn render_page_images(pages: &[(String, Vec<u8>)]) -> Vec<Result<(Vec<u8>, u32, u32), String>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<Result<(Vec<u8>, u32, u32), String>>>> =
+        Mutex::new((0..pages.len()).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..page_render_workers(pages.len()) {
+            let next = &next;
+            let results = &results;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((_, data)) = pages.get(index) else {
+                        break;
+                    };
+                    let rendered = render_page_image(data).map_err(|error| error.to_string());
+                    results.lock().expect("page results")[index] = Some(rendered);
+                }
+            });
+        }
+    });
+    results
+        .into_inner()
+        .expect("page results")
+        .into_iter()
+        .map(|result| result.expect("全 index を処理済み"))
+        .collect()
+}
+
 fn book_id_for(identity: Option<&Identity>, reuse_book_id: Option<&str>) -> String {
     // 再ダウンロード時は既存本を再利用して重複を防ぐ（未ログイン＝identity None でも）。
     if let Some(reuse) = reuse_book_id {
@@ -122,10 +175,32 @@ fn entry_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// 入れ子 ZIP の再帰展開の上限（決定 D5 / `docs/import-patterns.md` §11.2 R1）。
+///
+/// 実データで確認できた入れ子は 1 階層だけ（`d_305009` の ZIP 内 `.zip`）なので、
+/// 深さは 1 に固定する。2 階層目以降は展開せず警告に積む。
+pub const MAX_NESTED_DEPTH: usize = 1;
+
+/// 入れ子 ZIP から合流させるエントリの**非圧縮合計**サイズの上限（512 MiB）。
+///
+/// 外側 ZIP の実データ最大は展開後 1.33GB だが、入れ子は補助的な同梱物であり、
+/// これだけの量を 1 冊に含む例は無い。解凍爆弾・事故を弾くための天井として置く。
+pub const MAX_NESTED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 入れ子 ZIP から合流させるエントリ数の上限（2000）。
+///
+/// 1 冊（1 コンテンツ）のページ数としては十分大きく、数万エントリの異常な
+/// アーカイブを弾ける値。
+pub const MAX_NESTED_ENTRIES: usize = 2000;
+
 /// ZIP エントリの索引と名前（本体データは保持しない）。
 struct EntryMeta {
+    /// 読み出し先のアーカイブ内の索引（`nested` があればその入れ子内の索引）。
     index: usize,
     name: String,
+    /// 入れ子 ZIP 由来のとき、その入れ子アーカイブの生バイト。
+    /// 同じ入れ子のエントリ間で `Arc` を共有し、外側から読み直さない。
+    nested: Option<Arc<[u8]>>,
 }
 
 /// エントリの名前だけを集める（本体は伸長しない）。
@@ -146,6 +221,7 @@ fn collect_entry_metas<R: std::io::Read + std::io::Seek>(
         metas.push(EntryMeta {
             index,
             name: zip_names::decode_entry_name(entry.name_raw()),
+            nested: None,
         });
     }
     Ok(metas)
@@ -165,6 +241,155 @@ fn read_zip_entry<R: std::io::Read + std::io::Seek>(
         .read_to_end(&mut data)
         .map_err(|e| ImportError::Zip(e.to_string()))?;
     Ok(data)
+}
+
+/// 上限付きで ZIP エントリを読み出す（解凍爆弾対策）。
+/// 宣言サイズを信用せず、実際に読めたバイト数で上限を判定する。
+fn read_zip_entry_capped<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: usize,
+    limit: u64,
+) -> Result<Vec<u8>, ImportError> {
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|e| ImportError::Zip(e.to_string()))?;
+    let mut data = Vec::new();
+    entry
+        .by_ref()
+        .take(limit + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| ImportError::Zip(e.to_string()))?;
+    Ok(data)
+}
+
+/// `EntryMeta` が指すエントリを 1 件読み出す（入れ子 ZIP の中身にも対応）。
+fn read_entry<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    meta: &EntryMeta,
+) -> Result<Vec<u8>, ImportError> {
+    match &meta.nested {
+        None => read_zip_entry(archive, meta.index),
+        Some(bytes) => {
+            let mut nested = zip::ZipArchive::new(std::io::Cursor::new(Arc::clone(bytes)))
+                .map_err(|e| ImportError::Zip(e.to_string()))?;
+            read_zip_entry(&mut nested, meta.index)
+        }
+    }
+}
+
+/// エントリ名を集め、`.zip` エントリを 1 階層だけ展開して合流させる（決定 D5）。
+fn collect_metas_with_nested<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<EntryMeta>, ImportError> {
+    let mut metas = collect_entry_metas(archive)?;
+    expand_nested_archives(archive, &mut metas, warnings)?;
+    Ok(metas)
+}
+
+/// 外側アーカイブの `.zip` エントリを [`MAX_NESTED_DEPTH`] 階層だけ展開し、
+/// 中のエントリを `metas` に合流させる。
+///
+/// - 合流したエントリの名前は入れ子 ZIP のパス（拡張子を除く）を前置する。
+///   外側の分類規則（`classify_entry` / `content_folder`）がそのまま効き、
+///   入れ子内の画像・PDF・EPUB が 1 コンテンツとして認識される。
+/// - 壊れた入れ子 ZIP・上限超過は `warnings` に積んでスキップする
+///   （取り込み全体は失敗させない）。
+/// - 入れ子の中の `.zip` は展開しない（深さ上限）。警告だけ残す。
+fn expand_nested_archives<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    metas: &mut Vec<EntryMeta>,
+    warnings: &mut Vec<String>,
+) -> Result<(), ImportError> {
+    if MAX_NESTED_DEPTH == 0 {
+        return Ok(());
+    }
+    // 展開中は `metas` を伸ばすため、対象（外側の `.zip`）を先に確定させる。
+    let targets: Vec<(usize, String)> = metas
+        .iter()
+        .filter(|meta| meta.nested.is_none() && classify::is_nested_archive(&meta.name))
+        .map(|meta| (meta.index, meta.name.clone()))
+        .collect();
+
+    let mut merged_entries = 0usize;
+    let mut merged_bytes = 0u64;
+    for (index, name) in targets {
+        // 宣言サイズが上限を超える入れ子は開かない（読む前に弾く）。
+        let declared = {
+            let entry = archive
+                .by_index_raw(index)
+                .map_err(|e| ImportError::Zip(e.to_string()))?;
+            entry.size()
+        };
+        if declared > MAX_NESTED_BYTES {
+            warnings.push(format!(
+                "{name}: nested zip is larger than the size limit ({MAX_NESTED_BYTES} bytes)"
+            ));
+            continue;
+        }
+        let bytes: Arc<[u8]> =
+            Arc::from(read_zip_entry_capped(archive, index, MAX_NESTED_BYTES)?.into_boxed_slice());
+        if bytes.len() as u64 > MAX_NESTED_BYTES {
+            warnings.push(format!(
+                "{name}: nested zip is larger than the size limit ({MAX_NESTED_BYTES} bytes)"
+            ));
+            continue;
+        }
+        let mut nested = match zip::ZipArchive::new(std::io::Cursor::new(Arc::clone(&bytes))) {
+            Ok(nested) => nested,
+            Err(error) => {
+                warnings.push(format!("{name}: {error}"));
+                continue;
+            }
+        };
+        // 入れ子の中身を先に組み立て、上限内のときだけ合流させる
+        // （超過時に半分だけ取り込まない）。
+        let prefix = file_stem(&name).to_string();
+        let mut pending = Vec::new();
+        let mut count = 0usize;
+        let mut total = 0u64;
+        let mut deeper = false;
+        for inner_index in 0..nested.len() {
+            let entry = match nested.by_index_raw(inner_index) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warnings.push(format!("{name}: {error}"));
+                    continue;
+                }
+            };
+            if entry.is_dir() {
+                continue;
+            }
+            let inner_name = zip_names::decode_entry_name(entry.name_raw());
+            if classify::is_nested_archive(&inner_name) {
+                // 深さ上限: 入れ子の中の ZIP は展開しない。
+                deeper = true;
+                continue;
+            }
+            count += 1;
+            total = total.saturating_add(entry.size());
+            pending.push(EntryMeta {
+                index: inner_index,
+                name: format!("{prefix}/{inner_name}"),
+                nested: Some(Arc::clone(&bytes)),
+            });
+        }
+        if deeper {
+            warnings.push(format!(
+                "{name}: nested zip inside a nested zip is not expanded (depth limit {MAX_NESTED_DEPTH})"
+            ));
+        }
+        if merged_entries + count > MAX_NESTED_ENTRIES || merged_bytes + total > MAX_NESTED_BYTES {
+            warnings.push(format!(
+                "{name}: nested zip exceeds the entry/size limit and was skipped"
+            ));
+            continue;
+        }
+        merged_entries += count;
+        merged_bytes += total;
+        metas.extend(pending);
+    }
+    Ok(())
 }
 
 /// コンテンツのメディア種別（`book_contents.media_kind` の下地）。
@@ -1153,7 +1378,9 @@ pub fn analyze_zip(bytes: &[u8]) -> Result<ImportPlan, ImportError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| ImportError::Zip(e.to_string()))?;
     // 1 周目: 名前だけを集める（ページ画像は伸長しない）。
-    let metas = collect_entry_metas(&mut archive)?;
+    // 入れ子 ZIP はここで 1 階層だけ展開して名前一覧に合流させる（決定 D5）。
+    let mut warnings = Vec::new();
+    let metas = collect_metas_with_nested(&mut archive, &mut warnings)?;
     if metas.is_empty() {
         return Err(ImportError::EmptyArchive);
     }
@@ -1161,13 +1388,12 @@ pub fn analyze_zip(bytes: &[u8]) -> Result<ImportPlan, ImportError> {
     let primary = choose_primary(&contents);
 
     // `_export.txt` は本文テキストなので解析時に読む（小さく、画像の伸長は伴わない）。
-    let mut warnings = Vec::new();
     let mut export_texts: Vec<(i64, String)> = Vec::new();
     for meta in metas
         .iter()
         .filter(|meta| classify_entry(&meta.name) == EntryKind::ExportText)
     {
-        match read_zip_entry(&mut archive, meta.index) {
+        match read_entry(&mut archive, meta) {
             Ok(data) => {
                 let decoded = zip_names::decode_text_bytes(&data);
                 export_texts.extend(export_text::parse_export_text(&decoded));
@@ -1204,15 +1430,22 @@ pub fn commit_zip(
     reuse_book_id: Option<&str>,
     plan: &ImportPlan,
 ) -> Result<ImportedBook, ImportError> {
-    let unsupported = || ImportError::UnsupportedType("zip without pdf/epub/images".into());
-    let primary = plan.contents.get(plan.primary).ok_or_else(unsupported)?;
+    let primary = plan
+        .contents
+        .get(plan.primary)
+        .ok_or(ImportError::NotAReadableWork)?;
     if !is_viewable_media(primary.media_kind) {
         // 音声・動画は現行ビューアの対象外（docs/import-patterns.md §3.3）
-        return Err(unsupported());
+        return Err(ImportError::NotAReadableWork);
     }
+    // 内部不整合（ordinal が範囲外）用。呼び出し側の入力に由来する
+    // 「読めるものが無い」は `NotAReadableWork` で返す。
+    let missing_entry = || ImportError::Zip("entry index out of range".into());
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| ImportError::Zip(e.to_string()))?;
-    let metas = collect_entry_metas(&mut archive)?;
+    // 入れ子 ZIP の展開警告は `plan.warnings` に既に入っている
+    // （`analyze_zip` が同じ規則で解析する）ため、ここでは捨てる。
+    let metas = collect_metas_with_nested(&mut archive, &mut Vec::new())?;
 
     // 2 周目: 選んだエントリだけを 1 件ずつ読む。
     // 旧実装は全エントリを `Vec<(String, Vec<u8>)>` に読み込んでいたため、
@@ -1245,45 +1478,56 @@ pub fn commit_zip(
             let page_count = match rendition.kind {
                 MediaKind::Image => {
                     let start = page_rows.len();
-                    for ordinal in &rendition.entries {
-                        let meta = metas.get(*ordinal).ok_or_else(unsupported)?;
-                        let data = read_zip_entry(&mut archive, meta.index)?;
-                        // 壊れた画像 1 枚で全体を失敗させない（決定 D6）
-                        let (webp, width, height) = match render_page_image(&data) {
-                            Ok(rendered) => rendered,
-                            Err(error) => {
-                                warnings.push(format!("{}: {error}", meta.name));
-                                continue;
-                            }
-                        };
-                        if legacy && primary_thumbnail.is_none() {
-                            primary_thumbnail = Some(webp.clone());
+                    // ページ変換（デコード + webp 再圧縮）が重いので、チャンク単位で
+                    // 並列に処理する（順序は保つ）。チャンクに切るのは、全ページ分の
+                    // 圧縮バイトを一度に抱えないため。
+                    for chunk in rendition.entries.chunks(PAGE_RENDER_CHUNK) {
+                        // 1) チャンク分のページバイトを順に読む（ZIP は直列アクセス）
+                        let mut pages = Vec::with_capacity(chunk.len());
+                        for ordinal in chunk {
+                            let meta = metas.get(*ordinal).ok_or_else(missing_entry)?;
+                            pages.push((meta.name.clone(), read_entry(&mut archive, meta)?));
                         }
-                        let page_number = (page_rows.len() - start) as i64 + 1;
-                        let entry_path = format!("{prefix}/page_{page_number:04}.webp");
-                        pack_entries.push((
-                            entry_path.clone(),
-                            webp.clone(),
-                            "image/webp".to_string(),
-                            false,
-                        ));
-                        page_rows.push(PageRow {
-                            content_id: Some(content_id.clone()),
-                            format_id: Some(format_id.clone()),
-                            page_number,
-                            width: width as i64,
-                            height: height as i64,
-                            entry_path,
-                            file_size: webp.len() as i64,
-                            text: None,
-                        });
+                        // 2) デコード + webp 再圧縮を並列に
+                        let rendered = render_page_images(&pages);
+                        // 3) 入力順に積む（壊れた画像 1 枚で全体を失敗させない: 決定 D6）
+                        for ((name, _), result) in pages.iter().zip(rendered) {
+                            let (webp, width, height) = match result {
+                                Ok(rendered) => rendered,
+                                Err(error) => {
+                                    warnings.push(format!("{name}: {error}"));
+                                    continue;
+                                }
+                            };
+                            if legacy && primary_thumbnail.is_none() {
+                                primary_thumbnail = Some(webp.clone());
+                            }
+                            let page_number = (page_rows.len() - start) as i64 + 1;
+                            let entry_path = format!("{prefix}/page_{page_number:04}.webp");
+                            pack_entries.push((
+                                entry_path.clone(),
+                                webp.clone(),
+                                "image/webp".to_string(),
+                                false,
+                            ));
+                            page_rows.push(PageRow {
+                                content_id: Some(content_id.clone()),
+                                format_id: Some(format_id.clone()),
+                                page_number,
+                                width: width as i64,
+                                height: height as i64,
+                                entry_path,
+                                file_size: webp.len() as i64,
+                                text: None,
+                            });
+                        }
                     }
                     (page_rows.len() - start) as i64
                 }
                 MediaKind::Pdf => {
-                    let ordinal = rendition.entries.first().ok_or_else(unsupported)?;
-                    let meta = metas.get(*ordinal).ok_or_else(unsupported)?;
-                    let data = read_zip_entry(&mut archive, meta.index)?;
+                    let ordinal = rendition.entries.first().ok_or_else(missing_entry)?;
+                    let meta = metas.get(*ordinal).ok_or_else(missing_entry)?;
+                    let data = read_entry(&mut archive, meta)?;
                     // 進捗は既定表示コンテンツの PDF だけに流す（他は描画の副作用を避ける）
                     let pages = if legacy {
                         render_pdf_with(&data, Some(&mut *progress))?
@@ -1318,9 +1562,9 @@ pub fn commit_zip(
                     pages.len() as i64
                 }
                 MediaKind::Epub => {
-                    let ordinal = rendition.entries.first().ok_or_else(unsupported)?;
-                    let meta = metas.get(*ordinal).ok_or_else(unsupported)?;
-                    let data = read_zip_entry(&mut archive, meta.index)?;
+                    let ordinal = rendition.entries.first().ok_or_else(missing_entry)?;
+                    let meta = metas.get(*ordinal).ok_or_else(missing_entry)?;
+                    let data = read_entry(&mut archive, meta)?;
                     let entry_path = if legacy {
                         book_file_name = entry_file_name(&meta.name).to_string();
                         entry_file_name(&meta.name).to_string()

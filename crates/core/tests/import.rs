@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use opfspack::{Identity, PackBuilder, PackReader};
 use thundoku_core::db;
-use thundoku_core::import::{ImportError, MediaKind, analyze_zip, import_file, import_pdf_bytes};
+use thundoku_core::import::{
+    ImportError, MAX_NESTED_ENTRIES, MediaKind, analyze_zip, import_file, import_pdf_bytes,
+};
 use thundoku_core::tags;
 
 const PDF_FIXTURE: &str = concat!(
@@ -1140,4 +1142,238 @@ fn rename_content_in_pack_returns_none_when_unknown_or_missing() {
             .unwrap()
             .is_none()
     );
+}
+
+// ---- フェーズ8（§11.2 R1）: 入れ子アーカイブの上限付き再帰展開 ----
+
+/// ZIP をメモリ上で組み立てる（入れ子アーカイブの fixture 用）。
+fn build_zip(entries: impl IntoIterator<Item = (String, Vec<u8>)>) -> Vec<u8> {
+    use std::io::Write;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, data) in entries {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&data).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn planned_content<'a>(
+    plan: &'a thundoku_core::import::ImportPlan,
+    display_name: &str,
+) -> &'a thundoku_core::import::PlannedContent {
+    plan.contents
+        .iter()
+        .find(|content| content.display_name == display_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "content {display_name:?} not found in {:?}",
+                plan.contents
+                    .iter()
+                    .map(|content| content.display_name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+#[test]
+fn nested_zip_contents_are_imported() {
+    // ZIP の中の ZIP（決定 D5）。入れ子内の画像が 1 コンテンツとして取り込まれる。
+    let env = TestEnv::new("nested-zip-import");
+    let inner = build_zip([
+        ("001.jpg".to_string(), make_png(64, 96, [255, 0, 0])),
+        ("002.jpg".to_string(), make_png(64, 96, [0, 255, 0])),
+    ]);
+    let outer = build_zip([
+        // 表紙はページにならない（決定 D4）。入れ子だけが本文。
+        ("表紙.jpg".to_string(), make_png(64, 96, [10, 10, 10])),
+        ("本編.zip".to_string(), inner),
+    ]);
+
+    let plan = analyze_zip(&outer).unwrap();
+    let content = planned_content(&plan, "本編");
+    assert_eq!(content.media_kind, MediaKind::Image);
+    assert_eq!(content.renditions.len(), 1);
+    assert_eq!(
+        content.renditions[0].entries.len(),
+        2,
+        "入れ子内の画像 2 枚が合流する"
+    );
+    assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+
+    let imported = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "outer.zip",
+        &outer,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+    assert_eq!(imported.document.source_type, "image-set");
+    assert_eq!(imported.document.total_pages, 2);
+    assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+
+    // DB 上も入れ子内の画像がページとして入る
+    let images = db::documents::images_for_book(&env.pool, &imported.book.id).unwrap();
+    let pages: Vec<&db::documents::DocumentImage> = images
+        .iter()
+        .filter(|image| image.image_type == "page")
+        .collect();
+    assert_eq!(pages.len(), 2, "入れ子内の画像が document_images に入る");
+    let stored = db::contents::list_for_book(&env.pool, &imported.book.id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].display_name, "本編");
+    assert_eq!(stored[0].media_kind, "image");
+
+    // pack にもページが入る
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    let paths: Vec<&str> = reader.entries().iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"pages/page_0001.webp"));
+    assert!(paths.contains(&"pages/page_0002.webp"));
+}
+
+#[test]
+fn nested_zip_depth_two_is_not_expanded() {
+    // 深さ 2（ZIP in ZIP in ZIP）は展開しない。1 階層で止まる。
+    let env = TestEnv::new("nested-zip-depth");
+    let deepest = build_zip([("001.jpg".to_string(), make_png(64, 96, [0, 0, 255]))]);
+    let middle = build_zip([
+        ("001.jpg".to_string(), make_png(64, 96, [255, 0, 0])),
+        ("inner.zip".to_string(), deepest),
+    ]);
+    let outer = build_zip([("本編.zip".to_string(), middle)]);
+
+    let plan = analyze_zip(&outer).unwrap();
+    let content = planned_content(&plan, "本編");
+    assert_eq!(
+        content.renditions[0].entries.len(),
+        1,
+        "深さ 2 の画像は合流しない"
+    );
+    assert!(
+        plan.warnings.iter().any(|w| w.contains("depth limit")),
+        "深さ上限の警告が入る: {:?}",
+        plan.warnings
+    );
+
+    let imported = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "outer.zip",
+        &outer,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+    assert_eq!(imported.document.total_pages, 1);
+}
+
+#[test]
+fn nested_zip_over_entry_limit_is_skipped_with_warning() {
+    // エントリ数上限を超える入れ子はスキップし、警告に理由を積む（取り込みは続行）。
+    let env = TestEnv::new("nested-zip-limit");
+    let nested = build_zip(
+        (0..MAX_NESTED_ENTRIES + 1)
+            .map(|index| (format!("{index:05}.jpg"), make_png(8, 8, [255, 0, 0]))),
+    );
+    let outer = build_zip([
+        ("本文/001.jpg".to_string(), make_png(64, 96, [0, 0, 255])),
+        ("同梱.zip".to_string(), nested),
+    ]);
+
+    let imported = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "outer.zip",
+        &outer,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        imported.document.total_pages, 1,
+        "上限超過の入れ子は取り込まれない"
+    );
+    assert!(
+        imported
+            .warnings
+            .iter()
+            .any(|w| w.contains("同梱.zip") && w.contains("limit")),
+        "上限超過が warnings に入る: {:?}",
+        imported.warnings
+    );
+    let stored = db::contents::list_for_book(&env.pool, &imported.book.id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].display_name, "本文");
+}
+
+#[test]
+fn zip_without_readable_content_is_not_a_readable_work() {
+    // 読めるコンテンツ（画像 / PDF / EPUB）が無い ZIP は型付きで返す（R3）。
+    let env = TestEnv::new("not-readable-zip");
+    let bytes = build_zip([("readme.txt".to_string(), b"hello".to_vec())]);
+    let error = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "text.zip",
+        &bytes,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ImportError::NotAReadableWork),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn image_pages_keep_their_order_with_parallel_rendering() {
+    // 並列変換でもページの対応がずれないこと（ページ N の画像が N 枚目に入る）
+    let env = TestEnv::new("parallel-order");
+    let zip_path = env.root.join("ordered.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    let count = 12u8;
+    for page in 0..count {
+        zip.start_file(format!("本編/{:02}.png", page + 1), options)
+            .unwrap();
+        // ページごとに違う色の PNG（赤成分 = 20 * page）
+        let image = image::RgbImage::from_pixel(20, 30, image::Rgb([20 * page, 40, 60]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::io::Write::write_all(&mut zip, &png).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let mut no_progress = |_p: f32| {};
+    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    assert_eq!(imported.document.total_pages, count as i64);
+
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    for page in 1..=count as i64 {
+        let data = reader
+            .read_entry(&format!("pages/page_{page:04}.webp"), None)
+            .unwrap();
+        let decoded = image::load_from_memory(&data).unwrap().to_rgb8();
+        let red = decoded.get_pixel(0, 0).0[0] as i32;
+        let expected = 20 * (page as i32 - 1);
+        // webp は不可逆なので色は多少ずれる。隣のページとは 20 差なので、
+        // 許容 8 でも「順序がずれた」ことは検出できる。
+        assert!(
+            (red - expected).abs() <= 8,
+            "ページ {page} の赤が {red}（期待 {expected} 前後）。並列処理で順序がずれた可能性"
+        );
+    }
 }

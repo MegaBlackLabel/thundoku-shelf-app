@@ -149,6 +149,77 @@ pub struct BookshelfView {
     toast: Option<String>,
 }
 
+/// 取り込みの成功結果（読み飛ばしたエントリの警告付き）。
+struct ImportOutcome {
+    title: String,
+    warnings: Vec<String>,
+}
+
+/// 取り込みの失敗。UI 文言を出し分けるために型で持つ。
+enum ImportFailure {
+    /// 読めるコンテンツが無い（txt のみ / ゲーム / HTML 閲覧型など）
+    NotAReadable,
+    /// それ以外（DRM・通信・解析失敗など）。文言はそのまま出す
+    Message(String),
+}
+
+impl From<String> for ImportFailure {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// 取り込みエラーを UI 用の失敗種別に変換する（`NotAReadableWork` だけ特別扱い）。
+fn import_failure(error: thundoku_core::import::ImportError) -> ImportFailure {
+    match error {
+        thundoku_core::import::ImportError::NotAReadableWork => ImportFailure::NotAReadable,
+        other => ImportFailure::Message(other.to_string()),
+    }
+}
+
+/// 取り込み結果を (トースト, 赤いエラー行) に変換する。
+/// I/O と切り離した純粋関数にして文言を試せるようにしている。
+fn download_messages(
+    result: &Result<ImportOutcome, ImportFailure>,
+) -> (Option<String>, Option<String>) {
+    match result {
+        Ok(outcome) if outcome.warnings.is_empty() => (
+            Some(format!("「{}」をダウンロードしました", outcome.title)),
+            None,
+        ),
+        Ok(outcome) => {
+            // 壊れた画像などで読み飛ばした分は件数と先頭 2 件を出す
+            let head: Vec<&str> = outcome
+                .warnings
+                .iter()
+                .take(2)
+                .map(|warning| warning.as_str())
+                .collect();
+            let rest = outcome.warnings.len().saturating_sub(head.len());
+            let detail = if rest > 0 {
+                format!("{} ほか {rest} 件", head.join(" / "))
+            } else {
+                head.join(" / ")
+            };
+            (
+                Some(format!(
+                    "「{}」をダウンロードしました（一部を読み飛ばし: {detail}）",
+                    outcome.title
+                )),
+                None,
+            )
+        }
+        Err(ImportFailure::NotAReadable) => (
+            None,
+            Some(
+                "取り込めるコンテンツがありません（txt のみ・ゲーム・HTML 閲覧型など）。この作品はビューアーで読めません"
+                    .to_string(),
+            ),
+        ),
+        Err(ImportFailure::Message(message)) => (None, Some(message.clone())),
+    }
+}
+
 impl BookshelfView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let handle = cx.weak_entity();
@@ -1634,9 +1705,10 @@ impl BookshelfView {
         // ダウンロード + インポート（レンダリング含む）は GPUI のワーカーを
         // 数分ブロックすると他の処理（表紙取得など）が止まってビジーになるため、
         // 専用スレッドで実行して結果をチャネルで受け取る。
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<ImportOutcome, ImportFailure>>();
         std::thread::spawn(move || {
-            let result = (|| -> Result<String, String> {
+            let result = (|| -> Result<ImportOutcome, ImportFailure> {
                 // ダウンロード（サイトで分岐）:
                 // - BOOTH: セッション Cookie で downloadables/{id} を GET → 302 の
                 //   Location（署名付き S3 URL）を自動追跡してファイル本体を取得
@@ -1672,7 +1744,9 @@ impl BookshelfView {
                         FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
                     let detail = client.detail(&product_id).map_err(|e| e.to_string())?;
                     if detail.is_drm {
-                        return Err("DRM 付き作品は取り込めません".to_string());
+                        return Err(ImportFailure::Message(
+                            "DRM 付き作品は取り込めません".to_string(),
+                        ));
                     }
                     let url = detail
                         .download_link
@@ -1844,7 +1918,7 @@ impl BookshelfView {
                         identity.as_ref(),
                         reuse_book_id.as_deref(),
                     )
-                    .map_err(|e| e.to_string())?;
+                    .map_err(import_failure)?;
                     // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
                     if !site_id.is_empty() {
                         let _ = books::set_site_id(&db, &imported.book.id, &site_id);
@@ -1886,7 +1960,7 @@ impl BookshelfView {
                             Some(thundoku_core::owner::encrypt(key, sub)),
                         );
                     }
-                    Ok::<_, String>(imported)
+                    Ok::<_, ImportFailure>(imported)
                 } else {
                     let imported = match extension.as_str() {
                         "epub" => thundoku_core::import::import_epub_bytes(
@@ -2021,11 +2095,12 @@ impl BookshelfView {
                             );
                         }
                     }
-                    imported.map_err(|e| e.to_string())
+                    imported.map_err(import_failure)
                 };
-                imported
-                    .map(|imported| imported.book.title)
-                    .map_err(|e| e.to_string())
+                imported.map(|imported| ImportOutcome {
+                    title: imported.book.title,
+                    warnings: imported.warnings,
+                })
             })();
             let _ = result_tx.send(result);
         });
@@ -2073,22 +2148,24 @@ impl BookshelfView {
                         .await;
                 }
             }
-            let result = result_rx
-                .try_recv()
-                .unwrap_or_else(|_| Err("ダウンロード処理が結果を返しませんでした".into()));
+            let result = result_rx.try_recv().unwrap_or_else(|_| {
+                Err(ImportFailure::Message(
+                    "ダウンロード処理が結果を返しませんでした".to_string(),
+                ))
+            });
             log::info!("download_item: スレッド完了、UI 反映開始");
             let complete_start = std::time::Instant::now();
             handle.update(cx, |this, cx| {
                 this.download_states.remove(&database_id);
-                match result {
-                    Ok(title) => {
-                        this.toast = Some(format!("「{title}」をダウンロードしました"));
-                        this.reload(cx);
-                    }
-                    Err(error) => {
-                        log::warn!("download_item: 失敗しました: {error}");
-                        this.error = Some(error);
-                    }
+                let (toast, error) = download_messages(&result);
+                let succeeded = result.is_ok();
+                this.toast = toast;
+                this.error = error;
+                if let Some(error) = &this.error {
+                    log::warn!("download_item: 失敗しました: {error}");
+                }
+                if succeeded {
+                    this.reload(cx);
                 }
                 cx.notify();
             });
@@ -4746,6 +4823,7 @@ fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
 
+    use super::{ImportFailure, ImportOutcome, download_messages};
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
 
@@ -4929,6 +5007,41 @@ mod tests {
             )
             .unwrap();
         });
+    }
+
+    #[test]
+    fn download_messages_reports_skips_and_unreadable_works() {
+        // 成功（警告なし）
+        let (toast, error) = download_messages(&Ok(ImportOutcome {
+            title: "本".into(),
+            warnings: Vec::new(),
+        }));
+        assert_eq!(toast.as_deref(), Some("「本」をダウンロードしました"));
+        assert!(error.is_none());
+
+        // 一部を読み飛ばした（件数と先頭 2 件を出す）
+        let (toast, error) = download_messages(&Ok(ImportOutcome {
+            title: "本".into(),
+            warnings: vec![
+                "a.png: 壊れている".into(),
+                "b.png: 壊れている".into(),
+                "c.png: 壊れている".into(),
+            ],
+        }));
+        let toast = toast.expect("toast");
+        assert!(toast.contains("a.png"), "{toast}");
+        assert!(toast.contains("ほか 1 件"), "{toast}");
+        assert!(error.is_none());
+
+        // 読めるコンテンツが無い（txt のみ / ゲーム等）は理由を出す
+        let (toast, error) = download_messages(&Err(ImportFailure::NotAReadable));
+        assert!(toast.is_none());
+        let error = error.expect("error");
+        assert!(error.contains("txt のみ"), "{error}");
+
+        // それ以外の失敗はそのまま出す
+        let (_, error) = download_messages(&Err(ImportFailure::Message("通信に失敗".into())));
+        assert_eq!(error.as_deref(), Some("通信に失敗"));
     }
 
     #[gpui_kit::test]
