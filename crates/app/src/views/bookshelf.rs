@@ -2657,54 +2657,57 @@ impl BookshelfView {
             Some(render) => draw_size(render),
             None => (card_width, cover_h),
         };
-        let mut cover_el = div()
-            .relative()
-            .w(px(draw_w))
-            .h(px(draw_h))
-            .flex_shrink_0()
-            .rounded_t_lg()
+        // 上辺の角丸は**カード幅いっぱいのときだけ**（横長の表紙はカードの角に接するため
+        // 丸みを合わせる）。縦長は画像が中央に浮いてカードの角に接しないので、画像にも
+        // バッジにも丸みを付けない。
+        let fits_width = draw_w >= card_width - 0.5;
+        let mut cover_el = div().relative().w(px(draw_w)).h(px(draw_h)).flex_shrink_0();
+        if fits_width {
+            cover_el = cover_el.rounded_t_lg();
+        }
+        cover_el = cover_el
             .child(match &cover {
-                Some(render) => img(render.clone())
-                    .w_full()
-                    .h_full()
-                    .rounded_t_lg()
-                    .into_any_element(),
-                None => div()
-                    .w_full()
-                    .h_full()
-                    .rounded_t_lg()
-                    .bg(theme.muted)
-                    .into_any_element(),
+                Some(render) => {
+                    let mut el = img(render.clone()).w_full().h_full();
+                    if fits_width {
+                        el = el.rounded_t_lg();
+                    }
+                    el.into_any_element()
+                }
+                None => {
+                    let mut el = div().w_full().h_full().bg(theme.muted);
+                    if fits_width {
+                        el = el.rounded_t_lg();
+                    }
+                    el.into_any_element()
+                }
             })
             // 左上: 未読/既読バッジ（Web の statusText と同じ）
-            .child(if is_read {
-                div()
+            .child({
+                let mut badge = div()
                     .absolute()
                     .left_0()
                     .top_0()
-                    .rounded_tl_lg()
                     .rounded_br_md()
                     .px_1()
-                    .py_0p5()
-                    .bg(gpui_kit::rgb(0xd1fae5))
-                    .text_color(gpui_kit::rgb(0x047857))
-                    .text_xs()
-                    .child("読了")
-                    .into_any_element()
-            } else {
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .rounded_tl_lg()
-                    .rounded_br_md()
-                    .px_1()
-                    .py_0p5()
-                    .bg(gpui_kit::rgb(0xfef3c7))
-                    .text_color(gpui_kit::rgb(0xb45309))
-                    .text_xs()
-                    .child("未読")
-                    .into_any_element()
+                    .py_0p5();
+                if fits_width {
+                    badge = badge.rounded_tl_lg();
+                }
+                if is_read {
+                    badge
+                        .bg(gpui_kit::rgb(0xd1fae5))
+                        .text_color(gpui_kit::rgb(0x047857))
+                        .text_xs()
+                        .child("読了")
+                } else {
+                    badge
+                        .bg(gpui_kit::rgb(0xfef3c7))
+                        .text_color(gpui_kit::rgb(0xb45309))
+                        .text_xs()
+                        .child("未読")
+                }
+                .into_any_element()
             })
             // 右上: お気に入りハート（クリックでトグル）
             .child(
@@ -2786,42 +2789,44 @@ impl BookshelfView {
             let fraction = state.fraction();
             let percentage = (fraction * 100.0).round() as u32;
             let ring = progress_ring_image(fraction);
+            let mut overlay = div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui_kit::rgba(0x00000080));
+            if fits_width {
+                overlay = overlay.rounded_t_lg();
+            }
             cover_el = cover_el.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_t_lg()
-                    .bg(gpui_kit::rgba(0x00000080))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_1()
-                            .child(img(ring).w(px(72.0)).h(px(72.0)))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_color(gpui_kit::white())
-                                            .text_xs()
-                                            .child(state.label()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(gpui_kit::white())
-                                            .text_sm()
-                                            .font_weight(gpui_kit::FontWeight::BOLD)
-                                            .child(format!("{percentage}%")),
-                                    ),
-                            ),
-                    ),
+                overlay.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .child(img(ring).w(px(72.0)).h(px(72.0)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_color(gpui_kit::white())
+                                        .text_xs()
+                                        .child(state.label()),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(gpui_kit::white())
+                                        .text_sm()
+                                        .font_weight(gpui_kit::FontWeight::BOLD)
+                                        .child(format!("{percentage}%")),
+                                ),
+                        ),
+                ),
             );
         }
 
