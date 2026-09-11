@@ -371,7 +371,10 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
   - `matches_filter` に `circle_filter` / `author_filter` を追加（既存の site / search / event / tag フィルタと AND）
   - 同じリンクの再クリックでその絞り込みを解除
   - `bookshelf_items.author` は BOOTH 等のみ。技術書典は author が空のため author 絞り込みは対象が限られる（サークル名絞り込みは `circle_name` で全サイト可）
-  - **作者名の供給元**: BOOTH は shop 名。**FANZA / DLsite はダウンロード時に作品ページから取得**
+  - **作者名の供給元**: **BOOTH はダウンロード時に商品ページのショップ情報から取得**
+    （`class="user-avatar"` の `title` = ショップページの表示名。例: `YORIMIYA STUDIO`（サークル名）
+    → `YORIMIYA`（作者名）。**`shop.name`（サークル名）とは別物**なので使わない）。
+    **FANZA / DLsite もダウンロード時に作品ページから取得**
     （FANZA `<dt class="informationList__ttl">作者</dt>` / DLsite `<th>作者</th>`）し、
     `books.author`（`set_metadata`）と `bookshelf_items.author`（`bookshelf::update_author`）へ保存する。
     反映はダウンロード後（既DLの本は「再取得」で入る）
@@ -410,6 +413,18 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
   - 回帰テスト: `list_view_scroll_area_is_bounded_by_viewport` /
     `list_thumbnail_fills_row_height` / `portrait_cover_is_letterboxed_not_cropped` /
     `list_cover_area_fits_widest_common_cover`
+
+- [x] **再取得で作者が更新されない・カードが消えることがある（バグ）**（修正済み）
+  - **作者が更新されない**: サイト側メタ（作者名・サークル名・購入日）の反映が
+    **PDF 以外の取り込み経路にしか無く**、BOOTH の PDF（例: 電子版の技術解説本）などで
+    作者が入らなかった → `apply_site_metadata` に共通化し、PDF 経路からも呼ぶ。
+    作者が取得できなかったときは既存の `author` を消さない
+  - **カードが消える**: 再取得で表紙キャッシュとカードの `cover` をクリアしていたため、
+    `matches_filter`（ローカル無し + 表紙無し + `thumbnail_url` あり → 非表示）で
+    カードが隠れていた。**表紙は消さない**ようにし（再取得後は pack の表紙が reload で入る）、
+    表紙取得中は `download_item` が無視するため**完了後に実行するようキューに積む**
+  - 回帰テスト: `apply_site_metadata_writes_author_for_supported_sites` /
+    `redownload_keeps_cover_and_queues_while_busy`
 
 - [x] **閲覧情報を 1 ページ毎の閲覧回数・時間も記録する**（実装済み）
   - 現在の `view_history` は `id, book_id, started_at, ended_at` のみで、書籍単位の
