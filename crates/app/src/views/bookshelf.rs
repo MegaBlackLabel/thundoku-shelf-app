@@ -2651,38 +2651,31 @@ impl BookshelfView {
             let scale = (card_width / image_w).min(cover_h / image_h);
             ((image_w * scale).max(1.0), (image_h * scale).max(1.0))
         };
-        let image: gpui_kit::AnyElement = match &cover {
-            Some(render) => {
-                let (draw_w, draw_h) = draw_size(render);
-                div()
-                    .w_full()
-                    .h(px(cover_h))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_t_lg()
-                    .bg(theme.secondary)
-                    .child(
-                        img(render.clone())
-                            .w(px(draw_w))
-                            .h(px(draw_h))
-                            .rounded_t_lg(),
-                    )
-                    .into_any_element()
-            }
-            None => div()
-                .w_full()
-                .h(px(cover_h))
-                .rounded_t_lg()
-                .bg(theme.muted)
-                .into_any_element(),
+        // バッジ（未読/♡/↓）とオーバーレイは、枠ではなく**この画像の矩形**を基準に置く。
+        // 縦長の表紙は左右にバーが出るため、枠基準だとバッジが画像の外に浮いてしまう。
+        let (draw_w, draw_h) = match &cover {
+            Some(render) => draw_size(render),
+            None => (card_width, cover_h),
         };
-
         let mut cover_el = div()
             .relative()
-            .w_full()
-            .h(px(cover_h))
-            .child(image)
+            .w(px(draw_w))
+            .h(px(draw_h))
+            .flex_shrink_0()
+            .rounded_t_lg()
+            .child(match &cover {
+                Some(render) => img(render.clone())
+                    .w_full()
+                    .h_full()
+                    .rounded_t_lg()
+                    .into_any_element(),
+                None => div()
+                    .w_full()
+                    .h_full()
+                    .rounded_t_lg()
+                    .bg(theme.muted)
+                    .into_any_element(),
+            })
             // 左上: 未読/既読バッジ（Web の statusText と同じ）
             .child(if is_read {
                 div()
@@ -2832,6 +2825,18 @@ impl BookshelfView {
             );
         }
 
+        // 枠（カード幅 × 4:3）に表紙を中央寄せする。余りは theme.secondary（バー）。
+        let image: gpui_kit::AnyElement = div()
+            .w_full()
+            .h(px(cover_h))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_t_lg()
+            .bg(theme.secondary)
+            .child(cover_el)
+            .into_any_element();
+
         let mut card_el = div()
             .id(SharedString::from(format!(
                 "book-card-{}",
@@ -2887,9 +2892,9 @@ impl BookshelfView {
         card_el = card_el
             // 表紙（カードのヘッダー）: 端まで出す。読了は少し薄く表示する
             .child(if is_read {
-                div().opacity(0.75).child(cover_el)
+                div().opacity(0.75).child(image)
             } else {
-                div().child(cover_el)
+                div().child(image)
             })
             // 以降はパディング付きの内容ブロック（ヘッダーだけ端まで）
             .child(
