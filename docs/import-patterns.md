@@ -526,7 +526,14 @@ DB に入る**（実 DB に `âMâUÄòé┼é⌐éφéóéóùtÄqé│é±.pdf
     `book_contents` / `content_formats` / `imported_documents` / `document_images` を作り直す。
     すでに取り込み済みの本は何もしない（ローカルの取り込みを壊さない）。
     ページ画像の寸法はエントリのヘッダから読む（画素デコードはしない）
-  - 進捗（`reading_progress`）は DB バックアップ（`thundoku-backup.json`）から復元される
+    - **復元されないもの（pack だけでは戻せない）**:
+      - 本文テキスト（`document_images.extracted_text` / `document_text`）と
+        `token_analysis` — `rebuild_from_pack` は復元しない。ページ画像からは取り出せず、
+        EPUB の生エントリは pack にあるが再抽出はしていない
+      - `books.site_id` / `books.tbf_product_id` — `import_book` が `None` で作るため。
+        復元本は source 紐付けを失い、`find_by_source` の重複抑止や site 絞り込みに乗らない
+  - 進捗（`reading_progress`）・タグ（`book_tags`）は DB バックアップ（`thundoku-backup.json`）から復元される
+    （pack からは戻さない）
   - FANZA 作品は `folder-structures` API で構造を再取得できる（§0）が、**ページ画像は Pack が必要**
 - 旧 Pack（`contents` なし）は「全ページ = 単一コンテンツ」にフォールバック
 
@@ -610,7 +617,9 @@ DB に入る**（実 DB に `âMâUÄòé┼é⌐éφéóéóùtÄqé│é±.pdf
 3. **リーダー**: `PackPageLoader` を「コンテンツ + レンディションの選択でページ列を返す」対応に
 4. **ページ一覧 UI**: コンテンツツリー + 優先ラジオ + レンディションセレクタ + 遅延読み込み（§7）
 5. **進捗をコンテンツ単位に**: テーブル再作成 + 本棚カード（§8）
-6. **Drive 復元**: `import_book` を `document_images` / `reading_progress` まで再構築する
+6. **Drive 復元** ✓ 実装済み（2026-09-11 / §7.3）: `import_book` → `import::rebuild_from_pack`
+   が `imported_documents` / `book_contents` / `content_formats` / `document_images` を再構築する。
+   進捗・タグは DB バックアップから復元し、pack からは戻さない
 7. **名前カスタム**（`display_name` 編集）✓ 実装済み（2026-09-11）
 
 > まず 1〜3 を固めて 4 を MVP に。進捗の完全対応には 5 が必須。
@@ -629,7 +638,7 @@ DB に入る**（実 DB に `âMâUÄòé┼é⌐éφéóéóùtÄqé│é±.pdf
 | 音声・動画は junk（F2） | **音声作品はコンテンツ**（実在 2 件）。`media_kind` を追加（§3.3） |
 | 非書籍の想定なし | txt のみ / 0 ファイル / ゲームを**明示的に除外**（§5.4） |
 | 「txt を画像として取り込む」余地 | **不要**と結論。代わりに `_export.txt` → `document_text`（§4.3） |
-| Pack 復元の前提 | `drive/sync.rs::import_book` は `books` しか作らないため**未実装**と明記（§7.3） |
+| Pack 復元の前提 | 旧版は「`drive/sync.rs::import_book` は `books` しか作らないため**未実装**」と明記（§7.3）。**現在は実装済み**（`import_book` → `import::rebuild_from_pack`。上記 §7.3 の「復元されないもの」が残件） |
 | 旧版の想定のみだった A〜H | 実データで裏取り（§2.3）。観測不能な B1/B2・G2・G3 は「DL 後のみ判定」と明記 |
 
 **2026-09-10 の決定（§11.1）で変わった点**
