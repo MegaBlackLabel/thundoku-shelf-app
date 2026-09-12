@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use gpui_kit::StyledImage as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
@@ -219,6 +219,18 @@ impl ChipPalette {
         } else {
             muted
         }
+    }
+
+    /// 「絞込中」ボタンの配色（絞り込み中に使う）。
+    /// チップの「選択中」と同じ青系にして、選択状態が同じ色の系統で伝わるようにする。
+    /// 返り値: (背景, 文字, ホバー, 押下)
+    fn filter_all_colors(&self) -> (Hsla, Hsla, Hsla, Hsla) {
+        (
+            self.selected_bg,
+            self.selected_text,
+            self.selected_bg.alpha(0.45),
+            self.selected_bg.alpha(0.55),
+        )
     }
 }
 
@@ -4545,11 +4557,21 @@ impl Render for BookshelfView {
                                         let mut button = Button::new("filter-all")
                                             .cursor_pointer()
                                             .label(self.filter_all_label(cx));
-                                        // 絞り込み中は「絞り込みしてます」を表す警告色にし、
+                                        // 絞り込み中はタグ選択中と同じ青系（チップの選択色）にして、
                                         // 解除のショートカット（ESC）をツールチップで示す。
-                                        // 未絞り込み（= 全項目が選択中）は選択色
+                                        // 未絞り込み（= 全項目が選択中）は既定の選択色
                                         button = if self.is_filtering(cx) {
-                                            button.warning().tooltip("絞り込みを解除（ESC）")
+                                            let (bg, fg, hover, active) =
+                                                ChipPalette::for_theme(cx.theme()).filter_all_colors();
+                                            button
+                                                .custom(
+                                                    ButtonCustomVariant::new(cx)
+                                                        .color(bg)
+                                                        .foreground(fg)
+                                                        .hover(hover)
+                                                        .active(active),
+                                                )
+                                                .tooltip("絞り込みを解除（ESC）")
                                         } else {
                                             button.primary()
                                         };
@@ -6877,6 +6899,28 @@ mod tests {
         assert!(dark.favorite_text.l > 0.6, "ダークの文字は明るい色");
         assert!(dark.favorite_heart.l > 0.6, "ダークのハートは明るい色");
         assert!(dark.selected_text.l > 0.6, "ダークの選択中文字も明るい色");
+    }
+
+    /// 「絞込中」ボタンはタグ選択中と同じ青系（チップの選択色）を使い、
+    /// 絞り込み中であることが同じ色の系統で伝わるようにする。
+    #[test]
+    fn filter_all_button_uses_the_chip_selected_color() {
+        let muted = gpui_kit::hsla(0.0, 0.0, 0.5, 1.0);
+        for palette in [ChipPalette::light(), ChipPalette::dark()] {
+            let (bg, fg, hover, active) = palette.filter_all_colors();
+            assert_eq!(
+                bg,
+                palette.background(muted, false, true),
+                "背景はチップの選択中と同じ色"
+            );
+            assert_eq!(
+                fg,
+                palette.foreground(muted, false, true),
+                "文字はチップの選択中と同じ色"
+            );
+            assert!(hover.a > bg.a, "ホバーは少し濃く");
+            assert!(active.a > hover.a, "押下はさらに濃く");
+        }
     }
 
     #[gpui_kit::test]
