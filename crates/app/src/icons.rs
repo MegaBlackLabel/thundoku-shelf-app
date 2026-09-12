@@ -50,6 +50,10 @@ pub enum AppIcon {
     Database,
     /// 名前の変更（Pencil）
     Pencil,
+    /// お気に入り（lucide Heart、未登録）
+    Heart,
+    /// お気に入り（lucide Heart、登録済み = 塗りつぶし）
+    HeartFilled,
 }
 
 impl IconNamed for AppIcon {
@@ -73,6 +77,8 @@ impl IconNamed for AppIcon {
             Self::Monitor => "icons/monitor.svg".into(),
             Self::Database => "icons/database.svg".into(),
             Self::Pencil => "icons/pencil.svg".into(),
+            Self::Heart => "icons/heart.svg".into(),
+            Self::HeartFilled => "icons/heart-filled.svg".into(),
         }
     }
 }
@@ -114,6 +120,8 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
         "icons/moon.svg" => Some(include_bytes!("../assets/icons/moon.svg")),
         "icons/monitor.svg" => Some(include_bytes!("../assets/icons/monitor.svg")),
         "icons/pencil.svg" => Some(include_bytes!("../assets/icons/pencil.svg")),
+        "icons/heart.svg" => Some(include_bytes!("../assets/icons/heart.svg")),
+        "icons/heart-filled.svg" => Some(include_bytes!("../assets/icons/heart-filled.svg")),
         _ => None,
     }
 }
@@ -145,6 +153,8 @@ mod tests {
             AppIcon::Monitor,
             AppIcon::Database,
             AppIcon::Pencil,
+            AppIcon::Heart,
+            AppIcon::HeartFilled,
         ];
         for icon in icons {
             let path = icon.path();

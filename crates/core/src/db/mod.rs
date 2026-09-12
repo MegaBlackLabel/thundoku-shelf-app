@@ -11,6 +11,7 @@ pub mod bookshelf;
 pub mod checklist;
 pub mod contents;
 pub mod documents;
+pub mod favorites;
 pub mod page_views;
 pub mod progress;
 pub mod samples;
@@ -278,6 +279,14 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         // 冪等に適用する。1 冊 × 1 ページの累計表示回数・累計滞在秒数を持つ集計表）
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS page_views (               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               content_id TEXT NOT NULL DEFAULT '',               page_number INTEGER NOT NULL,               view_count INTEGER NOT NULL DEFAULT 0,               total_seconds REAL NOT NULL DEFAULT 0,               last_viewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               PRIMARY KEY (book_id, content_id, page_number)             );             CREATE INDEX IF NOT EXISTS idx_page_views_book ON page_views(book_id)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        // サークル / 作者のお気に入り（タグのお気に入り `favorite_tags` と同じ
+        // チップのハート）。開発中のためマイグレーションファイルは作らず、
+        // 他の後発テーブルと同様に IF NOT EXISTS で冪等に適用する。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS favorite_entities (               entity_kind TEXT NOT NULL,               entity_name TEXT NOT NULL,               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               PRIMARY KEY (entity_kind, entity_name)             )",
         )
         .execute(&mut *conn)
         .await?;

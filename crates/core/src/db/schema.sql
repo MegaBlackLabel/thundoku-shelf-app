@@ -245,6 +245,14 @@ CREATE TABLE IF NOT EXISTS favorite_tags (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- サークル / 作者のお気に入り（チップのハート）。種別ごとに独立。
+CREATE TABLE IF NOT EXISTS favorite_entities (
+  entity_kind TEXT NOT NULL,
+  entity_name TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (entity_kind, entity_name)
+);
+
 CREATE TABLE IF NOT EXISTS book_first_events (
   site_id TEXT NOT NULL,
   database_id TEXT NOT NULL,

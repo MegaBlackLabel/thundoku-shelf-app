@@ -18,7 +18,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _,
 };
 use gpui_kit::{
-    App, Context, Entity, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
+    App, Context, Entity, Hsla, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
     SharedString, Window, div, img, px, relative,
 };
 use thundoku_core::booth::BoothClient;
@@ -50,7 +50,7 @@ enum EntityLink {
 }
 
 impl EntityLink {
-    /// リンクの手前のラベル（値だけに下線を引くため、ラベルと分離する）。
+    /// チップの手前に置くラベル。チップ（タグ）には含めない。
     fn prefix(self) -> &'static str {
         match self {
             EntityLink::Circle => "サークル:",
@@ -65,6 +65,38 @@ impl EntityLink {
             EntityLink::Author => format!("author-link-{database_id}"),
         }
     }
+
+    /// お気に入りハートの要素 id（チップ右端。タグチップと同じ位置）。
+    fn heart_id(self, database_id: &str) -> String {
+        match self {
+            EntityLink::Circle => format!("circle-heart-{database_id}"),
+            EntityLink::Author => format!("author-heart-{database_id}"),
+        }
+    }
+
+    /// チップ本体（値 + ハート）の要素 id。ラベルはこれに含めない。
+    fn chip_id(self, database_id: &str) -> String {
+        match self {
+            EntityLink::Circle => format!("circle-chip-{database_id}"),
+            EntityLink::Author => format!("author-chip-{database_id}"),
+        }
+    }
+
+    /// チップの外に置くラベルの要素 id。
+    fn label_id(self, database_id: &str) -> String {
+        match self {
+            EntityLink::Circle => format!("circle-label-{database_id}"),
+            EntityLink::Author => format!("author-label-{database_id}"),
+        }
+    }
+
+    /// DB（`favorite_entities`）に保存する種別。
+    fn db_kind(self) -> db::favorites::EntityKind {
+        match self {
+            EntityLink::Circle => db::favorites::EntityKind::Circle,
+            EntityLink::Author => db::favorites::EntityKind::Author,
+        }
+    }
 }
 
 /// 本棚の表示モード（Web の viewMode 相当）。
@@ -72,6 +104,122 @@ impl EntityLink {
 pub enum ViewMode {
     Card,
     List,
+}
+
+/// お気に入りハートの丸ボタンの一辺。文字だけだと押しにくいのでクリック領域を広げる。
+const CHIP_HEART_BUTTON: f32 = 18.0;
+/// 丸ボタンの中に置くハートアイコンの一辺。
+const CHIP_HEART_ICON: f32 = 12.0;
+
+/// 絞り込み選択中の背景（半透明の青）。ライトの白背景でもダークの黒背景でも
+/// 「選択中」に見えるように、テーマ共通で半透明の青を重ねる。
+/// ※ `Hsla.h` は 0..1 の正規化値。度（例: 217.0）を渡すと clamp されて別の色になる。
+const CHIP_SELECTED_BG: Hsla = gpui_kit::hsla(0.6028, 0.85, 0.55, 0.30);
+
+/// チップ（タグ / サークル / 作者）の配色。
+///
+/// - 状態: **絞り込み選択（青）> お気に入り（ピンク）> 既定** の優先度で塗る。
+///   選択とお気に入りが重なっても、ハートの色でお気に入りが分かる。
+/// - ダークテーマは塗りを半透明にしてカード背景となじませ、明るい文字色 +
+///   輪郭（ボーダー）で沈まないようにする。ライトテーマは不透明の淡色。
+#[derive(Clone, Copy)]
+struct ChipPalette {
+    favorite_bg: Hsla,
+    favorite_text: Hsla,
+    favorite_heart: Hsla,
+    selected_bg: Hsla,
+    selected_text: Hsla,
+    /// 既定 / お気に入り / 選択中それぞれの輪郭色（タグだと分かるように付ける）
+    default_border: Hsla,
+    favorite_border: Hsla,
+    selected_border: Hsla,
+    /// ハートの丸ボタンの地色（チップの上に重ねる）とホバー色
+    heart_button: Hsla,
+    heart_button_hover: Hsla,
+}
+
+impl ChipPalette {
+    /// ライトテーマ: お気に入りは不透明の淡色、選択中は半透明の青 + 控えめな輪郭。
+    fn light() -> Self {
+        Self {
+            favorite_bg: gpui_kit::rgb(0xfce7f3).into(),
+            favorite_text: gpui_kit::rgb(0x9d174d).into(),
+            favorite_heart: gpui_kit::rgb(0xdb2777).into(),
+            selected_bg: CHIP_SELECTED_BG,
+            selected_text: gpui_kit::rgb(0x1e40af).into(),
+            default_border: gpui_kit::hsla(0.0, 0.0, 0.0, 0.12),
+            favorite_border: gpui_kit::hsla(0.925, 0.71, 0.51, 0.35),
+            selected_border: gpui_kit::hsla(0.6028, 0.91, 0.60, 0.40),
+            heart_button: gpui_kit::hsla(0.0, 0.0, 0.0, 0.06),
+            heart_button_hover: gpui_kit::hsla(0.0, 0.0, 0.0, 0.14),
+        }
+    }
+
+    /// ダークテーマ: 塗りを半透明にして、明るい文字 + 強めの輪郭で読みやすくする。
+    fn dark() -> Self {
+        Self {
+            favorite_bg: gpui_kit::hsla(0.925, 0.55, 0.50, 0.24),
+            favorite_text: gpui_kit::rgb(0xf9a8d4).into(),
+            favorite_heart: gpui_kit::rgb(0xf472b6).into(),
+            selected_bg: CHIP_SELECTED_BG,
+            selected_text: gpui_kit::rgb(0x93c5fd).into(),
+            default_border: gpui_kit::hsla(0.0, 0.0, 1.0, 0.22),
+            favorite_border: gpui_kit::hsla(0.925, 0.80, 0.72, 0.45),
+            selected_border: gpui_kit::hsla(0.6028, 0.90, 0.72, 0.45),
+            heart_button: gpui_kit::hsla(0.0, 0.0, 1.0, 0.14),
+            heart_button_hover: gpui_kit::hsla(0.0, 0.0, 1.0, 0.24),
+        }
+    }
+
+    fn for_theme(theme: &gpui_kit::component::Theme) -> Self {
+        if theme.is_dark() {
+            Self::dark()
+        } else {
+            Self::light()
+        }
+    }
+
+    /// 背景色。選択 > お気に入り > 既定（`muted`）の優先度。
+    fn background(&self, muted: Hsla, is_favorite: bool, is_selected: bool) -> Hsla {
+        if is_selected {
+            self.selected_bg
+        } else if is_favorite {
+            self.favorite_bg
+        } else {
+            muted
+        }
+    }
+
+    /// 文字色（[`Self::background`] と対）。
+    fn foreground(&self, muted: Hsla, is_favorite: bool, is_selected: bool) -> Hsla {
+        if is_selected {
+            self.selected_text
+        } else if is_favorite {
+            self.favorite_text
+        } else {
+            muted
+        }
+    }
+
+    /// 輪郭色（状態ごとに色を変えてタグだと分かるようにする）。
+    fn border(&self, is_favorite: bool, is_selected: bool) -> Hsla {
+        if is_selected {
+            self.selected_border
+        } else if is_favorite {
+            self.favorite_border
+        } else {
+            self.default_border
+        }
+    }
+
+    /// ハートの色。お気に入り専用のチャンネルなので、選択中でも色を変えない。
+    fn heart(&self, muted: Hsla, is_favorite: bool) -> Hsla {
+        if is_favorite {
+            self.favorite_heart
+        } else {
+            muted
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -97,6 +245,18 @@ pub(crate) struct ShelfCard {
     cover: Option<Arc<RenderImage>>,
     /// 表紙の取得・デコードが失敗したカード（NoImage ダミーを表示する）
     cover_fetch_failed: bool,
+}
+
+/// カード / 行のチップ表示に必要な状態のスナップショット
+/// （お気に入り = ハート、絞り込み選択 = 背景色）。
+#[derive(Clone, Default)]
+struct ChipState {
+    favorite_tags: Vec<String>,
+    favorite_circles: Vec<String>,
+    favorite_authors: Vec<String>,
+    selected_tags: Vec<String>,
+    circle_filter: Option<String>,
+    author_filter: Option<String>,
 }
 
 /// Download/import progress for a bookshelf card, fraction 0..1.
@@ -126,6 +286,10 @@ pub struct BookshelfView {
     shelf_cards: Vec<ShelfCard>,
     download_states: HashMap<String, DownloadState>,
     favorite_tags: Vec<String>,
+    /// お気に入りサークル（チップのハート。`favorite_entities`）
+    favorite_circles: Vec<String>,
+    /// お気に入り作者（チップのハート。`favorite_entities`）
+    favorite_authors: Vec<String>,
     search_state: Option<Entity<InputState>>,
     selected_tags: Vec<String>,
     all_tags: Vec<String>,
@@ -400,6 +564,8 @@ impl BookshelfView {
             shelf_cards: Vec::new(),
             download_states: HashMap::new(),
             favorite_tags: Vec::new(),
+            favorite_circles: Vec::new(),
+            favorite_authors: Vec::new(),
             search_state: None,
             selected_tags: Vec::new(),
             all_tags: Vec::new(),
@@ -506,7 +672,7 @@ impl BookshelfView {
         }
     }
 
-    /// キーボード操作: Enter で開く、矢印 / hjkl で選択移動
+    /// キーボード操作: Enter で開く、矢印 / hjkl で選択移動、ESC で絞り込み解除
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "enter" => self.activate_selected(cx),
@@ -514,6 +680,12 @@ impl BookshelfView {
             "left" | "h" => self.shift_selection(-1, 0, window, cx),
             "down" | "j" => self.shift_selection(0, 1, window, cx),
             "up" | "k" => self.shift_selection(0, -1, window, cx),
+            // ESC: 絞り込み中ならすべて解除（全項目へ戻す）。絞り込みが無いときは
+            // 何もせず、親（ワークスペース）の ESC 処理へ流す。
+            "escape" if self.is_filtering(cx) => {
+                cx.stop_propagation();
+                self.clear_filters(window, cx);
+            }
             _ => {}
         }
     }
@@ -603,10 +775,31 @@ impl BookshelfView {
         })
     }
 
+    /// チップ表示（お気に入り / 絞り込み選択）に使う状態をまとめて取り出す。
+    fn chip_state(&self) -> ChipState {
+        ChipState {
+            favorite_tags: self.favorite_tags.clone(),
+            favorite_circles: self.favorite_circles.clone(),
+            favorite_authors: self.favorite_authors.clone(),
+            selected_tags: self.selected_tags.clone(),
+            circle_filter: self.circle_filter.clone(),
+            author_filter: self.author_filter.clone(),
+        }
+    }
+
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         log::info!("reload: 開始");
         let reload_start = std::time::Instant::now();
-        let (entries, shelf_items, all_tags, favorite_tags, available_events, shelf_cards) = {
+        let (
+            entries,
+            shelf_items,
+            all_tags,
+            favorite_tags,
+            favorite_circles,
+            favorite_authors,
+            available_events,
+            shelf_cards,
+        ) = {
             let state = Self::app_state(cx);
             let db = &state.db_pool;
             let packs_dir = state.packs_dir.clone();
@@ -746,6 +939,12 @@ impl BookshelfView {
                 }
             }
             let favorite_tags: Vec<String> = db::tags::list_favorites(db).unwrap_or_default();
+            let favorite_circles: Vec<String> =
+                db::favorites::list_favorites(db, db::favorites::EntityKind::Circle)
+                    .unwrap_or_default();
+            let favorite_authors: Vec<String> =
+                db::favorites::list_favorites(db, db::favorites::EntityKind::Author)
+                    .unwrap_or_default();
             let mut available_events: Vec<String> = Vec::new();
             for item in &shelf_items {
                 if let Some(event) = item.event_name.as_deref()
@@ -870,6 +1069,8 @@ impl BookshelfView {
                 shelf_items,
                 all_tags,
                 favorite_tags,
+                favorite_circles,
+                favorite_authors,
                 available_events,
                 shelf_cards,
             )
@@ -884,6 +1085,8 @@ impl BookshelfView {
         self.shelf_cards = shelf_cards;
         self.all_tags = all_tags;
         self.favorite_tags = favorite_tags;
+        self.favorite_circles = favorite_circles;
+        self.favorite_authors = favorite_authors;
         self.available_events = available_events;
         self.selected_tags.retain(|tag| self.all_tags.contains(tag));
         self.filtered_dirty = true;
@@ -2425,10 +2628,10 @@ impl BookshelfView {
             || self.read_filter != ReadFilter::All
     }
 
-    /// 全項目ボタンのラベル。絞り込み中は「絞込中」。
+    /// 全項目ボタンのラベル。絞り込み中は「絞込中 ✕」（クリック / ESC で解除）。
     fn filter_all_label(&self, cx: &App) -> &'static str {
         if self.is_filtering(cx) {
-            "絞込中"
+            "絞込中 ✕"
         } else {
             "全項目"
         }
@@ -2447,11 +2650,7 @@ impl BookshelfView {
         if self.site_filter.is_some() {
             self.site_filter = None;
             // 次回起動時の復元用に「すべての本」も保存する
-            let _ = db::settings::set(
-                &Self::app_state(cx).db_pool,
-                "bookshelf.site_filter",
-                "all",
-            );
+            let _ = db::settings::set(&Self::app_state(cx).db_pool, "bookshelf.site_filter", "all");
         }
         self.filtered_dirty = true;
         cx.notify();
@@ -2469,6 +2668,29 @@ impl BookshelfView {
             self.favorite_tags.retain(|t| t != tag);
         } else {
             self.favorite_tags.push(tag.to_string());
+        }
+        cx.notify();
+    }
+
+    /// サークル / 作者のお気に入りトグル（`favorite_entities`）。
+    fn toggle_favorite_entity(&mut self, cx: &mut Context<Self>, kind: EntityLink, value: &str) {
+        let is_favorite = match kind {
+            EntityLink::Circle => self.favorite_circles.iter().any(|v| v == value),
+            EntityLink::Author => self.favorite_authors.iter().any(|v| v == value),
+        };
+        {
+            let state = Self::app_state(cx);
+            let db = &state.db_pool;
+            let _ = db::favorites::set_favorite(db, kind.db_kind(), value, !is_favorite);
+        }
+        let favorites = match kind {
+            EntityLink::Circle => &mut self.favorite_circles,
+            EntityLink::Author => &mut self.favorite_authors,
+        };
+        if is_favorite {
+            favorites.retain(|v| v != value);
+        } else {
+            favorites.push(value.to_string());
         }
         cx.notify();
     }
@@ -2771,7 +2993,7 @@ impl BookshelfView {
         card_width: f32,
         download_state: Option<DownloadState>,
         editing: bool,
-        favorite_tags: &[String],
+        chips: &ChipState,
         editing_tags: &[String],
         editing_suggestions: &[String],
         editing_input: Option<&gpui_kit::Entity<InputState>>,
@@ -3108,21 +3330,34 @@ impl BookshelfView {
                                 _ => event_text.clone(),
                             }),
                     )
-                    // サークル名 / 作者名（下線リンク。クリックでその値に絞り込む）
-                    .child(BookshelfView::render_entity_link(
-                        theme,
-                        &handle,
-                        EntityLink::Circle,
-                        &circle_name,
-                        &database_id,
-                    ))
-                    .child(BookshelfView::render_entity_link(
-                        theme,
-                        &handle,
-                        EntityLink::Author,
-                        &author,
-                        &database_id,
-                    ))
+                    // サークル名 / 作者名（タグと同じチップ。本体クリックで絞り込み、
+                    // 右端のハートでお気に入り）
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_1()
+                            .items_center()
+                            .child(BookshelfView::render_entity_chip(
+                                theme,
+                                &handle,
+                                EntityLink::Circle,
+                                &circle_name,
+                                &database_id,
+                                chips.favorite_circles.contains(&circle_name),
+                                chips.circle_filter.as_deref() == Some(circle_name.as_str()),
+                            ))
+                            .child(BookshelfView::render_entity_chip(
+                                theme,
+                                &handle,
+                                EntityLink::Author,
+                                &author,
+                                &database_id,
+                                chips.favorite_authors.contains(&author),
+                                chips.author_filter.as_deref() == Some(author.as_str()),
+                            )),
+                    )
                     .child(match progress_text.as_deref() {
                         Some(text) => div()
                             .text_xs()
@@ -3160,7 +3395,8 @@ impl BookshelfView {
                 .children(BookshelfView::render_tag_chips(
                     theme,
                     &handle,
-                    favorite_tags,
+                    &chips.favorite_tags,
+                    &chips.selected_tags,
                     card,
                 ))
                 .child(BookshelfView::render_tag_edit_button(
@@ -3224,109 +3460,251 @@ impl BookshelfView {
         })
     }
 
-    /// サークル名 / 作者名のリンク行。
-    /// ラベル（`サークル:` / `作者:`）は下線もクリックもせず、**値だけ**をリンクにする。
-    fn render_entity_link(
+    /// サークル名 / 作者名のチップ（タグチップと同じ見た目）。
+    /// ラベル（`サークル:` / `作者:`）は**チップの外**に置き、タグ化しない。
+    /// 値クリックでその値に絞り込み（選択中は青）、右端のハートでお気に入り。
+    fn render_entity_chip(
         theme: &gpui_kit::component::Theme,
         handle: &gpui_kit::Entity<BookshelfView>,
         kind: EntityLink,
         value: &str,
         database_id: &str,
+        is_favorite: bool,
+        is_selected: bool,
     ) -> gpui_kit::AnyElement {
         if value.is_empty() {
             return div().into_any_element();
         }
         let value = value.to_string();
-        let selector = kind.element_id(database_id);
+        let chip_selector = kind.chip_id(database_id);
+        let label_selector = kind.label_id(database_id);
+        let link_selector = kind.element_id(database_id);
+        let heart_selector = kind.heart_id(database_id);
+        let value_for_link = value.clone();
+        let value_for_heart = value.clone();
+        let palette = ChipPalette::for_theme(theme);
+        let icon_selector = format!("{heart_selector}-icon");
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap_0p5()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(kind.prefix())
+            // ラベルはチップの外（タグに含めない）
             .child(
                 div()
-                    .id(SharedString::from(selector.clone()))
-                    .debug_selector(move || selector.clone())
-                    .underline()
-                    .cursor_pointer()
-                    .on_click({
-                        let handle = handle.clone();
-                        let value = value.clone();
-                        move |_, _, cx| {
-                            // カード / 行のクリック（開く・ダウンロード）を発火させない
-                            cx.stop_propagation();
-                            handle.update(cx, |this, cx| match kind {
-                                EntityLink::Circle => this.toggle_circle_filter(cx, &value),
-                                EntityLink::Author => this.toggle_author_filter(cx, &value),
-                            });
-                        }
+                    .id(SharedString::from(label_selector.clone()))
+                    .debug_selector({
+                        let label_selector = label_selector.clone();
+                        move || label_selector.clone()
                     })
-                    .child(value),
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(kind.prefix()),
+            )
+            // チップ本体 = 値 + ハート（タグチップと同じ見た目）
+            .child(
+                div()
+                    .id(SharedString::from(chip_selector.clone()))
+                    .debug_selector({
+                        let chip_selector = chip_selector.clone();
+                        move || chip_selector.clone()
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(palette.border(is_favorite, is_selected))
+                    .bg(palette.background(theme.muted, is_favorite, is_selected))
+                    .text_color(palette.foreground(
+                        theme.muted_foreground,
+                        is_favorite,
+                        is_selected,
+                    ))
+                    .text_xs()
+                    .child(
+                        div()
+                            .id(SharedString::from(link_selector.clone()))
+                            .debug_selector({
+                                let link_selector = link_selector.clone();
+                                move || link_selector.clone()
+                            })
+                            .cursor_pointer()
+                            .on_click({
+                                let handle = handle.clone();
+                                move |_, _, cx| {
+                                    // カード / 行のクリック（開く・ダウンロード）を発火させない
+                                    cx.stop_propagation();
+                                    handle.update(cx, |this, cx| match kind {
+                                        EntityLink::Circle => {
+                                            this.toggle_circle_filter(cx, &value_for_link)
+                                        }
+                                        EntityLink::Author => {
+                                            this.toggle_author_filter(cx, &value_for_link)
+                                        }
+                                    });
+                                }
+                            })
+                            .child(value),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(heart_selector.clone()))
+                            .debug_selector({
+                                let heart_selector = heart_selector.clone();
+                                move || heart_selector.clone()
+                            })
+                            // 押しやすいように丸ボタンにしてハートを中に置く
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(CHIP_HEART_BUTTON))
+                            .h(px(CHIP_HEART_BUTTON))
+                            .rounded_full()
+                            .bg(palette.heart_button)
+                            .hover(move |style| style.bg(palette.heart_button_hover))
+                            .text_color(palette.heart(theme.muted_foreground, is_favorite))
+                            .cursor_pointer()
+                            .on_click({
+                                let handle = handle.clone();
+                                move |_, _, cx| {
+                                    // ハートはお気に入りのみ。値の絞り込みへ伝播させない
+                                    cx.stop_propagation();
+                                    handle.update(cx, |this, cx| {
+                                        this.toggle_favorite_entity(cx, kind, &value_for_heart);
+                                    });
+                                }
+                            })
+                            // アイコンを丸の中心に置く（文字グリフのフォント依存のズレを避ける）
+                            .child(
+                                div()
+                                    .id(SharedString::from(icon_selector.clone()))
+                                    .debug_selector({
+                                        let icon_selector = icon_selector.clone();
+                                        move || icon_selector.clone()
+                                    })
+                                    .child(
+                                        Icon::new(if is_favorite {
+                                            AppIcon::HeartFilled
+                                        } else {
+                                            AppIcon::Heart
+                                        })
+                                        .size(px(CHIP_HEART_ICON)),
+                                    ),
+                            ),
+                    ),
             )
             .into_any_element()
     }
 
-    /// タグチップ行（Web の TagList 相当: お気に入りは ♥ + ピンク）。
+    /// タグチップ行（Web の TagList 相当）。
+    /// クリックで絞り込み選択（青）、ハートでお気に入り（ピンク / ♥）。
     fn render_tag_chips(
         theme: &gpui_kit::component::Theme,
         handle: &gpui_kit::Entity<BookshelfView>,
         favorite_tags: &[String],
+        selected_tags: &[String],
         card: &ShelfCard,
     ) -> Vec<gpui_kit::AnyElement> {
         let shelf = &card.shelf;
         let tags = card.tags.clone();
-        let favorite_tags = favorite_tags.to_vec();
         let handle = handle.clone();
         tags.into_iter()
             .map(|tag| {
                 let is_favorite = favorite_tags.contains(&tag);
+                let is_selected = selected_tags.contains(&tag);
                 let handle = handle.clone();
-                let tag_id = tag.clone();
-                let chip_selector = format!("tag-chip-{}-{}", shelf.database_id, tag);
+                let tag_for_text = tag.clone();
+                let tag_for_heart = tag.clone();
+                let label_selector = format!("tag-label-{}-{}", shelf.database_id, tag);
+                let heart_selector = format!("tag-heart-{}-{}", shelf.database_id, tag);
+                let icon_selector = format!("{heart_selector}-icon");
+                let palette = ChipPalette::for_theme(theme);
                 div()
-                    .id(SharedString::from(format!(
-                        "tag-chip-{}-{}",
-                        shelf.database_id, tag
-                    )))
-                    .debug_selector(move || chip_selector.clone())
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_0p5()
+                    .gap_1p5()
                     .px_1()
                     .py_0p5()
                     .rounded_full()
-                    .bg(if is_favorite {
-                        gpui_kit::rgb(0xfbcfe8).into()
-                    } else {
-                        theme.muted
-                    })
-                    .text_color(if is_favorite {
-                        gpui_kit::rgb(0x9d174d).into()
-                    } else {
-                        theme.muted_foreground
-                    })
+                    .border_1()
+                    .border_color(palette.border(is_favorite, is_selected))
+                    .bg(palette.background(theme.muted, is_favorite, is_selected))
+                    .text_color(palette.foreground(
+                        theme.muted_foreground,
+                        is_favorite,
+                        is_selected,
+                    ))
                     .text_xs()
+                    // タグ文字のクリックでそのタグに絞り込む
                     .child(
                         div()
-                            .text_color(if is_favorite {
-                                gpui_kit::rgb(0xbe185d).into()
-                            } else {
-                                theme.muted_foreground
+                            .id(SharedString::from(label_selector.clone()))
+                            .debug_selector({
+                                let label_selector = label_selector.clone();
+                                move || label_selector.clone()
                             })
-                            .child(if is_favorite { "♥" } else { "♡" }),
+                            .cursor_pointer()
+                            .on_click({
+                                let handle = handle.clone();
+                                move |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                    handle.update(cx, |this, cx| {
+                                        this.toggle_tag(cx, &tag_for_text);
+                                    });
+                                }
+                            })
+                            .child(tag),
                     )
-                    .child(div().child(tag))
-                    .cursor_pointer()
-                    .on_click(move |_event, _window, cx| {
-                        cx.stop_propagation();
-                        handle.update(cx, |this, cx| {
-                            this.toggle_favorite_tag(cx, &tag_id);
-                        });
-                    })
+                    // ハート（文字の後ろ = 右端）は押しやすい丸ボタン。クリックでお気に入り
+                    .child(
+                        div()
+                            .id(SharedString::from(heart_selector.clone()))
+                            .debug_selector({
+                                let heart_selector = heart_selector.clone();
+                                move || heart_selector.clone()
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(CHIP_HEART_BUTTON))
+                            .h(px(CHIP_HEART_BUTTON))
+                            .rounded_full()
+                            .bg(palette.heart_button)
+                            .hover(move |style| style.bg(palette.heart_button_hover))
+                            .text_color(palette.heart(theme.muted_foreground, is_favorite))
+                            .cursor_pointer()
+                            .on_click({
+                                let handle = handle.clone();
+                                move |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                    handle.update(cx, |this, cx| {
+                                        this.toggle_favorite_tag(cx, &tag_for_heart);
+                                    });
+                                }
+                            })
+                            // アイコンを丸の中心に置く（文字グリフのフォント依存のズレを避ける）
+                            .child(
+                                div()
+                                    .id(SharedString::from(icon_selector.clone()))
+                                    .debug_selector({
+                                        let icon_selector = icon_selector.clone();
+                                        move || icon_selector.clone()
+                                    })
+                                    .child(
+                                        Icon::new(if is_favorite {
+                                            AppIcon::HeartFilled
+                                        } else {
+                                            AppIcon::Heart
+                                        })
+                                        .size(px(CHIP_HEART_ICON)),
+                                    ),
+                            ),
+                    )
                     .into_any_element()
             })
             .collect()
@@ -3655,15 +4033,9 @@ impl BookshelfView {
         };
         // 縦長（エリアより縦長）は高さいっぱい、横長は幅いっぱいに合わせる
         let (img_w, img_h) = if image_aspect <= LIST_COVER_ASPECT {
-            (
-                relative(image_aspect / LIST_COVER_ASPECT),
-                relative(1.0),
-            )
+            (relative(image_aspect / LIST_COVER_ASPECT), relative(1.0))
         } else {
-            (
-                relative(1.0),
-                relative(LIST_COVER_ASPECT / image_aspect),
-            )
+            (relative(1.0), relative(LIST_COVER_ASPECT / image_aspect))
         };
         let img_selector = format!("list-cover-img-{database_id}");
         let image: gpui_kit::AnyElement = match &cover {
@@ -3862,21 +4234,34 @@ impl BookshelfView {
                             _ => event_text.clone(),
                         }),
                 )
-                // サークル名 / 作者名（下線リンク。クリックでその値に絞り込む）
-                .child(BookshelfView::render_entity_link(
-                    cx.theme(),
-                    &handle,
-                    EntityLink::Circle,
-                    &circle_name,
-                    &database_id,
-                ))
-                .child(BookshelfView::render_entity_link(
-                    cx.theme(),
-                    &handle,
-                    EntityLink::Author,
-                    &author,
-                    &database_id,
-                ))
+                // サークル名 / 作者名（タグと同じチップ。本体クリックで絞り込み、
+                // 右端のハートでお気に入り）
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap_1()
+                        .items_center()
+                        .child(BookshelfView::render_entity_chip(
+                            cx.theme(),
+                            &handle,
+                            EntityLink::Circle,
+                            &circle_name,
+                            &database_id,
+                            self.favorite_circles.contains(&circle_name),
+                            self.circle_filter.as_deref() == Some(circle_name.as_str()),
+                        ))
+                        .child(BookshelfView::render_entity_chip(
+                            cx.theme(),
+                            &handle,
+                            EntityLink::Author,
+                            &author,
+                            &database_id,
+                            self.favorite_authors.contains(&author),
+                            self.author_filter.as_deref() == Some(author.as_str()),
+                        )),
+                )
                 .child(match progress_text.as_deref() {
                     Some(text) => div()
                         .text_xs()
@@ -3911,6 +4296,7 @@ impl BookshelfView {
                                 cx.theme(),
                                 &handle,
                                 &self.favorite_tags,
+                                &self.selected_tags,
                                 card,
                             ))
                             .child(BookshelfView::render_tag_edit_button(
@@ -4159,10 +4545,11 @@ impl Render for BookshelfView {
                                         let mut button = Button::new("filter-all")
                                             .cursor_pointer()
                                             .label(self.filter_all_label(cx));
-                                        // 絞り込み中は「絞り込みしてます」を表す警告色、
+                                        // 絞り込み中は「絞り込みしてます」を表す警告色にし、
+                                        // 解除のショートカット（ESC）をツールチップで示す。
                                         // 未絞り込み（= 全項目が選択中）は選択色
                                         button = if self.is_filtering(cx) {
-                                            button.warning()
+                                            button.warning().tooltip("絞り込みを解除（ESC）")
                                         } else {
                                             button.primary()
                                         };
@@ -4608,7 +4995,7 @@ impl Render for BookshelfView {
                                             move |ix, window, cx| {
                                                 // 借用を閉じるため可視行のカードと状態を先にコピーする
                                                 // （可視行のみなので全カード構築より桁違いに軽い）
-                                                let (cards, favorite_tags, editing_tags, editing_suggestions, editing_input) = {
+                                                let (cards, chips, editing_tags, editing_suggestions, editing_input) = {
                                                     let view = handle.read(cx);
                                                     let start = ix * columns;
                                                     let end =
@@ -4638,7 +5025,7 @@ impl Render for BookshelfView {
                                                         .collect::<Vec<_>>();
                                                     (
                                                         cards,
-                                                        view.favorite_tags.clone(),
+                                                        view.chip_state(),
                                                         view.editing_tags.clone(),
                                                         view.editing_suggestions.clone(),
                                                         view.editing_input.clone(),
@@ -4659,7 +5046,7 @@ impl Render for BookshelfView {
                                                                 card_width,
                                                                 *ds,
                                                                 *editing,
-                                                                &favorite_tags,
+                                                                &chips,
                                                                 &editing_tags,
                                                                 &editing_suggestions,
                                                                 editing_input.as_ref(),
@@ -5413,7 +5800,10 @@ mod tests {
             );
             // 対象外サイト（技術書典）は何もしない
             apply_site_metadata(db, "techbookfest", "db-1", "book-1", &item, Some("X"));
-            assert_eq!(books::get(db, "book-1").unwrap().unwrap().author, "YORIMIYA");
+            assert_eq!(
+                books::get(db, "book-1").unwrap().unwrap().author,
+                "YORIMIYA"
+            );
         });
     }
 
@@ -5896,16 +6286,25 @@ mod tests {
     fn cover_fit_size_preserves_aspect_and_fits_box() {
         // 横長 (FANZA の原寸 560x420) は 4:3 の枠にそのまま収まる
         let (w, h) = fit_cover_size(560.0, 420.0, 120.0, 90.0);
-        assert!((w - 120.0).abs() < 0.01 && (h - 90.0).abs() < 0.01, "{w}x{h}");
+        assert!(
+            (w - 120.0).abs() < 0.01 && (h - 90.0).abs() < 0.01,
+            "{w}x{h}"
+        );
         // 縦長 (DLsite 290x408) は高さいっぱい・幅は比率なり
         let (w, h) = fit_cover_size(290.0, 408.0, 120.0, 90.0);
         assert!((h - 90.0).abs() < 0.01, "縦長は高さいっぱい: {w}x{h}");
-        assert!((w - 90.0 * 290.0 / 408.0).abs() < 0.01, "比率を保つ: {w}x{h}");
+        assert!(
+            (w - 90.0 * 290.0 / 408.0).abs() < 0.01,
+            "比率を保つ: {w}x{h}"
+        );
         assert!(w <= 120.0, "枠の幅を超えない: {w}");
         // 極端な横長も枠内に収まり比率を保つ
         let (w, h) = fit_cover_size(1000.0, 100.0, 120.0, 90.0);
         assert!((w - 120.0).abs() < 0.01, "横長は幅いっぱい: {w}x{h}");
-        assert!((h - 120.0 * 100.0 / 1000.0).abs() < 0.01, "比率を保つ: {w}x{h}");
+        assert!(
+            (h - 120.0 * 100.0 / 1000.0).abs() < 0.01,
+            "比率を保つ: {w}x{h}"
+        );
         assert!(h <= 90.0);
         // 壊れた画像（0）でも 0 除算しない
         let (w, h) = fit_cover_size(0.0, 0.0, 120.0, 90.0);
@@ -6043,8 +6442,13 @@ mod tests {
         // タグ行がある分だけ行が高くなる（実データに近い状態）。枠がそれに追従すること。
         cx.update(|cx| {
             let db = &AppState::global(cx).db_pool;
-            bookshelf::update_tags(db, "techbookfest", "db-1", &["タグA".into(), "タグB".into()])
-                .unwrap();
+            bookshelf::update_tags(
+                db,
+                "techbookfest",
+                "db-1",
+                &["タグA".into(), "タグB".into()],
+            )
+            .unwrap();
         });
         let view = cx.new(BookshelfView::new);
         cx.update(|cx| {
@@ -6362,6 +6766,117 @@ mod tests {
         // 超広幅（4K 等）は列数を増やしてタイルの間延びを防ぐ
         assert_eq!(BookshelfView::columns_for_width(2560.0), 7);
         assert!(BookshelfView::columns_for_width(3840.0) > 5);
+    }
+
+    /// チップの色は「絞り込み選択（青）」と「お気に入り（ピンク）」を区別する。
+    /// ライト / ダーク両方で成立し、ダークは半透明 + 輪郭で背景に沈まない。
+    #[test]
+    fn chip_colors_distinguish_selection_from_favorite_in_both_themes() {
+        let muted = gpui_kit::hsla(0.0, 0.0, 0.5, 1.0);
+        for (name, palette) in [
+            ("light", ChipPalette::light()),
+            ("dark", ChipPalette::dark()),
+        ] {
+            let plain = palette.background(muted, false, false);
+            let favorite = palette.background(muted, true, false);
+            let selected = palette.background(muted, false, true);
+            assert_eq!(plain, muted, "{name}: 未選択・未お気に入りは既定色");
+            assert_ne!(favorite, plain, "{name}: お気に入りは既定色と別の色");
+            assert_ne!(selected, favorite, "{name}: 選択中はお気に入りと別の色");
+            assert_ne!(selected, plain, "{name}: 選択中は既定色と別の色");
+
+            // 選択 + お気に入りは背景・文字が選択色、ハートはお気に入りの色のまま
+            assert_eq!(
+                palette.background(muted, true, true),
+                selected,
+                "{name}: 重なったら選択色"
+            );
+            assert_eq!(
+                palette.foreground(muted, true, true),
+                palette.foreground(muted, false, true),
+                "{name}"
+            );
+            assert_ne!(
+                palette.heart(muted, true),
+                palette.heart(muted, false),
+                "{name}: ハートはお気に入りで色が変わる"
+            );
+            assert_ne!(
+                palette.heart(muted, true),
+                selected,
+                "{name}: 選択中でもハートは選択色と別（お気に入りが分かる）"
+            );
+
+            // 輪郭（ボーダー）は状態ごとに色が変わり、塗りとも別の色
+            assert_ne!(
+                palette.border(false, false),
+                palette.border(true, false),
+                "{name}: お気に入りの輪郭は既定と別"
+            );
+            assert_ne!(
+                palette.border(false, false),
+                palette.border(false, true),
+                "{name}: 選択中の輪郭は既定と別"
+            );
+            assert_ne!(palette.border(true, false), favorite, "{name}");
+            assert_ne!(palette.heart_button, palette.border(false, false), "{name}");
+
+            // `Hsla.h` は 0..1 の正規化値。度で書くと clamp されて別の色になる
+            // （過去に hsla(333.0, ..) が赤になっていた）ので全色で範囲を固定する。
+            for (label, color) in [
+                ("favorite_bg", palette.favorite_bg),
+                ("favorite_text", palette.favorite_text),
+                ("favorite_heart", palette.favorite_heart),
+                ("selected_bg", palette.selected_bg),
+                ("selected_text", palette.selected_text),
+                ("default_border", palette.default_border),
+                ("favorite_border", palette.favorite_border),
+                ("selected_border", palette.selected_border),
+                ("heart_button", palette.heart_button),
+                ("heart_button_hover", palette.heart_button_hover),
+            ] {
+                assert!(
+                    (0.0..=1.0).contains(&color.h),
+                    "{name}/{label}: h は 0..1 正規化（現在 {}）",
+                    color.h
+                );
+            }
+            // お気に入りはピンク、選択は青（色相で見分けられる）
+            assert!(
+                palette.favorite_bg.h > 0.85 || palette.favorite_bg.h < 0.05,
+                "{name}: お気に入りの背景はピンク系（h={}）",
+                palette.favorite_bg.h
+            );
+            assert!(
+                (0.55..=0.70).contains(&palette.selected_bg.h),
+                "{name}: 選択中の背景は青系（h={}）",
+                palette.selected_bg.h
+            );
+        }
+
+        // 選択中はどちらのテーマでも「半透明の青」を重ねて、既定のグレーや白に
+        // 紛れないようにする（ライトは不透明の淡色だと選択中に見えなかった）
+        let dark = ChipPalette::dark();
+        let light = ChipPalette::light();
+        for (name, palette) in [("light", light), ("dark", dark)] {
+            let selected = palette.background(muted, false, true);
+            assert!(selected.a < 1.0, "{name}: 選択中の背景は半透明");
+            assert!(selected.s > 0.5, "{name}: 選択中の背景は青が十分濃い");
+            assert!(
+                selected.l < 0.95,
+                "{name}: 選択中の背景は白っぽすぎない（l={}）",
+                selected.l
+            );
+        }
+
+        // ダークはお気に入りも半透明でカードの背景になじませ、ライトは不透明のまま
+        assert!(dark.favorite_bg.a < 1.0, "ダークのお気に入り背景は半透明");
+        assert!(dark.heart_button.a < 1.0, "ダークのハートボタンは半透明");
+        assert_eq!(light.favorite_bg.a, 1.0, "ライトのお気に入りは不透明");
+        // ダークの文字・ハートは明るい色（暗い背景の上で読める）
+        assert!(dark.favorite_text.l > 0.6, "ダークの文字は明るい色");
+        assert!(dark.favorite_heart.l > 0.6, "ダークのハートは明るい色");
+        assert!(dark.selected_text.l > 0.6, "ダークの選択中文字も明るい色");
     }
 
     #[gpui_kit::test]
@@ -7101,16 +7616,20 @@ mod tests {
                 arena_clear.clear(cx);
             });
         }
-        // タグチップの ♥ をクリック → お気に入り登録される
-        let chip = visual
-            .debug_bounds("tag-chip-db-1-後で読む")
-            .expect("tag chip rendered");
-        visual.simulate_click(chip.center(), gpui_kit::Modifiers::default());
+        // タグチップの ♥ をクリック → お気に入り登録される（絞り込みは発火しない）
+        let heart = visual
+            .debug_bounds("tag-heart-db-1-後で読む")
+            .expect("tag heart rendered");
+        visual.simulate_click(heart.center(), gpui_kit::Modifiers::default());
         assert!(
             view.read_with(cx, |this, _| this
                 .favorite_tags
                 .contains(&"後で読む".to_string())),
             "heart click must add the tag to favorites"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.selected_tags.is_empty()),
+            "heart click must not filter by the tag"
         );
         // DB にも保存される
         let stored = cx.update(|cx| {
@@ -7118,6 +7637,265 @@ mod tests {
             db::tags::list_favorites(db).unwrap_or_default()
         });
         assert_eq!(stored, vec!["後で読む".to_string()]);
+    }
+
+    /// タグ文字のクリックでそのタグに絞り込み、全項目ボタンが「絞込中」になる。
+    #[gpui_kit::test]
+    async fn tag_text_click_filters_by_tag_and_shows_refining(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本1", "サークルA");
+        seed_book(cx, "b2", "本2", "サークルB");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::tags::set_for_book(db, "b1", &[("react", "manual")]).unwrap();
+            db::tags::set_for_book(db, "b2", &[("rust", "manual")]).unwrap();
+            for (id, product) in [("b1", "db-1"), ("b2", "db-2")] {
+                thundoku_core::db::block_on(async {
+                    sqlx::query("UPDATE books SET tbf_product_id = ?1 WHERE id = ?2")
+                        .bind(product)
+                        .bind(id)
+                        .execute(db)
+                        .await
+                })
+                .unwrap();
+            }
+        });
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルB", None);
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        // タグ文字のクリック → そのタグで絞り込み
+        let label = visual
+            .debug_bounds("tag-label-db-1-react")
+            .expect("tag label rendered");
+        visual.simulate_click(label.center(), gpui_kit::Modifiers::default());
+        assert_eq!(
+            view.read_with(cx, |this, _| this.selected_tags.clone()),
+            vec!["react".to_string()],
+            "tag text click must select the tag as a filter"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "絞込中 ✕",
+            "タグ絞り込み中は全項目が絞込中になる"
+        );
+        let visible = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            visible,
+            vec!["db-1".to_string()],
+            "react の本だけ表示される"
+        );
+        // カードのダウンロード（クリック伝播）は発火しない
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.is_empty()),
+            "clicking the tag must not trigger a card download"
+        );
+
+        // 同じタグの再クリックで解除
+        visual.simulate_click(label.center(), gpui_kit::Modifiers::default());
+        assert!(
+            view.read_with(cx, |this, _| this.selected_tags.is_empty()),
+            "re-click must clear the tag filter"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "全項目"
+        );
+    }
+
+    /// タグチップのお気に入りハートは**タグ文字の後ろ**に置き、押しやすいように
+    /// 丸ボタン（16px 以上）にして文字から少し離す。
+    #[gpui_kit::test]
+    async fn tag_heart_is_a_separated_round_button_after_the_tag_text(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本1", "サークルA");
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = 'db-1' WHERE id = 'b1'")
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
+            db::tags::set_for_book(db, "b1", &[("後で読む", "manual")]).unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let label = visual
+            .debug_bounds("tag-label-db-1-後で読む")
+            .expect("tag label rendered");
+        let heart = visual
+            .debug_bounds("tag-heart-db-1-後で読む")
+            .expect("tag heart rendered");
+        assert!(
+            heart.origin.x >= label.origin.x + label.size.width,
+            "ハートはタグ文字の後ろに置くこと"
+        );
+        assert!(
+            heart.size.width >= gpui_kit::px(16.0) && heart.size.height >= gpui_kit::px(16.0),
+            "ハートは押しやすい丸ボタン（16px 以上）にすること（現在 {:?}）",
+            heart.size
+        );
+        let gap = heart.origin.x - (label.origin.x + label.size.width);
+        assert!(
+            gap >= gpui_kit::px(6.0),
+            "ハートは文字から少し離すこと（現在 {gap:?}）"
+        );
+        // アイコンは丸の中心に置く（文字グリフのフォント依存のズレを避ける）
+        let icon = visual
+            .debug_bounds("tag-heart-db-1-後で読む-icon")
+            .expect("heart icon rendered");
+        assert!(
+            (icon.center().x - heart.center().x).as_f32().abs() < 1.0
+                && (icon.center().y - heart.center().y).as_f32().abs() < 1.0,
+            "ハートアイコンは丸の中心に置くこと（ズレ {:?} / {:?}）",
+            (icon.center().x - heart.center().x).as_f32(),
+            (icon.center().y - heart.center().y).as_f32()
+        );
+    }
+
+    /// サークル名 / 作者名はタグと同じチップ表示で、右端のハートでお気に入りにできる。
+    /// ハートのクリックは絞り込み（本体クリック）を発火させない。
+    #[gpui_kit::test]
+    async fn entity_chip_hearts_toggle_circle_and_author_favorites(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item_with_author(cx, "db-1", "本1", "サークルA", "作者X");
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        // ラベル（サークル: / 作者:）はタグ化しない = チップの外に置く
+        let label = visual
+            .debug_bounds("circle-label-db-1")
+            .expect("circle label rendered");
+        let chip = visual
+            .debug_bounds("circle-chip-db-1")
+            .expect("circle chip rendered");
+        assert!(
+            label.origin.x + label.size.width <= chip.origin.x,
+            "ラベル（サークル:）はチップの外に置くこと"
+        );
+
+        // ハートはチップ文字の後ろにある
+        let body = visual
+            .debug_bounds("circle-link-db-1")
+            .expect("circle link rendered");
+        let heart = visual
+            .debug_bounds("circle-heart-db-1")
+            .expect("circle heart rendered");
+        assert!(
+            heart.origin.x >= body.origin.x + body.size.width,
+            "ハートはサークル名の後ろに置くこと"
+        );
+        assert!(
+            heart.size.width >= gpui_kit::px(16.0) && heart.size.height >= gpui_kit::px(16.0),
+            "ハートは押しやすい丸ボタン（16px 以上）にすること（現在 {:?}）",
+            heart.size
+        );
+        assert!(
+            heart.origin.x - (body.origin.x + body.size.width) >= gpui_kit::px(6.0),
+            "ハートはサークル名から少し離すこと"
+        );
+        let icon = visual
+            .debug_bounds("circle-heart-db-1-icon")
+            .expect("circle heart icon rendered");
+        assert!(
+            (icon.center().x - heart.center().x).as_f32().abs() < 1.0
+                && (icon.center().y - heart.center().y).as_f32().abs() < 1.0,
+            "ハートアイコンは丸の中心に置くこと"
+        );
+
+        // クリックでお気に入り登録（絞り込みは発火しない）
+        visual.simulate_click(heart.center(), gpui_kit::Modifiers::default());
+        assert!(
+            view.read_with(cx, |this, _| this
+                .favorite_circles
+                .contains(&"サークルA".to_string())),
+            "circle heart click must add the circle to favorites"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.circle_filter.is_none()),
+            "heart click must not trigger the circle filter"
+        );
+        let stored = cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::favorites::list_favorites(db, db::favorites::EntityKind::Circle).unwrap_or_default()
+        });
+        assert_eq!(stored, vec!["サークルA".to_string()]);
+
+        // もう一度クリックで解除
+        visual.simulate_click(heart.center(), gpui_kit::Modifiers::default());
+        assert!(
+            !view.read_with(cx, |this, _| this
+                .favorite_circles
+                .contains(&"サークルA".to_string())),
+            "re-click must remove the circle from favorites"
+        );
+
+        // 作者も同じ方式
+        let author_heart = visual
+            .debug_bounds("author-heart-db-1")
+            .expect("author heart rendered");
+        visual.simulate_click(author_heart.center(), gpui_kit::Modifiers::default());
+        assert!(
+            view.read_with(cx, |this, _| this
+                .favorite_authors
+                .contains(&"作者X".to_string())),
+            "author heart click must add the author to favorites"
+        );
+        let stored = cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::favorites::list_favorites(db, db::favorites::EntityKind::Author).unwrap_or_default()
+        });
+        assert_eq!(stored, vec!["作者X".to_string()]);
     }
 
     #[gpui_kit::test]
@@ -7222,7 +8000,7 @@ mod tests {
         assert_eq!(visible, vec!["db-1".to_string()], "サークル絞り込みが効く");
         assert_eq!(
             view.read_with(cx, |this, cx| this.filter_all_label(cx)),
-            "絞込中",
+            "絞込中 ✕",
             "絞り込み中は全項目ボタンが絞込中になる"
         );
 
@@ -7281,6 +8059,11 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(visible, vec!["db-1".to_string()], "作者絞り込みが効く");
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "絞込中 ✕",
+            "作者絞り込み中は全項目が絞込中になる"
+        );
 
         // 同じリンクの再クリックで解除
         visual.simulate_click(link.center(), gpui_kit::Modifiers::default());
@@ -7324,7 +8107,7 @@ mod tests {
         });
         assert_eq!(
             view.read_with(cx, |this, cx| this.filter_all_label(cx)),
-            "絞込中",
+            "絞込中 ✕",
             "タグ絞り込み中も絞込中になる"
         );
 
@@ -7339,6 +8122,66 @@ mod tests {
         assert_eq!(
             view.read_with(cx, |this, cx| this.filter_all_label(cx)),
             "全項目"
+        );
+    }
+
+    /// 絞り込み中に ESC を押すとすべての絞り込みが解除される。
+    #[gpui_kit::test]
+    async fn escape_clears_active_filters(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        // タグ + サークル + 既読モードで絞り込む
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.toggle_tag(cx, "react");
+                this.toggle_circle_filter(cx, "サークルA");
+                this.read_filter = ReadFilter::Favorite;
+            })
+        });
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "絞込中 ✕"
+        );
+
+        visual.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: gpui_kit::Keystroke::parse("escape").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+
+        assert!(
+            view.read_with(cx, |this, _| this.selected_tags.is_empty()),
+            "ESC でタグ絞り込みが解除される"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.circle_filter.is_none()),
+            "ESC でサークル絞り込みが解除される"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.read_filter == ReadFilter::All),
+            "ESC で既読モードが解除される"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "全項目",
+            "ESC で全項目に戻る"
         );
     }
 

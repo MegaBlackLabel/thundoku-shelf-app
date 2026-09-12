@@ -2,9 +2,9 @@
 
 アプリのデータは SQLite（`thundoku-shelf.db`）に保存されます。スキーマの正本は
 `crates/core/src/db/schema.sql`、マイグレーションは `crates/core/migrations/0001_init.sql`
-（`sqlx::migrate!` 管理）です。後から追加されたテーブル（`view_history`）は
-マイグレーションファイルではなく、`migrate()` 内の冪等な DDL（`CREATE TABLE IF NOT
-EXISTS`）で適用されます。
+（`sqlx::migrate!` 管理）です。後から追加されたテーブル（`view_history` / `page_views` /
+`favorite_entities` など）はマイグレーションファイルではなく、`migrate()` 内の冪等な DDL
+（`CREATE TABLE IF NOT EXISTS`）で適用されます。
 
 ## テーブル一覧
 
@@ -241,6 +241,18 @@ Drive 同期設定など）。
 
 お気に入りタグ（タグチップのハート）。
 
+### favorite_entities
+
+お気に入りのサークル / 作者（サークル名 / 作者名チップのハート）。
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| entity_kind | TEXT PK | `circle`（サークル）/ `author`（作者） |
+| entity_name | TEXT PK | サークル名 / 作者名 |
+| created_at | TEXT | 登録日時 |
+
+同じ名前でも `entity_kind` が違えば別エントリ。
+
 ### zenn_tag_metadata
 
 Zenn のタグメタデータ（`https://zenn.dev/api/tags` 相当から取得、
@@ -258,8 +270,8 @@ Zenn のタグメタデータ（`https://zenn.dev/api/tags` 相当から取得�
 
 - `crates/core/migrations/0001_init.sql`: 初期スキーマ（`sqlx::migrate!` で
   チェックサム管理。**変更すると既存 DB が VersionMismatch で開けなくなる**）
-- `view_history` / `page_views` / `book_contents` / `content_formats`、
-  `document_images.content_id` / `format_id`: `migrate()` 内の
+- `view_history` / `page_views` / `favorite_entities` / `book_contents` /
+  `content_formats`、`document_images.content_id` / `format_id`: `migrate()` 内の
   `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN` で適用
   （新しいマイグレーションファイルは作らない方針）
 - `content_formats.label` の旧値（`画像` / `PDF` / `EPUB`）は `migrate()` 内の

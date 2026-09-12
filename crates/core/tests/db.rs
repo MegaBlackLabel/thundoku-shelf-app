@@ -1,7 +1,7 @@
 //! Storage/DB tests: verbatim schema migration + repository CRUD.
 
 use thundoku_core::db::{
-    books, bookshelf, checklist, contents, progress, settings, sync_state, tags,
+    books, bookshelf, checklist, contents, favorites, progress, settings, sync_state, tags,
 };
 
 fn memory_db() -> thundoku_core::db::SqlitePool {
@@ -36,6 +36,7 @@ fn migrate_creates_all_schema_tables() {
             "document_images",
             "document_text",
             "drive_sync_state",
+            "favorite_entities",
             "favorite_tags",
             "imported_documents",
             "page_views",
@@ -64,6 +65,31 @@ fn migrate_creates_all_schema_tables() {
     })
     .unwrap();
     assert_eq!(count, 1);
+}
+
+/// サークル / 作者のお気に入り（チップのハート）。種別ごとに独立し、
+/// 同名でも kind が違えば別エントリとして扱う。
+#[test]
+fn favorite_entities_roundtrip() {
+    let pool = memory_db();
+    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-a", true).unwrap();
+    // 同じ名前を二度お気に入りにしても重複しない（ON CONFLICT DO NOTHING）
+    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-a", true).unwrap();
+    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-b", true).unwrap();
+    favorites::set_favorite(&pool, favorites::EntityKind::Author, "author-x", true).unwrap();
+    // 同名でも種別が違えば独立
+    favorites::set_favorite(&pool, favorites::EntityKind::Author, "circle-a", true).unwrap();
+    // 解除
+    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-b", false).unwrap();
+
+    assert_eq!(
+        favorites::list_favorites(&pool, favorites::EntityKind::Circle).unwrap(),
+        vec!["circle-a".to_string()]
+    );
+    assert_eq!(
+        favorites::list_favorites(&pool, favorites::EntityKind::Author).unwrap(),
+        vec!["author-x".to_string(), "circle-a".to_string()]
+    );
 }
 
 #[test]
@@ -1241,7 +1267,9 @@ fn books_delete_removes_dependent_rows() {
         "タグも消えること"
     );
     assert!(
-        contents::list_for_book(&pool, "book-del").unwrap().is_empty(),
+        contents::list_for_book(&pool, "book-del")
+            .unwrap()
+            .is_empty(),
         "コンテンツも消えること"
     );
     assert!(
