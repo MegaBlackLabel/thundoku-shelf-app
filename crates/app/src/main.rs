@@ -100,6 +100,12 @@ fn main() {
             gpui_kit::init(cx);
             cx.set_app_identity("com.megablacklabel.thundoku-shelf", "Thundoku Shelf");
             Theme::sync_system_appearance(None, cx);
+            // カルーセルのスナップはテーマの `motion.spring_move`（既定 280ms / 減衰 0.85）で
+            // 動くため、1 コマ送りのたびに鈍く感じる。移動系スプリングを短くして切れよくする
+            // （カルーセル側に個別の設定は無く、テーマの値が唯一のつまみ）。
+            Theme::global_mut(cx).motion.spring_move =
+                gpui_kit::base::Spring::new(std::time::Duration::from_millis(120))
+                    .with_damping(0.9);
             cx.set_menus(app_menus());
             cx.activate(true);
 

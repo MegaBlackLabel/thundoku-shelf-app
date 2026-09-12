@@ -6,16 +6,19 @@ use std::sync::{Arc, LazyLock};
 
 use gpui_kit::StyledImage as _;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::carousel::{Carousel, CarouselContent, CarouselItem, CarouselState};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::tag::{Tag, TagVariant};
 use gpui_kit::component::theme::Colorize as _;
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Size};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AppContext as _, InteractiveElement as _, ReadGlobal as _,
-    StatefulInteractiveElement as _, Styled as _,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _,
 };
 use gpui_kit::{
     App, Context, Entity, Hsla, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
@@ -257,6 +260,8 @@ pub(crate) struct ShelfCard {
     cover: Option<Arc<RenderImage>>,
     /// 表紙の取得・デコードが失敗したカード（NoImage ダミーを表示する）
     cover_fetch_failed: bool,
+    /// 関連書籍（同一サークル / 同一作者）の `shelf_cards` インデックス。`reload` で作る。
+    related: Vec<usize>,
 }
 
 /// カード / 行のチップ表示に必要な状態のスナップショット
@@ -325,6 +330,8 @@ pub struct BookshelfView {
     editing_input: Option<Entity<InputState>>,
     /// アクション経由でリクエストされたタグ編集（window が必要なため render で処理）
     pending_tag_edit: Option<String>,
+    /// タグ列を展開している本（「+n」→「戻す」）。行ごとに独立。
+    expanded_tag_rows: std::collections::HashSet<String>,
     read_filter: ReadFilter,
     view_mode: ViewMode,
     tag_fetch_enabled: bool,
@@ -349,6 +356,9 @@ pub struct BookshelfView {
     list_state: gpui_kit::ListState,
     /// リスト表示のスクロール追跡（選択行のスクロール連動用）
     scroll_handle: gpui_kit::ScrollHandle,
+    /// リスト表示の行ごとの関連書籍カルーセル状態（`reload` で作る）。
+    /// render 中に作ると毎描画で実体が増えるため、view 側で保持して使い回す。
+    carousel_states: HashMap<String, Entity<CarouselState>>,
     /// キーバインド用フォーカス
     focus_handle: gpui_kit::FocusHandle,
     /// フォーカス初回付与済みフラグ
@@ -592,6 +602,7 @@ impl BookshelfView {
             editing_suggestions: Vec::new(),
             editing_input: None,
             pending_tag_edit: None,
+            expanded_tag_rows: std::collections::HashSet::new(),
             read_filter: ReadFilter::All,
             view_mode: ViewMode::Card,
             tag_fetch_enabled: true,
@@ -611,6 +622,7 @@ impl BookshelfView {
             )
             .measure_all(),
             scroll_handle: gpui_kit::ScrollHandle::new(),
+            carousel_states: HashMap::new(),
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
             selected_index: Some(0),
@@ -806,6 +818,40 @@ impl BookshelfView {
             selected_tags: self.selected_tags.clone(),
             circle_filter: self.circle_filter.clone(),
             author_filter: self.author_filter.clone(),
+        }
+    }
+
+    /// 関連書籍（同一サークル / 同一作者）のインデックスと、行ごとのカルーセル状態を作る。
+    /// `shelf_cards` が確定した後に呼ぶ（`reload` の最後）。
+    fn rebuild_related(&mut self, cx: &mut Context<Self>) {
+        let keys: Vec<(String, String)> = self
+            .shelf_cards
+            .iter()
+            .map(|card| (card.shelf.circle_name.clone(), card.shelf.author.clone()))
+            .collect();
+        for index in 0..self.shelf_cards.len() {
+            let related = related_book_indices(&keys, index, LIST_RELATED_LIMIT);
+            self.shelf_cards[index].related = related;
+        }
+        // カルーセルの状態は関連件数が変わったときだけ作り直す（毎描画で作ると実体が増える）。
+        let counts: Vec<(String, usize)> = self
+            .shelf_cards
+            .iter()
+            .filter(|card| !card.related.is_empty())
+            .map(|card| (card.shelf.database_id.clone(), card.related.len()))
+            .collect();
+        let live: std::collections::HashSet<String> =
+            counts.iter().map(|(id, _)| id.clone()).collect();
+        self.carousel_states.retain(|id, _| live.contains(id));
+        for (id, count) in counts {
+            let needs_new = match self.carousel_states.get(&id) {
+                Some(state) => state.read(cx).item_count() != count,
+                None => true,
+            };
+            if needs_new {
+                let state = cx.new(|_| CarouselState::new(count));
+                self.carousel_states.insert(id, state);
+            }
         }
     }
 
@@ -1030,6 +1076,7 @@ impl BookshelfView {
                     }),
                     tags,
                     cover,
+                    related: Vec::new(),
                 });
             }
             // ローカルの本（インポート済みで技術書典の本棚に無いもの）も
@@ -1083,6 +1130,7 @@ impl BookshelfView {
                         tags: entry.tags.clone(),
                         cover: entry.cover.clone(),
                         cover_fetch_failed: false,
+                        related: Vec::new(),
                     });
                 }
             }
@@ -1112,6 +1160,8 @@ impl BookshelfView {
         self.available_events = available_events;
         self.selected_tags.retain(|tag| self.all_tags.contains(tag));
         self.filtered_dirty = true;
+        // 関連書籍（同一サークル / 同一作者）と、行ごとのカルーセル状態を作る
+        self.rebuild_related(cx);
         // タグ取得トグル（Web 版の tagFetchEnabled 相当、デフォルト OFF）
         self.tag_fetch_enabled = {
             let state = Self::app_state(cx);
@@ -2843,6 +2893,14 @@ impl BookshelfView {
         }
     }
 
+    /// タグ列の折りたたみ / 展開を切り替える（「+n」↔「戻す」）。行ごとに独立。
+    fn toggle_tag_expansion(&mut self, database_id: &str, cx: &mut Context<Self>) {
+        if !self.expanded_tag_rows.remove(database_id) {
+            self.expanded_tag_rows.insert(database_id.to_string());
+        }
+        cx.notify();
+    }
+
     /// タグ編集を保存（Web の handleSave 相当）。
     fn save_tag_edit(&mut self, cx: &mut Context<Self>) {
         let Some(book_id) = self.editing_book_id.clone() else {
@@ -2952,6 +3010,25 @@ impl BookshelfView {
         self.read_filter = filter;
         self.filtered_dirty = true;
         cx.notify();
+    }
+
+    /// 行 / 関連サムネイルのクリック。ローカル本なら開き、未ダウンロードなら取り込む。
+    /// ダウンロード中の本は無視する（二重ダウンロード防止。行クリックと同じ扱い）。
+    fn open_or_download(
+        &mut self,
+        cx: &mut Context<Self>,
+        database_id: &str,
+        book_id: Option<String>,
+        item: &bookshelf::BookshelfItem,
+    ) {
+        if self.download_states.contains_key(database_id) {
+            return;
+        }
+        if let Some(book_id) = book_id {
+            self.open_book(cx, &book_id);
+        } else {
+            self.download_item(cx, item.clone());
+        }
     }
 
     fn open_book(&mut self, cx: &mut Context<Self>, book_id: &str) {
@@ -3990,6 +4067,346 @@ impl BookshelfView {
             .into_any_element()
     }
 
+    /// 状態（未読 / 既読 / ダウンロード済み / お気に入り）をタイトルの横に出す。
+    ///
+    /// 文字タグは短い「未読 / 既読」だけにする（「ダウンロード済み」「お気に入り」は
+    /// 長くて変な折り返しになるためアイコン + tooltip で出す）。
+    /// 配色は「注意が必要なものだけ色を付ける」方針:
+    /// 未読 = 落ち着いた灰色、既読 = 緑、未ダウンロード = 黄、ダウンロード済み = 緑、
+    /// お気に入り = ピンク（カードのハートと同じ色味）。
+    fn render_status_tags(
+        card: &ShelfCard,
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
+    ) -> Vec<gpui_kit::AnyElement> {
+        let database_id = card.shelf.database_id.as_str();
+        let downloaded = card.local.is_some();
+        let read = card
+            .local
+            .as_ref()
+            .map(|entry| entry.is_read)
+            .unwrap_or(false);
+        let mut tags = Vec::with_capacity(3);
+        if downloaded {
+            if read {
+                tags.push(status_tag(database_id, "read", "既読", TagVariant::Success));
+            } else {
+                tags.push(status_tag(
+                    database_id,
+                    "unread",
+                    "未読",
+                    TagVariant::Secondary,
+                ));
+            }
+            tags.push(status_icon(
+                database_id,
+                "downloaded",
+                AppIcon::HardDrive,
+                if theme.is_dark() {
+                    gpui_kit::rgb(0x34d399).into()
+                } else {
+                    gpui_kit::rgb(0x059669).into()
+                },
+                "ダウンロード済み",
+                None,
+            ));
+        } else {
+            // 未ダウンロードの本は読めないので「未読」は出さない
+            tags.push(status_icon(
+                database_id,
+                "not-downloaded",
+                AppIcon::Cloud,
+                if theme.is_dark() {
+                    gpui_kit::rgb(0xfbbf24).into()
+                } else {
+                    gpui_kit::rgb(0xb45309).into()
+                },
+                "未ダウンロード",
+                None,
+            ));
+        }
+        // お気に入りは登録 / 未登録の両方を出し、**クリックでトグル**する
+        // （アイコンだけだと行クリックに伝播してビューアーが開いてしまうため止める）。
+        let is_favorite = card.shelf.is_favorite == 1;
+        let palette = ChipPalette::for_theme(theme);
+        let favorite_card = card.clone();
+        let favorite_handle = handle.clone();
+        tags.push(status_icon(
+            database_id,
+            if is_favorite {
+                "favorite"
+            } else {
+                "not-favorite"
+            },
+            if is_favorite {
+                AppIcon::HeartFilled
+            } else {
+                AppIcon::Heart
+            },
+            palette.heart(theme.muted_foreground, is_favorite),
+            if is_favorite {
+                "お気に入り（クリックで解除）"
+            } else {
+                "お気に入りにする"
+            },
+            Some(Box::new(move |_window: &mut Window, cx: &mut App| {
+                // 行クリック（ビューアー / ダウンロード）へ伝播させない
+                cx.stop_propagation();
+                favorite_handle.update(cx, |this, cx| {
+                    this.toggle_favorite(cx, &favorite_card);
+                });
+            })),
+        ));
+        tags
+    }
+
+    /// カルーセルの前へ / 次へバー。**四角**で、高さは列（サムネイル）いっぱい、
+    /// 幅はアイコン程度。組み込みのコントロールは円形で、しかもコンテンツ枠の外側に
+    /// 絶対配置されるため見切れる。ここでは通常の flex 要素として並べる。
+    fn render_carousel_bar(
+        database_id: &str,
+        direction: &str,
+        icon: IconName,
+        label: &str,
+        enabled: bool,
+        state: &Entity<CarouselState>,
+        theme: &gpui_kit::component::Theme,
+    ) -> gpui_kit::AnyElement {
+        let selector = format!("list-carousel-{direction}-{database_id}");
+        let element_id = format!("related-{direction}-{database_id}");
+        let tooltip = label.to_string();
+        let state = state.clone();
+        let next = direction == "next";
+        let foreground = if enabled {
+            theme.foreground
+        } else {
+            // 無効時は Button の disabled と同じ薄さにする（アイコンが通常色のままだと
+            // 押せるように見えてしまう）
+            theme.muted_foreground.opacity(0.5)
+        };
+        div()
+            .id(SharedString::from(element_id))
+            .debug_selector(move || selector.clone())
+            .flex_none()
+            .w(px(LIST_CAROUSEL_BAR_W))
+            // 高さは列（サムネイル）いっぱい。親が auto 高さなので `h_full()` では
+            // 効かない（% 高さが auto に解決される）→ align-self: stretch で伸ばす
+            .self_stretch()
+            .flex()
+            .items_center()
+            .justify_center()
+            // 四角（既定は角丸）
+            .rounded(px(0.0))
+            .bg(if enabled {
+                theme.muted
+            } else {
+                // 無効時はボタンに見えないよう背景も落とす
+                theme.muted.opacity(0.4)
+            })
+            // ホバーで応答（移動できる向きだけ）。`theme.secondary` はダークで背景の
+            // `muted` と同色になるため、明示のホバー色を使う。
+            .when(enabled, |this| {
+                this.hover(move |style| style.bg(crate::views::hover_bg(theme)))
+            })
+            .when(enabled, |this| this.cursor_pointer())
+            .on_click(move |_, _, cx| {
+                // 行クリック（ビューアー / ダウンロード）へ伝播させない。
+                // **移動できない向きでもハンドラを必ず登録する**（登録が無いと
+                // クリックが行へ抜けてビューアーが開いてしまう）。
+                cx.stop_propagation();
+                if enabled {
+                    state.update(cx, |state, cx| {
+                        if next {
+                            state.select_next(cx);
+                        } else {
+                            state.select_previous(cx);
+                        }
+                    });
+                }
+            })
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .child(
+                div()
+                    .text_color(foreground)
+                    .child(Icon::new(icon).size(px(LIST_STATUS_ICON))),
+            )
+            .into_any_element()
+    }
+
+    /// タグ列の折りたたみトグル（「+n」/「戻す」）。タグチップと同じ配色にして、
+    /// タグ列の一部として見せる。クリックは行の動作（ビューアー / ダウンロード）へ
+    /// 伝播させない。
+    fn render_tag_toggle(
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
+        database_id: &str,
+        hidden: usize,
+        expanded: bool,
+    ) -> gpui_kit::AnyElement {
+        let selector = format!("tag-toggle-{database_id}");
+        let handle = handle.clone();
+        let id = database_id.to_string();
+        let label = if expanded {
+            "戻す".to_string()
+        } else {
+            format!("+{hidden}")
+        };
+        let tooltip = if expanded {
+            "タグを折りたたむ".to_string()
+        } else {
+            format!("残り {hidden} 件のタグを表示")
+        };
+        let palette = ChipPalette::for_theme(theme);
+        div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_1()
+            .py_0p5()
+            .rounded_full()
+            .border_1()
+            .border_color(palette.border(false, false))
+            .bg(palette.background(theme.muted, false, false))
+            .text_color(palette.foreground(theme.muted_foreground, false, false))
+            .text_xs()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.muted_foreground.opacity(0.2)))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                handle.update(cx, |this, cx| this.toggle_tag_expansion(&id, cx));
+            })
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .child(label)
+            .into_any_element()
+    }
+
+    /// タグ情報エリアの右側に、同一サークル / 同一作者の関連書籍をカルーセルで出す。
+    /// **残りの幅を全部使う**（アイテム幅は固定なので、幅が広いほど多く見える）。
+    /// サムネイルをクリックすると、行と同じ経路で開く / ダウンロードする。
+    fn render_related_carousel(
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
+        database_id: &str,
+        state: &Entity<CarouselState>,
+        thumbs: &[RelatedThumb],
+        has_previous: bool,
+        has_next: bool,
+    ) -> gpui_kit::AnyElement {
+        let selector = format!("list-carousel-{database_id}");
+        div()
+            .debug_selector(move || selector.clone())
+            .flex_1()
+            .min_w_0()
+            .child(
+                Carousel::new(
+                    SharedString::from(format!("related-carousel-{database_id}")),
+                    state,
+                )
+                // ルートは既定で縦積み（コンテンツ + コントロール）なので横に並べる。
+                // 前へ / 次へは自前のバー（組み込みコントロールは円形 + 枠外配置で見切れる）。
+                // 行が高くなったとき（タグ展開）は表紙と同じく**上揃え**にする
+                // （中央揃えだと上下に余白ができて浮いて見える）。
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(Self::render_carousel_bar(
+                    database_id,
+                    "prev",
+                    IconName::ChevronLeft,
+                    "前へ",
+                    has_previous,
+                    state,
+                    theme,
+                ))
+                .child(
+                    CarouselContent::new(state)
+                        .flex_1()
+                        .min_w_0()
+                        // アイテム側の pl_1 と対で、先頭の余白を打ち消す
+                        .track_style(StyleRefinement::default().ml_neg_1())
+                        .children(thumbs.iter().map(|thumb| {
+                            CarouselItem::new(
+                                SharedString::from(format!(
+                                    "related-item-{database_id}-{}",
+                                    thumb.position
+                                )),
+                                thumb.position,
+                                state,
+                            )
+                            // カルーセル列の幅を N 等分して**埋める**（端に切れかけを出さない）。
+                            // 大きさの上限は表紙と同じ（窓が広いときはこの上限で並ぶ）
+                            .w(relative(1.0 / LIST_RELATED_PER_VIEW))
+                            .max_w(px(LIST_COVER_W))
+                            .flex_none()
+                            .pl_1()
+                            .child(Self::render_related_thumb(
+                                theme,
+                                handle,
+                                database_id,
+                                thumb,
+                            ))
+                        })),
+                )
+                .child(Self::render_carousel_bar(
+                    database_id,
+                    "next",
+                    IconName::ChevronRight,
+                    "次へ",
+                    has_next,
+                    state,
+                    theme,
+                )),
+            )
+            .into_any_element()
+    }
+
+    /// 関連書籍 1 件のサムネイル（ツールチップで作品名、クリックでビューアー）。
+    fn render_related_thumb(
+        theme: &gpui_kit::component::Theme,
+        handle: &gpui_kit::Entity<BookshelfView>,
+        database_id: &str,
+        thumb: &RelatedThumb,
+    ) -> gpui_kit::AnyElement {
+        let selector = format!("list-related-{database_id}-{}", thumb.position);
+        let img_selector = format!("list-related-img-{database_id}-{}", thumb.position);
+        let element_id = format!("related-thumb-{database_id}-{}", thumb.position);
+        let tooltip_title = thumb.title.clone();
+        let click_database_id = thumb.item.database_id.clone();
+        let click_book_id = thumb.book_id.clone();
+        let click_item = thumb.item.clone();
+        let cover = thumb.cover.clone();
+        let handle = handle.clone();
+        div()
+            .id(SharedString::from(element_id))
+            .debug_selector(move || selector.clone())
+            .cursor_pointer()
+            // アイテム（カルーセル列幅の 1/N）いっぱいに広げて 3:2 を保つ
+            .relative()
+            .w_full()
+            .aspect_ratio(LIST_COVER_ASPECT)
+            .overflow_hidden()
+            .rounded(px(2.0))
+            .bg(theme.muted)
+            .tooltip(move |window, cx| Tooltip::new(tooltip_title.clone()).build(window, cx))
+            .on_click(move |_, _, cx| {
+                // 行クリック（この行の本を開く / ダウンロードする）へ伝播させない
+                cx.stop_propagation();
+                let handle = handle.clone();
+                let book_id = click_book_id.clone();
+                let item = click_item.clone();
+                let database_id = click_database_id.clone();
+                handle.update(cx, |this, cx| {
+                    this.open_or_download(cx, &database_id, book_id, &item);
+                });
+            })
+            // 画像は比率を保つ（切り抜きしない）。リストの表紙と同じ見た目にする
+            .child(cover_fit_inside_frame(cover.as_ref(), img_selector))
+            .into_any_element()
+    }
+
     /// リスト表示の 1 行（Web の table 行相当: サムネイル + タイトル + イベント + 進捗 + タグ）。
     fn render_list_row(
         &self,
@@ -4019,9 +4436,6 @@ impl BookshelfView {
             }
         });
         let local = card.local.as_ref();
-        let is_read = local.map(|e| e.is_read).unwrap_or(false);
-        let is_downloaded = local.is_some();
-        let _is_favorite = shelf.is_favorite == 1;
         let download_state = self.download_states.get(&shelf.database_id).copied();
         let progress_text = local.and_then(|e| {
             e.progress.map(|(current, total)| match total {
@@ -4034,125 +4448,24 @@ impl BookshelfView {
         let delete_id = local.map(|e| e.book.id.clone());
         let _ = window;
 
-        // 表紙: 表示エリアは**全行で同じ比率**（3:2）。高さは行の高さに追従する。
-        // 画像はエリアに対する**実寸（%）を明示指定**して比率を保つ。`object_fit` に頼らないので
+        // 表紙: 表示エリアは**全行で同じ比率・同じ大きさ**（3:2 / 162x108 固定）。
+        // 画像は枠に対する**実寸（%）を明示指定**して比率を保つ。`object_fit` に頼らないので
         // 切り抜きは起き得ない（縦長は左右、横長は上下に余白ができる）。
-        let image_aspect = match &cover {
-            Some(render) => {
-                let size = render.size(0);
-                size.width.0.max(1) as f32 / size.height.0.max(1) as f32
-            }
-            None => LIST_COVER_ASPECT,
-        };
-        // 縦長（エリアより縦長）は高さいっぱい、横長は幅いっぱいに合わせる
-        let (img_w, img_h) = if image_aspect <= LIST_COVER_ASPECT {
-            (relative(image_aspect / LIST_COVER_ASPECT), relative(1.0))
-        } else {
-            (relative(1.0), relative(LIST_COVER_ASPECT / image_aspect))
-        };
-        let img_selector = format!("list-cover-img-{database_id}");
-        let image: gpui_kit::AnyElement = match &cover {
-            Some(render) => div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .w(img_w)
-                        .h(img_h)
-                        .debug_selector(move || img_selector.clone())
-                        .child(
-                            img(render.clone())
-                                .w_full()
-                                .h_full()
-                                .object_fit(gpui_kit::ObjectFit::Fill),
-                        ),
-                )
-                .into_any_element(),
-            None => div().absolute().inset_0().into_any_element(),
-        };
+        let image = cover_fit_inside_frame(cover.as_ref(), format!("list-cover-img-{database_id}"));
 
         let cover_selector = format!("list-cover-{database_id}");
+        // 大きさは固定。未読 / 既読 / ダウンロード済みはサムネイルに重ねず、
+        // タイトルの横に出す（重ねると行の内容でも大きさが変わり、ガタつきの原因になる）。
         let mut cover_el = div()
             .relative()
-            .h_full()
-            .aspect_ratio(LIST_COVER_ASPECT)
+            .w(px(LIST_COVER_W))
+            .h(px(LIST_COVER_MIN_H))
             .flex_shrink_0()
             .overflow_hidden()
             // 縦長表紙で余る左右の余白を周囲と馴染ませる
             .bg(cx.theme().muted)
             .debug_selector(move || cover_selector.clone())
-            .child(image)
-            .child(if is_read {
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .rounded_br_md()
-                    .px_1()
-                    .py_0p5()
-                    .bg(gpui_kit::rgb(0xd1fae5))
-                    .text_color(gpui_kit::rgb(0x047857))
-                    .text_xs()
-                    .child("読了")
-                    .into_any_element()
-            } else {
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .rounded_br_md()
-                    .px_1()
-                    .py_0p5()
-                    .bg(gpui_kit::rgb(0xfef3c7))
-                    .text_color(gpui_kit::rgb(0xb45309))
-                    .text_xs()
-                    .child("未読")
-                    .into_any_element()
-            })
-            .child(if is_downloaded {
-                div()
-                    .absolute()
-                    .right_0p5()
-                    .bottom_0p5()
-                    .rounded_full()
-                    .w(px(18.0))
-                    .h(px(18.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui_kit::rgba(0x05966933))
-                    .child(
-                        div()
-                            .text_color(gpui_kit::rgb(0x059669))
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child("✓"),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .absolute()
-                    .right_0p5()
-                    .bottom_0p5()
-                    .rounded_full()
-                    .w(px(18.0))
-                    .h(px(18.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui_kit::rgba(0x00000033))
-                    .child(
-                        div()
-                            .text_color(gpui_kit::white())
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child("↓"),
-                    )
-                    .into_any_element()
-            });
+            .child(image);
 
         if let Some(state) = download_state {
             let fraction = state.fraction();
@@ -4207,121 +4520,221 @@ impl BookshelfView {
             let click_database_id = database_id.clone();
             move |_, _window, cx| {
                 handle.update(cx, |this, cx| {
-                    if this.download_states.contains_key(&click_database_id) {
-                        return;
-                    }
-                    if let Some(book_id) = &open_book_id {
-                        this.open_book(cx, book_id);
-                    } else {
-                        this.download_item(cx, download_item.clone());
-                    }
+                    this.open_or_download(
+                        cx,
+                        &click_database_id,
+                        open_book_id.clone(),
+                        &download_item,
+                    );
                 });
             }
         });
 
-        row = row.child(cover_el).child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .min_w_0()
-                .flex_1()
-                .child(
+        // 情報列（幅固定）: タイトル / 購入日 / サークル・作者 / ページ数 / 状態
+        let info_selector = format!("list-info-{database_id}");
+        let title_selector = format!("list-title-{database_id}");
+        let progress_selector = format!("list-progress-{database_id}");
+        let status_selector = format!("list-status-row-{database_id}");
+        let info_column = div()
+            .debug_selector(move || info_selector.clone())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .min_w_0()
+            .w(px(LIST_INFO_W))
+            // 幅は固定だが、窓が狭いときは縮められるようにする
+            // （`flex_shrink_0` にすると狭い窓で行が横にはみ出す）
+            .child(
+                div()
+                    .debug_selector(move || title_selector.clone())
+                    .text_sm()
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    // Web の formatEventLabel と同じ: イベント不明のときは
+                    // 「イベント不明」を表示
+                    .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
+                        ("booth", Some(date)) | ("fanza", Some(date)) | ("dlsite", Some(date)) => {
+                            format!("購入日: {date}")
+                        }
+                        _ => event_text.clone(),
+                    }),
+            )
+            // サークル名 / 作者名（タグと同じチップ。本体クリックで絞り込み、
+            // 右端のハートでお気に入り）
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .items_center()
+                    .child(BookshelfView::render_entity_chip(
+                        cx.theme(),
+                        &handle,
+                        EntityLink::Circle,
+                        &circle_name,
+                        &database_id,
+                        self.favorite_circles.contains(&circle_name),
+                        self.circle_filter.as_deref() == Some(circle_name.as_str()),
+                    ))
+                    .child(BookshelfView::render_entity_chip(
+                        cx.theme(),
+                        &handle,
+                        EntityLink::Author,
+                        &author,
+                        &database_id,
+                        self.favorite_authors.contains(&author),
+                        self.author_filter.as_deref() == Some(author.as_str()),
+                    )),
+            )
+            // ページ数（未取得の本は進捗が無いので出さない）
+            .when_some(progress_text, |this, text| {
+                this.child(
                     div()
-                        .text_sm()
-                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .child(title),
-                )
-                .child(
-                    div()
+                        .debug_selector({
+                            let selector = progress_selector.clone();
+                            move || selector.clone()
+                        })
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        // Web の formatEventLabel と同じ: イベント不明のときは
-                        // 「イベント不明」を表示
-                        .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
-                            ("booth", Some(date))
-                            | ("fanza", Some(date))
-                            | ("dlsite", Some(date)) => {
-                                format!("購入日: {date}")
-                            }
-                            _ => event_text.clone(),
-                        }),
+                        .child(text),
                 )
-                // サークル名 / 作者名（タグと同じチップ。本体クリックで絞り込み、
-                // 右端のハートでお気に入り）
-                .child(
-                    div()
+            })
+            // 状態（未読 / 既読 / ダウンロード済み / お気に入り）はページ数の下
+            .child(
+                div()
+                    .debug_selector(move || status_selector.clone())
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .children(BookshelfView::render_status_tags(card, cx.theme(), &handle)),
+            );
+
+        // タグ情報エリア: タグだけを**行の幅の約 20%** に収め、入りきらなければ折り返す。
+        // 状態タグ（未読 / ダウンロード済み 等）はタイトルの横に出す。
+        let tags_selector = format!("list-tags-{database_id}");
+        let tag_area = div()
+            .debug_selector(move || tags_selector.clone())
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            // 折り返した行を**上詰め**にする。既定は align-content: stretch で、行が
+            // タグ列の高さいっぱいまで伸びるため、タグが無い / 少ない本では編集ボタンが
+            // 縦中央に落ちてしまう（上の行と揃わない）。
+            .content_start()
+            .gap_1()
+            .items_center()
+            .w(relative(LIST_TAGS_W_RATIO))
+            .min_w_0()
+            .child(
+                if self.editing_book_id.as_deref() == Some(database_id.as_str()) {
+                    BookshelfView::render_tag_editor(
+                        window,
+                        cx.theme(),
+                        &handle,
+                        &self.editing_tags,
+                        &self.editing_suggestions,
+                        &self.editing_input.clone().expect("editing input"),
+                        self.editing_site_id.as_deref() == Some("fanza"),
+                    )
+                    .into_any_element()
+                } else {
+                    let chips = BookshelfView::render_tag_chips(
+                        cx.theme(),
+                        &handle,
+                        &self.favorite_tags,
+                        &self.selected_tags,
+                        card,
+                    );
+                    // タグが多い本は列の中で折りたたむ（行の高さをタグ列に支配させない）。
+                    // 「+n」で全件表示、「戻す」で折りたたみへ戻す。
+                    let tag_count = chips.len();
+                    let expanded = self.expanded_tag_rows.contains(&database_id);
+                    let visible = if expanded {
+                        tag_count
+                    } else {
+                        tag_count.min(LIST_TAGS_COLLAPSED_MAX)
+                    };
+                    let hidden = tag_count - visible;
+                    let mut tag_row = div()
+                        .id(SharedString::from(format!("tag-row-{database_id}")))
                         .flex()
                         .flex_row()
                         .flex_wrap()
                         .gap_1()
                         .items_center()
-                        .child(BookshelfView::render_entity_chip(
+                        .flex_1()
+                        .min_w_0()
+                        .cursor_pointer()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .children(chips.into_iter().take(visible));
+                    if tag_count > LIST_TAGS_COLLAPSED_MAX {
+                        tag_row = tag_row.child(BookshelfView::render_tag_toggle(
                             cx.theme(),
                             &handle,
-                            EntityLink::Circle,
-                            &circle_name,
                             &database_id,
-                            self.favorite_circles.contains(&circle_name),
-                            self.circle_filter.as_deref() == Some(circle_name.as_str()),
-                        ))
-                        .child(BookshelfView::render_entity_chip(
-                            cx.theme(),
-                            &handle,
-                            EntityLink::Author,
-                            &author,
-                            &database_id,
-                            self.favorite_authors.contains(&author),
-                            self.author_filter.as_deref() == Some(author.as_str()),
-                        )),
-                )
-                .child(match progress_text.as_deref() {
-                    Some(text) => div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(text.to_string())
-                        .into_any_element(),
-                    None => div().into_any_element(),
-                })
-                .child(
-                    if self.editing_book_id.as_deref() == Some(database_id.as_str()) {
-                        BookshelfView::render_tag_editor(
+                            hidden,
+                            expanded,
+                        ));
+                    }
+                    tag_row
+                        .child(BookshelfView::render_tag_edit_button(
                             window,
                             cx.theme(),
                             &handle,
-                            &self.editing_tags,
-                            &self.editing_suggestions,
-                            &self.editing_input.clone().expect("editing input"),
-                            self.editing_site_id.as_deref() == Some("fanza"),
-                        )
+                            &database_id,
+                        ))
                         .into_any_element()
-                    } else {
-                        div()
-                            .id(SharedString::from(format!("tag-row-{database_id}")))
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .gap_1()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_click(|_, _, cx| cx.stop_propagation())
-                            .children(BookshelfView::render_tag_chips(
-                                cx.theme(),
-                                &handle,
-                                &self.favorite_tags,
-                                &self.selected_tags,
-                                card,
-                            ))
-                            .child(BookshelfView::render_tag_edit_button(
-                                window,
-                                cx.theme(),
-                                &handle,
-                                &database_id,
-                            ))
-                            .into_any_element()
-                    },
-                ),
-        );
+                },
+            );
+
+        // タグ情報エリアの右側: 同一サークル / 同一作者の関連書籍カルーセル。
+        // 関連が無い本には出さない（空のカルーセル枠を残さない）。
+        let carousel = self
+            .carousel_states
+            .get(&database_id)
+            .filter(|_| !card.related.is_empty())
+            .cloned()
+            .map(|state| {
+                let thumbs: Vec<RelatedThumb> = card
+                    .related
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, index)| {
+                        let target = self.shelf_cards.get(*index)?;
+                        Some(RelatedThumb {
+                            position,
+                            title: target.shelf.title.clone(),
+                            book_id: target.local.as_ref().map(|entry| entry.book.id.clone()),
+                            item: target.shelf.clone(),
+                            cover: target.cover.clone(),
+                        })
+                    })
+                    .collect();
+                let has_previous = state.read(cx).has_previous();
+                let has_next = state.read(cx).has_next();
+                BookshelfView::render_related_carousel(
+                    cx.theme(),
+                    &handle,
+                    &database_id,
+                    &state,
+                    &thumbs,
+                    has_previous,
+                    has_next,
+                )
+            });
+
+        row = row
+            .child(cover_el)
+            .child(info_column)
+            .child(tag_area)
+            .children(carousel);
 
         row.context_menu({
             let has_local = delete_id.is_some();
@@ -5270,10 +5683,175 @@ pub(crate) fn cover_url_candidates(site_id: &str, stored_url: &str) -> Vec<Strin
 /// - 縦長（0.7）は左右に余白ができる（要望どおり）
 ///
 /// 画像は比率を保ってこのエリアに縮小して収める（切り抜きは起きない）。
-/// 高さは行の高さに追従するため、サムネイルの高さは常に行の高さと一致する。
+/// エリアの大きさは**固定**（行の高さに追従させない）。追従させると行高 × 1.5 で
+/// 表紙の幅が行ごとに変わり、右側のテキスト開始 X がずれる（ガタつきの原因）。
 const LIST_COVER_ASPECT: f32 = 3.0 / 2.0;
-/// 表紙が無いときのエリアの下限の高さ（行の高さは通常これより高い）。
-const LIST_COVER_MIN_H: f32 = 108.0;
+/// 表紙エリアの高さ（固定）。行の高さはこの値 + 余白で決まる。
+const LIST_COVER_MIN_H: f32 = 133.0;
+/// 表紙エリアの幅（固定）。
+const LIST_COVER_W: f32 = LIST_COVER_MIN_H * LIST_COVER_ASPECT;
+/// 情報列の幅（固定）。表紙と同じく、行ごとに開始 X がずれないようにする。
+/// タイトルの横に状態タグを並べるため、タイトルが折り返さない程度の幅を確保する。
+const LIST_INFO_W: f32 = 320.0;
+/// タグ情報エリアの幅（行の幅に対する割合）。タグはこの中で折り返す。
+const LIST_TAGS_W_RATIO: f32 = 0.20;
+/// タグ列を折りたたむときの最大表示数（残りは「+n」チップで畳む）。
+///
+/// タグの折り返しで行の高さが伸びると、固定サイズの表紙 / カルーセルとの間に
+/// 大きな余白ができる（行の高さをタグ列に支配させない）。タグ列の幅（約 20%）で
+/// 3 行程度 = 表紙の高さ（108px）に収まる数を上限にする。
+const LIST_TAGS_COLLAPSED_MAX: usize = 8;
+/// カルーセルに出す関連書籍の最大件数。
+const LIST_RELATED_LIMIT: usize = 5;
+/// カルーセルの 1 画面あたりの表示枚数（列幅をこの数で等分してサムネを埋める）。
+/// 実測（1484px 幅・カルーセル列 598px）: 2 枚 = 196x130 = 表紙（200x133）とほぼ同じ大きさ。
+/// 3 枚にすると 179x119 まで小さくなるため、表紙と同じ大きさを優先して 2 枚にしている。
+const LIST_RELATED_PER_VIEW: f32 = 2.0;
+/// カルーセルの前へ / 次へバーの幅（アイコン程度。高さは列＝サムネイルいっぱい）。
+const LIST_CAROUSEL_BAR_W: f32 = 26.0;
+
+/// 同一サークル / 同一作者の関連書籍のインデックスを、**サークル一致 → 作者一致**の順で
+/// 最大 `limit` 件返す（自分自身は含めない。空のキーは一致とみなさない）。
+///
+/// 技術書典の作者は空なので、空キー同士を一致させると無関係な本が全部つながる。
+/// `keys` は `(circle_name, author)` を並べたもの（`shelf_cards` と同じ順）。
+fn related_book_indices(keys: &[(String, String)], index: usize, limit: usize) -> Vec<usize> {
+    let Some((circle, author)) = keys.get(index) else {
+        return Vec::new();
+    };
+    let mut related: Vec<usize> = Vec::new();
+    if !circle.is_empty() {
+        for (i, (other, _)) in keys.iter().enumerate() {
+            if i != index && other == circle {
+                related.push(i);
+            }
+        }
+    }
+    if !author.is_empty() {
+        for (i, (_, other)) in keys.iter().enumerate() {
+            if i != index && other == author && !related.contains(&i) {
+                related.push(i);
+            }
+        }
+    }
+    related.truncate(limit);
+    related
+}
+
+/// 表紙エリア（3:2 の枠）の中に、画像を**比率のまま**収めた要素（切り抜きしない）。
+/// リストの表紙と関連書籍サムネイルで同じ見た目・同じ比率にするための共通処理。
+/// `selector` は画像要素のデバッグ用 id（テストが枠との比率を検証する）。
+fn cover_fit_inside_frame(
+    cover: Option<&Arc<RenderImage>>,
+    selector: String,
+) -> gpui_kit::AnyElement {
+    let image_aspect = match cover {
+        Some(render) => {
+            let size = render.size(0);
+            size.width.0.max(1) as f32 / size.height.0.max(1) as f32
+        }
+        None => LIST_COVER_ASPECT,
+    };
+    // 縦長（枠より縦長）は高さいっぱい、横長は幅いっぱいに合わせる
+    let (img_w, img_h) = if image_aspect <= LIST_COVER_ASPECT {
+        (relative(image_aspect / LIST_COVER_ASPECT), relative(1.0))
+    } else {
+        (relative(1.0), relative(LIST_COVER_ASPECT / image_aspect))
+    };
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .w(img_w)
+                .h(img_h)
+                .debug_selector(move || selector.clone())
+                .child(match cover {
+                    Some(render) => img(render.clone())
+                        .w_full()
+                        .h_full()
+                        .object_fit(gpui_kit::ObjectFit::Fill)
+                        .into_any_element(),
+                    None => div().into_any_element(),
+                }),
+        )
+        .into_any_element()
+}
+
+/// 状態アイコン（ダウンロード済み / お気に入り）の一辺。
+/// 文字だと長くて変な折り返しになるためアイコンで出す（チップのハート 12px より大きめ）。
+const LIST_STATUS_ICON: f32 = 16.0;
+
+/// 状態アイコンのクリックハンドラ（お気に入りのトグル）。
+type StatusIconClick = Box<dyn Fn(&mut Window, &mut App) + 'static>;
+
+/// 状態アイコン 1 つ。意味は tooltip で補う（アイコンだけでは伝わらないため）。
+/// `on_click` を渡すと押せるようになる（お気に入りのトグル）。
+fn status_icon(
+    database_id: &str,
+    kind: &str,
+    icon: AppIcon,
+    color: Hsla,
+    tooltip: &str,
+    on_click: Option<StatusIconClick>,
+) -> gpui_kit::AnyElement {
+    let selector = format!("list-status-{kind}-{database_id}");
+    let element_id = format!("list-status-icon-{kind}-{database_id}");
+    let tooltip = tooltip.to_string();
+    let clickable = on_click.is_some();
+    div()
+        .id(SharedString::from(element_id))
+        .debug_selector(move || selector.clone())
+        .flex()
+        .items_center()
+        .when(clickable, |this| this.cursor_pointer())
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .when_some(on_click, |this, click| {
+            this.on_click(move |_, window, cx| click(window, cx))
+        })
+        .child(
+            div()
+                .text_color(color)
+                .child(Icon::new(icon).size(px(LIST_STATUS_ICON))),
+        )
+        .into_any_element()
+}
+
+/// 状態タグ 1 つ（四角い `Tag`）。`Tag` には `debug_selector` を付けられないため、
+/// div で包んで付ける（テストが位置を検証する）。既定の `Tag` は角丸なので 0 にする。
+fn status_tag(
+    database_id: &str,
+    kind: &str,
+    label: &str,
+    variant: TagVariant,
+) -> gpui_kit::AnyElement {
+    let selector = format!("list-status-{kind}-{database_id}");
+    div()
+        .debug_selector(move || selector.clone())
+        .child(
+            Tag::new()
+                .with_variant(variant)
+                .rounded(px(0.0))
+                .with_size(Size::XSmall)
+                .child(label.to_string()),
+        )
+        .into_any_element()
+}
+
+/// カルーセルの 1 件を描くための、`shelf_cards` から切り出した情報
+/// （`render_list_row` は `&self` なので、借用を跨がずに描けるようにする）。
+struct RelatedThumb {
+    /// 関連リスト内の位置（要素 id とカルーセルの index に使う）
+    position: usize,
+    title: String,
+    /// ローカル本の id（あれば開く。無ければダウンロード）
+    book_id: Option<String>,
+    item: bookshelf::BookshelfItem,
+    cover: Option<Arc<RenderImage>>,
+}
 
 /// インポート直後に**サイト側のメタ**（タイトル / 作者名 / サークル名 / 購入日）を
 /// `books` と `bookshelf_items` に反映する。
@@ -6162,6 +6740,26 @@ mod tests {
         });
     }
 
+    /// ローカル本を読了にする（状態タグ「既読」の検証用）。
+    fn mark_read(cx: &mut TestAppContext, id: &str) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            progress::upsert(
+                db,
+                &progress::ReadingProgress {
+                    book_id: id.into(),
+                    content_id: String::new(),
+                    current_page: 10,
+                    total_pages: Some(10),
+                    finished_at: Some("2026-08-21 00:00:00".into()),
+                    last_read_at: "2026-08-21 00:00:00".into(),
+                    scroll_position: 0.0,
+                },
+            )
+            .unwrap();
+        });
+    }
+
     /// `plan_of` に渡すコンテンツ定義（ファイル名, 種別, (レンディション名, エントリ数)）。
     type TestContents<'a> = Vec<(&'a str, MediaKind, Vec<(&'a str, usize)>)>;
 
@@ -6393,6 +6991,39 @@ mod tests {
         );
     }
 
+    /// 関連書籍は「同一サークル → 同一作者」の順に並ぶ（サークルの方が結び付きが強い）。
+    #[test]
+    fn related_book_indices_prefers_same_circle_then_author() {
+        let keys = vec![
+            ("サークルA".to_string(), "作者X".to_string()),
+            ("サークルB".to_string(), "作者X".to_string()),
+            ("サークルA".to_string(), "作者Y".to_string()),
+            ("サークルC".to_string(), "作者Z".to_string()),
+        ];
+        assert_eq!(related_book_indices(&keys, 0, 5), vec![2, 1]);
+    }
+
+    /// 自分自身と空のキー（技術書典の作者は空）は関連とみなさず、上限で切る。
+    #[test]
+    fn related_book_indices_skips_self_and_empty_keys_and_respects_the_limit() {
+        let keys = vec![
+            ("サークルA".to_string(), String::new()),
+            (String::new(), String::new()),
+            ("サークルA".to_string(), String::new()),
+            ("サークルA".to_string(), String::new()),
+            ("サークルA".to_string(), String::new()),
+        ];
+        assert_eq!(related_book_indices(&keys, 0, 2), vec![2, 3], "上限で切る");
+        assert!(
+            !related_book_indices(&keys, 0, 5).contains(&0),
+            "自分自身は含めない"
+        );
+        assert!(
+            related_book_indices(&keys, 1, 5).is_empty(),
+            "空キーだけの本には関連が無い"
+        );
+    }
+
     /// テスト用の単色 RenderImage（表紙の比率を固定して検証するため）。
     fn test_cover_image(w: u32, h: u32) -> Arc<RenderImage> {
         let rgba = image::RgbaImage::from_pixel(w, h, image::Rgba([30, 60, 90, 255]));
@@ -6455,22 +7086,24 @@ mod tests {
         );
     }
 
-    /// リスト表示のサムネイルは**行の内容高さいっぱい**に広がること（上下に余白が残らない）。
+    /// 表紙エリアと情報列の幅は行の内容で変わらない（全行でテキスト開始 X が揃う）。
+    ///
+    /// 旧仕様: 表紙枠は `h_full().aspect_ratio(3:2)` で、行高 × 1.5 が表紙の幅になっていた。
+    /// 行高はタグ数などで変わるため、表紙の幅とテキスト開始 X が行ごとにずれていた。
+    /// タグ列は上限で折りたたまれる（＝通常の行は同じ高さ）ので、ここでは展開して
+    /// 行の高さが内容で変わる状態を作って検証する。
     #[gpui_kit::test]
-    async fn list_thumbnail_fills_row_height(cx: &mut TestAppContext) {
+    async fn list_row_keeps_a_fixed_cover_and_info_column(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
-        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
-        // タグ行がある分だけ行が高くなる（実データに近い状態）。枠がそれに追従すること。
+        seed_shelf_item(cx, "db-1", "タグが多い本", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "タグが無い本", "サークルB", None);
+        // 窓を狭くしてタグ情報エリアを狭め、db-1 のタグを折り返させる
+        // （行の高さが内容で変わる状態 = 旧実装では表紙の幅と開始 X も変わっていた状態）
         cx.update(|cx| {
             let db = &AppState::global(cx).db_pool;
-            bookshelf::update_tags(
-                db,
-                "techbookfest",
-                "db-1",
-                &["タグA".into(), "タグB".into()],
-            )
-            .unwrap();
+            let tags: Vec<String> = (0..30).map(|i| format!("タグ{i}")).collect();
+            bookshelf::update_tags(db, "techbookfest", "db-1", &tags).unwrap();
         });
         let view = cx.new(BookshelfView::new);
         cx.update(|cx| {
@@ -6493,31 +7126,636 @@ mod tests {
                 arena_clear.clear(cx);
             });
         }
-        let row = visual
-            .debug_bounds("book-list-db-1")
-            .expect("行が描画されている");
-        let cover = visual
-            .debug_bounds("list-cover-db-1")
-            .expect("サムネイルが描画されている");
-        // 行は p_2（上下 8px ずつ）なので内容高さ = 行の高さ - 16
-        let content_h = row.size.height.as_f32() - 16.0;
+        // タグ列は折りたたまれるので、行の高さを内容で変えるには展開する
+        // （折りたたみ中は全行が同じ高さ = 表紙の高さになる）。
+        let toggle = visual
+            .debug_bounds("tag-toggle-db-1")
+            .expect("折りたたみトグル（+n）が出ている");
+        visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        for _ in 0..6 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let row1 = visual.debug_bounds("book-list-db-1").expect("行1");
+        let row2 = visual.debug_bounds("book-list-db-2").expect("行2");
+        let cover1 = visual.debug_bounds("list-cover-db-1").expect("表紙1");
+        let cover2 = visual.debug_bounds("list-cover-db-2").expect("表紙2");
+        let info1 = visual.debug_bounds("list-info-db-1").expect("情報列1");
+        let info2 = visual.debug_bounds("list-info-db-2").expect("情報列2");
+
         assert!(
-            (cover.size.height.as_f32() - content_h).abs() < 1.5,
-            "サムネイルの高さが行の内容高さと一致しない: cover={} row={}",
-            cover.size.height.as_f32(),
-            row.size.height.as_f32()
+            row1.size.height.as_f32() > row2.size.height.as_f32() + 8.0,
+            "前提: タグを展開すると行の高さが変わる (row1={} row2={})",
+            row1.size.height.as_f32(),
+            row2.size.height.as_f32()
+        );
+        // 表紙・情報列の幅と開始 X は行に依存しない
+        for (a, b, label) in [(cover1, cover2, "表紙"), (info1, info2, "情報列")] {
+            assert!(
+                (a.size.width.as_f32() - b.size.width.as_f32()).abs() < 0.5,
+                "{label}の幅が行で違う: {} vs {}",
+                a.size.width.as_f32(),
+                b.size.width.as_f32()
+            );
+            assert!(
+                (a.origin.x.as_f32() - b.origin.x.as_f32()).abs() < 0.5,
+                "{label}の開始 X が行でずれている: {} vs {}",
+                a.origin.x.as_f32(),
+                b.origin.x.as_f32()
+            );
+        }
+        let expected_w = LIST_COVER_MIN_H * LIST_COVER_ASPECT;
+        assert!(
+            (cover1.size.width.as_f32() - expected_w).abs() < 1.0,
+            "表紙の幅が固定値でない: {} expected={expected_w}",
+            cover1.size.width.as_f32()
+        );
+        // タグ情報エリアは行の幅の約 20%（その中で折り返す）
+        let tags1 = visual.debug_bounds("list-tags-db-1").expect("タグエリア1");
+        let expected_tags_w = (row1.size.width.as_f32() - 16.0) * LIST_TAGS_W_RATIO;
+        assert!(
+            (tags1.size.width.as_f32() - expected_tags_w).abs() < 2.5,
+            "タグ情報エリアの幅が 20% でない: width={} expected={expected_tags_w}",
+            tags1.size.width.as_f32()
+        );
+    }
+
+    /// 未読 / 既読 / ダウンロード済み / お気に入り はページ数の下に出す
+    /// （文字は短い「未読 / 既読」だけ。長いものはアイコン）。
+    #[gpui_kit::test]
+    async fn list_row_puts_status_items_below_the_page_count(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // db-1: ダウンロード済み + 読了 + お気に入り
+        seed_shelf_item(cx, "db-1", "読了した本", "サークルA", None);
+        seed_book(cx, "book-1", "読了した本", "サークルA");
+        mark_read(cx, "book-1");
+        // db-2: 未ダウンロード
+        seed_shelf_item(cx, "db-2", "未ダウンロードの本", "サークルB", None);
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            bookshelf::set_favorite(db, "techbookfest", "db-1", true).unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let status_row = visual.debug_bounds("list-status-row-db-1").expect("状態行");
+        let tags_area = visual.debug_bounds("list-tags-db-1").expect("タグエリア");
+        let progress = visual.debug_bounds("list-progress-db-1").expect("ページ数");
+        // ページ数の下に出る
+        assert!(
+            status_row.origin.y.as_f32()
+                >= progress.origin.y.as_f32() + progress.size.height.as_f32() - 0.5,
+            "状態行がページ数の下にない: status_y={} progress_bottom={}",
+            status_row.origin.y.as_f32(),
+            progress.origin.y.as_f32() + progress.size.height.as_f32()
+        );
+        // 情報列の中（タグ情報エリアには入っていない）
+        assert!(
+            status_row.origin.x.as_f32() + status_row.size.width.as_f32()
+                <= tags_area.origin.x.as_f32() + 0.5,
+            "状態行がタグ情報エリアにかぶっている（情報列に収まっていない）"
+        );
+        for selector in [
+            "list-status-read-db-1",
+            "list-status-favorite-db-1",
+            "list-status-downloaded-db-1",
+        ] {
+            let bounds = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} が描画されていない"));
+            // 状態行の中に並ぶ
+            assert!(
+                (bounds.origin.y.as_f32() - status_row.origin.y.as_f32()).abs() < 12.0,
+                "{selector} が状態行にない: y={} row_y={}",
+                bounds.origin.y.as_f32(),
+                status_row.origin.y.as_f32()
+            );
+            assert!(
+                bounds.origin.x.as_f32() >= status_row.origin.x.as_f32() - 0.5,
+                "{selector} が状態行より左にある"
+            );
+        }
+        // アイコン（ダウンロード済み / お気に入り / 未登録ハート）は見える大きさであること
+        for selector in [
+            "list-status-downloaded-db-1",
+            "list-status-favorite-db-1",
+            "list-status-not-downloaded-db-2",
+            "list-status-not-favorite-db-2",
+        ] {
+            let bounds = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} が描画されていない"));
+            assert!(
+                bounds.size.height.as_f32() >= 14.0 && bounds.size.width.as_f32() >= 14.0,
+                "{selector} のアイコンが小さすぎる: {}x{}",
+                bounds.size.width.as_f32(),
+                bounds.size.height.as_f32()
+            );
+        }
+        // 未ダウンロードの本は読めないので「未読」は出さない
+        assert!(
+            visual
+                .debug_bounds("list-status-not-downloaded-db-2")
+                .is_some(),
+            "未ダウンロードタグが出ていない"
         );
         assert!(
-            cover.size.height.as_f32() >= 90.0,
-            "サムネイルの下限 90px を下回る: {}",
-            cover.size.height.as_f32()
+            visual.debug_bounds("list-status-unread-db-2").is_none(),
+            "未ダウンロードの本に「未読」が出ている"
         );
-        // エリアの幅は高さ × 3:2（全行で一定）
-        let expected_w = cover.size.height.as_f32() * LIST_COVER_ASPECT;
+        // お気に入りは登録 / 未登録の両方を出す（未登録は控えめな輪郭ハート）
         assert!(
-            (cover.size.width.as_f32() - expected_w).abs() < 1.5,
-            "サムネイル表示エリアの幅が比率どおりでない: width={} expected={expected_w}",
+            visual.debug_bounds("list-status-favorite-db-2").is_none(),
+            "お気に入りでない本に「登録済み」ハートが出ている"
+        );
+        assert!(
+            visual
+                .debug_bounds("list-status-not-favorite-db-2")
+                .is_some(),
+            "お気に入りでない本に未登録ハートが出ていない"
+        );
+        assert!(
+            visual
+                .debug_bounds("list-status-not-favorite-db-1")
+                .is_none(),
+            "お気に入りの本に未登録ハートが出ている"
+        );
+    }
+
+    /// お気に入りアイコンのクリックは、ビューアー / ダウンロードではなく
+    /// **お気に入りのトグル**になる（行クリックへ伝播させない）。
+    #[gpui_kit::test]
+    async fn status_heart_click_toggles_favorite(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 未取得の本（行クリックならダウンロードが走るので伝播を検出できる）
+        seed_shelf_item(cx, "db-1", "お気に入り前の本", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let heart = visual
+            .debug_bounds("list-status-not-favorite-db-1")
+            .expect("未登録ハートが描画されている");
+        visual.simulate_click(heart.center(), gpui_kit::Modifiers::default());
+
+        assert_eq!(
+            view.read_with(cx, |this, _| this.shelf_cards[0].shelf.is_favorite),
+            1,
+            "クリックでお気に入りになっていない"
+        );
+        let stored = cx.update(|cx| {
+            bookshelf::list_all(&AppState::global(cx).db_pool)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.database_id == "db-1")
+                .map(|item| item.is_favorite)
+        });
+        assert_eq!(stored, Some(1), "DB に保存されていない");
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.is_empty()),
+            "行クリックに伝播してダウンロードが始まっている"
+        );
+    }
+
+    /// 同一サークル / 同一作者の本をカルーセルに出す（関連が無い本には出さない）。
+    #[gpui_kit::test]
+    async fn list_row_shows_related_books_carousel(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        seed_shelf_item(cx, "db-3", "本3", "サークルA", None);
+        seed_shelf_item(cx, "db-4", "別サークルの本", "サークルZ", None);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let carousel = visual
+            .debug_bounds("list-carousel-db-1")
+            .expect("カルーセルが描画されている");
+        assert!(
+            carousel.size.width.as_f32() > 40.0,
+            "カルーセルが潰れている: {}",
+            carousel.size.width.as_f32()
+        );
+        // 行の右端まで使う（残り幅いっぱい = 表示できる最大の幅）
+        let row = visual.debug_bounds("book-list-db-1").expect("行");
+        let row_right = row.origin.x.as_f32() + row.size.width.as_f32() - 8.0; // p_2
+        let carousel_right = carousel.origin.x.as_f32() + carousel.size.width.as_f32();
+        assert!(
+            (carousel_right - row_right).abs() < 2.0,
+            "カルーセルが行の右端まで届いていない: right={carousel_right} row_right={row_right}"
+        );
+        // 関連サムネイルは**カルーセル列の幅を LIST_RELATED_PER_VIEW 等分**して埋める
+        //（端に切れかけを出さない）。大きさの上限はリストの表紙と同じ。
+        let cover = visual.debug_bounds("list-cover-db-1").expect("表紙");
+        let related = visual
+            .debug_bounds("list-related-db-1-0")
+            .expect("関連サムネイル");
+        let related2 = visual
+            .debug_bounds("list-related-db-1-1")
+            .expect("2 件目の関連サムネイル");
+        assert!(
+            (related.size.width.as_f32() - related2.size.width.as_f32()).abs() < 0.5,
+            "関連サムネイルの幅が揃っていない: {} vs {}",
+            related.size.width.as_f32(),
+            related2.size.width.as_f32()
+        );
+        assert!(
+            related.size.width.as_f32() <= cover.size.width.as_f32() + 0.5,
+            "関連サムネイルが表紙より大きい: related={} cover={}",
+            related.size.width.as_f32(),
             cover.size.width.as_f32()
+        );
+        assert!(
+            (related.size.width.as_f32() / related.size.height.as_f32() - LIST_COVER_ASPECT).abs()
+                < 0.05,
+            "関連サムネイルが 3:2 でない: {}x{}",
+            related.size.width.as_f32(),
+            related.size.height.as_f32()
+        );
+        // 前へ / 次へは**四角いバー**（高さは列いっぱい = サムネイルと同じ、幅はアイコン程度）で、
+        // カルーセル領域の中に収まっている
+        for (bar_selector, direction) in [
+            ("list-carousel-prev-db-1", "前へ"),
+            ("list-carousel-next-db-1", "次へ"),
+        ] {
+            let bar = visual
+                .debug_bounds(bar_selector)
+                .unwrap_or_else(|| panic!("{direction} バーが描画されていない"));
+            assert!(
+                (20.0..=40.0).contains(&bar.size.width.as_f32()),
+                "{direction} バーの幅がアイコン程度でない: {}",
+                bar.size.width.as_f32()
+            );
+            assert!(
+                (bar.size.height.as_f32() - related.size.height.as_f32()).abs() < 1.5,
+                "{direction} バーの高さがサムネイルと揃っていない: bar={} thumb={}",
+                bar.size.height.as_f32(),
+                related.size.height.as_f32()
+            );
+            assert!(
+                bar.origin.x.as_f32() >= carousel.origin.x.as_f32() - 0.5
+                    && bar.origin.x.as_f32() + bar.size.width.as_f32() <= carousel_right + 0.5,
+                "{direction} バーがカルーセル領域の外にある"
+            );
+        }
+        assert!(
+            visual.debug_bounds("list-related-db-1-0").is_some(),
+            "1 件目の関連書籍が出ていない"
+        );
+        assert!(
+            visual.debug_bounds("list-related-db-1-1").is_some(),
+            "2 件目の関連書籍が出ていない"
+        );
+        assert!(
+            visual.debug_bounds("list-related-db-1-2").is_none(),
+            "関連は 2 件のはず（同一サークルの他 2 冊）"
+        );
+        assert!(
+            visual.debug_bounds("list-carousel-db-4").is_none(),
+            "関連が無い本にカルーセルを出している"
+        );
+    }
+
+    /// 関連書籍のサムネイルをクリックすると、その本を開く / ダウンロードする
+    /// （行クリックと同じ経路）。
+    #[gpui_kit::test]
+    async fn related_thumbnail_click_starts_the_download(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let item = visual
+            .debug_bounds("list-related-db-1-0")
+            .expect("関連サムネイルが描画されている");
+        visual.simulate_click(item.center(), gpui_kit::Modifiers::default());
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.contains_key("db-2")),
+            "関連サムネイルのクリックでダウンロードが始まっていない"
+        );
+    }
+
+    /// 移動できる向きのバーをクリックすると 1 つ進む（前へ / 次への動作）。
+    #[gpui_kit::test]
+    async fn enabled_carousel_bar_navigates(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 同一サークル 5 冊（窓を狭くすると全部は収まらない）
+        for i in 1..=5 {
+            seed_shelf_item(cx, &format!("db-{i}"), &format!("本{i}"), "サークルA", None);
+        }
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let selected = |view: &gpui_kit::Entity<BookshelfView>, cx: &mut TestAppContext| {
+            view.read_with(cx, |this, cx| {
+                this.carousel_states
+                    .get("db-1")
+                    .and_then(|state| state.read(cx).selected_index())
+            })
+        };
+        assert_eq!(selected(&view, cx), Some(0), "初期選択が先頭でない");
+        let bar = visual
+            .debug_bounds("list-carousel-next-db-1")
+            .expect("次へバーが描画されている");
+        visual.simulate_click(bar.center(), gpui_kit::Modifiers::default());
+        assert_eq!(
+            selected(&view, cx),
+            Some(1),
+            "次へバーのクリックで進んでいない"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.is_empty()),
+            "バーのクリックが行へ伝播してダウンロードが始まっている"
+        );
+    }
+
+    /// 移動できない向きのバーをクリックしても、行クリック（ビューアー / ダウンロード）へ
+    /// 伝播しない（ハンドラを登録しないと抜けてビューアーが開いてしまう）。
+    #[gpui_kit::test]
+    async fn disabled_carousel_bar_does_not_trigger_the_row_click(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 同一サークル 2 冊 + 広い窓 → 2 冊とも収まり、前へ / 次へは移動できない
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1600.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let bar = visual
+            .debug_bounds("list-carousel-next-db-1")
+            .expect("次へバーが描画されている");
+        visual.simulate_click(bar.center(), gpui_kit::Modifiers::default());
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.is_empty()),
+            "移動不可のバーのクリックが行へ伝播してダウンロードが始まっている"
+        );
+        let selected = view.read_with(cx, |this, cx| {
+            this.carousel_states
+                .get("db-1")
+                .and_then(|state| state.read(cx).selected_index())
+        });
+        assert_eq!(selected, Some(0), "移動不可なのに選択が動いている");
+    }
+
+    /// タグが無い本でも、タグ編集ボタンは行の**上**に揃う（縦中央に落ちない）。
+    #[gpui_kit::test]
+    async fn tag_edit_button_sits_at_the_top_of_the_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1400.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let row = visual.debug_bounds("book-list-db-1").expect("行");
+        let button = visual
+            .debug_bounds("tag-edit-db-1")
+            .expect("タグ編集ボタンが描画されている");
+        assert!(
+            button.center().y - row.origin.y < row.size.height * 0.25,
+            "タグ編集ボタンが行の上に揃っていない（縦中央に落ちている）: row={row:?} button={button:?}"
+        );
+    }
+
+    /// タグが多い本はタグ列が一定数で折りたたまれ、行の高さが伸びない。
+    /// 「+n」をクリックすると全タグが出て行が伸び、「戻す」で元に戻る。
+    #[gpui_kit::test]
+    async fn tag_column_collapses_and_expands(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本1", "サークルA");
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        // 行が 4 列そろうよう、関連書籍（カルーセル）も出る状態にする
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = 'db-1' WHERE id = 'b1'")
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
+            // 長めのタグ名にして折り返し行数を増やす（展開で行がしっかり伸びる状態を作る）
+            let tags: Vec<String> = (1..=20).map(|i| format!("長いタグ名前{i:02}")).collect();
+            let pairs: Vec<(&str, &str)> = tags.iter().map(|t| (t.as_str(), "manual")).collect();
+            db::tags::set_for_book(db, "b1", &pairs).expect("seed tags");
+        });
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1400.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..6 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+        let row_h = |visual: &mut gpui_kit::VisualTestContext| {
+            visual
+                .debug_bounds("book-list-db-1")
+                .expect("行が描画されている")
+                .size
+                .height
+        };
+
+        // 折りたたみ: 上限まで出して残りは「+n」
+        assert!(
+            visual
+                .debug_bounds("tag-label-db-1-長いタグ名前08")
+                .is_some(),
+            "折りたたみ時の上限までタグが出ていない"
+        );
+        assert!(
+            visual
+                .debug_bounds("tag-label-db-1-長いタグ名前09")
+                .is_none(),
+            "折りたたまれていない（9 件目以降も出ている）"
+        );
+        let collapsed_h = row_h(visual);
+        let toggle = visual
+            .debug_bounds("tag-toggle-db-1")
+            .expect("折りたたみトグル（+n）が出ていない");
+
+        // 展開: 全タグが出て行が伸びる
+        visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert!(
+            visual
+                .debug_bounds("tag-label-db-1-長いタグ名前20")
+                .is_some(),
+            "展開しても全タグが出ていない"
+        );
+        let expanded_h = row_h(visual);
+        assert!(
+            expanded_h > collapsed_h,
+            "展開しても行が伸びていない: {collapsed_h:?} -> {expanded_h:?}"
+        );
+        // 戻す: 折りたたみに戻り、行の高さも戻る
+        let toggle = visual
+            .debug_bounds("tag-toggle-db-1")
+            .expect("「戻す」トグルが出ていない");
+        visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert!(
+            visual.debug_bounds("tag-label-db-1-タグ09").is_none(),
+            "「戻す」で折りたたまれていない"
+        );
+        assert_eq!(
+            row_h(visual),
+            collapsed_h,
+            "「戻す」で行の高さが元に戻っていない"
+        );
+
+        // タグをクリックしても行の動作（開く / ダウンロード）へ伝播しない
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.is_empty()),
+            "タグ列のクリックが行へ伝播している"
         );
     }
 

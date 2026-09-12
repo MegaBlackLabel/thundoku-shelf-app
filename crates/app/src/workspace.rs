@@ -1502,11 +1502,7 @@ impl Workspace {
     ) -> gpui_kit::AnyElement {
         // Windows 標準のタイトルバーボタンのホバー色（テーマに応じて明暗を出す）。
         // 背景（theme.secondary）と区別できるよう、ダークは明るめ・ライトは濃いめのグレー。
-        let hover_bg = match theme.mode {
-            gpui_kit::component::ThemeMode::Dark => gpui_kit::rgb(0x3e3e3e),
-            // ライトモードは背景（白）と区別しやすい濃いめのグレー
-            gpui_kit::component::ThemeMode::Light => gpui_kit::rgb(0xcfcfcf),
-        };
+        let hover_bg = crate::views::hover_bg(theme);
         div()
             .flex()
             .items_center()
