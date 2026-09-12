@@ -330,7 +330,10 @@ mod tests {
                         body: Vec::new(),
                     });
                 }
-                if spec.url.contains("operationName=EventOfflineCircleChecklistQuery") {
+                if spec
+                    .url
+                    .contains("operationName=EventOfflineCircleChecklistQuery")
+                {
                     let body = serde_json::to_vec(&serde_json::json!({
                         "data": { "viewer": { "checkedProductInfos": {
                             "edges": nodes
@@ -427,8 +430,12 @@ mod tests {
         // サーバーと同じ状態を先に作る → 再同期で差分なし
         let events = client.events().unwrap();
         save_events(&pool, &events).unwrap();
-        save_checklist(&pool, "tbf20", &[checklist_entry("tbf20:p1", "A", "あ-01", "本")])
-            .unwrap();
+        save_checklist(
+            &pool,
+            "tbf20",
+            &[checklist_entry("tbf20:p1", "A", "あ-01", "本")],
+        )
+        .unwrap();
         let outcome = refresh_checklist(&pool, &mut client, "tbf20").unwrap();
         assert_eq!(outcome.count, 1);
         assert!(!outcome.changed);
@@ -438,15 +445,16 @@ mod tests {
     fn refresh_checklist_reports_change_when_items_diff() {
         let pool = crate::db::test_pool();
         migrate(&pool).unwrap();
-        let mut client = mock_client(&[
-            ("p1", "A", "あ-01", "本"),
-            ("p2", "B", "い-02", "別の本"),
-        ]);
+        let mut client = mock_client(&[("p1", "A", "あ-01", "本"), ("p2", "B", "い-02", "別の本")]);
         // DB には p1 のみ → 同期で p2 が追加され差分あり
         let events = client.events().unwrap();
         save_events(&pool, &events).unwrap();
-        save_checklist(&pool, "tbf20", &[checklist_entry("tbf20:p1", "A", "あ-01", "本")])
-            .unwrap();
+        save_checklist(
+            &pool,
+            "tbf20",
+            &[checklist_entry("tbf20:p1", "A", "あ-01", "本")],
+        )
+        .unwrap();
         let outcome = refresh_checklist(&pool, &mut client, "tbf20").unwrap();
         assert_eq!(outcome.count, 2);
         assert!(outcome.changed);

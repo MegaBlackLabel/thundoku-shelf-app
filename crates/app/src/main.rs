@@ -3,8 +3,8 @@
 // Windows ではコンソール（黒い cmd 窓）を出さない（GUI サブシステム）。
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use gpui_kit::*;
 use gpui_kit::component::*;
+use gpui_kit::*;
 
 use thundoku_shelf::app_state::AppState;
 use thundoku_shelf::icons::AppAssets;
@@ -91,15 +91,12 @@ fn main() {
                                 // 起動時の Drive 復元確認（show_restore_prompt）が表示中の
                                 // まま閉じようとしたら、アップロード確認は出さずにそのまま閉じる。
                                 // Drive 側のバックアップをローカル（旧/空）で上書きしないため。
-                                let restoring_pending = ws.read_with(cx, |ws, _| {
-                                    ws.restore_prompt_active()
-                                });
+                                let restoring_pending =
+                                    ws.read_with(cx, |ws, _| ws.restore_prompt_active());
                                 if restoring_pending {
                                     true
                                 } else {
-                                    ws.update(cx, |ws, cx| {
-                                        ws.request_exit_upload_check(cx)
-                                    });
+                                    ws.update(cx, |ws, cx| ws.request_exit_upload_check(cx));
                                     false
                                 }
                             } else {

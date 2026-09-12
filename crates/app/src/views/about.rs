@@ -5,13 +5,13 @@
 
 use gpui_kit::Styled as _;
 use gpui_kit::StyledImage as _;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Icon;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::{
     Context, FontWeight, IntoElement, ParentElement, Render, SharedString, Window, div, px,
     relative,
 };
-use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::Icon;
-use gpui_kit::component::scroll::ScrollableElement as _;
 
 use crate::icons::AppIcon;
 

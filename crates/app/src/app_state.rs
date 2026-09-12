@@ -9,9 +9,9 @@ use gpui_kit::ReadGlobal as _;
 use gpui_kit::{App, Bounds, Global, Point, Size, Window, WindowBounds, px};
 use parking_lot::Mutex;
 use thundoku_core::booth::BoothSession;
+use thundoku_core::db;
 use thundoku_core::dlsite::client::DlsiteSession;
 use thundoku_core::fanza::client::FanzaSession;
-use thundoku_core::db;
 use thundoku_core::google::{GoogleClient, GoogleProfile};
 use thundoku_core::secrets::SecretStore;
 use thundoku_core::tbf::{TbfClient, TbfSession};
@@ -143,11 +143,8 @@ impl AppState {
         // sqlx で接続 + マイグレーション適用（migrations/ ディレクトリ管理）
         let db_pool = db::connect(&db_path).expect("open database");
         // P4: 初回起動（新旧モデル移行）で既存データをクリアして新モデルで開始する。
-        let _ = db::clear_owner_model_if_first_run(
-            &db_pool,
-            &packs_dir,
-            &data_dir.join("thumbnails"),
-        );
+        let _ =
+            db::clear_owner_model_if_first_run(&db_pool, &packs_dir, &data_dir.join("thumbnails"));
 
         let secrets = SecretStore::new();
         let mut tbf = TbfClient::new();

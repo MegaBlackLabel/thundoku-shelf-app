@@ -5,8 +5,8 @@
 //! ノベル / 動画は保存しない。リッチメタ（`release_date`/`maker_id`/`age_rating`/
 //! `series_name`/`custom_genres`）は `product_info`（一括）からベストエフォートで反映する。
 
-use crate::db::bookshelf::{self, BookshelfItem};
 use crate::db::SqlitePool;
+use crate::db::bookshelf::{self, BookshelfItem};
 use crate::dlsite::client::{DlsiteClient, DlsiteError};
 use crate::dlsite::{ai_to_str, classify, is_viewable_included, media_to_str};
 
@@ -28,7 +28,9 @@ pub fn save_purchases(pool: &SqlitePool, client: &mut DlsiteClient) -> Result<us
     let mut saved = 0usize;
     for p in items {
         let meta = metas.get(&p.content_id);
-        let site_id = meta.map(|m| m.site_id.as_str()).unwrap_or(p.site_id.as_str());
+        let site_id = meta
+            .map(|m| m.site_id.as_str())
+            .unwrap_or(p.site_id.as_str());
         let age_category = meta.and_then(|m| m.age_category);
         let cfg = classify(&p.work_type, &p.genre_icons, site_id, age_category);
         if !is_viewable_included(&cfg, true) {
@@ -102,8 +104,8 @@ mod tests {
     use super::*;
     use crate::db::bookshelf;
     use crate::dlsite::client::DlsiteSession;
-    use crate::tbf::transport::{RequestSpec, ResponseSpec};
     use crate::tbf::TbfError;
+    use crate::tbf::transport::{RequestSpec, ResponseSpec};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -117,7 +119,14 @@ mod tests {
     }
 
     /// 1 行分の購入履歴 HTML。`store` はダウンロード URL のストアセグメント（下り URL から site_id を導出）。
-    fn row_html(store: &str, content_id: &str, title: &str, icon_spans: &str, maker: &str, maker_id: &str) -> String {
+    fn row_html(
+        store: &str,
+        content_id: &str,
+        title: &str,
+        icon_spans: &str,
+        maker: &str,
+        maker_id: &str,
+    ) -> String {
         format!(
             r#"<tr><td class="buy_date">2026/05/04 17:03</td>
 <td class="work_1col_thumb"><img src="//img.dlsite.jp/resize/images2/work/doujin/RJ{base}/{content_id}_img_main_240x240.webp"></td>
@@ -136,15 +145,78 @@ mod tests {
     /// 混在カテゴリの一覧ページ（maniax の page/1）。
     fn mixed_page() -> String {
         let rows = [
-            row_html("maniax", "RJ00000001", "漫画本", r#"<span class="icon_MNG" title="マンガ">マンガ</span>"#, "C1", "RG1"),
-            row_html("maniax", "RJ00000002", "漫画AI一部", r#"<span class="icon_MNG" title="マンガ">マンガ</span><span class="icon_AIP" title="AI一部利用">AI一部利用</span>"#, "C2", "RG2"),
-            row_html("maniax", "RJ00000003", "CGイラスト", r#"<span class="icon_ICG" title="CG・イラスト">CG・イラスト</span>"#, "C3", "RG3"),
-            row_html("ai", "RJ00000004", "CGフルAI", r#"<span class="icon_ICG" title="CG・イラスト">CG・イラスト</span><span class="icon_AIG" title="AI生成作品">AI生成作品</span>"#, "C4", "RG4"),
-            row_html("maniax", "RJ00000005", "ボイス", r#"<span class="icon_SOU" title="音声・ASMR">音声・ASMR</span>"#, "C5", "RG5"),
-            row_html("maniax", "RJ00000006", "ゲーム", r#"<span class="icon_ACN" title="アクション">アクション</span>"#, "C6", "RG6"),
-            row_html("maniax", "RJ00000007", "ノベル", r#"<span class="icon_NRE" title="ノベル">ノベル</span>"#, "C7", "RG7"),
-            row_html("maniax", "RJ00000008", "ボイスコミック", r#"<span class="icon_VCM" title="ボイスコミック">ボイスコミック</span>"#, "C8", "RG8"),
-            row_html("maniax", "RJ00000009", "Webtoon", r#"<span class="icon_WBT" title="Webtoon">Webtoon</span>"#, "C9", "RG9"),
+            row_html(
+                "maniax",
+                "RJ00000001",
+                "漫画本",
+                r#"<span class="icon_MNG" title="マンガ">マンガ</span>"#,
+                "C1",
+                "RG1",
+            ),
+            row_html(
+                "maniax",
+                "RJ00000002",
+                "漫画AI一部",
+                r#"<span class="icon_MNG" title="マンガ">マンガ</span><span class="icon_AIP" title="AI一部利用">AI一部利用</span>"#,
+                "C2",
+                "RG2",
+            ),
+            row_html(
+                "maniax",
+                "RJ00000003",
+                "CGイラスト",
+                r#"<span class="icon_ICG" title="CG・イラスト">CG・イラスト</span>"#,
+                "C3",
+                "RG3",
+            ),
+            row_html(
+                "ai",
+                "RJ00000004",
+                "CGフルAI",
+                r#"<span class="icon_ICG" title="CG・イラスト">CG・イラスト</span><span class="icon_AIG" title="AI生成作品">AI生成作品</span>"#,
+                "C4",
+                "RG4",
+            ),
+            row_html(
+                "maniax",
+                "RJ00000005",
+                "ボイス",
+                r#"<span class="icon_SOU" title="音声・ASMR">音声・ASMR</span>"#,
+                "C5",
+                "RG5",
+            ),
+            row_html(
+                "maniax",
+                "RJ00000006",
+                "ゲーム",
+                r#"<span class="icon_ACN" title="アクション">アクション</span>"#,
+                "C6",
+                "RG6",
+            ),
+            row_html(
+                "maniax",
+                "RJ00000007",
+                "ノベル",
+                r#"<span class="icon_NRE" title="ノベル">ノベル</span>"#,
+                "C7",
+                "RG7",
+            ),
+            row_html(
+                "maniax",
+                "RJ00000008",
+                "ボイスコミック",
+                r#"<span class="icon_VCM" title="ボイスコミック">ボイスコミック</span>"#,
+                "C8",
+                "RG8",
+            ),
+            row_html(
+                "maniax",
+                "RJ00000009",
+                "Webtoon",
+                r#"<span class="icon_WBT" title="Webtoon">Webtoon</span>"#,
+                "C9",
+                "RG9",
+            ),
         ];
         format!(
             r#"<div id="buy_history_this"><table class="work_list_main"><tr class="item_name"><td>..</td></tr>{}</table><table class="global_pagination"><td class="page_no"><a href="/page/1">1</a></td></table></div>"#,
@@ -169,15 +241,42 @@ mod tests {
             })
         }
         let mut m = serde_json::Map::new();
-        m.insert("RJ00000001".into(), meta("RJ00000001", "maniax", "MNG", &["タグA"], "シリーズ1"));
-        m.insert("RJ00000002".into(), meta("RJ00000002", "maniax", "MNG", &["タグB"], "シリーズ2"));
-        m.insert("RJ00000003".into(), meta("RJ00000003", "maniax", "ICG", &[], "シリーズ3"));
-        m.insert("RJ00000004".into(), meta("RJ00000004", "ai", "ICG", &["タグC"], "シリーズ4"));
-        m.insert("RJ00000005".into(), meta("RJ00000005", "maniax", "SOU", &[], "シリーズ5"));
-        m.insert("RJ00000006".into(), meta("RJ00000006", "maniax", "ACN", &[], "シリーズ6"));
-        m.insert("RJ00000007".into(), meta("RJ00000007", "maniax", "NRE", &[], "シリーズ7"));
-        m.insert("RJ00000008".into(), meta("RJ00000008", "maniax", "VCM", &[], "シリーズ8"));
-        m.insert("RJ00000009".into(), meta("RJ00000009", "maniax", "WBT", &[], "シリーズ9"));
+        m.insert(
+            "RJ00000001".into(),
+            meta("RJ00000001", "maniax", "MNG", &["タグA"], "シリーズ1"),
+        );
+        m.insert(
+            "RJ00000002".into(),
+            meta("RJ00000002", "maniax", "MNG", &["タグB"], "シリーズ2"),
+        );
+        m.insert(
+            "RJ00000003".into(),
+            meta("RJ00000003", "maniax", "ICG", &[], "シリーズ3"),
+        );
+        m.insert(
+            "RJ00000004".into(),
+            meta("RJ00000004", "ai", "ICG", &["タグC"], "シリーズ4"),
+        );
+        m.insert(
+            "RJ00000005".into(),
+            meta("RJ00000005", "maniax", "SOU", &[], "シリーズ5"),
+        );
+        m.insert(
+            "RJ00000006".into(),
+            meta("RJ00000006", "maniax", "ACN", &[], "シリーズ6"),
+        );
+        m.insert(
+            "RJ00000007".into(),
+            meta("RJ00000007", "maniax", "NRE", &[], "シリーズ7"),
+        );
+        m.insert(
+            "RJ00000008".into(),
+            meta("RJ00000008", "maniax", "VCM", &[], "シリーズ8"),
+        );
+        m.insert(
+            "RJ00000009".into(),
+            meta("RJ00000009", "maniax", "WBT", &[], "シリーズ9"),
+        );
         serde_json::to_vec(&serde_json::Value::Object(m)).unwrap()
     }
 
@@ -193,16 +292,28 @@ mod tests {
             handler: Box::new(move |spec: RequestSpec| {
                 let url = spec.url;
                 if url.contains("/product/info/ajax") {
-                    Ok(ResponseSpec { status: 200, headers: vec![], body: body.clone() })
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![],
+                        body: body.clone(),
+                    })
                 } else if url.contains("/mypage/userbuy/") {
                     let page = if url.contains("maniax") && url.contains("page/1") {
                         mixed_page()
                     } else {
                         empty_page()
                     };
-                    Ok(ResponseSpec { status: 200, headers: vec![], body: page.into_bytes() })
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![],
+                        body: page.into_bytes(),
+                    })
                 } else {
-                    Ok(ResponseSpec { status: 404, headers: vec![], body: vec![] })
+                    Ok(ResponseSpec {
+                        status: 404,
+                        headers: vec![],
+                        body: vec![],
+                    })
                 }
             }),
         };
@@ -214,7 +325,8 @@ mod tests {
 
         let rows = bookshelf::list(&pool, SITE_ID_DLSITE).unwrap();
         assert_eq!(rows.len(), 4);
-        let ids: std::collections::HashSet<_> = rows.iter().map(|r| r.database_id.clone()).collect();
+        let ids: std::collections::HashSet<_> =
+            rows.iter().map(|r| r.database_id.clone()).collect();
         assert!(ids.contains("RJ00000001"));
         assert!(ids.contains("RJ00000002"));
         assert!(ids.contains("RJ00000003"));

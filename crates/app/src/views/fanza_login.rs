@@ -4,11 +4,11 @@
 //! accounts.dmm.co.jp のパスワードログインを WebView 内で完了して www.dmm.co.jp に戻ったら、
 //! www.dmm.co.jp / accounts.dmm.co.jp のセッション Cookie を自動取得して永続化する。
 
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_kit::component::{Icon, IconName};
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
 

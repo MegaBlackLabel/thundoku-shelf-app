@@ -1,8 +1,8 @@
 //! thundoku-core: storage, DB, external API clients and sync engines.
 pub mod booth;
 pub mod db;
-pub mod drive;
 pub mod dlsite;
+pub mod drive;
 pub mod fanza;
 pub mod google;
 pub mod import;

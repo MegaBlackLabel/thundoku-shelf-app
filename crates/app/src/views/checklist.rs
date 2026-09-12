@@ -5,6 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::sync::Arc;
 
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName};
 use gpui_kit::{
     Context, FontWeight, IntoElement, ParentElement, Render, RenderImage, SharedString,
     StyledImage, Window, div, img, px,
@@ -12,11 +17,6 @@ use gpui_kit::{
 use gpui_kit::{
     InteractiveElement as _, ReadGlobal as _, StatefulInteractiveElement as _, Styled as _,
 };
-use gpui_kit::component::Sizable as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName};
 use thundoku_core::db;
 use thundoku_core::db::checklist::{CheckedItem, TbfEvent};
 use thundoku_core::tbf;
@@ -325,12 +325,13 @@ impl ChecklistView {
         let tbf_client = state.tbf.clone();
         let db = state.db_pool.clone();
         let slug_for_task = slug.clone();
-        let task: gpui_kit::Task<Result<usize, String>> = cx.background_executor().spawn(async move {
-            let mut client = tbf_client.lock();
-            let outcome = tbf::sync::refresh_checklist(&db, &mut client, &slug_for_task)
-                .map_err(|e| e.to_string())?;
-            Ok(outcome.count)
-        });
+        let task: gpui_kit::Task<Result<usize, String>> =
+            cx.background_executor().spawn(async move {
+                let mut client = tbf_client.lock();
+                let outcome = tbf::sync::refresh_checklist(&db, &mut client, &slug_for_task)
+                    .map_err(|e| e.to_string())?;
+                Ok(outcome.count)
+            });
         cx.spawn(async move |_window, cx| {
             let result = task.await;
             handle.update(cx, |this, cx| {
@@ -373,14 +374,16 @@ impl ChecklistView {
         let tbf_client = state.tbf.clone();
         let db = state.db_pool.clone();
         let slug_for_task = slug.clone();
-        let task: gpui_kit::Task<Result<usize, String>> = cx.background_executor().spawn(async move {
-            let mut client = tbf_client.lock();
-            let entries = client
-                .favorites(&slug_for_task)
-                .map_err(|e| e.to_string())?;
-            tbf::sync::save_checklist(&db, &slug_for_task, &entries).map_err(|e| e.to_string())?;
-            Ok(entries.len())
-        });
+        let task: gpui_kit::Task<Result<usize, String>> =
+            cx.background_executor().spawn(async move {
+                let mut client = tbf_client.lock();
+                let entries = client
+                    .favorites(&slug_for_task)
+                    .map_err(|e| e.to_string())?;
+                tbf::sync::save_checklist(&db, &slug_for_task, &entries)
+                    .map_err(|e| e.to_string())?;
+                Ok(entries.len())
+            });
         cx.spawn(async move |_window, cx| {
             let result = task.await;
             handle.update(cx, |this, cx| {

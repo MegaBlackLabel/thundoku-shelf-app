@@ -6,11 +6,11 @@
 //! ログイン後も `login.dlsite.com` のまま（初回ガイド等）なら、ストアへ遷移して
 //! ストア Cookie の発行を促す。
 
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_kit::component::{Icon, IconName};
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
 

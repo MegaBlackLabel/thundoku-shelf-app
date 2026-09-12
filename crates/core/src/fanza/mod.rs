@@ -36,9 +36,9 @@ pub struct FanzaMeta {
 
 /// `image_src` の `/digital/{comic,cg,voice,game,video}/` セグメントからメディア種別を判定する。
 fn media_from_image_src(image_src: &str) -> Option<MediaCategory> {
-    let seg = image_src.split('/').find(|s| {
-        matches!(*s, "comic" | "cg" | "voice" | "game" | "video")
-    })?;
+    let seg = image_src
+        .split('/')
+        .find(|s| matches!(*s, "comic" | "cg" | "voice" | "game" | "video"))?;
     Some(match seg {
         "comic" => MediaCategory::Comic,
         "cg" => MediaCategory::Cg,
@@ -80,7 +80,10 @@ pub fn classify(image_src: &str, genre: &str) -> FanzaMeta {
     let media = media_from_image_src(image_src)
         .or_else(|| media_from_genre(genre))
         .unwrap_or(MediaCategory::Video);
-    FanzaMeta { media, ai: ai_from_genre(genre) }
+    FanzaMeta {
+        media,
+        ai: ai_from_genre(genre),
+    }
 }
 
 /// ビューアー（画像系）対象か。画像系（`Comic` / `Cg`。AI バリアント含む）かつ
@@ -118,33 +121,57 @@ mod tests {
     #[test]
     fn classicify_media_and_ai_axes() {
         assert_eq!(
-            classify("https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl.jpg", "コミック"),
-            FanzaMeta { media: MediaCategory::Comic, ai: AiType::None }
+            classify(
+                "https://doujin-assets.dmm.co.jp/digital/comic/d_1/d_1pl.jpg",
+                "コミック"
+            ),
+            FanzaMeta {
+                media: MediaCategory::Comic,
+                ai: AiType::None
+            }
         );
         assert_eq!(
             classify("https://assets/digital/comic/d_1/x.jpg", "コミック・一部AI"),
-            FanzaMeta { media: MediaCategory::Comic, ai: AiType::PartialAi }
+            FanzaMeta {
+                media: MediaCategory::Comic,
+                ai: AiType::PartialAi
+            }
         );
         assert_eq!(
             classify("https://assets/digital/cg/d_2/x.jpg", "CG・AI"),
-            FanzaMeta { media: MediaCategory::Cg, ai: AiType::FullAi }
+            FanzaMeta {
+                media: MediaCategory::Cg,
+                ai: AiType::FullAi
+            }
         );
         assert_eq!(
             classify("https://assets/digital/voice/d_3/x.jpg", "ボイス"),
-            FanzaMeta { media: MediaCategory::Voice, ai: AiType::None }
+            FanzaMeta {
+                media: MediaCategory::Voice,
+                ai: AiType::None
+            }
         );
         assert_eq!(
             classify("https://assets/digital/game/d_4/x.jpg", "ゲーム"),
-            FanzaMeta { media: MediaCategory::Game, ai: AiType::None }
+            FanzaMeta {
+                media: MediaCategory::Game,
+                ai: AiType::None
+            }
         );
         assert_eq!(
             classify("https://assets/digital/video/d_5/x.jpg", "動画"),
-            FanzaMeta { media: MediaCategory::Video, ai: AiType::None }
+            FanzaMeta {
+                media: MediaCategory::Video,
+                ai: AiType::None
+            }
         );
         // AI でもメディア種別で除外される（ボイス・AI）
         assert_eq!(
             classify("https://assets/digital/voice/d_6/x.jpg", "ボイス・AI"),
-            FanzaMeta { media: MediaCategory::Voice, ai: AiType::FullAi }
+            FanzaMeta {
+                media: MediaCategory::Voice,
+                ai: AiType::FullAi
+            }
         );
     }
 
@@ -153,23 +180,71 @@ mod tests {
     fn classify_falls_back_to_genre_when_no_image_path() {
         assert_eq!(
             classify("", "ボイス・一部AI"),
-            FanzaMeta { media: MediaCategory::Voice, ai: AiType::PartialAi }
+            FanzaMeta {
+                media: MediaCategory::Voice,
+                ai: AiType::PartialAi
+            }
         );
         assert_eq!(
             classify("https://example.com/thumb.jpg", "コミック"),
-            FanzaMeta { media: MediaCategory::Comic, ai: AiType::None }
+            FanzaMeta {
+                media: MediaCategory::Comic,
+                ai: AiType::None
+            }
         );
     }
 
     /// 画像系（comic/cg。AI 含む）+ DRM 無しのみ viewable。未知メディアは安全側（除外）。
     #[test]
     fn is_viewable_included_filters_image_only_and_drm() {
-        assert!(is_viewable_included(&FanzaMeta { media: MediaCategory::Comic, ai: AiType::None }, true));
-        assert!(is_viewable_included(&FanzaMeta { media: MediaCategory::Comic, ai: AiType::FullAi }, true));
-        assert!(is_viewable_included(&FanzaMeta { media: MediaCategory::Cg, ai: AiType::PartialAi }, true));
-        assert!(!is_viewable_included(&FanzaMeta { media: MediaCategory::Voice, ai: AiType::None }, true));
-        assert!(!is_viewable_included(&FanzaMeta { media: MediaCategory::Game, ai: AiType::None }, true));
-        assert!(!is_viewable_included(&FanzaMeta { media: MediaCategory::Video, ai: AiType::None }, true));
-        assert!(!is_viewable_included(&FanzaMeta { media: MediaCategory::Comic, ai: AiType::None }, false)); // DRM 付き
+        assert!(is_viewable_included(
+            &FanzaMeta {
+                media: MediaCategory::Comic,
+                ai: AiType::None
+            },
+            true
+        ));
+        assert!(is_viewable_included(
+            &FanzaMeta {
+                media: MediaCategory::Comic,
+                ai: AiType::FullAi
+            },
+            true
+        ));
+        assert!(is_viewable_included(
+            &FanzaMeta {
+                media: MediaCategory::Cg,
+                ai: AiType::PartialAi
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &FanzaMeta {
+                media: MediaCategory::Voice,
+                ai: AiType::None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &FanzaMeta {
+                media: MediaCategory::Game,
+                ai: AiType::None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &FanzaMeta {
+                media: MediaCategory::Video,
+                ai: AiType::None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &FanzaMeta {
+                media: MediaCategory::Comic,
+                ai: AiType::None
+            },
+            false
+        )); // DRM 付き
     }
 }

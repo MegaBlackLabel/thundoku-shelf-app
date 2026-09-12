@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 
-use crate::tbf::transport::{RequestSpec, Transport};
 use crate::tbf::TbfError;
+use crate::tbf::transport::{RequestSpec, Transport};
 
 /// 列挙するストアフロア。`soft`（PC ソフト）/ `app`（スマホゲーム）はゲーム系・対象外。
 pub const STORES: [&str; 4] = ["maniax", "home", "books", "ai"];
@@ -186,14 +186,24 @@ impl DlsiteClient {
     }
 
     /// 作品メタを取得する（`product/info/ajax`、複数 ID はカンマ区切り一括）。
-    pub fn product_info(&mut self, ids: &[&str]) -> Result<HashMap<String, DlsiteWorkMeta>, DlsiteError> {
+    pub fn product_info(
+        &mut self,
+        ids: &[&str],
+    ) -> Result<HashMap<String, DlsiteWorkMeta>, DlsiteError> {
         let mut out = HashMap::new();
         for chunk in ids.chunks(20) {
             let joined = chunk.join(",");
-            let url = format!("https://www.dlsite.com/maniax/product/info/ajax?product_id={joined}");
+            let url =
+                format!("https://www.dlsite.com/maniax/product/info/ajax?product_id={joined}");
             let resp = self
                 .transport
-                .send(RequestSpec { method: "GET".into(), url, headers: self.ajax_headers(), body: None, redirects: 3 })
+                .send(RequestSpec {
+                    method: "GET".into(),
+                    url,
+                    headers: self.ajax_headers(),
+                    body: None,
+                    redirects: 3,
+                })
                 .map_err(DlsiteError::Transport)?;
             if resp.status == 401 || resp.status == 403 {
                 return Err(DlsiteError::Unauthorized(resp.status));
@@ -291,7 +301,9 @@ impl DlsiteClient {
             return Err(DlsiteError::Http(resp.status));
         }
         if resp.body.starts_with(b"<!doctype") || resp.body.starts_with(b"<html") {
-            return Err(DlsiteError::Parse("HTML レスポンス（ファイルではない）".into()));
+            return Err(DlsiteError::Parse(
+                "HTML レスポンス（ファイルではない）".into(),
+            ));
         }
         Ok(resp.body)
     }
@@ -300,7 +312,13 @@ impl DlsiteClient {
     fn get_html(&mut self, url: &str) -> Result<String, DlsiteError> {
         let resp = self
             .transport
-            .send(RequestSpec { method: "GET".into(), url: url.into(), headers: self.cookie_headers(), body: None, redirects: 3 })
+            .send(RequestSpec {
+                method: "GET".into(),
+                url: url.into(),
+                headers: self.cookie_headers(),
+                body: None,
+                redirects: 3,
+            })
             .map_err(DlsiteError::Transport)?;
         if resp.status == 401 || resp.status == 403 {
             return Err(DlsiteError::Unauthorized(resp.status));
@@ -333,11 +351,15 @@ pub fn parse_userbuy_page(html: &str) -> (Vec<DlsitePurchase>, Option<usize>) {
 /// 1 つの `<tr>` 行から購入作品を抽出する。
 fn parse_row(s: &str) -> Option<DlsitePurchase> {
     fn cap(re: &str, hay: &str, idx: usize) -> Option<String> {
-        regex::Regex::new(re).ok()?.captures(hay).map(|c| c.get(idx).unwrap().as_str().trim().to_string())
+        regex::Regex::new(re)
+            .ok()?
+            .captures(hay)
+            .map(|c| c.get(idx).unwrap().as_str().trim().to_string())
     }
     let content_id = cap(r"(?i)product_id\/(RJ\d+)\.html", s, 1)?;
     let title = cap(r#"class="work_name"[^>]*>\s*<a[^>]*>([^<]*)</a>"#, s, 1).unwrap_or_default();
-    let maker_name = cap(r#"class="maker_name"[^>]*>\s*<a[^>]*>([^<]*)</a>"#, s, 1).unwrap_or_default();
+    let maker_name =
+        cap(r#"class="maker_name"[^>]*>\s*<a[^>]*>([^<]*)</a>"#, s, 1).unwrap_or_default();
     let maker_id = cap(r"(?i)maker_id\/(RG\d+)\.html", s, 1);
     let price = cap(r#"class="work_price"[^>]*>\s*([^<]*)"#, s, 1);
     let purchase_date = cap(r#"class="buy_date"[^>]*>\s*([^<]*)"#, s, 1);
@@ -430,17 +452,26 @@ pub fn parse_last_page(html: &str) -> Option<usize> {
 }
 
 fn s(v: &serde_json::Value, key: &str) -> String {
-    v.get(key).and_then(serde_json::Value::as_str).unwrap_or("").to_string()
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn s_opt(v: &serde_json::Value, key: &str) -> Option<String> {
-    v.get(key).and_then(serde_json::Value::as_str).map(|s| s.to_string())
+    v.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string())
 }
 
 fn arr_str(v: &serde_json::Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(serde_json::Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -469,7 +500,10 @@ mod tests {
         maker: &str,
         maker_id: &str,
     ) -> String {
-        let thumb = format!("//img.dlsite.jp/resize/images2/work/doujin/RJ{base}/{content_id}_img_main_240x240.webp", base = &content_id[..8]);
+        let thumb = format!(
+            "//img.dlsite.jp/resize/images2/work/doujin/RJ{base}/{content_id}_img_main_240x240.webp",
+            base = &content_id[..8]
+        );
         format!(
             r#"<tr><td class="buy_date">2026/05/04 17:03</td>
 <td class="work_1col_thumb"><img src="{thumb}"></td>
@@ -495,8 +529,20 @@ mod tests {
 <table class="global_pagination"><td class="page_no">
 <a href="/maniax/mypage/userbuy/.../page/1">1</a><a href="/maniax/mypage/userbuy/.../page/3">3</a>
 </td></table></div>"#,
-            row_html("RJ01234567", "タイトルA", "icon_MNG", "サークルA", "RG12345"),
-            row_html("RJ05678912", "タイトルB", "icon_ICG", "サークルB", "RG67890"),
+            row_html(
+                "RJ01234567",
+                "タイトルA",
+                "icon_MNG",
+                "サークルA",
+                "RG12345"
+            ),
+            row_html(
+                "RJ05678912",
+                "タイトルB",
+                "icon_ICG",
+                "サークルB",
+                "RG67890"
+            ),
         );
         let (rows, last) = parse_userbuy_page(&html);
         assert_eq!(rows.len(), 2);
@@ -507,8 +553,17 @@ mod tests {
         assert_eq!(rows[0].maker_id.as_deref(), Some("RG12345"));
         assert_eq!(rows[0].price.as_deref(), Some("440円"));
         assert_eq!(rows[0].purchase_date.as_deref(), Some("2026/05/04 17:03"));
-        assert_eq!(rows[0].down_url.as_deref(), Some("https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html"));
-        assert!(rows[0].thumbnail_url.as_deref().unwrap().ends_with("RJ01234567_img_main_240x240.webp"));
+        assert_eq!(
+            rows[0].down_url.as_deref(),
+            Some("https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html")
+        );
+        assert!(
+            rows[0]
+                .thumbnail_url
+                .as_deref()
+                .unwrap()
+                .ends_with("RJ01234567_img_main_240x240.webp")
+        );
         assert_eq!(rows[1].work_type, "ICG");
         assert_eq!(last, Some(3));
     }
@@ -545,7 +600,10 @@ mod tests {
         assert_eq!(m.maker_id.as_deref(), Some("RG12345"));
         assert_eq!(m.regist_date.as_deref(), Some("2025-06-17 16:00:00"));
         assert_eq!(m.price, Some(440));
-        assert_eq!(m.down_url.as_deref(), Some("https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html"));
+        assert_eq!(
+            m.down_url.as_deref(),
+            Some("https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html")
+        );
         assert_eq!(m.custom_genres, vec!["dlsiteawards2025"]);
         assert_eq!(m.age_category, Some(1));
         assert_eq!(m.title_name.as_deref(), Some("少年エルフ"));
@@ -554,20 +612,37 @@ mod tests {
     /// `purchased` が複数ストア × ページを走査し、Cookie ヘッダを送ることを検証する。
     #[test]
     fn purchased_pages_all_stores_and_sends_cookie() {
-        use std::sync::Arc;
         use parking_lot::Mutex;
+        use std::sync::Arc;
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls2 = calls.clone();
         let transport = MockTransport {
             handler: Box::new(move |spec: RequestSpec| {
-                calls2.lock().push(format!("{} {}", spec.url, spec.headers.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")));
+                calls2.lock().push(format!(
+                    "{} {}",
+                    spec.url,
+                    spec.headers
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join("&")
+                ));
                 let (rows, last) = if spec.url.contains("page/1") {
-                    (row_html("RJ01234567", "A", "icon_MNG", "C", "RG1").to_string(), "2")
+                    (
+                        row_html("RJ01234567", "A", "icon_MNG", "C", "RG1").to_string(),
+                        "2",
+                    )
                 } else {
                     (String::new(), "1")
                 };
-                let html = format!("<div id=\"buy_history_this\"><table class=\"work_list_main\"><tr class=\"item_name\"></tr>{rows}</table><table class=\"global_pagination\"><td class=\"page_no\"><a href=\"/page/{last}\">…</a></td></table></div>");
-                Ok(ResponseSpec { status: 200, headers: vec![], body: html.into_bytes() })
+                let html = format!(
+                    "<div id=\"buy_history_this\"><table class=\"work_list_main\"><tr class=\"item_name\"></tr>{rows}</table><table class=\"global_pagination\"><td class=\"page_no\"><a href=\"/page/{last}\">…</a></td></table></div>"
+                );
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: html.into_bytes(),
+                })
             }),
         };
         let mut client = DlsiteClient::with_transport(Box::new(transport), session());
@@ -584,8 +659,8 @@ mod tests {
     /// HTML レスポンスは拒否する。
     #[test]
     fn download_manually_follows_302_to_cdn_with_jwt() {
-        use std::sync::Arc;
         use parking_lot::Mutex;
+        use std::sync::Arc;
         let cdn_spec = Arc::new(Mutex::new(None::<RequestSpec>));
         let cdn_spec2 = cdn_spec.clone();
         let transport = MockTransport {
@@ -601,7 +676,11 @@ mod tests {
                     })
                 } else {
                     *cdn_spec2.lock() = Some(spec);
-                    Ok(ResponseSpec { status: 200, headers: vec![("content-type".into(), "application/zip".into())], body: b"PK\x03\x04zipdata".to_vec() })
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/zip".into())],
+                        body: b"PK\x03\x04zipdata".to_vec(),
+                    })
                 }
             }),
         };
@@ -611,14 +690,28 @@ mod tests {
         );
         let mut on = |_: u64, _: u64| {};
         let bytes = client
-            .download_with_progress("https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html", &mut on)
+            .download_with_progress(
+                "https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html",
+                &mut on,
+            )
             .unwrap();
         assert_eq!(bytes, b"PK\x03\x04zipdata");
         let spec = cdn_spec.lock().clone().expect("CDN request made");
         assert!(spec.url.starts_with("https://download.dlsite.com/"));
-        let cookie = spec.headers.iter().find(|(k, _)| k == "Cookie").map(|(_, v)| v.clone()).unwrap_or_default();
-        assert!(cookie.contains("__DLsite_SID=abc"), "session cookie missing: {cookie}");
-        assert!(cookie.contains("jwt=eyJh.eyJwYXRoIjovY29udGVudC9kb3VqaW4vcmlwL3oifQ.sig"), "jwt cookie missing: {cookie}");
+        let cookie = spec
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Cookie")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert!(
+            cookie.contains("__DLsite_SID=abc"),
+            "session cookie missing: {cookie}"
+        );
+        assert!(
+            cookie.contains("jwt=eyJh.eyJwYXRoIjovY29udGVudC9kb3VqaW4vcmlwL3oifQ.sig"),
+            "jwt cookie missing: {cookie}"
+        );
     }
 
     /// `parse_last_page` は数値リンクの最大値と `最後` リンクを検出する。

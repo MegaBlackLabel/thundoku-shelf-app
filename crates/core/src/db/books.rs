@@ -298,11 +298,9 @@ pub fn owned_book_ids(
     let mut out = std::collections::HashSet::new();
     for (id, owner_sub) in rows {
         let owned = match current_sub {
-            Some(s) => {
-                owner_sub
-                    .as_deref()
-                    .is_some_and(|b| crate::owner::decrypt(key, b).as_deref() == Some(s))
-            }
+            Some(s) => owner_sub
+                .as_deref()
+                .is_some_and(|b| crate::owner::decrypt(key, b).as_deref() == Some(s)),
             None => owner_sub.is_none(),
         };
         if owned {

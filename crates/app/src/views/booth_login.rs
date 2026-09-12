@@ -4,11 +4,11 @@
 //! WebView 内でログインを完了して booth.pm に戻ったら、booth.pm のセッション
 //! Cookie を自動取得して永続化する（Cookie の手動コピーは不要）。
 
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_kit::component::{Icon, IconName};
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
 

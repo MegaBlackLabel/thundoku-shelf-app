@@ -113,7 +113,11 @@ pub fn classify(
 
 /// ビューアー（画像系）対象か。画像系（`Comic` / `Cg`。AI バリアント含む）かつ DRM 無しのみ。
 pub fn is_viewable_included(meta: &DlsiteMeta, drm_ok: bool) -> bool {
-    drm_ok && matches!(meta.media, DlsiteMediaCategory::Comic | DlsiteMediaCategory::Cg)
+    drm_ok
+        && matches!(
+            meta.media,
+            DlsiteMediaCategory::Comic | DlsiteMediaCategory::Cg
+        )
 }
 
 /// `DlsiteMediaCategory` → 正規化文字列（`bookshelf_items.media_category` の値）。
@@ -152,17 +156,35 @@ mod tests {
     #[test]
     fn classify_work_type_axis() {
         use DlsiteMediaCategory::*;
-        assert_eq!(classify("MNG", &icons(&["icon_MNG"]), "home", Some(1)).media, Comic);
-        assert_eq!(classify("ICG", &icons(&["icon_ICG"]), "home", None).media, Cg);
-        assert_eq!(classify("SOU", &icons(&["icon_SOU"]), "maniax", None).media, Voice);
-        for g in ["ACN", "ADV", "QIZ", "RPG", "STG", "SLN", "TBL", "TYP", "PZL", "ETC"] {
-            assert_eq!(classify(g, &icons(&[]), "home", None).media, Game, "game {g}");
+        assert_eq!(
+            classify("MNG", &icons(&["icon_MNG"]), "home", Some(1)).media,
+            Comic
+        );
+        assert_eq!(
+            classify("ICG", &icons(&["icon_ICG"]), "home", None).media,
+            Cg
+        );
+        assert_eq!(
+            classify("SOU", &icons(&["icon_SOU"]), "maniax", None).media,
+            Voice
+        );
+        for g in [
+            "ACN", "ADV", "QIZ", "RPG", "STG", "SLN", "TBL", "TYP", "PZL", "ETC",
+        ] {
+            assert_eq!(
+                classify(g, &icons(&[]), "home", None).media,
+                Game,
+                "game {g}"
+            );
         }
         assert_eq!(classify("NRE", &icons(&[]), "home", None).media, Novel);
         assert_eq!(classify("DNV", &icons(&[]), "home", None).media, Novel);
         assert_eq!(classify("VCM", &icons(&[]), "home", None).media, Video);
         assert_eq!(classify("WBT", &icons(&[]), "home", None).media, Video);
-        assert_eq!(classify("", &icons(&["icon_MNG"]), "home", None).media, Comic);
+        assert_eq!(
+            classify("", &icons(&["icon_MNG"]), "home", None).media,
+            Comic
+        );
         assert_eq!(classify("", &icons(&["icon_ICG"]), "home", None).media, Cg);
         // 不明は安全側（Other → 除外）
         assert_eq!(classify("UNKNOWN", &icons(&[]), "home", None).media, Other);
@@ -172,11 +194,20 @@ mod tests {
     /// `icon_AIP` → partial。
     #[test]
     fn classify_ai_axis() {
-        use DlsiteAiType::{PartialAi, FullAi};
+        use DlsiteAiType::{FullAi, PartialAi};
         assert_eq!(classify("MNG", &icons(&[]), "ai", None).ai, FullAi);
-        assert_eq!(classify("MNG", &icons(&["icon_AIG"]), "home", None).ai, FullAi);
-        assert_eq!(classify("MNG", &icons(&["icon_AIP"]), "home", None).ai, PartialAi);
-        assert_eq!(classify("MNG", &icons(&["icon_MNG"]), "home", None).ai, DlsiteAiType::None);
+        assert_eq!(
+            classify("MNG", &icons(&["icon_AIG"]), "home", None).ai,
+            FullAi
+        );
+        assert_eq!(
+            classify("MNG", &icons(&["icon_AIP"]), "home", None).ai,
+            PartialAi
+        );
+        assert_eq!(
+            classify("MNG", &icons(&["icon_MNG"]), "home", None).ai,
+            DlsiteAiType::None
+        );
     }
 
     /// 年齢指定: `age_category=1` → all、R18 フロア（`maniax`）or 2 以上 → r18、無し → None。
@@ -193,20 +224,76 @@ mod tests {
     fn is_viewable_included_filters_image_only_and_drm() {
         use DlsiteAiType::FullAi;
         use DlsiteMediaCategory::*;
-        assert!(is_viewable_included(&DlsiteMeta { media: Comic, ai: DlsiteAiType::None, age: None }, true));
-        assert!(is_viewable_included(&DlsiteMeta { media: Cg, ai: FullAi, age: None }, true));
-        assert!(!is_viewable_included(&DlsiteMeta { media: Voice, ai: DlsiteAiType::None, age: None }, true));
-        assert!(!is_viewable_included(&DlsiteMeta { media: Game, ai: DlsiteAiType::None, age: None }, true));
-        assert!(!is_viewable_included(&DlsiteMeta { media: Novel, ai: DlsiteAiType::None, age: None }, true));
-        assert!(!is_viewable_included(&DlsiteMeta { media: Video, ai: DlsiteAiType::None, age: None }, true));
-        assert!(!is_viewable_included(&DlsiteMeta { media: Other, ai: DlsiteAiType::None, age: None }, true));
-        assert!(!is_viewable_included(&DlsiteMeta { media: Comic, ai: DlsiteAiType::None, age: None }, false)); // DRM
+        assert!(is_viewable_included(
+            &DlsiteMeta {
+                media: Comic,
+                ai: DlsiteAiType::None,
+                age: None
+            },
+            true
+        ));
+        assert!(is_viewable_included(
+            &DlsiteMeta {
+                media: Cg,
+                ai: FullAi,
+                age: None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &DlsiteMeta {
+                media: Voice,
+                ai: DlsiteAiType::None,
+                age: None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &DlsiteMeta {
+                media: Game,
+                ai: DlsiteAiType::None,
+                age: None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &DlsiteMeta {
+                media: Novel,
+                ai: DlsiteAiType::None,
+                age: None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &DlsiteMeta {
+                media: Video,
+                ai: DlsiteAiType::None,
+                age: None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &DlsiteMeta {
+                media: Other,
+                ai: DlsiteAiType::None,
+                age: None
+            },
+            true
+        ));
+        assert!(!is_viewable_included(
+            &DlsiteMeta {
+                media: Comic,
+                ai: DlsiteAiType::None,
+                age: None
+            },
+            false
+        )); // DRM
     }
 
     /// 正規化文字列（DB 値）。
     #[test]
     fn media_and_ai_to_str() {
-        use DlsiteAiType::{PartialAi, FullAi};
+        use DlsiteAiType::{FullAi, PartialAi};
         use DlsiteMediaCategory::*;
         assert_eq!(media_to_str(Comic), "comic");
         assert_eq!(media_to_str(Cg), "cg");

@@ -7,13 +7,12 @@
 use std::collections::HashMap;
 
 use crate::fanza::classify;
-use crate::tbf::transport::{RequestSpec, ResponseSpec, Transport};
 use crate::tbf::TbfError;
+use crate::tbf::transport::{RequestSpec, ResponseSpec, Transport};
 use serde::Deserialize;
 use serde_json::Value;
 
-pub const LIBRARY_BASE: &str =
-    "https://www.dmm.co.jp/dc/doujin/api/mylibraries/";
+pub const LIBRARY_BASE: &str = "https://www.dmm.co.jp/dc/doujin/api/mylibraries/";
 /// jar 等の参照メタ列は一覧 API では返さない（`details` / 商品ページで取得）。
 pub const PAGE_LIMIT: usize = 20;
 
@@ -135,10 +134,7 @@ pub fn parse_product_page(html: &str) -> FanzaProductPage {
         .and_then(|re| re.captures(html))
         .map(|cap| cap[1].trim().to_string())
         .filter(|author| !author.is_empty());
-    FanzaProductPage {
-        genre_tags,
-        author,
-    }
+    FanzaProductPage { genre_tags, author }
 }
 
 /// FANZA 同人クライアント（`tbf::transport` を再利用、`Transport` でモック可能）。
@@ -209,7 +205,10 @@ impl FanzaClient {
                     }
                 }
             }
-            let has_next = data.get("hasNext").and_then(Value::as_bool).unwrap_or(false);
+            let has_next = data
+                .get("hasNext")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let total = data.get("total").and_then(Value::as_i64).unwrap_or(0) as usize;
             if !has_next || out.len() >= total || out.len() >= PAGE_LIMIT * 100 {
                 break;
@@ -231,13 +230,17 @@ impl FanzaClient {
             .and_then(Value::as_object)
             .and_then(|m| m.get("1"))
             .and_then(Value::as_str)
-            .map(|s| if s.starts_with('/') { format!("https://www.dmm.co.jp{s}") } else { s.to_string() });
+            .map(|s| {
+                if s.starts_with('/') {
+                    format!("https://www.dmm.co.jp{s}")
+                } else {
+                    s.to_string()
+                }
+            });
         let is_drm = d
             .get("drm")
             .map(|v| {
-                v.get("dmmBooks")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
+                v.get("dmmBooks").and_then(Value::as_bool).unwrap_or(false)
                     || v.get("softDenchi")
                         .and_then(Value::as_bool)
                         .unwrap_or(false)
@@ -249,7 +252,10 @@ impl FanzaClient {
             title: s(d, "title"),
             genre: s(d, "genre"),
             maker_name: s(d, "makerName"),
-            maker_id: d.get("makerId").and_then(Value::as_i64).map(|v| v.to_string()),
+            maker_id: d
+                .get("makerId")
+                .and_then(Value::as_i64)
+                .map(|v| v.to_string()),
             delivery_date: s_opt(d, "deliveryDate"),
             download_link,
             is_drm,
@@ -267,10 +273,7 @@ impl FanzaClient {
             body: None,
             redirects: 3,
         };
-        let resp = self
-            .transport
-            .send(spec)
-            .map_err(FanzaError::Transport)?;
+        let resp = self.transport.send(spec).map_err(FanzaError::Transport)?;
         self.check_status(&resp)?;
         let html = String::from_utf8_lossy(&resp.body).to_string();
         Ok(parse_product_page(&html))
@@ -460,19 +463,38 @@ mod tests {
     /// GET リクエストに Cookie ヘッダが付くこと、`hasNext` でページングし `total` で打ち切ることを検証。
     #[test]
     fn purchased_pages_until_hasnext_false_and_sends_cookie() {
-        use std::sync::Arc;
         use parking_lot::Mutex;
+        use std::sync::Arc;
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let calls2 = calls.clone();
         let transport = MockTransport {
             handler: Box::new(move |spec: RequestSpec| {
-                calls2.lock().push(format!("{} {}", spec.url, spec.headers.iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")));
+                calls2.lock().push(format!(
+                    "{} {}",
+                    spec.url,
+                    spec.headers
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join("&")
+                ));
                 let page1 = if spec.url.contains("page=1") {
                     page_json(vec![purchase("d_1", "コミック", "comic")], true, 3)
                 } else {
-                    page_json(vec![purchase("d_2", "CG", "cg"), purchase("d_3", "ボイス", "voice")], false, 3)
+                    page_json(
+                        vec![
+                            purchase("d_2", "CG", "cg"),
+                            purchase("d_3", "ボイス", "voice"),
+                        ],
+                        false,
+                        3,
+                    )
                 };
-                Ok(ResponseSpec { status: 200, headers: vec![], body: json_body(page1) })
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: json_body(page1),
+                })
             }),
         };
         let mut client = FanzaClient::with_transport(Box::new(transport), session());
@@ -503,26 +525,52 @@ mod tests {
         });
         let body_bytes = json_body(body);
         let transport = MockTransport {
-            handler: Box::new(move |_| Ok(ResponseSpec { status: 200, headers: vec![], body: body_bytes.clone() })),
+            handler: Box::new(move |_| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: body_bytes.clone(),
+                })
+            }),
         };
         let mut client = FanzaClient::with_transport(Box::new(transport), session());
         let d = client.detail("d_1").unwrap();
-        assert_eq!(d.download_link.as_deref(), Some("https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=d_1/"));
+        assert_eq!(
+            d.download_link.as_deref(),
+            Some(
+                "https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=d_1/"
+            )
+        );
         assert!(!d.is_drm);
         assert_eq!(d.maker_id.as_deref(), Some("42"));
         assert_eq!(d.file_size.as_deref(), Some("57.15MB"));
         // 詳細メタの 2 軸分類（コミック・一部AI）
-        assert_eq!(d.meta(), FanzaMeta { media: MediaCategory::Comic, ai: AiType::PartialAi });
+        assert_eq!(
+            d.meta(),
+            FanzaMeta {
+                media: MediaCategory::Comic,
+                ai: AiType::PartialAi
+            }
+        );
     }
 
     /// セッション切れ（error_code != 0）および DRM 付き詳細の判定。
     #[test]
     fn detail_rejects_error_code_and_flags_drm() {
         let transport = MockTransport {
-            handler: Box::new(move |_| Ok(ResponseSpec { status: 200, headers: vec![], body: json_body(serde_json::json!({ "error_code": 1, "data": {} })) })),
+            handler: Box::new(move |_| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: json_body(serde_json::json!({ "error_code": 1, "data": {} })),
+                })
+            }),
         };
         let mut client = FanzaClient::with_transport(Box::new(transport), session());
-        assert!(matches!(client.detail("d_1").unwrap_err(), FanzaError::SessionExpired));
+        assert!(matches!(
+            client.detail("d_1").unwrap_err(),
+            FanzaError::SessionExpired
+        ));
 
         let body = serde_json::json!({
             "error_code": 0, "data": {
@@ -533,7 +581,13 @@ mod tests {
         });
         let body_bytes2 = json_body(body);
         let transport2 = MockTransport {
-            handler: Box::new(move |_| Ok(ResponseSpec { status: 200, headers: vec![], body: body_bytes2.clone() })),
+            handler: Box::new(move |_| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: body_bytes2.clone(),
+                })
+            }),
         };
         let mut c2 = FanzaClient::with_transport(Box::new(transport2), session());
         assert!(c2.detail("d_1").unwrap().is_drm);
@@ -543,8 +597,8 @@ mod tests {
     /// 取得すること。ureq がクロスホストリダイレクトで Cookie を落とす問題の回帰テスト。
     #[test]
     fn download_manually_follows_proxy_302_to_cdn_with_cookie() {
-        use std::sync::Arc;
         use parking_lot::Mutex;
+        use std::sync::Arc;
         let cdn_spec = Arc::new(Mutex::new(None::<RequestSpec>));
         let cdn_spec2 = cdn_spec.clone();
         let transport = MockTransport {
@@ -592,8 +646,15 @@ mod tests {
         assert_eq!(bytes, b"PK\x03\x04zipdata");
         // CDN リクエストには Cookie（CloudFront 署名含む）が送られ、proxy URL ではなく CDN URL 宛。
         let spec = cdn_spec.lock().clone().expect("CDN request made");
-        assert!(spec.url.starts_with("https://doujin.contents.doujin.dmm.co.jp/"));
-        assert!(spec.headers.iter().any(|(k, v)| k == "Cookie" && v.contains("login_id=abc")));
+        assert!(
+            spec.url
+                .starts_with("https://doujin.contents.doujin.dmm.co.jp/")
+        );
+        assert!(
+            spec.headers
+                .iter()
+                .any(|(k, v)| k == "Cookie" && v.contains("login_id=abc"))
+        );
         // proxy 応答で発行された署名 Cookie（CloudFront-*）が CDN へ届く
         let cf = spec
             .headers
@@ -601,7 +662,10 @@ mod tests {
             .find(|(k, _)| k == "Cookie")
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        assert!(cf.contains("CloudFront-Signature=abc"), "CloudFront signature cookie missing: {cf}");
+        assert!(
+            cf.contains("CloudFront-Signature=abc"),
+            "CloudFront signature cookie missing: {cf}"
+        );
         assert!(cf.contains("CloudFront-Key-Pair-Id=K123"));
         assert!(spec.redirects == 3);
     }
@@ -613,7 +677,11 @@ mod tests {
         let page = parse_product_page(html);
         assert_eq!(
             page.genre_tags,
-            vec!["拘束".to_string(), "触手".to_string(), "ファンタジー".to_string()]
+            vec![
+                "拘束".to_string(),
+                "触手".to_string(),
+                "ファンタジー".to_string()
+            ]
         );
     }
 
@@ -665,7 +733,10 @@ mod tests {
         c_headers.push(("Sec-Fetch-Dest".into(), "document".into()));
         c_headers.push(("Sec-Fetch-Mode".into(), "navigate".into()));
         c_headers.push(("Sec-Fetch-Site".into(), "cross-site".into()));
-        c_headers.push(("Accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into()));
+        c_headers.push((
+            "Accept".into(),
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into(),
+        ));
         let c_spec = RequestSpec {
             method: "GET".into(),
             url: loc,
@@ -675,6 +746,11 @@ mod tests {
         };
         let mut on = |_: u64, _: u64| {};
         let r = t.send_download(c_spec, &mut on).unwrap();
-        eprintln!("CDN status={} len={} ct={:?}", r.status, r.body.len(), r.header("content-type"));
+        eprintln!(
+            "CDN status={} len={} ct={:?}",
+            r.status,
+            r.body.len(),
+            r.header("content-type")
+        );
     }
 }

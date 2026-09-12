@@ -2574,7 +2574,8 @@ mod tests {
             .debug_bounds("bookshelf-site-dlsite")
             .expect("最終行 (DLsite) が描画されている");
         assert!(
-            last.origin.y + last.size.height <= wrap.origin.y + wrap.size.height + gpui_kit::px(1.0),
+            last.origin.y + last.size.height
+                <= wrap.origin.y + wrap.size.height + gpui_kit::px(1.0),
             "サブメニューの高さが足りず最終行が切れている: wrap={wrap:?} last={last:?}"
         );
     }

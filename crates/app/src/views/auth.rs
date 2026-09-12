@@ -1,14 +1,14 @@
 //! 認証ダイアログ: 技術書典・Google・BOOTH をアプリ内 WebView（gpui-wry）でログインする。
 //! 各プロバイダは WebView でログイン画面を開き、Cookie / 認可フローを自動処理する。
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use gpui_kit::{AppContext as _, ReadGlobal as _, Styled as _};
 use gpui_kit::{
     Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement, Render,
     StatefulInteractiveElement as _, Window, deferred, div, px,
 };
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use thundoku_core::google::GoogleProfile;
 
 use crate::app_state::AppState;

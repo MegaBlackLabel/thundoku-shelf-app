@@ -8,12 +8,12 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, ReadGlobal as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
     div, px,
 };
-use gpui_kit::component::{Icon, IconName};
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
 use thundoku_core::google::{GoogleError, GoogleProfile, PendingGoogleAuth};
@@ -79,18 +79,14 @@ impl GoogleLoginView {
         #[cfg(debug_assertions)]
         let builder = builder.with_devtools(true);
         let window_handle = match window.window_handle() {
-            Ok(h) => {
-                h
-            }
+            Ok(h) => h,
             Err(e) => {
                 log::error!("google login: window_handle() failed: {e:?}");
                 return None;
             }
         };
         let webview = match builder.build(&window_handle) {
-            Ok(w) => {
-                w
-            }
+            Ok(w) => w,
             Err(e) => {
                 log::error!("google login: wry build() failed: {e:?} | {e}");
                 return None;

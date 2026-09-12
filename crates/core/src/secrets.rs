@@ -1,8 +1,8 @@
 //! OS keyring-backed secret storage (sessions, OAuth tokens). Passwords are
 //! never stored — only session cookies / tokens.
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use rand::RngCore;
 
 pub const SERVICE: &str = "com.megablacklabel.thundoku-shelf";

@@ -101,11 +101,7 @@ pub fn list_events(pool: &SqlitePool) -> Result<Vec<TbfEvent>, sqlx::Error> {
 }
 
 /// 「このイベントについて、技術書典手から最新状況を同期する」トグルを保存する。
-pub fn set_poll_enabled(
-    pool: &SqlitePool,
-    slug: &str,
-    enabled: bool,
-) -> Result<(), sqlx::Error> {
+pub fn set_poll_enabled(pool: &SqlitePool, slug: &str, enabled: bool) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query("UPDATE tbf_events SET poll_sync_enabled = ?1 WHERE slug = ?2")
             .bind(enabled as i64)
@@ -240,8 +236,8 @@ pub fn get_item(pool: &SqlitePool, item_id: &str) -> Result<Option<CheckedItem>,
 
 #[cfg(test)]
 mod tests {
-    use crate::tbf::SITE_ID_TECHBOOKFEST;
     use super::*;
+    use crate::tbf::SITE_ID_TECHBOOKFEST;
 
     fn event(slug: &str) -> TbfEvent {
         let ts = "2026-01-01 00:00:00".to_string();
@@ -296,7 +292,10 @@ mod tests {
         upsert_event(&pool, &event("tbf30")).unwrap();
         upsert_event(&pool, &event("tbf29")).unwrap();
         set_poll_enabled(&pool, "tbf30", true).unwrap();
-        assert_eq!(list_enabled_slugs(&pool).unwrap(), vec!["tbf30".to_string()]);
+        assert_eq!(
+            list_enabled_slugs(&pool).unwrap(),
+            vec!["tbf30".to_string()]
+        );
     }
 
     #[test]

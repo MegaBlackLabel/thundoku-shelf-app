@@ -7,8 +7,8 @@
 //! ever compared in memory after decryption (P2).
 
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use rand::RngCore;
 
 /// Encrypt a `sub` into a BASE64 `IV(12) || ciphertext || tag` blob.

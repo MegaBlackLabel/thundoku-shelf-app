@@ -4,11 +4,11 @@
 //! メールアドレス・パスワードでログインしてログイン後のページに遷移したら、
 //! セッション Cookie を自動取得して永続化する（BOOTH と同じ方式）。
 
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_kit::component::{Icon, IconName};
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
 use thundoku_core::tbf::TbfSession;

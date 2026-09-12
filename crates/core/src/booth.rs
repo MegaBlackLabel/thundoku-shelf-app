@@ -500,7 +500,8 @@ pub fn parse_item_author(html: &str) -> Option<String> {
     if let Some(name) = first_capture(&avatar, html) {
         return Some(name);
     }
-    let shop_name = regex::Regex::new(r#"<div class="shop-name[^"]*">\s*<a[^>]*>([^<]+)</a>"#).ok()?;
+    let shop_name =
+        regex::Regex::new(r#"<div class="shop-name[^"]*">\s*<a[^>]*>([^<]+)</a>"#).ok()?;
     if let Some(name) = first_capture(&shop_name, html) {
         return Some(name);
     }
@@ -522,8 +523,9 @@ fn first_capture(re: &regex::Regex, haystack: &str) -> Option<String> {
 /// 商品ページ内のショップリンク（`{subdomain}.booth.pm`）の表示名でもある。
 /// JSON-LD が無い / `brand` が無い / 壊れている場合は `None`。
 pub fn parse_item_brand(html: &str) -> Option<String> {
-    let re = regex::Regex::new(r#"(?s)<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>"#)
-        .ok()?;
+    let re =
+        regex::Regex::new(r#"(?s)<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>"#)
+            .ok()?;
     for cap in re.captures_iter(html) {
         // 壊れた JSON-LD はスキップして次の script を見る
         let Ok(value) = serde_json::from_str::<Value>(cap[1].trim()) else {
