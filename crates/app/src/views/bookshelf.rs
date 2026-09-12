@@ -642,6 +642,16 @@ impl BookshelfView {
         if self.fetching_covers || self.sync_busy > 0 {
             return;
         }
+        // 個別サイトへ切り替えたときは、そのサイトでは無効になり得る絞り込みを解除する
+        // （FANZA のタグで絞ったまま技術書典へ移ると 0 件になる、など）。
+        // 検索・既読モードはサイトに依存しないので維持し、「すべての本」へ戻すときは
+        // 何も解除しない。
+        if site.is_some() && self.site_filter.as_deref() != site {
+            self.selected_tags.clear();
+            self.selected_events.clear();
+            self.circle_filter = None;
+            self.author_filter = None;
+        }
         self.site_filter = site.map(String::from);
         self.filtered_dirty = true;
         // 次回起動時に同じ表示を復元する
@@ -2628,11 +2638,11 @@ impl BookshelfView {
         cx.notify();
     }
 
-    /// いずれかの絞り込み（サイト / 検索 / イベント / タグ / サークル / 作者 / 既読モード）が
+    /// いずれかのフィルタ（検索 / イベント / タグ / サークル / 作者 / 既読モード）が
     /// 効いているか。全項目ボタンの「絞込中」表示に使う。
+    /// サイト選択はサイドバーの閲覧スコープ（フィルタではない）なので数えない。
     fn is_filtering(&self, cx: &App) -> bool {
-        self.site_filter.is_some()
-            || self.current_search(cx).is_some()
+        self.current_search(cx).is_some()
             || !self.selected_events.is_empty()
             || !self.selected_tags.is_empty()
             || self.circle_filter.is_some()
@@ -2649,7 +2659,8 @@ impl BookshelfView {
         }
     }
 
-    /// 全項目ボタン: すべての絞り込みを解除して全件表示に戻す。
+    /// 全項目ボタン: フィルタ（検索 / イベント / タグ / サークル / 作者 / 既読モード）を
+    /// 解除する。サイト（サイドバーのスコープ）は変更しない。
     fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.circle_filter = None;
         self.author_filter = None;
@@ -2658,11 +2669,6 @@ impl BookshelfView {
         self.read_filter = ReadFilter::All;
         if let Some(state) = self.search_state.clone() {
             state.update(cx, |state, cx| state.set_value("", window, cx));
-        }
-        if self.site_filter.is_some() {
-            self.site_filter = None;
-            // 次回起動時の復元用に「すべての本」も保存する
-            let _ = db::settings::set(&Self::app_state(cx).db_pool, "bookshelf.site_filter", "all");
         }
         self.filtered_dirty = true;
         cx.notify();
@@ -8273,6 +8279,131 @@ mod tests {
             view.read_with(cx, |this, _| this.selected_events.clone()),
             vec!["技術書典18".to_string()],
             "clicking the event row must select the event"
+        );
+    }
+
+    /// サイト選択（サイドバーのスコープ）は「絞込中」に数えない。
+    /// 全項目 / ESC はフィルタだけを解除し、サイトは変更しない。
+    #[gpui_kit::test]
+    async fn site_selection_is_not_counted_as_filtering(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item_for_site(cx, "fanza", "db-1", "FANZA本", "サークルA");
+        seed_shelf_item_for_site(cx, "techbookfest", "db-2", "技術書典本", "サークルB");
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.set_site_filter(cx, Some("fanza"))));
+
+        // サイトを選んだだけでは絞込中にしない
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "全項目",
+            "サイト選択だけでは絞込中にしない"
+        );
+
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        // タグを選ぶと絞込中
+        cx.update(|cx| view.update(cx, |this, cx| this.toggle_tag(cx, "react")));
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "絞込中 ✕"
+        );
+
+        // 全項目ボタン → タグは解除、サイト（スコープ）は維持
+        let all = visual
+            .debug_bounds("filter-all-btn")
+            .expect("filter-all button rendered");
+        visual.simulate_click(all.center(), gpui_kit::Modifiers::default());
+        assert!(
+            view.read_with(cx, |this, _| this.selected_tags.is_empty()),
+            "全項目でタグ絞り込みは解除される"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this.site_filter.clone()),
+            Some("fanza".to_string()),
+            "全項目ボタンはサイト（スコープ）を変更しない"
+        );
+        let visible = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(visible, vec!["db-1".to_string()], "FANZA の本のまま");
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.filter_all_label(cx)),
+            "全項目"
+        );
+    }
+
+    /// 個別サイトへ切り替えると、そのサイトでは無効になり得る絞り込み
+    /// （タグ / サークル / 作者 / イベント）は解除する。サイト非依存の既読モードは
+    /// 維持し、「すべての本」へ戻すときは何も解除しない。
+    #[gpui_kit::test]
+    async fn switching_site_clears_site_scoped_filters(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "FANZA本", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "技術書典本", "サークルB", None);
+        let view = cx.new(BookshelfView::new);
+
+        // FANZA でタグ / サークル / 既読モードを絞り込む
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_site_filter(cx, Some("fanza"));
+                this.toggle_tag(cx, "react");
+                this.toggle_circle_filter(cx, "サークルA");
+                this.set_read_filter(cx, ReadFilter::Unread);
+            })
+        });
+        assert!(!view.read_with(cx, |this, _| this.selected_tags.is_empty()));
+
+        // 技術書典へ切り替え → サイト依存の絞り込みは解除される
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_site_filter(cx, Some("techbookfest"))
+            })
+        });
+        assert!(
+            view.read_with(cx, |this, _| this.selected_tags.is_empty()),
+            "サイトを切り替えたらタグ絞り込みは解除される"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.circle_filter.is_none()),
+            "サークル絞り込みも解除される"
+        );
+        assert!(view.read_with(cx, |this, _| this.author_filter.is_none()));
+        assert!(view.read_with(cx, |this, _| this.selected_events.is_empty()));
+        assert!(
+            view.read_with(cx, |this, _| this.read_filter == ReadFilter::Unread),
+            "サイトに依存しない既読モードは維持する"
+        );
+
+        // 「すべての本」へ戻すときは何も解除しない
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.toggle_tag(cx, "react");
+                this.set_site_filter(cx, None);
+            })
+        });
+        assert!(
+            view.read_with(cx, |this, _| this
+                .selected_tags
+                .contains(&"react".to_string())),
+            "すべての本では絞り込みを維持する"
         );
     }
 
