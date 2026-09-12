@@ -8,5 +8,6 @@ pub mod google;
 pub mod import;
 pub mod owner;
 pub mod secrets;
+pub mod single_instance;
 pub mod tags;
 pub mod tbf;

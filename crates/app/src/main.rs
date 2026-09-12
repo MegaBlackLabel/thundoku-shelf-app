@@ -6,6 +6,7 @@
 use gpui_kit::component::*;
 use gpui_kit::*;
 
+use thundoku_core::single_instance::{InstanceError, InstanceGuard};
 use thundoku_shelf::app_state::AppState;
 use thundoku_shelf::icons::AppAssets;
 use thundoku_shelf::workspace::{Workspace, app_menus};
@@ -19,6 +20,30 @@ fn main() {
     unsafe {
         std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
     }
+
+    // 2 重起動を防ぐ（macOS / Windows / Linux 共通。実体は OS のファイルロック）。
+    // ログの初期化より先に判定する: 下のログ初期化は File::create で切り詰めるため、
+    // 2 個目のプロセスが起動中インスタンスのログを壊してしまう。ロックは main の
+    // 間ずっと保持する（プロセスが終了すれば OS が解放する）。
+    let _instance_guard: Option<InstanceGuard> = match instance_lock_path() {
+        Some(lock_path) => match InstanceGuard::acquire(&lock_path) {
+            Ok(guard) => Some(guard),
+            Err(InstanceError::AlreadyRunning(_)) => {
+                // 既に起動している。2 個目は何もせず静かに終了する。
+                note_second_launch(&lock_path);
+                return;
+            }
+            // ロックファイルが開けないだけで起動を止めるのは避ける
+            Err(err) => {
+                eprintln!("単一インスタンスガードを取得できないため続行します: {err}");
+                None
+            }
+        },
+        None => {
+            eprintln!("単一インスタンスガードを無効化します: config ディレクトリを解決できない");
+            None
+        }
+    };
 
     // Windows（Wine/CrossOver）ではコンソール出力が抑制されるためファイルにも出す
     #[cfg(windows)]
@@ -41,7 +66,23 @@ fn main() {
             }
         }));
         // ログファイルが開けなくてもアプリは起動を続ける（best-effort）。
-        if let Ok(f) = std::fs::File::create(&log_path) {
+        //
+        // 追記（append）で開く: `File::create` は既存ログを切り詰めるため、
+        // 2 個目の起動が 1 個目（起動中）のログを消してしまう。また非 append の
+        // ハンドルは自分のオフセットに書き込むので、追記された行を後から
+        // 上書きしてしまう。追記なら両プロセスの行が残る。
+        // 増え続けないよう、大きくなったら起動時に捨てる。
+        const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(&log_path)
+            && meta.len() > MAX_LOG_BYTES
+        {
+            let _ = std::fs::File::create(&log_path);
+        }
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
                 .target(env_logger::Target::Pipe(Box::new(f)))
                 .init();
@@ -116,4 +157,42 @@ fn main() {
             })
             .detach();
         });
+}
+
+/// 単一インスタンスガードのロックファイル。
+///
+/// データ保存先（変更可能）ではなく config ディレクトリに置く。保存先を変更しても
+/// 「同時に動くアプリは 1 つ」を保つため。
+fn instance_lock_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("thundoku-shelf").join("instance.lock"))
+}
+
+/// 2 重起動を検知したことをログに残す。
+///
+/// Windows はコンソールを持たない（`windows_subsystem = "windows"`）ため stderr は
+/// 見えない。起動中インスタンスが使っているログを切り詰めないよう、追記で書く。
+fn note_second_launch(lock_path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::io::Write as _;
+        let log_path = std::env::temp_dir()
+            .join("thundoku-shelf")
+            .join("thundoku.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(
+                file,
+                "既に別のインスタンスが起動しているため終了します（lock: {}）",
+                lock_path.display()
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    eprintln!(
+        "既に別のインスタンスが起動しているため終了します（lock: {}）",
+        lock_path.display()
+    );
 }
