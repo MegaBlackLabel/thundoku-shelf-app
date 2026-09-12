@@ -177,17 +177,38 @@ fn import_book(
     Ok(())
 }
 
+/// 同期 1 回分の入力。
+pub struct SyncRequest<'a> {
+    /// ローカル DB プール
+    pub pool: &'a SqlitePool,
+    /// Drive 接続
+    pub drive: &'a mut dyn DriveApi,
+    /// ローカルの pack 置き場（ダウンロード先／アップロード元）
+    pub packs_dir: &'a Path,
+    /// 衝突時のローカル退避などに使う作業ディレクトリ
+    pub downloads_dir: &'a Path,
+    /// ログイン中アカウントの sub（未ログインは None＝アップロード対象なし）
+    pub identity_sub: Option<&'a str>,
+    /// 所有者列（`owner_sub`）の復号鍵（未ログインは None）
+    pub owner_key: Option<&'a [u8; 32]>,
+    /// Drive 側の同期フォルダ id
+    pub folder_id: &'a str,
+    /// DB バックアップのローカルパス（None なら DB バックアップ／復元をしない）
+    pub db_path: Option<&'a Path>,
+}
+
 /// Run one full sync pass.
-pub fn sync(
-    pool: &SqlitePool,
-    drive: &mut dyn DriveApi,
-    packs_dir: &Path,
-    downloads_dir: &Path,
-    identity_sub: Option<&str>,
-    owner_key: Option<&[u8; 32]>,
-    folder_id: &str,
-    db_path: Option<&Path>,
-) -> Result<SyncOutcome, SyncError> {
+pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
+    let SyncRequest {
+        pool,
+        drive,
+        packs_dir,
+        downloads_dir,
+        identity_sub,
+        owner_key,
+        folder_id,
+        db_path,
+    } = request;
     log::info!("drive sync: list_files start");
     let files = drive.list_files(folder_id)?;
     log::info!("drive sync: list_files -> {} files", files.len());
@@ -1018,16 +1039,16 @@ mod tests {
             downloads: Default::default(),
         };
         // 初回: JSON バックアップがアップロードされる
-        let outcome = super::sync(
-            &pool,
-            &mut drive,
-            &packs,
-            &dl,
-            Some("test-sub"),
-            Some(&key),
-            "folder",
-            Some(&db_path),
-        )
+        let outcome = super::sync(super::SyncRequest {
+            pool: &pool,
+            drive: &mut drive,
+            packs_dir: &packs,
+            downloads_dir: &dl,
+            identity_sub: Some("test-sub"),
+            owner_key: Some(&key),
+            folder_id: "folder",
+            db_path: Some(&db_path),
+        })
         .unwrap();
         assert!(
             outcome.database_backed_up,
@@ -1037,16 +1058,16 @@ mod tests {
         assert_eq!(drive.uploaded.borrow()[0].0, "thundoku-backup.json");
 
         // 2 回目（同じデータ）: md5 一致でスキップ
-        let outcome = super::sync(
-            &pool,
-            &mut drive,
-            &packs,
-            &dl,
-            Some("test-sub"),
-            Some(&key),
-            "folder",
-            Some(&db_path),
-        )
+        let outcome = super::sync(super::SyncRequest {
+            pool: &pool,
+            drive: &mut drive,
+            packs_dir: &packs,
+            downloads_dir: &dl,
+            identity_sub: Some("test-sub"),
+            owner_key: Some(&key),
+            folder_id: "folder",
+            db_path: Some(&db_path),
+        })
         .unwrap();
         assert!(
             !outcome.database_backed_up,
@@ -1098,16 +1119,16 @@ mod tests {
             Some(crate::owner::encrypt(&key, "test-sub")),
         )
         .unwrap();
-        let outcome = super::sync(
-            &pool,
-            &mut drive,
-            &packs,
-            &dl,
-            Some("test-sub"),
-            Some(&key),
-            "folder",
-            Some(&db_path),
-        )
+        let outcome = super::sync(super::SyncRequest {
+            pool: &pool,
+            drive: &mut drive,
+            packs_dir: &packs,
+            downloads_dir: &dl,
+            identity_sub: Some("test-sub"),
+            owner_key: Some(&key),
+            folder_id: "folder",
+            db_path: Some(&db_path),
+        })
         .unwrap();
         assert!(
             outcome.database_backed_up,

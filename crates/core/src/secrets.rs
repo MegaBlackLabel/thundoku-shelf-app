@@ -69,18 +69,17 @@ impl SecretStore {
     /// P1: 起動時に無い場合は新規生成（既存の `owner_sub` は復号不能になるが許容）。
     /// 鍵の BASE64 を keyring に保存する。
     pub fn db_key(&self) -> Result<[u8; 32], SecretError> {
-        if let Some(encoded) = self.load(USER_DB_KEY)? {
-            if let Ok(decoded) = B64.decode(encoded.trim()) {
-                if decoded.len() == 32 {
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(&decoded);
-                    return Ok(key);
-                }
-            }
+        if let Some(encoded) = self.load(USER_DB_KEY)?
+            && let Ok(decoded) = B64.decode(encoded.trim())
+            && decoded.len() == 32
+        {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&decoded);
+            return Ok(key);
         }
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
-        self.save(USER_DB_KEY, &B64.encode(&key))?;
+        self.save(USER_DB_KEY, &B64.encode(key))?;
         Ok(key)
     }
 }

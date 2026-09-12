@@ -193,16 +193,16 @@ fn sync_env(
     env: &mut TestEnv,
     drive: &mut dyn DriveApi,
 ) -> Result<thundoku_core::drive::sync::SyncOutcome, SyncError> {
-    sync(
-        &env.pool,
+    sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
         drive,
-        &env.packs(),
-        &env.downloads(),
-        None,
-        None,
-        "folder-1",
-        None,
-    )
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: None,
+        owner_key: None,
+        folder_id: "folder-1",
+        db_path: None,
+    })
 }
 
 #[test]
@@ -365,7 +365,7 @@ fn conflict_backs_up_local_and_takes_drive_version() {
 
 #[test]
 fn uploads_local_pack_without_state_row() {
-    let mut env = TestEnv::new("upload-new");
+    let env = TestEnv::new("upload-new");
     let mut drive = FakeDrive::new();
     let bytes = plain_pack("pages/page_0001.webp", b"LOCAL-ONLY");
     std::fs::write(env.packs().join("pack-9.opfspack"), &bytes).unwrap();
@@ -411,16 +411,16 @@ fn uploads_local_pack_without_state_row() {
     )
     .unwrap();
 
-    let outcome = sync(
-        &env.pool,
-        &mut drive,
-        &env.packs(),
-        &env.downloads(),
-        Some("test-sub"),
-        Some(&key),
-        "folder-1",
-        None,
-    )
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("test-sub"),
+        owner_key: Some(&key),
+        folder_id: "folder-1",
+        db_path: None,
+    })
     .unwrap();
     assert_eq!(outcome.uploaded, vec!["pack-9"]);
     assert_eq!(drive.upload_count(), 1);
@@ -460,16 +460,16 @@ fn reuploads_locally_modified_pack() {
     )
     .unwrap();
     // last_synced_at in the past → mtime newer → re-upload
-    let outcome = sync(
-        &env.pool,
-        &mut drive,
-        &env.packs(),
-        &env.downloads(),
-        Some("test-sub"),
-        Some(&key),
-        "folder-1",
-        None,
-    )
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("test-sub"),
+        owner_key: Some(&key),
+        folder_id: "folder-1",
+        db_path: None,
+    })
     .unwrap();
     assert_eq!(outcome.uploaded, vec!["pack-2"]);
     assert_eq!(drive.upload_count(), 1);
@@ -555,16 +555,16 @@ fn encrypted_pack_imports_with_matching_identity() {
         sub: "test-sub".into(),
         pack_id: "pack-e".into(),
     };
-    let outcome = sync(
-        &env.pool,
-        &mut drive,
-        &env.packs(),
-        &env.downloads(),
-        Some("test-sub"),
-        None,
-        "folder-1",
-        None,
-    )
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("test-sub"),
+        owner_key: None,
+        folder_id: "folder-1",
+        db_path: None,
+    })
     .unwrap();
     assert_eq!(outcome.downloaded, vec!["pack-e"]);
     let book = db::books::get(&env.pool, "pack-e").unwrap().unwrap();

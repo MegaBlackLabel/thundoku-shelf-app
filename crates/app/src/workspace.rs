@@ -747,16 +747,16 @@ impl Workspace {
                 Box::new(thundoku_core::tbf::UreqTransport::new()),
                 token,
             );
-            let _ = thundoku_core::drive::sync::sync(
-                &db,
-                &mut drive,
-                &packs_dir,
-                &downloads_dir,
-                google_sub.as_deref(),
-                db_key.as_ref(),
-                &folder_id,
-                Some(&db_path),
-            )
+            let _ = thundoku_core::drive::sync::sync(thundoku_core::drive::sync::SyncRequest {
+                pool: &db,
+                drive: &mut drive,
+                packs_dir: &packs_dir,
+                downloads_dir: &downloads_dir,
+                identity_sub: google_sub.as_deref(),
+                owner_key: db_key.as_ref(),
+                folder_id: &folder_id,
+                db_path: Some(&db_path),
+            })
             .map_err(|e| e.to_string())?;
             Ok(())
         });
@@ -1221,7 +1221,7 @@ impl Render for Workspace {
                     .right_0()
                     .bottom_0()
                     .left_0()
-                    .bg(theme.background.clone())
+                    .bg(theme.background)
                     // リーダー内のクリックを下の層（本棚）へ伝えない。
                     // これが無いと、リーダーの余白をクリックしたときに
                     // 下にある本棚のカードが反応して本が開き直る。
@@ -1621,7 +1621,7 @@ impl Workspace {
             .on_click({
                 let handle = handle.clone();
                 move |_event, window, cx| {
-                    let _ = handle.update(cx, |this, cx| {
+                    handle.update(cx, |this, cx| {
                         if !this.sidebar_open {
                             this.sidebar_open = true;
                         }
@@ -1823,7 +1823,7 @@ impl Workspace {
                 let handle = handle.clone();
                 move |_, _window, cx| {
                     cx.stop_propagation();
-                    let _ = handle.update(cx, |this, cx| {
+                    handle.update(cx, |this, cx| {
                         this.switch_to(NavTarget::About, cx);
                     });
                 }
@@ -1894,7 +1894,7 @@ impl Workspace {
                 let handle = handle.clone();
                 move |event, window, cx| {
                     cx.stop_propagation();
-                    let _ = handle.update(cx, |this, cx| {
+                    handle.update(cx, |this, cx| {
                         let is_bookshelf = target == NavTarget::Bookshelf;
                         if is_bookshelf && event.click_count() >= 2 {
                             if !this.sidebar_open {
@@ -1979,7 +1979,7 @@ impl Workspace {
                 let handle = handle.clone();
                 move |_, _window, cx| {
                     cx.stop_propagation();
-                    let _ = handle.update(cx, |this, cx| {
+                    handle.update(cx, |this, cx| {
                         on_click(this, cx);
                     });
                 }
@@ -2219,6 +2219,60 @@ impl Workspace {
     }
 }
 
+/// F11 用: 最大化⇔復元をトグルする。
+fn toggle_maximize(window: &mut Window) {
+    if window.is_maximized() {
+        window_restore(window);
+    } else {
+        window_maximize(window);
+    }
+}
+
+/// ESC 用: 最大化中なら復元する。通常時は何もしない。
+fn restore_window(window: &mut Window) {
+    if window.is_maximized() {
+        window_restore(window);
+    }
+}
+
+fn window_maximize(window: &mut Window) {
+    #[cfg(windows)]
+    {
+        if let Ok(handle) = window.window_handle()
+            && let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw()
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, ShowWindow};
+            let hwnd = win.hwnd.get() as _;
+            unsafe {
+                ShowWindow(hwnd, SW_MAXIMIZE);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        window.zoom_window();
+    }
+}
+
+fn window_restore(window: &mut Window) {
+    #[cfg(windows)]
+    {
+        if let Ok(handle) = window.window_handle()
+            && let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw()
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
+            let hwnd = win.hwnd.get() as _;
+            unsafe {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        window.zoom_window();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2376,7 +2430,7 @@ mod tests {
                         format_id: None,
                         page_number: page,
                         image_type: "page".into(),
-                        opfs_path: format!("b1/p{page}").into(),
+                        opfs_path: format!("b1/p{page}"),
                         width: 1,
                         height: 1,
                         mime_type: "image/webp".into(),
@@ -2612,59 +2666,5 @@ mod tests {
             cx.dispatch_action(&crate::actions::OpenAuth);
         });
         assert!(ws.read_with(cx, |w, _| w.show_auth));
-    }
-}
-
-/// F11 用: 最大化⇔復元をトグルする。
-fn toggle_maximize(window: &mut Window) {
-    if window.is_maximized() {
-        window_restore(window);
-    } else {
-        window_maximize(window);
-    }
-}
-
-/// ESC 用: 最大化中なら復元する。通常時は何もしない。
-fn restore_window(window: &mut Window) {
-    if window.is_maximized() {
-        window_restore(window);
-    }
-}
-
-fn window_maximize(window: &mut Window) {
-    #[cfg(windows)]
-    {
-        if let Ok(handle) = window.window_handle() {
-            if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, ShowWindow};
-                let hwnd = win.hwnd.get() as _;
-                unsafe {
-                    ShowWindow(hwnd, SW_MAXIMIZE);
-                }
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        window.zoom_window();
-    }
-}
-
-fn window_restore(window: &mut Window) {
-    #[cfg(windows)]
-    {
-        if let Ok(handle) = window.window_handle() {
-            if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
-                let hwnd = win.hwnd.get() as _;
-                unsafe {
-                    ShowWindow(hwnd, SW_RESTORE);
-                }
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        window.zoom_window();
     }
 }

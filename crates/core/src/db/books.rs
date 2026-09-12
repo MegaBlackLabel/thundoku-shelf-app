@@ -288,6 +288,7 @@ pub fn list_owner_subs(pool: &SqlitePool) -> Result<Vec<(String, Option<String>)
 /// 現在の表示/同期/バックアップ対象の book id 集合（P2）。
 /// - `current_sub = Some(s)`：`s` に帰属する本。
 /// - `current_sub = None`（未ログイン）：未所属（owner_sub IS NULL）の本。
+///
 /// 他アカウント・復号不能（未知）の本は除外する。
 pub fn owned_book_ids(
     pool: &SqlitePool,
@@ -330,6 +331,7 @@ pub fn find_by_source(
 /// 再DL時に使い回す既存 book id（P5）。
 /// - `sub = Some(s)`：同一 source で `s` に帰属する行の id。
 /// - `sub = None`（未ログイン）：同一 source で未所属（owner_sub IS NULL）の行の id。
+///
 /// **他の owner の行は更新対象にしない**（別途追加。自動変換はしない）。
 pub fn resolve_reuse_id(
     pool: &SqlitePool,

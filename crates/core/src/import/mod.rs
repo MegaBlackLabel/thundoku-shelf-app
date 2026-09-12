@@ -127,14 +127,17 @@ fn page_render_workers(page_count: usize) -> usize {
     cores.min(8).min(page_count.max(1))
 }
 
+/// 1 ページ分の変換結果（WebP バイト列・幅・高さ）。失敗時は理由を持つ。
+type RenderedPage = Result<(Vec<u8>, u32, u32), String>;
+
 /// ページ画像を**入力順**で変換する（デコード + webp 再圧縮を並列実行）。
 /// 失敗したページは `Err(理由)` を返す（呼び出し側が警告に積んでスキップする）。
-fn render_page_images(pages: &[(String, Vec<u8>)]) -> Vec<Result<(Vec<u8>, u32, u32), String>> {
+fn render_page_images(pages: &[(String, Vec<u8>)]) -> Vec<RenderedPage> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<Option<Result<(Vec<u8>, u32, u32), String>>>> =
+    let results: Mutex<Vec<Option<RenderedPage>>> =
         Mutex::new((0..pages.len()).map(|_| None).collect());
     std::thread::scope(|scope| {
         for _ in 0..page_render_workers(pages.len()) {

@@ -812,16 +812,16 @@ impl SettingsView {
                 };
                 log::info!("sync_drive_now: running sync engine");
                 // メインの DB プールをそのまま使う（WAL により同期タスクと並行可能）
-                let outcome = sync::sync(
-                    &db,
-                    &mut drive,
-                    &packs_dir,
-                    &downloads_dir,
-                    google_sub.as_deref(),
-                    db_key.as_ref(),
-                    &folder_id,
-                    Some(&db_path),
-                )
+                let outcome = sync::sync(sync::SyncRequest {
+                    pool: &db,
+                    drive: &mut drive,
+                    packs_dir: &packs_dir,
+                    downloads_dir: &downloads_dir,
+                    identity_sub: google_sub.as_deref(),
+                    owner_key: db_key.as_ref(),
+                    folder_id: &folder_id,
+                    db_path: Some(&db_path),
+                })
                 .map_err(|e| e.to_string())?;
                 log::info!(
                     "sync_drive_now: done dl={} ul={} skip={} conflicts={} db_backup={}",
@@ -966,10 +966,8 @@ impl SettingsView {
                                 }
                                 copy_ok
                             };
-                            if ok {
-                                if let Some(name) = from.file_name() {
-                                    moved.push(name.to_string_lossy().to_string());
-                                }
+                            if ok && let Some(name) = from.file_name() {
+                                moved.push(name.to_string_lossy().to_string());
                             }
                         }
                     };

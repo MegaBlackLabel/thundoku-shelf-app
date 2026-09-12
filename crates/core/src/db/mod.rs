@@ -349,7 +349,7 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             for table in ["bookshelf_items", "books"] {
                 for def in cols {
                     let col = def.split_whitespace().next().unwrap();
-                    ensure_column(&mut *conn, table, col, def).await?;
+                    ensure_column(&mut conn, table, col, def).await?;
                 }
             }
         }

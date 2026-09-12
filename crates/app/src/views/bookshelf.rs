@@ -2112,14 +2112,14 @@ impl BookshelfView {
                 // FANZA は ZIP（画像セット）または PDF。ファイル名由来の拡張子
                 // （既定 .pdf）で誤判定して PDF レンダリングするのを防ぐため、
                 // 実バイトのマジックナンバーから拡張子を判定する。
-                if site_id == "fanza" || site_id == "dlsite" {
-                    if let Some(ext) = sniff_extension(&bytes) {
-                        let stem = file_name
-                            .rsplit_once('.')
-                            .map(|(s, _)| s)
-                            .unwrap_or(&file_name);
-                        file_name = format!("{stem}.{ext}");
-                    }
+                if (site_id == "fanza" || site_id == "dlsite")
+                    && let Some(ext) = sniff_extension(&bytes)
+                {
+                    let stem = file_name
+                        .rsplit_once('.')
+                        .map(|(s, _)| s)
+                        .unwrap_or(&file_name);
+                    file_name = format!("{stem}.{ext}");
                 }
                 let extension = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
                 let import_tx = progress_tx.clone();
@@ -2308,17 +2308,13 @@ impl BookshelfView {
                                 item.age_rating.as_deref(),
                                 item.series_name.as_deref(),
                             );
-                            if let Some(tags_json) = &item.tags_json {
-                                if let Ok(tags) = serde_json::from_str::<Vec<String>>(tags_json) {
-                                    if !tags.is_empty() {
-                                        let pairs: Vec<(&str, &str)> = tags
-                                            .iter()
-                                            .map(|t| (t.as_str(), "dlsite_genre"))
-                                            .collect();
-                                        let _ =
-                                            db::tags::set_for_book(&db, &imported.book.id, &pairs);
-                                    }
-                                }
+                            if let Some(tags_json) = &item.tags_json
+                                && let Ok(tags) = serde_json::from_str::<Vec<String>>(tags_json)
+                                && !tags.is_empty()
+                            {
+                                let pairs: Vec<(&str, &str)> =
+                                    tags.iter().map(|t| (t.as_str(), "dlsite_genre")).collect();
+                                let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
                             }
                         }
                         // 進捗行は既にあるときは触らない（再取得で読書位置を消さない）
@@ -2776,8 +2772,7 @@ impl BookshelfView {
                     set
                 });
             for tag in favorites {
-                if allowed.as_ref().map_or(true, |s| s.contains(&tag))
-                    && !suggestions.contains(&tag)
+                if allowed.as_ref().is_none_or(|s| s.contains(&tag)) && !suggestions.contains(&tag)
                 {
                     suggestions.push(tag);
                 }
@@ -5249,18 +5244,14 @@ impl Render for BookshelfView {
     }
 }
 
-/// Resolve a remote/cached cover for a bookshelf item to a RenderImage.
-/// GPUI の RenderImage は BGRA を期待するため、RGBA から R/B を入れ替える。
+/// 保存 URL から実際に取得を試す URL の並びを返す（失敗したら次を試す）。
 /// サイトごとの表紙画像の取得（URL 規則をここに集約。本棚と設定の両方から使う）。
 ///
 /// - BOOTH: 商品ページの共有画像（オリジナル・高解像度）を優先し、保存 URL をフォールバック
 /// - DLsite: 公開 CDN（`img.dlsite.jp`）をそのまま
-/// - FANZA: `-200x150` を外した**原寸**を優先し、失敗したら保存 URL に戻す
+/// - FANZA: `-200x150` を外した**原寸**を優先（実測: `pl-200x150` = 200x150 に対し
+///   `pl` = 560x420）。失敗したら保存 URL に戻す
 /// - 技術書典: 公開 URL を直接。失敗時のみセッション付きクライアントで再試行
-/// 保存 URL から実際に取得を試す URL の並びを返す（失敗したら次を試す）。
-///
-/// FANZA は `-200x150` を外した**原寸**を先に試し、失敗したら保存 URL に戻す
-/// （実測: `pl-200x150` = 200x150 に対し `pl` = 560x420）。それ以外は保存 URL のまま。
 pub(crate) fn cover_url_candidates(site_id: &str, stored_url: &str) -> Vec<String> {
     if site_id == "fanza" {
         let full = thundoku_core::fanza::sync::full_size_thumb(stored_url);
@@ -6171,8 +6162,11 @@ mod tests {
         });
     }
 
+    /// `plan_of` に渡すコンテンツ定義（ファイル名, 種別, (レンディション名, エントリ数)）。
+    type TestContents<'a> = Vec<(&'a str, MediaKind, Vec<(&'a str, usize)>)>;
+
     /// テスト用の計画を組み立てる（`analyze_zip` を通さずに直接作る）。
-    fn plan_of(contents: Vec<(&str, MediaKind, Vec<(&str, usize)>)>) -> ImportPlan {
+    fn plan_of(contents: TestContents<'_>) -> ImportPlan {
         ImportPlan {
             contents: contents
                 .into_iter()
