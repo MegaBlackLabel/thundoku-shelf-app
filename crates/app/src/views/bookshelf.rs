@@ -266,14 +266,199 @@ pub(crate) struct ShelfCard {
 
 /// カード / 行のチップ表示に必要な状態のスナップショット
 /// （お気に入り = ハート、絞り込み選択 = 背景色）。
+/// お気に入りタグの判定は `TagOrder`（表示順も持つ）に集約している。
 #[derive(Clone, Default)]
 struct ChipState {
-    favorite_tags: Vec<String>,
     favorite_circles: Vec<String>,
     favorite_authors: Vec<String>,
-    selected_tags: Vec<String>,
     circle_filter: Option<String>,
     author_filter: Option<String>,
+}
+
+/// タグチップの表示順（選択中 → お気に入り → 集計数の多い順 → 名前順）を決めるスナップショット。
+///
+/// 1 回の描画につき 1 つ作り、可視カードのタグ並び替えで使い回す（カードごとに
+/// 作るとお気に入り判定の集合と集計表をカード数分コピーすることになる）。
+/// 集計表は `Arc` で共有するので、描画ごとのコピーは起こらない。
+/// 集計数は「そのタグを持つカード数」で、`reload` のたびに作り直す。
+#[derive(Clone)]
+struct TagOrder {
+    /// 絞り込みで選択中のタグ。折りたたみ中でも見えるよう最優先で先頭に出す
+    /// （解除すると集計数 / 名前順の元の位置に戻る）。
+    selected: std::collections::HashSet<String>,
+    favorites: std::collections::HashSet<String>,
+    counts: std::sync::Arc<std::collections::HashMap<String, usize>>,
+}
+
+impl TagOrder {
+    fn new(
+        favorite_tags: &[String],
+        selected_tags: &[String],
+        counts: std::sync::Arc<std::collections::HashMap<String, usize>>,
+    ) -> Self {
+        Self {
+            selected: selected_tags.iter().cloned().collect(),
+            favorites: favorite_tags.iter().cloned().collect(),
+            counts,
+        }
+    }
+
+    /// 絞り込みで選択中のタグか（チップの選択色にも使う）。
+    fn is_selected(&self, tag: &str) -> bool {
+        self.selected.contains(tag)
+    }
+
+    /// お気に入りタグか（ハートの塗り分けにも使う）。
+    fn is_favorite(&self, tag: &str) -> bool {
+        self.favorites.contains(tag)
+    }
+
+    /// タグ名 → 集計数（そのタグを持つカード数）。
+    fn count(&self, tag: &str) -> usize {
+        self.counts.get(tag).copied().unwrap_or(0)
+    }
+
+    /// タグを表示順に並べ替えた新しい Vec を返す。
+    /// 選択 / お気に入り / 集計数・名前で決まるので、同じ入力なら常に同じ順になる。
+    fn sorted(&self, tags: &[String]) -> Vec<String> {
+        let mut sorted = tags.to_vec();
+        sorted.sort_by(|a, b| {
+            self.is_selected(b)
+                .cmp(&self.is_selected(a))
+                .then_with(|| self.is_favorite(b).cmp(&self.is_favorite(a)))
+                .then_with(|| self.count(b).cmp(&self.count(a)))
+                .then_with(|| a.cmp(b))
+        });
+        sorted
+    }
+}
+
+/// タグ情報エリア（タグ列）の幅。行の幅 × `LIST_TAGS_W_RATIO` で、行の左右パディング
+/// （`p_2` の 8+8）を引いてから割合を掛ける。行の幅は窓幅からサイドバー（`SIDEBAR_W`）と
+/// ビューの左右パディング（`p_3` の 12+12）を引いたもの（カードの幅計算と同じ前提）。
+fn list_tag_area_width(window: &Window) -> f32 {
+    let row_width = window.bounds().size.width.as_f32() - SIDEBAR_W - 24.0;
+    (row_width - 16.0) * LIST_TAGS_W_RATIO
+}
+
+/// 折りたたみ時にリストのタグ列へ出せるタグ数。個数の固定上限は持たず、
+/// **タグ列の幅 × 折り返し行数**から計算する（窓が広いほど多く出る）。
+/// タグの幅は GPUI のテキスト計測で実測する。
+fn list_tags_visible_count(
+    window: &Window,
+    theme: &gpui_kit::component::Theme,
+    ordered: &[String],
+) -> usize {
+    let area_w = list_tag_area_width(window);
+    let widths: Vec<f32> = ordered
+        .iter()
+        .map(|tag| tag_chip_width(window, theme, tag))
+        .collect();
+    // 最後の行には末尾要素（タグ編集ボタン + 「+n」チップ）が入る。
+    // 「+n」のラベル幅は残り件数で変わるので、最大桁数（+99）で見積もる。
+    let trailing = TAG_EDIT_BUTTON_W
+        + TAG_CHIP_GAP
+        + tag_text_width(window, theme, "+99")
+        + TAG_TOGGLE_CHROME_W;
+    let visible = packed_tag_count(&widths, area_w, LIST_TAG_MAX_ROWS, trailing);
+    if visible == ordered.len() {
+        // 全部入るので「+n」は不要 → 編集ボタンぶんだけ確保して詰め直す
+        packed_tag_count(&widths, area_w, LIST_TAG_MAX_ROWS, TAG_EDIT_BUTTON_W)
+    } else {
+        visible
+    }
+}
+
+/// タグチップのラベル（タグ名 / 「+n」）の幅を GPUI のテキスト計測で実測する。
+/// チップは `.text_xs()`（= rem の 0.75 倍）なので、フォントサイズは rem から求める。
+/// 計測結果は GPUI 側でフレーム単位にキャッシュされる（同じ文字列は次フレームで再利用）。
+fn tag_text_width(window: &Window, theme: &gpui_kit::component::Theme, text: &str) -> f32 {
+    let font_size = window.rem_size() * 0.75;
+    let run = gpui_kit::TextRun {
+        len: text.len(),
+        font: gpui_kit::Font {
+            family: theme.font_family.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    window
+        .text_system()
+        .layout_line(text, font_size, &[run], None)
+        .width
+        .as_f32()
+}
+
+/// タグチップ 1 個の幅（タグ名の実測幅 + チップの装飾）。
+fn tag_chip_width(window: &Window, theme: &gpui_kit::component::Theme, tag: &str) -> f32 {
+    tag_text_width(window, theme, tag) + CHIP_CHROME_W
+}
+
+/// 幅 `widths`（表示順）のチップを `row_width` の行に詰め、最後に使った行の使用幅と
+/// 個数を返す（`max_rows` 行を超えない）。
+fn packed_rows(widths: &[f32], row_width: f32, max_rows: usize) -> (usize, f32) {
+    let mut rows = 1usize;
+    let mut used = 0.0f32;
+    let mut count = 0usize;
+    for width in widths {
+        if used > 0.0 && used + TAG_CHIP_GAP + width > row_width {
+            if rows >= max_rows {
+                break;
+            }
+            rows += 1;
+            used = 0.0;
+        }
+        used += if used > 0.0 {
+            TAG_CHIP_GAP + width
+        } else {
+            *width
+        };
+        count += 1;
+    }
+    (count, used)
+}
+
+/// 折りたたみ時に表示するタグ数を、チップの幅と表示エリアの幅から計算する。
+///
+/// 幅の広い順（＝表示順）に詰めていき、`max_rows` 行に収まる個数を返す。最後に使った
+/// 行には末尾要素（タグ編集ボタン / 「+n」チップ）の幅 `trailing` を確保するので、
+/// 入らなければ 1 個ずつ減らす。幅が足りないときでも 1 個は出す（「+n」だけの行を作らない）。
+fn packed_tag_count(widths: &[f32], row_width: f32, max_rows: usize, trailing: f32) -> usize {
+    if widths.is_empty() || max_rows == 0 || row_width <= 0.0 {
+        return 0;
+    }
+    let (mut count, _) = packed_rows(widths, row_width, max_rows);
+    while count > 1 {
+        let (_, used) = packed_rows(&widths[..count], row_width, max_rows);
+        if used + TAG_CHIP_GAP + trailing <= row_width {
+            break;
+        }
+        count -= 1;
+    }
+    count
+}
+
+/// タグの折りたたみトグルのラベル。折りたたみ中は残り件数（「+n」）、展開中は「閉じる」。
+fn tag_toggle_label(hidden: usize, expanded: bool) -> String {
+    if expanded {
+        "閉じる".to_string()
+    } else {
+        format!("+{hidden}")
+    }
+}
+
+/// タグの使用数（タグ名 → そのタグを持つカード数）を数える。
+/// 同じカードに同じタグが複数あっても 1 冊として数える。
+fn count_tag_usage<'a>(
+    cards: impl IntoIterator<Item = &'a [String]>,
+) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for tags in cards {
+        for tag in tags.iter().collect::<std::collections::HashSet<_>>() {
+            *counts.entry(tag.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// Download/import progress for a bookshelf card, fraction 0..1.
@@ -310,6 +495,9 @@ pub struct BookshelfView {
     search_state: Option<Entity<InputState>>,
     selected_tags: Vec<String>,
     all_tags: Vec<String>,
+    /// タグ名 → そのタグを持つカード数（タグチップの並び替えキー）。`reload` で作る。
+    /// 描画ごとに `TagOrder` が `Arc` で共有するため、コピーは `reload` 時だけ。
+    tag_counts: std::sync::Arc<std::collections::HashMap<String, usize>>,
     selected_events: Vec<String>,
     available_events: Vec<String>,
     /// サイトフィルタ（None = すべての本、Some(site_id) = そのサイトのみ）
@@ -330,7 +518,7 @@ pub struct BookshelfView {
     editing_input: Option<Entity<InputState>>,
     /// アクション経由でリクエストされたタグ編集（window が必要なため render で処理）
     pending_tag_edit: Option<String>,
-    /// タグ列を展開している本（「+n」→「戻す」）。行ごとに独立。
+    /// タグ列を展開している本（「+n」→「閉じる」）。行ごとに独立。
     expanded_tag_rows: std::collections::HashSet<String>,
     read_filter: ReadFilter,
     view_mode: ViewMode,
@@ -591,6 +779,7 @@ impl BookshelfView {
             search_state: None,
             selected_tags: Vec::new(),
             all_tags: Vec::new(),
+            tag_counts: std::sync::Arc::new(std::collections::HashMap::new()),
             selected_events: Vec::new(),
             site_filter: Self::read_site_filter(cx),
             circle_filter: None,
@@ -693,7 +882,7 @@ impl BookshelfView {
         if window_width >= 2560.0 {
             // 4K 等の超広幅では、タイル幅を理想値に近づけるよう列数を増やす
             // （固定 5 列だとタイルが横に間延びするため）。
-            let content = window_width - 255.0 - 24.0; // サイドバー + パディング
+            let content = window_width - SIDEBAR_W - 24.0; // サイドバー + パディング
             ((content / 320.0).round() as usize).clamp(5, 16)
         } else if window_width >= 1280.0 {
             5
@@ -812,10 +1001,8 @@ impl BookshelfView {
     /// チップ表示（お気に入り / 絞り込み選択）に使う状態をまとめて取り出す。
     fn chip_state(&self) -> ChipState {
         ChipState {
-            favorite_tags: self.favorite_tags.clone(),
             favorite_circles: self.favorite_circles.clone(),
             favorite_authors: self.favorite_authors.clone(),
-            selected_tags: self.selected_tags.clone(),
             circle_filter: self.circle_filter.clone(),
             author_filter: self.author_filter.clone(),
         }
@@ -1150,10 +1337,15 @@ impl BookshelfView {
             shelf_cards.len(),
             reload_start.elapsed()
         );
+        // タグチップの並び替えに使う集計（カード数分の線形走査。追加の SQL は無し）
+        let tag_counts = std::sync::Arc::new(count_tag_usage(
+            shelf_cards.iter().map(|card| card.tags.as_slice()),
+        ));
         self.entries = entries;
         self.shelf_items = shelf_items;
         self.shelf_cards = shelf_cards;
         self.all_tags = all_tags;
+        self.tag_counts = tag_counts;
         self.favorite_tags = favorite_tags;
         self.favorite_circles = favorite_circles;
         self.favorite_authors = favorite_authors;
@@ -2893,7 +3085,7 @@ impl BookshelfView {
         }
     }
 
-    /// タグ列の折りたたみ / 展開を切り替える（「+n」↔「戻す」）。行ごとに独立。
+    /// タグ列の折りたたみ / 展開を切り替える（「+n」↔「閉じる」）。行ごとに独立。
     fn toggle_tag_expansion(&mut self, database_id: &str, cx: &mut Context<Self>) {
         if !self.expanded_tag_rows.remove(database_id) {
             self.expanded_tag_rows.insert(database_id.to_string());
@@ -3084,6 +3276,8 @@ impl BookshelfView {
         download_state: Option<DownloadState>,
         editing: bool,
         chips: &ChipState,
+        tag_order: &TagOrder,
+        tags_expanded: bool,
         editing_tags: &[String],
         editing_suggestions: &[String],
         editing_input: Option<&gpui_kit::Entity<InputState>>,
@@ -3333,11 +3527,10 @@ impl BookshelfView {
             .child(cover_el)
             .into_any_element();
 
+        let card_selector = format!("book-card-{}", shelf.database_id);
         let mut card_el = div()
-            .id(SharedString::from(format!(
-                "book-card-{}",
-                shelf.database_id
-            )))
+            .id(SharedString::from(card_selector.clone()))
+            .debug_selector(move || card_selector.clone())
             .w(px(card_width))
             .flex()
             .flex_col()
@@ -3473,7 +3666,23 @@ impl BookshelfView {
         } else {
             // タグ行のどこをクリックしてもカードのクリック（開く/ダウンロード）
             // が発火しないようにする（Web 版のタグ行と同じ挙動）
-            div()
+            let ordered = tag_order.sorted(&card.tags);
+            // タグが多い本はカードでも折りたたむ（行の高さを共有するため、1 冊の
+            // タグ数で行全体が間延びする）。「+n」で全件表示、「閉じる」で畳む。
+            let visible = if tags_expanded {
+                ordered.len()
+            } else {
+                ordered.len().min(CARD_TAGS_COLLAPSED_MAX)
+            };
+            let chips = BookshelfView::render_tag_chips(
+                theme,
+                &handle,
+                tag_order,
+                &database_id,
+                &ordered[..visible],
+            );
+            let hidden = ordered.len() - visible;
+            let mut tag_row = div()
                 .id(SharedString::from(format!("tag-row-{database_id}")))
                 .flex()
                 .flex_row()
@@ -3482,13 +3691,18 @@ impl BookshelfView {
                 .items_center()
                 .cursor_pointer()
                 .on_click(|_, _, cx| cx.stop_propagation())
-                .children(BookshelfView::render_tag_chips(
+                .children(chips);
+            // 展開中も閉じられるようにトグルを出す（折りたたみ中は残り件数があるときだけ）
+            if tags_expanded || hidden > 0 {
+                tag_row = tag_row.child(BookshelfView::render_tag_toggle(
                     theme,
                     &handle,
-                    &chips.favorite_tags,
-                    &chips.selected_tags,
-                    card,
-                ))
+                    &database_id,
+                    hidden,
+                    tags_expanded,
+                ));
+            }
+            tag_row
                 .child(BookshelfView::render_tag_edit_button(
                     window,
                     theme,
@@ -3691,26 +3905,26 @@ impl BookshelfView {
     }
 
     /// タグチップ行（Web の TagList 相当）。
+    /// 並び順は `tag_order`（お気に入り → 集計数の多い順 → 名前順）。
     /// クリックで絞り込み選択（青）、ハートでお気に入り（ピンク / ♥）。
     fn render_tag_chips(
         theme: &gpui_kit::component::Theme,
         handle: &gpui_kit::Entity<BookshelfView>,
-        favorite_tags: &[String],
-        selected_tags: &[String],
-        card: &ShelfCard,
+        tag_order: &TagOrder,
+        database_id: &str,
+        tags: &[String],
     ) -> Vec<gpui_kit::AnyElement> {
-        let shelf = &card.shelf;
-        let tags = card.tags.clone();
         let handle = handle.clone();
-        tags.into_iter()
+        tags.iter()
+            .cloned()
             .map(|tag| {
-                let is_favorite = favorite_tags.contains(&tag);
-                let is_selected = selected_tags.contains(&tag);
+                let is_favorite = tag_order.is_favorite(&tag);
+                let is_selected = tag_order.is_selected(&tag);
                 let handle = handle.clone();
                 let tag_for_text = tag.clone();
                 let tag_for_heart = tag.clone();
-                let label_selector = format!("tag-label-{}-{}", shelf.database_id, tag);
-                let heart_selector = format!("tag-heart-{}-{}", shelf.database_id, tag);
+                let label_selector = format!("tag-label-{database_id}-{tag}");
+                let heart_selector = format!("tag-heart-{database_id}-{tag}");
                 let icon_selector = format!("{heart_selector}-icon");
                 let palette = ChipPalette::for_theme(theme);
                 div()
@@ -4233,7 +4447,7 @@ impl BookshelfView {
             .into_any_element()
     }
 
-    /// タグ列の折りたたみトグル（「+n」/「戻す」）。タグチップと同じ配色にして、
+    /// タグ列の折りたたみトグル（「+n」/「閉じる」）。タグチップと同じ配色にして、
     /// タグ列の一部として見せる。クリックは行の動作（ビューアー / ダウンロード）へ
     /// 伝播させない。
     fn render_tag_toggle(
@@ -4246,13 +4460,9 @@ impl BookshelfView {
         let selector = format!("tag-toggle-{database_id}");
         let handle = handle.clone();
         let id = database_id.to_string();
-        let label = if expanded {
-            "戻す".to_string()
-        } else {
-            format!("+{hidden}")
-        };
+        let label = tag_toggle_label(hidden, expanded);
         let tooltip = if expanded {
-            "タグを折りたたむ".to_string()
+            "タグを閉じる".to_string()
         } else {
             format!("残り {hidden} 件のタグを表示")
         };
@@ -4414,6 +4624,7 @@ impl BookshelfView {
         cx: &mut Context<Self>,
         card: &ShelfCard,
         selected: bool,
+        tag_order: &TagOrder,
     ) -> impl IntoElement {
         let shelf = &card.shelf;
         let title = shelf.title.clone();
@@ -4645,23 +4856,23 @@ impl BookshelfView {
                     )
                     .into_any_element()
                 } else {
+                    let ordered = tag_order.sorted(&card.tags);
+                    let expanded = self.expanded_tag_rows.contains(&database_id);
+                    let visible = if expanded {
+                        ordered.len()
+                    } else {
+                        list_tags_visible_count(window, cx.theme(), &ordered)
+                    };
                     let chips = BookshelfView::render_tag_chips(
                         cx.theme(),
                         &handle,
-                        &self.favorite_tags,
-                        &self.selected_tags,
-                        card,
+                        tag_order,
+                        &database_id,
+                        &ordered[..visible],
                     );
                     // タグが多い本は列の中で折りたたむ（行の高さをタグ列に支配させない）。
-                    // 「+n」で全件表示、「戻す」で折りたたみへ戻す。
-                    let tag_count = chips.len();
-                    let expanded = self.expanded_tag_rows.contains(&database_id);
-                    let visible = if expanded {
-                        tag_count
-                    } else {
-                        tag_count.min(LIST_TAGS_COLLAPSED_MAX)
-                    };
-                    let hidden = tag_count - visible;
+                    // 「+n」で全件表示、「閉じる」で折りたたみへ戻す。
+                    let hidden = ordered.len() - visible;
                     let mut tag_row = div()
                         .id(SharedString::from(format!("tag-row-{database_id}")))
                         .flex()
@@ -4673,8 +4884,9 @@ impl BookshelfView {
                         .min_w_0()
                         .cursor_pointer()
                         .on_click(|_, _, cx| cx.stop_propagation())
-                        .children(chips.into_iter().take(visible));
-                    if tag_count > LIST_TAGS_COLLAPSED_MAX {
+                        .children(chips);
+                    // 展開中も閉じられるようにトグルを出す（折りたたみ中は残り件数があるときだけ）
+                    if expanded || hidden > 0 {
                         tag_row = tag_row.child(BookshelfView::render_tag_toggle(
                             cx.theme(),
                             &handle,
@@ -4838,9 +5050,17 @@ impl Render for BookshelfView {
         let tag_fetch_enabled = self.tag_fetch_enabled;
         let available_events = self.available_events.clone();
         let selected_events = self.selected_events.clone();
+        // タグチップ / お気に入りタグ一覧の並び替えキー（お気に入り + 集計数）。
+        // 描画ごとに 1 つ作り、可視カード / 行 / ポップオーバーで使い回す。お気に入りを
+        // 変えると次の描画でここが作り直され、ハートのクリックだけで並び替わる。
+        let tag_order = TagOrder::new(
+            &self.favorite_tags,
+            &self.selected_tags,
+            self.tag_counts.clone(),
+        );
         let favorite_tags = {
             let favs = self.favorite_tags.clone();
-            match self.site_filter.as_deref() {
+            let sorted = match self.site_filter.as_deref() {
                 // サイト選択中はそのサイトのタグでお気に入りタグフィルタを絞る
                 Some(site) => {
                     let state = Self::app_state(cx);
@@ -4865,7 +5085,9 @@ impl Render for BookshelfView {
                         .collect::<Vec<_>>()
                 }
                 None => favs,
-            }
+            };
+            // 一覧もタグチップと同じ並び（集計数の多い順 → 名前順）にする
+            tag_order.sorted(&sorted)
         };
         let search_state = self.search_state.clone().expect("search state");
         // Popover の content クロージャは 'static なのでテーマ色を先にコピーする
@@ -4890,6 +5112,7 @@ impl Render for BookshelfView {
             )
         });
         let handle = cx.entity();
+        let card_tag_order = tag_order.clone();
 
         div()
             .id("bookshelf-root")
@@ -5403,7 +5626,7 @@ impl Render for BookshelfView {
                             // サイドバー(255px)・パディング・gap を差し引いてカード幅を計算
                             let window_width = window.bounds().size.width.as_f32();
                             let columns = Self::columns_for_width(window_width);
-                            let content_width = window_width - 255.0 - 24.0;
+                            let content_width = window_width - SIDEBAR_W - 24.0;
                             let card_width = ((content_width - (columns as f32 - 1.0) * 12.0)
                                 / columns as f32)
                                 .max(160.0);
@@ -5456,7 +5679,12 @@ impl Render for BookshelfView {
                                                             let selected =
                                                                 view.selected_index
                                                                     == Some(start + k);
-                                                            (card, ds, editing, selected)
+                                                            let tags_expanded = view
+                                                                .expanded_tag_rows
+                                                                .contains(
+                                                                    &card.shelf.database_id,
+                                                                );
+                                                            (card, ds, editing, selected, tags_expanded)
                                                         })
                                                         .collect::<Vec<_>>();
                                                     (
@@ -5473,7 +5701,7 @@ impl Render for BookshelfView {
                                                     .gap_3()
                                                     .pb_3()
                                                     .children(cards.iter().map(
-                                                        |(card, ds, editing, selected)| {
+                                                        |(card, ds, editing, selected, tags_expanded)| {
                                                             BookshelfView::render_card(
                                                                 window,
                                                                 &theme,
@@ -5483,6 +5711,8 @@ impl Render for BookshelfView {
                                                                 *ds,
                                                                 *editing,
                                                                 &chips,
+                                                                &card_tag_order,
+                                                                *tags_expanded,
                                                                 &editing_tags,
                                                                 &editing_suggestions,
                                                                 editing_input.as_ref(),
@@ -5516,7 +5746,8 @@ impl Render for BookshelfView {
                               .track_scroll(&self.scroll_handle)
                               .children(visible.iter().enumerate().map(|(idx, entry)| {
                                 let selected = self.selected_index == Some(idx);
-                                self.render_list_row(window, cx, entry, selected).into_any_element()
+                                self.render_list_row(window, cx, entry, selected, &tag_order)
+                                    .into_any_element()
                             }))
                             .into_any_element(),
                     }),
@@ -5695,12 +5926,33 @@ const LIST_COVER_W: f32 = LIST_COVER_MIN_H * LIST_COVER_ASPECT;
 const LIST_INFO_W: f32 = 320.0;
 /// タグ情報エリアの幅（行の幅に対する割合）。タグはこの中で折り返す。
 const LIST_TAGS_W_RATIO: f32 = 0.20;
-/// タグ列を折りたたむときの最大表示数（残りは「+n」チップで畳む）。
+/// サイドバーの幅。カード / リストの表示幅を窓幅から計算するときに差し引く。
+const SIDEBAR_W: f32 = 255.0;
+/// リストのタグ列で折り返してよい行数。表紙の高さ（`LIST_COVER_MIN_H` = 133px）に
+/// 収まる数にする（チップ 1 行 ≈ 29px の実測から 4 行 = 116px）。
+/// これ以上は行の高さがタグ列に支配され、固定サイズの表紙 / カルーセルとの間に
+/// 余白ができる（＝行が間延びする）。表示する個数はこの行数と**タグ列の幅**から計算する
+/// （`packed_tag_count`）。
+const LIST_TAG_MAX_ROWS: usize = 4;
+/// タグチップの装飾ぶんの幅（左右パディング 4+4・文字とハートの間隔 6・
+/// ハートの丸ボタン `CHIP_HEART_BUTTON` 18・枠線 1+1）。
+const CHIP_CHROME_W: f32 = 34.0;
+/// 折りたたみトグル（「+n」）の装飾ぶんの幅（左右パディング 4+4・枠線 1+1）。
+const TAG_TOGGLE_CHROME_W: f32 = 10.0;
+/// タグチップ同士の間隔（`gap_1`）。
+const TAG_CHIP_GAP: f32 = 4.0;
+/// タグ編集ボタン（✎）の幅。
+const TAG_EDIT_BUTTON_W: f32 = 24.0;
+/// カード（グリッド）のタグを折りたたむときの最大表示数。
 ///
-/// タグの折り返しで行の高さが伸びると、固定サイズの表紙 / カルーセルとの間に
-/// 大きな余白ができる（行の高さをタグ列に支配させない）。タグ列の幅（約 20%）で
-/// 3 行程度 = 表紙の高さ（108px）に収まる数を上限にする。
-const LIST_TAGS_COLLAPSED_MAX: usize = 8;
+/// カードは行の高さを共有する（同じ行のカードは一番高いカードに揃う）ため、
+/// タグをそのまま全部出すと 1 冊のタグ数で行全体が間延びする。幅 190px のカード
+/// （`p_3` の内容幅 166px・「タグ01」= 2 文字 + 2 桁）での実測は
+/// タグ無し = 296.5px、6 件 = チップ 3 行・+90.0px、20 件 = 10 行・+295.0px。
+/// 長いタグ名（「長いタグ名前01」）だと 6 件 = 6 行・+149.0px まで伸びる。
+/// ここを既定の上限にして残りは「+n」に畳む（お気に入りタグは並び替えで先頭に
+/// 来るので折りたたまれない）。
+const CARD_TAGS_COLLAPSED_MAX: usize = 6;
 /// カルーセルに出す関連書籍の最大件数。
 const LIST_RELATED_LIMIT: usize = 5;
 /// カルーセルの 1 画面あたりの表示枚数（列幅をこの数で等分してサムネを埋める）。
@@ -6611,6 +6863,22 @@ mod tests {
         });
     }
 
+    /// ローカル本と本棚アイテムを紐付ける。紐付けが無いとカードは `book_tags` ではなく
+    /// `bookshelf_items.tags_json` を表示するため、タグのテストでは必要。
+    fn link_book_to_shelf(cx: &mut TestAppContext, book_id: &str, database_id: &str) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = ?1 WHERE id = ?2")
+                    .bind(database_id)
+                    .bind(book_id)
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
+        });
+    }
+
     /// 作者名つきの本棚アイテムを seed する（作者絞り込みテスト用）。
     fn seed_shelf_item_with_author(
         cx: &mut TestAppContext,
@@ -6939,7 +7207,13 @@ mod tests {
         cx.update(AppState::init_test);
         // 画面（600px）に収まりきらない件数（1 行 ≒ 106px）を用意する
         for i in 0..30 {
-            seed_shelf_item(cx, &format!("db-{i}"), &format!("本{i}"), "サークルA", None);
+            seed_shelf_item(
+                cx,
+                &format!("db-{i}"),
+                &format!("本{i:02}"),
+                "サークルA",
+                None,
+            );
         }
         let view = cx.new(BookshelfView::new);
         cx.update(|cx| {
@@ -7520,7 +7794,13 @@ mod tests {
         cx.update(AppState::init_test);
         // 同一サークル 5 冊（窓を狭くすると全部は収まらない）
         for i in 1..=5 {
-            seed_shelf_item(cx, &format!("db-{i}"), &format!("本{i}"), "サークルA", None);
+            seed_shelf_item(
+                cx,
+                &format!("db-{i}"),
+                &format!("本{i:02}"),
+                "サークルA",
+                None,
+            );
         }
         let view = cx.new(BookshelfView::new);
         cx.update(|cx| {
@@ -7649,8 +7929,8 @@ mod tests {
         );
     }
 
-    /// タグが多い本はタグ列が一定数で折りたたまれ、行の高さが伸びない。
-    /// 「+n」をクリックすると全タグが出て行が伸び、「戻す」で元に戻る。
+    /// タグが多い本はタグ列が**表示エリアの幅に収まる数**で折りたたまれ、行の高さが伸びない。
+    /// 「+n」をクリックすると全タグが出て行が伸び、「閉じる」で元に戻る。
     #[gpui_kit::test]
     async fn tag_column_collapses_and_expands(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
@@ -7704,18 +7984,12 @@ mod tests {
                 .height
         };
 
-        // 折りたたみ: 上限まで出して残りは「+n」
+        // 折りたたみ: 表示エリアに収まる数だけ出す（20 件目は出ない）
         assert!(
             visual
-                .debug_bounds("tag-label-db-1-長いタグ名前08")
-                .is_some(),
-            "折りたたみ時の上限までタグが出ていない"
-        );
-        assert!(
-            visual
-                .debug_bounds("tag-label-db-1-長いタグ名前09")
+                .debug_bounds("tag-label-db-1-長いタグ名前20")
                 .is_none(),
-            "折りたたまれていない（9 件目以降も出ている）"
+            "折りたたまれていない（20 件目まで出ている）"
         );
         let collapsed_h = row_h(visual);
         let toggle = visual
@@ -7736,26 +8010,549 @@ mod tests {
             expanded_h > collapsed_h,
             "展開しても行が伸びていない: {collapsed_h:?} -> {expanded_h:?}"
         );
-        // 戻す: 折りたたみに戻り、行の高さも戻る
+        // 閉じる: 折りたたみに戻り、行の高さも戻る
         let toggle = visual
             .debug_bounds("tag-toggle-db-1")
-            .expect("「戻す」トグルが出ていない");
+            .expect("「閉じる」トグルが出ていない");
         visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
         draw(visual);
         assert!(
-            visual.debug_bounds("tag-label-db-1-タグ09").is_none(),
-            "「戻す」で折りたたまれていない"
+            visual
+                .debug_bounds("tag-label-db-1-長いタグ名前20")
+                .is_none(),
+            "「閉じる」で折りたたまれていない"
         );
         assert_eq!(
             row_h(visual),
             collapsed_h,
-            "「戻す」で行の高さが元に戻っていない"
+            "「閉じる」で行の高さが元に戻っていない"
         );
 
         // タグをクリックしても行の動作（開く / ダウンロード）へ伝播しない
         assert!(
             view.read_with(cx, |this, _| this.download_states.is_empty()),
             "タグ列のクリックが行へ伝播している"
+        );
+    }
+
+    /// 折りたたみ個数は、チップ幅と表示エリアの幅から計算する（折り返しを模擬）。
+    /// 末尾要素（タグ編集ボタン / 「+n」チップ）の幅は最後の行に確保する。
+    #[test]
+    fn packed_tag_count_fills_rows_from_the_available_width() {
+        // 1 行 250px・チップ 60px・末尾 40px: 3 個（60*3 + gap 4*2 = 188）入り、
+        // 188 + gap 4 + 40 = 232 ≤ 250 なので末尾も入る
+        assert_eq!(packed_tag_count(&[60.0, 60.0, 60.0], 250.0, 1, 40.0), 3);
+        // 1 行 200px: 3 個だと 188 + 44 = 232 > 200 で末尾が入らない → 2 個まで減らす
+        assert_eq!(packed_tag_count(&[60.0, 60.0, 60.0], 200.0, 1, 40.0), 2);
+        // 1 行 130px・2 行: 1 行 2 個（124）まで → 2 行で 4 個
+        assert_eq!(
+            packed_tag_count(&[60.0; 5], 130.0, 2, 0.0),
+            4,
+            "行数を超えて詰めている"
+        );
+        // 幅が足りないときでも 1 個は出す（「+n」だけの行を作らない）
+        assert_eq!(packed_tag_count(&[60.0], 50.0, 4, 40.0), 1);
+        // 幅もタグも無い
+        assert_eq!(packed_tag_count(&[], 200.0, 4, 40.0), 0);
+        assert_eq!(packed_tag_count(&[60.0], 0.0, 4, 40.0), 0);
+    }
+
+    /// リストの折りたたみ個数は表示エリアの幅から決まる（件数の固定上限ではない）。
+    /// 同じ本でも窓が広いほど多くのタグが出て、狭いほど少なくなる。
+    /// また、折りたたみ中の行の高さはタグ無しの行と変わらない（表紙の高さを超えない）。
+    #[gpui_kit::test]
+    async fn list_tag_collapse_count_follows_the_available_width(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本01", "サークルA");
+        seed_shelf_item(cx, "db-1", "本01", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本02", "サークルB", None);
+        link_book_to_shelf(cx, "b1", "db-1");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            let tags: Vec<String> = (1..=20).map(|i| format!("タグ{i:02}")).collect();
+            let pairs: Vec<(&str, &str)> = tags.iter().map(|t| (t.as_str(), "manual")).collect();
+            db::tags::set_for_book(db, "b1", &pairs).expect("seed tags");
+        });
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        // 折りたたみ中に描画されているタグ数（01..20 のうち出ているもの）
+        let visible_tags = |visual: &mut gpui_kit::VisualTestContext| -> usize {
+            let mut count = 0;
+            for selector in [
+                "tag-label-db-1-タグ01",
+                "tag-label-db-1-タグ02",
+                "tag-label-db-1-タグ03",
+                "tag-label-db-1-タグ04",
+                "tag-label-db-1-タグ05",
+                "tag-label-db-1-タグ06",
+                "tag-label-db-1-タグ07",
+                "tag-label-db-1-タグ08",
+                "tag-label-db-1-タグ09",
+                "tag-label-db-1-タグ10",
+                "tag-label-db-1-タグ11",
+                "tag-label-db-1-タグ12",
+                "tag-label-db-1-タグ13",
+                "tag-label-db-1-タグ14",
+                "tag-label-db-1-タグ15",
+                "tag-label-db-1-タグ16",
+                "tag-label-db-1-タグ17",
+                "tag-label-db-1-タグ18",
+                "tag-label-db-1-タグ19",
+                "tag-label-db-1-タグ20",
+            ] {
+                if visual.debug_bounds(selector).is_some() {
+                    count += 1;
+                }
+            }
+            count
+        };
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..6 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+
+        let mut measure = |width: f32| -> (usize, f32, f32) {
+            let window = cx.open_window(
+                gpui_kit::Size {
+                    width: gpui_kit::px(width),
+                    height: gpui_kit::px(600.0),
+                },
+                |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+            );
+            let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+            draw(visual);
+            let with_tags = visual
+                .debug_bounds("book-list-db-1")
+                .expect("タグ付きの行")
+                .size
+                .height
+                .as_f32();
+            let without = visual
+                .debug_bounds("book-list-db-2")
+                .expect("タグ無しの行")
+                .size
+                .height
+                .as_f32();
+            (visible_tags(visual), with_tags, without)
+        };
+
+        let (wide, wide_row, plain_row) = measure(1400.0);
+        let (narrow, _, _) = measure(700.0);
+        assert!(
+            wide > narrow,
+            "窓が広いほうが多くのタグが出ていない: 1400px={wide} / 700px={narrow}"
+        );
+        assert!(narrow >= 1, "狭い窓でタグが 1 つも出ていない");
+        assert!(
+            wide >= 8,
+            "広い窓で表示個数が少なすぎる（幅から計算できていない）: {wide}"
+        );
+        assert!(wide < 20, "折りたたまれずに全タグが出ている: {wide}");
+        assert!(
+            (wide_row - plain_row).abs() < 1.0,
+            "折りたたみ中の行がタグで伸びている: タグ付き={wide_row} / タグ無し={plain_row}"
+        );
+    }
+
+    /// 選択中のタグは折りたたみ中でも先頭に出る（畳まれて見えなくならない）。
+    /// 選択を解除すると元の位置（集計数 / 名前順）へ戻る。
+    #[gpui_kit::test]
+    async fn selected_tag_stays_visible_when_collapsed(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本01", "サークルA");
+        seed_shelf_item(cx, "db-1", "本01", "サークルA", None);
+        link_book_to_shelf(cx, "b1", "db-1");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            let tags: Vec<String> = (1..=20).map(|i| format!("タグ{i:02}")).collect();
+            let pairs: Vec<(&str, &str)> = tags.iter().map(|t| (t.as_str(), "manual")).collect();
+            db::tags::set_for_book(db, "b1", &pairs).expect("seed tags");
+        });
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..6 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        let click = |visual: &mut gpui_kit::VisualTestContext, selector: &'static str| {
+            let bounds = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} が描画されていない"));
+            visual.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
+        };
+        let first_tag = |visual: &mut gpui_kit::VisualTestContext| -> &'static str {
+            let mut first: Option<(&'static str, (f32, f32))> = None;
+            for selector in [
+                "tag-label-db-1-タグ01",
+                "tag-label-db-1-タグ02",
+                "tag-label-db-1-タグ15",
+            ] {
+                let Some(bounds) = visual.debug_bounds(selector) else {
+                    continue;
+                };
+                let pos = (bounds.origin.y.as_f32(), bounds.origin.x.as_f32());
+                if first.is_none_or(|(_, found)| pos < found) {
+                    first = Some((selector, pos));
+                }
+            }
+            first.expect("タグチップが描画されている").0
+        };
+
+        draw(visual);
+        // 折りたたみ中は後ろのタグ（15 件目）は出ていない
+        assert!(
+            visual.debug_bounds("tag-label-db-1-タグ15").is_none(),
+            "折りたたみ中に 15 件目が出ている"
+        );
+        // 展開して 15 件目（既定では隠れるタグ）を選択し、閉じる
+        click(visual, "tag-toggle-db-1");
+        draw(visual);
+        click(visual, "tag-label-db-1-タグ15");
+        draw(visual);
+        assert!(
+            view.read_with(cx, |this, _| this
+                .selected_tags
+                .contains(&"タグ15".to_string())),
+            "タグを選択できていない"
+        );
+        click(visual, "tag-toggle-db-1");
+        draw(visual);
+        assert!(
+            visual.debug_bounds("tag-label-db-1-タグ15").is_some(),
+            "選択したタグが折りたたみで隠れている"
+        );
+        assert_eq!(
+            first_tag(visual),
+            "tag-label-db-1-タグ15",
+            "選択したタグが先頭に来ていない"
+        );
+        // 選択を解除すると元の位置（隠れる位置）に戻る
+        click(visual, "tag-label-db-1-タグ15");
+        draw(visual);
+        assert!(
+            !view.read_with(cx, |this, _| this
+                .selected_tags
+                .contains(&"タグ15".to_string())),
+            "選択を解除できていない"
+        );
+        assert!(
+            visual.debug_bounds("tag-label-db-1-タグ15").is_none(),
+            "選択解除後も先頭に出たままになっている"
+        );
+        assert_eq!(
+            first_tag(visual),
+            "tag-label-db-1-タグ01",
+            "選択解除で元の並びに戻っていない"
+        );
+    }
+
+    /// 折りたたみトグルのラベル: 折りたたみ中は残り件数の「+n」、展開中は「閉じる」。
+    #[test]
+    fn tag_toggle_label_shows_close_when_expanded() {
+        assert_eq!(tag_toggle_label(16, false), "+16");
+        assert_eq!(tag_toggle_label(0, true), "閉じる");
+    }
+
+    /// タグの表示順: 選択中 → お気に入り → 集計数（そのタグを持つカード数）の多い順 → 名前順。
+    /// 集計が同じときは名前順で決定的に並ぶ。
+    #[test]
+    fn tag_display_order_puts_selected_then_favorites_then_frequent_tags() {
+        let favorites = vec!["react".to_string()];
+        let selected = vec!["go".to_string()];
+        let mut counts = HashMap::new();
+        counts.insert("rust".to_string(), 7);
+        counts.insert("react".to_string(), 1);
+        counts.insert("zenn".to_string(), 7);
+        let order = TagOrder::new(&favorites, &selected, std::sync::Arc::new(counts));
+        let sorted = order.sorted(&["go", "rust", "zenn", "react"].map(String::from));
+        assert_eq!(
+            sorted,
+            vec!["go", "react", "rust", "zenn"],
+            "選択中 → お気に入り → 集計数の多い順 → 名前順で並んでいない"
+        );
+        // 選択を解除すると、お気に入り / 集計数 / 名前順の元の位置に戻る
+        let order = TagOrder::new(
+            &favorites,
+            &[],
+            std::sync::Arc::new(
+                [
+                    ("rust".to_string(), 7),
+                    ("react".to_string(), 1),
+                    ("zenn".to_string(), 7),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        assert_eq!(
+            order.sorted(&["go", "rust", "zenn", "react"].map(String::from)),
+            vec!["react", "rust", "zenn", "go"],
+            "選択解除で元の並びに戻っていない"
+        );
+    }
+
+    /// 集計は「そのタグを持つカード数」。同じカード内の重複タグは 1 冊と数える。
+    #[test]
+    fn tag_usage_counts_each_card_once() {
+        let cards = [
+            vec!["rust".to_string(), "rust".to_string(), "react".to_string()],
+            vec!["rust".to_string()],
+        ];
+        let counts = count_tag_usage(cards.iter().map(|tags| tags.as_slice()));
+        assert_eq!(counts.get("rust"), Some(&2));
+        assert_eq!(counts.get("react"), Some(&1));
+    }
+
+    /// 並び替えの負荷: 集計はカード数、並び替えはカード内のタグ数に比例する。
+    /// 実測（debug）: 1000 冊 × 30 タグ（= 集計 30,000 件）で 20ms 未満、
+    /// 1 フレーム分（可視 25 冊 × 30 タグの並び替え × 30 回の平均）で 1ms 未満。
+    /// お気に入りの付け外しは `TagOrder` を作り直すだけなので、この並び替えしか走らない。
+    #[test]
+    fn tag_ordering_stays_cheap_for_a_realistic_shelf() {
+        let cards: Vec<Vec<String>> = (0..1000)
+            .map(|i| {
+                (0..30)
+                    .map(|tag| format!("タグ{:03}", (i * 7 + tag) % 200))
+                    .collect()
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let counts = std::sync::Arc::new(count_tag_usage(cards.iter().map(|tags| tags.as_slice())));
+        let count_elapsed = start.elapsed();
+        let order = TagOrder::new(&[], &[], counts);
+        // 1 フレーム分（可視 25 冊）を 30 回繰り返して平均を取る
+        let start = std::time::Instant::now();
+        for _ in 0..30 {
+            for tags in cards.iter().take(25) {
+                std::hint::black_box(order.sorted(tags));
+            }
+        }
+        let frame_elapsed = start.elapsed() / 30;
+        assert!(
+            count_elapsed < std::time::Duration::from_millis(500),
+            "集計が遅すぎる: {count_elapsed:?}"
+        );
+        assert!(
+            frame_elapsed < std::time::Duration::from_millis(10),
+            "1 フレーム分の並び替えが遅すぎる: {frame_elapsed:?}"
+        );
+        // 実測値を確認できるようにしておく（`--nocapture` で表示）
+        println!("tag ordering: counts={count_elapsed:?} frame={frame_elapsed:?}");
+    }
+
+    /// カード（グリッド）のタグは `CARD_TAGS_COLLAPSED_MAX` 件で折りたたみ、「+n」で
+    /// 全件表示できる。折りたたみ中はタグの折り返しでカードが間延びしない。
+    #[gpui_kit::test]
+    async fn card_tags_are_capped_and_expandable(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本01", "サークルA");
+        // 本棚の並びは title ASC なので、db-1 が先頭（1 行目）に来るよう 0 埋めする
+        seed_shelf_item(cx, "db-1", "本01", "サークルA", None);
+        link_book_to_shelf(cx, "b1", "db-1");
+        // タグ無しのカード（同じ行に並べる / 2 行目にも 1 枚置く）
+        for i in 2..=6 {
+            seed_shelf_item(
+                cx,
+                &format!("db-{i}"),
+                &format!("本{i:02}"),
+                "サークルA",
+                None,
+            );
+        }
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            let tags: Vec<String> = (1..=20).map(|i| format!("タグ{i:02}")).collect();
+            let pairs: Vec<(&str, &str)> = tags.iter().map(|t| (t.as_str(), "manual")).collect();
+            db::tags::set_for_book(db, "b1", &pairs).expect("seed tags");
+        });
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1280.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..6 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+        // 折りたたみ: 上限までだけ出て、「+n」トグルが付く
+        assert!(
+            visual.debug_bounds("tag-label-db-1-タグ06").is_some(),
+            "折りたたみ時の上限までタグが出ていない"
+        );
+        assert!(
+            visual.debug_bounds("tag-label-db-1-タグ07").is_none(),
+            "カードのタグが折りたたまれていない"
+        );
+        assert!(
+            visual.debug_bounds("tag-toggle-db-1").is_some(),
+            "「+n」トグルが出ていない"
+        );
+        // タグ 6 件のカードは、タグ無しのカード（別の行）より 3 行分しか高くならない
+        // （この幅で実測 90.0px。上限なしの 20 件 = 10 行にすると +295px まで伸びる）
+        let with_tags = visual
+            .debug_bounds("book-card-db-1")
+            .expect("タグ付きカード");
+        let without = visual
+            .debug_bounds("book-card-db-6")
+            .expect("タグ無しカード");
+        assert!(
+            with_tags.size.height.as_f32() - without.size.height.as_f32() <= 100.0,
+            "カードがタグで間延びしている: {} vs {}",
+            with_tags.size.height.as_f32(),
+            without.size.height.as_f32()
+        );
+        // 展開: 上限を超えたタグが出てカードが伸びる
+        // （全 20 件だと下端は 600px のビューポート外になるため、上限 +3 件目で確認する。
+        //   「全件出る」ことはリスト側の tag_column_collapses_and_expands で確認している）
+        let toggle = visual.debug_bounds("tag-toggle-db-1").expect("+n");
+        visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert!(
+            visual.debug_bounds("tag-label-db-1-タグ09").is_some(),
+            "展開しても上限を超えたタグが出ていない"
+        );
+        let expanded = visual.debug_bounds("book-card-db-1").expect("展開カード");
+        assert!(
+            expanded.size.height.as_f32() > with_tags.size.height.as_f32() + 40.0,
+            "展開してもカードが伸びていない: {} vs {}",
+            expanded.size.height.as_f32(),
+            with_tags.size.height.as_f32()
+        );
+    }
+
+    /// カードのタグはお気に入りが先頭、次に集計数（使用冊数）の多い順。
+    /// ハートを押した瞬間に並び替わる（reload 不要）。
+    #[gpui_kit::test]
+    async fn card_tag_order_prefers_favorites_then_frequent_tags(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        for (book, shelf, circle) in [
+            ("b1", "db-1", "サークルA"),
+            ("b2", "db-2", "サークルB"),
+            ("b3", "db-3", "サークルC"),
+        ] {
+            seed_book(cx, book, shelf, circle);
+            seed_shelf_item(cx, shelf, shelf, circle, None);
+            link_book_to_shelf(cx, book, shelf);
+        }
+        // db-1 は 4 タグ、db-2 / db-3 は「いか」だけ → 「いか」が 3 冊で最多
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::tags::set_for_book(
+                db,
+                "b1",
+                &[
+                    ("あか", "manual"),
+                    ("いか", "manual"),
+                    ("うか", "manual"),
+                    ("えか", "manual"),
+                ],
+            )
+            .expect("seed tags");
+            db::tags::set_for_book(db, "b2", &[("いか", "manual")]).expect("seed tags");
+            db::tags::set_for_book(db, "b3", &[("いか", "manual")]).expect("seed tags");
+        });
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1280.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..6 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        // 先頭（一番上・左）のタグチップを座標から求める
+        let first_tag = |visual: &mut gpui_kit::VisualTestContext| -> &'static str {
+            let mut first: Option<(&'static str, (f32, f32))> = None;
+            for selector in [
+                "tag-label-db-1-あか",
+                "tag-label-db-1-いか",
+                "tag-label-db-1-うか",
+                "tag-label-db-1-えか",
+            ] {
+                let Some(bounds) = visual.debug_bounds(selector) else {
+                    continue;
+                };
+                let pos = (bounds.origin.y.as_f32(), bounds.origin.x.as_f32());
+                if first.is_none_or(|(_, found)| pos < found) {
+                    first = Some((selector, pos));
+                }
+            }
+            first.expect("タグチップが描画されている").0
+        };
+        draw(visual);
+        assert_eq!(
+            first_tag(visual),
+            "tag-label-db-1-いか",
+            "集計数が多いタグが先頭に来ていない"
+        );
+        // お気に入りにすると集計数に関係なく先頭へ移動する
+        let heart = visual
+            .debug_bounds("tag-heart-db-1-えか")
+            .expect("えかのハート");
+        visual.simulate_click(heart.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert_eq!(
+            first_tag(visual),
+            "tag-label-db-1-えか",
+            "お気に入りにしたタグが先頭に来ていない"
+        );
+        // 解除すると集計数順に戻る
+        let heart = visual
+            .debug_bounds("tag-heart-db-1-えか")
+            .expect("えかのハート");
+        visual.simulate_click(heart.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert_eq!(
+            first_tag(visual),
+            "tag-label-db-1-いか",
+            "お気に入り解除で集計数順に戻っていない"
         );
     }
 
@@ -9243,6 +10040,64 @@ mod tests {
                 .selected_tags
                 .contains(&"react".to_string())),
             "clicking the selected tag chip must deselect it"
+        );
+    }
+
+    /// お気に入りタグ一覧（フィルタのポップオーバー）も、よく使うタグが先頭に来る。
+    #[gpui_kit::test]
+    async fn tag_filter_popover_orders_favorites_by_usage(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::tags::set_favorite(db, "あか", true).unwrap();
+            db::tags::set_favorite(db, "いか", true).unwrap();
+        });
+        // 「いか」を 2 冊が持つので、名前順（あか → いか）ではなく集計数順で先頭になる
+        for (book, shelf) in [("b1", "db-1"), ("b2", "db-2")] {
+            seed_book(cx, book, shelf, "サークルA");
+            seed_shelf_item(cx, shelf, shelf, "サークルA", None);
+            link_book_to_shelf(cx, book, shelf);
+        }
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::tags::set_for_book(db, "b1", &[("あか", "manual"), ("いか", "manual")]).unwrap();
+            db::tags::set_for_book(db, "b2", &[("いか", "manual")]).unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+        let trigger = visual
+            .debug_bounds("tag-filter-trigger")
+            .expect("tag filter trigger rendered");
+        visual.simulate_click(trigger.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        let used = visual
+            .debug_bounds("tag-option-いか")
+            .expect("いかのチップが出ている");
+        let unused = visual
+            .debug_bounds("tag-option-あか")
+            .expect("あかのチップが出ている");
+        assert!(
+            (used.origin.y, used.origin.x) < (unused.origin.y, unused.origin.x),
+            "集計数が多いお気に入りタグが先頭に来ていない: {} vs {}",
+            used.origin.x.as_f32(),
+            unused.origin.x.as_f32()
         );
     }
 
