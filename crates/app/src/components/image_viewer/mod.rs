@@ -40,6 +40,10 @@ const OVERLAY_HIDE_MS: u64 = 5000;
 /// ウィンドウカスタムタイトルバーの高さ（px）。リーダーはタイトルバーを残すため、
 /// 画像のフィット計算でウィンドウ全体の高さから差し引く（Windows のみ。Mac は 0）。
 #[cfg(windows)]
+const WIN_TITLE_BAR_HEIGHT: f32 = 36.0;
+#[cfg(not(windows))]
+const WIN_TITLE_BAR_HEIGHT: f32 = 0.0;
+
 /// ページ一覧に出すサムネイルの幅（px）。表示用のフル解像度ページとは別に持つ。
 const PAGE_THUMB_WIDTH: f32 = 200.0;
 /// ページ一覧で同時に保持するサムネイル数（超えたら古い順に捨てる）。
@@ -52,10 +56,6 @@ const PAGE_LIST_HEIGHT: f32 = 420.0;
 /// ページ一覧の 1 行の高さ（固定）。`measure_all` は全行を測定のために構築するため
 /// 使わない（行の構築でサムネイル読み込みを起こすので、全ページ読んでしまう）。
 const PAGE_LIST_ROW_HEIGHT: f32 = 196.0;
-
-const WIN_TITLE_BAR_HEIGHT: f32 = 36.0;
-#[cfg(not(windows))]
-const WIN_TITLE_BAR_HEIGHT: f32 = 0.0;
 
 /// Page data source (pack entries or base64 sample pages).
 pub trait PageLoader: Send + Sync + 'static {
