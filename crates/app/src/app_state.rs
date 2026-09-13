@@ -327,7 +327,7 @@ pub fn default_client_id() -> String {
     }
 }
 
-/// アプリ全体のトーストを表示する（workspace のトーストホストが 3 秒で消す）。
+/// アプリ全体の通知を出す（Workspace が gpui-kit の Notification に流す。既定 5 秒で自動消滅）。
 /// トーストホスト（workspace）を notify して再レンダリングを促す。
 /// 通知の種別（gpui-kit の `NotificationType` に対応）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

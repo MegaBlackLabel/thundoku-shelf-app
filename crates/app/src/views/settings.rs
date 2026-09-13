@@ -598,7 +598,7 @@ impl SettingsView {
         .detach();
     }
 
-    /// アプリ全体のトーストを表示する（workspace のトーストホストが 3 秒で消す）
+    /// アプリ全体の通知を出す（Workspace が gpui-kit の Notification に流す。既定 5 秒で自動消滅）
     fn show_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         crate::app_state::set_toast(cx, message);
         cx.notify();

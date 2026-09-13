@@ -116,7 +116,7 @@ pub fn render_pdf_pages(
     Ok(out)
 }
 
-/// Render every page of a PDF to webp (q80) at a target width of 800px
+/// Render every page of a PDF to webp (q80) at a target width of 1000px
 /// and extract the page text. `progress` receives 0..=1.
 #[cfg(not(windows))]
 pub fn render_pdf_pages(
