@@ -54,6 +54,19 @@ fn pdfium_instance() -> Result<&'static pdfium_render::prelude::Pdfium, ImportEr
     PDFIUM.as_ref().map_err(|e| ImportError::Pdf(e.clone()))
 }
 
+/// PDFium はプロセスで 1 つのライブラリ状態（フォントキャッシュ等）を共有し、
+/// **同時利用がスレッドセーフではない**。`pdfium-render` の `thread_safe` feature は
+/// `unsafe impl Send/Sync for Pdfium` を足すだけでロックはしない（呼び出し側の責任）。
+///
+/// 実測（Windows / pdfium-render 0.9.3）: テキスト入りの 1 ページ PDF を 8 スレッドで
+/// 同時にレンダリングすると `STATUS_ACCESS_VIOLATION` (0xc0000005) でプロセスが落ちる。
+/// スレッドごとに `load_pdf_from_byte_slice` し直しても再現する（＝ドキュメントを分けても
+/// ダメ）。そのため PDFium を使う区間はこの Mutex で直列化する。
+/// 1 冊の中の描画は元々このループが逐次なので、単冊の速度は変わらない（並行に複数冊を
+/// 取り込むときだけ待ち合う）。
+#[cfg(windows)]
+static PDFIUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 pub fn render_pdf_pages(
     bytes: &[u8],
@@ -61,6 +74,10 @@ pub fn render_pdf_pages(
 ) -> Result<Vec<PageImage>, ImportError> {
     use pdfium_render::prelude::*;
 
+    // PDFium の同時利用は未定義動作なので、初期化も含めてここから直列化する。
+    let _pdfium_guard = PDFIUM_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let pdfium = pdfium_instance()?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)

@@ -806,19 +806,31 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
   - **タグ絞り込みと併用**でき、「全項目 / 絞込中 ✕」ボタンと **ESC** で両方まとめて解除する
     （`is_filtering` = タグ or 検索。本棚の `filter_all_label` と同じ挙動）
 
-- [ ] **PDF の並列取り込みで稀にクラッシュする（未着手）**
-  - `crates/core/src/import/pdf.rs::render_pdf_pages` が **1 つの `PdfDocument` を 8 スレッドで
-    共有**してページを描画している（`std::thread::scope` + `chunk_size = total / 8`）。
-    PDFium のドキュメントはスレッドセーフではないため、同時アクセスは未定義動作になる
-  - 実測: `cargo test --workspace`（並列実行）で `crates/core/tests/import.rs` のバイナリが
-    `STATUS_ACCESS_VIOLATION` / `STATUS_STACK_BUFFER_OVERRUN` などで稀に異常終了する
-    （再現率 約 1/8。今回は画像取り込み系テストの追加で露出しやすくなった）
-  - `--test-threads=1` では再現しない。また今回追加したテスト（`analyze_zip` / `classify` /
-    `_export_text` / 壊れ画像）を外した 14 テスト構成でも再現したため、**特定テストではなく
-    PDFium の並列利用が原因**
-  - アプリ本体でも PDF を同時に複数取り込むと踏む可能性がある（テストだけの問題ではない）
-  - **修正案**: スレッドごとに `Pdfium::load_pdf_from_byte_slice` し直して `PdfDocument` を
-    共有しない（PDFium の推奨パターン）か、描画を直列化する。どちらも未検証
+- [x] **PDF の並列取り込みで稀にクラッシュする（修正済み）**
+  - **原因（確定）**: **PDFium の同時利用そのものがスレッドセーフではない**。
+    PDFium はプロセスで 1 つのライブラリ状態（フォントキャッシュ等）を共有し、
+    `pdfium-render` の `thread_safe` feature は `unsafe impl Send/Sync for Pdfium` を
+    足すだけ（**ロックはしない。呼び出し側の責任**）。
+    当時の記録は「1 つの `PdfDocument` を 8 スレッドで共有」としていたが、実際の Windows 経路は
+    **逐次ループ**、非 Windows の mupdf 経路も**スレッドごとに `Document::from_bytes`** しており、
+    **ドキュメントを分けても再現する**（＝共有が原因ではなく PDFium 自体の同時利用が原因）
+  - **再現（実測 / Windows / pdfium-render 0.9.3）**:
+    - テキスト入りの 1 ページ PDF を 8 スレッド × 5 回で同時レンダリング → **3/3 で
+      `STATUS_ACCESS_VIOLATION` (0xc0000005)、約 2 秒**（フォントキャッシュの競合）
+    - リポジトリのフィクスチャ PDF を 8 スレッドで同時レンダリング →
+      **`STATUS_STACK_BUFFER_OVERRUN` (0xc0000409)、数秒**
+    - 四角形だけの PDF（フォント無し）や **WebP 並列エンコードは落ちない** →
+      エンコーダは無関係で、**フォントを使う描画**が引き金
+  - **採用した方針**: PDFium を使う区間（`pdfium_instance()` の初期化を含む）を
+    `static PDFIUM_LOCK: Mutex<()>` で**直列化**する（`crates/core/src/import/pdf.rs`）。
+    1 冊の中の描画は元々このループが逐次なので**単冊の速度は変わらない**（並行に複数冊を
+    取り込むときだけ待ち合う）。非 Windows の mupdf 経路は `thread_local` コンテキストで
+    スレッドごとに独立しているため**変更しない**（並列のまま）
+  - **回帰テスト**: `crates/core/tests/import.rs::pdf_rendering_is_safe_from_multiple_threads`
+    （テキスト入り PDF を 8 スレッド × 5 回。修正前はこのテストでプロセスが落ちていた）
+  - **検証**: 回帰テスト **10/10 パス**（修正前は 3/3 クラッシュ）、フィクスチャ PDF の
+    8 並列ストレス OK、`cargo test -p thundoku-core --test import`（並列実行）を **2 回とも
+    34 passed**（修正前は約 1/8 で異常終了）
 
 - [ ] **メモリ使用量の調査・削減（実測 約 6,000MB）**
   - アプリ実行中のメモリ使用量が 6GB 程度になる。**どこが支配的かを特定して抑える**

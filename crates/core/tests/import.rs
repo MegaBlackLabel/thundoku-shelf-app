@@ -44,20 +44,9 @@ impl Drop for TestEnv {
 
 fn no_progress(_: f32) {}
 
-/// 指定コンテンツ（塗りオペレータ）の 200x200 単一ページ PDF を生成する。
-fn solid_pdf_with_content(content: &str) -> Vec<u8> {
+/// オブジェクト列から最小 PDF を組み立てる（xref / trailer 付き）。
+fn build_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
     let mut pdf: Vec<u8> = b"%PDF-1.4\n".to_vec();
-    let objects: Vec<Vec<u8>> = vec![
-        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>".to_vec(),
-        format!(
-            "<< /Length {} >>\nstream\n{}endstream",
-            content.len(),
-            content
-        )
-        .into_bytes(),
-    ];
     let mut offsets = Vec::new();
     for (index, object) in objects.iter().enumerate() {
         offsets.push(pdf.len());
@@ -83,6 +72,39 @@ fn solid_pdf_with_content(content: &str) -> Vec<u8> {
     pdf
 }
 
+fn content_stream(content: &str) -> Vec<u8> {
+    format!(
+        "<< /Length {} >>\nstream\n{}endstream",
+        content.len(),
+        content
+    )
+    .into_bytes()
+}
+
+/// 指定コンテンツ（塗りオペレータ）の 200x200 単一ページ PDF を生成する。
+fn solid_pdf_with_content(content: &str) -> Vec<u8> {
+    build_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>".to_vec(),
+        content_stream(content),
+    ])
+}
+
+/// Helvetica のテキストを描く 200x200 単一ページ PDF。PDFium のフォントキャッシュを
+/// 使わせるため、並列レンダリングの回帰テストに使う。
+fn text_pdf() -> Vec<u8> {
+    build_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R \
+           /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_vec(),
+        content_stream("BT /F1 24 Tf 20 150 Td (Hello PDFium 0123456789) Tj ET\n"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ])
+}
+
 /// 指定色で塗りつぶした 200x200 の単一ページ PDF を生成する（最小 PDF）。
 fn solid_color_pdf(r: u8, g: u8, b: u8) -> Vec<u8> {
     let content = format!(
@@ -102,6 +124,43 @@ fn center_rgb(pdf: &[u8]) -> (u8, u8, u8) {
     let (w, h) = (rgba.width(), rgba.height());
     let p = rgba.get_pixel(w / 2, h / 2);
     (p[0], p[1], p[2])
+}
+
+/// PDFium はグローバルなフォントキャッシュを持ち、**同時利用が安全ではない**
+/// （`pdfium-render` の `thread_safe` feature は `unsafe impl Send/Sync` を足すだけで
+/// ロックはしない）。8 スレッドで同時にレンダリングしても落ちず、内容も正しいこと。
+/// 修正前はこの形で `STATUS_ACCESS_VIOLATION` によりプロセスが落ちていた。
+#[test]
+fn pdf_rendering_is_safe_from_multiple_threads() {
+    let bytes = text_pdf();
+    let texts = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let bytes = &bytes;
+            let texts = &texts;
+            scope.spawn(move || {
+                for _ in 0..5 {
+                    let mut progress = no_progress;
+                    let pages = thundoku_core::import::pdf::render_pdf_pages(bytes, &mut progress)
+                        .expect("render");
+                    assert_eq!(pages.len(), 1);
+                    assert!(
+                        pages[0].text.contains("Hello PDFium"),
+                        "テキストが取れていない: {:?}",
+                        pages[0].text
+                    );
+                    let image = image::load_from_memory(&pages[0].data).expect("webp をデコード");
+                    assert!(image.width() > 0 && image.height() > 0);
+                    texts.lock().unwrap().push(pages[0].text.clone());
+                }
+            });
+        }
+    });
+    assert_eq!(
+        texts.lock().unwrap().len(),
+        40,
+        "8 スレッド × 5 回すべて結果が返る"
+    );
 }
 
 #[test]
