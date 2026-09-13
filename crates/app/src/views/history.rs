@@ -27,8 +27,8 @@ use crate::icons::AppIcon;
 use crate::views::bookshelf::{
     CARD_TAGS_COLLAPSED_MAX, CHIP_HEART_BUTTON, CHIP_HEART_ICON, LIST_COVER_MIN_H, LIST_COVER_W,
     LIST_INFO_W, LIST_TAGS_W_RATIO, SIDEBAR_W, TagOrder, ViewMode, cover_fit_inside_frame,
-    fit_cover_size, list_tags_visible_count, load_cover_image, no_image_cover, owned_book_ids,
-    placeholder_cover,
+    fit_cover_size, list_tags_visible_count, load_cached_cover, load_cover_image, no_image_cover,
+    owned_book_ids, placeholder_cover,
 };
 
 /// 期間フィルタ。
@@ -213,6 +213,8 @@ impl HistoryView {
         let state = AppState::global(cx);
         let pool = &state.db_pool;
         let packs_dir = state.packs_dir.clone();
+        // 本棚と同じ表紙の解決順にそろえる（サイトのサムネキャッシュを最優先）
+        let thumbnails_dir = state.data_dir.join("thumbnails");
         let owned = owned_book_ids(state);
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
@@ -271,7 +273,12 @@ impl HistoryView {
                 continue;
             }
             let item = HistoryItem {
-                cover: load_cover_image(&packs_dir, book),
+                // 本棚と同じ順: サイトのサムネイルキャッシュ → pack の表紙 → プレースホルダ。
+                // 以前は pack の表紙しか見ておらず、本棚と違う絵が出ていた。
+                cover: shelf
+                    .and_then(|item| load_cached_cover(&thumbnails_dir, item))
+                    .or_else(|| load_cover_image(&packs_dir, book))
+                    .or_else(|| placeholder_cover(&book.title, &book.circle_name)),
                 book: book.clone(),
                 event_text: shelf_event_text(shelf),
                 is_read,
@@ -736,13 +743,16 @@ impl HistoryView {
         cover_el = cover_el
             .child(match &cover {
                 Some(render) => {
-                    let mut el = img(render.clone()).w_full().h_full();
+                    let mut el = img(render.clone()).w_full().h_full().debug_selector({
+                        let selector = format!("history-card-cover-img-{database_id}");
+                        move || selector.clone()
+                    });
                     if fits_width {
                         el = el.rounded_t_lg();
                     }
                     el.into_any_element()
                 }
-                None => div().into_any_element(),
+                None => div().w_full().h_full().bg(theme.muted).into_any_element(),
             })
             // 左上: 未読 / 既読（本棚のカードと同じバッジ）
             .child({
@@ -771,7 +781,32 @@ impl HistoryView {
                 .into_any_element()
             })
             // 右上: お気に入りハート（本棚のカードと同じ）
-            .child(Self::render_heart(theme, handle, item, 24.0));
+            .child(Self::render_heart(theme, handle, item, 24.0))
+            // 右下: ダウンロード済みバッジ（本棚のカードと同じ。履歴はすべてローカル本）
+            .child(
+                div()
+                    .debug_selector({
+                        let selector = format!("history-card-cover-downloaded-{database_id}");
+                        move || selector.clone()
+                    })
+                    .absolute()
+                    .right_1()
+                    .bottom_1()
+                    .rounded_full()
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui_kit::rgba(0x05966933))
+                    .child(
+                        div()
+                            .text_color(gpui_kit::rgb(0x059669))
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .child("✓"),
+                    ),
+            );
 
         let image: AnyElement = div()
             .w_full()
@@ -938,13 +973,13 @@ impl HistoryView {
                         let selector = format!("history-cover-{database_id}");
                         move || selector.clone()
                     })
+                    .relative()
                     .w(px(LIST_COVER_W))
                     .h(px(LIST_COVER_MIN_H))
                     .flex_shrink_0()
-                    .relative()
-                    .rounded_md()
                     .overflow_hidden()
-                    .bg(theme.secondary)
+                    // 縦長表紙で余る左右の余白を周囲と馴染ませる（本棚の行と同じ）
+                    .bg(theme.muted)
                     .child(cover_fit_inside_frame(
                         cover.as_ref(),
                         format!("history-cover-img-{database_id}"),
@@ -1566,6 +1601,84 @@ mod tests {
         }
     }
 
+    /// 表紙は本棚と同じ順で解決する（サイトのサムネイルキャッシュを最優先）。
+    /// キャッシュに 4:1 の PNG を置き、カードの表紙画像がその比率で描かれることで確かめる
+    /// （pack の表紙もプレースホルダ（3:4）も無い本なので、比率が違えば別の絵を使っている）。
+    #[gpui_kit::test]
+    async fn history_cover_prefers_the_site_thumbnail_cache(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::{Duration, Utc};
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book(cx, "b1", "本1", "techbookfest");
+        // 本棚アイテムに紐づけて、サイトのサムネイルキャッシュを置く
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let pool = &state.db_pool;
+            db::bookshelf::upsert(
+                pool,
+                &db::bookshelf::BookshelfItem {
+                    ..test_shelf_item("db-cache-1")
+                },
+            )
+            .unwrap();
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = 'db-cache-1' WHERE id = 'b1'")
+                    .execute(pool)
+                    .await
+            })
+            .unwrap();
+            // キャッシュ（448px へ縮小される前の元画像）を 4:1 で作る
+            let dir = state.data_dir.join("thumbnails");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path =
+                crate::views::bookshelf::cover_cache_path(&dir, "techbookfest", "db-cache-1");
+            let img = image::RgbaImage::from_pixel(160, 40, image::Rgba([10, 20, 30, 255]));
+            img.save(&path).unwrap();
+        });
+        add_session(cx, "s1", "b1", Utc::now() - Duration::hours(1), 10);
+
+        let view = cx.new(HistoryView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let cover = visual
+            .debug_bounds("history-card-cover-img-b1")
+            .expect("カードの表紙画像が出ていない");
+        let ratio = cover.size.width.as_f32() / cover.size.height.as_f32();
+        assert!(
+            (ratio - 4.0).abs() < 0.3,
+            "サイトのサムネイルキャッシュが使われていない（比率 {ratio}）"
+        );
+        // ダウンロード済みバッジ（本棚のカードと同じ）
+        assert!(
+            visual
+                .debug_bounds("history-card-cover-downloaded-b1")
+                .is_some(),
+            "ダウンロード済みバッジが出ていない"
+        );
+        // 後始末（temp のキャッシュを残さない）
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let path = crate::views::bookshelf::cover_cache_path(
+                &state.data_dir.join("thumbnails"),
+                "techbookfest",
+                "db-cache-1",
+            );
+            let _ = std::fs::remove_file(path);
+        });
+    }
+
     /// 選択移動の計算（本棚と同じ規則: dx は ±1、dy は行ぶん、端で止まる）。
     #[test]
     fn next_selection_index_clamps_and_handles_empty() {
@@ -1937,6 +2050,14 @@ mod tests {
         assert!(
             cover.origin.x < info.origin.x && info.origin.x < tags_area.origin.x,
             "列の並びが 表紙 → 情報列 → タグ列 になっていない"
+        );
+        // 表紙枠は本棚の行と同じ 200x133 固定
+        assert!(
+            (cover.size.width.as_f32() - LIST_COVER_W).abs() < 1.0
+                && (cover.size.height.as_f32() - LIST_COVER_MIN_H).abs() < 1.0,
+            "行の表紙枠が本棚と違う: {}x{}",
+            cover.size.width.as_f32(),
+            cover.size.height.as_f32()
         );
         // サークル名のチップ（本棚と同じ: 値 + ハート）
         assert!(

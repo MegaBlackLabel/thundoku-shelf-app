@@ -6399,7 +6399,7 @@ pub(crate) fn remove_legacy_cover_cache(
 }
 
 /// `thumbnails/{site_id}_{database_id}_448.png` キャッシュ -> RenderImage。
-fn load_cached_cover(
+pub(crate) fn load_cached_cover(
     thumbnails_dir: &std::path::Path,
     shelf: &bookshelf::BookshelfItem,
 ) -> Option<Arc<RenderImage>> {
