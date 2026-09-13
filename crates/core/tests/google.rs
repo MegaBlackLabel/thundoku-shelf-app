@@ -186,6 +186,14 @@ fn logout_clears_tokens() {
     assert!(!client.is_authenticated());
 }
 
+/// 実ループバック（固定ポート 38387）を使うテストは、並列実行すると同じポートを
+/// 奪い合って flaky になる（片方が bind に失敗する）。この mutex で直列化する。
+static LOOPBACK_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_loopback_port() -> std::sync::MutexGuard<'static, ()> {
+    LOOPBACK_PORT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn loopback_receives_code_and_rejects_state_mismatch() {
     // real ephemeral loopback: bind, receive in a thread, connect from test
@@ -231,6 +239,7 @@ fn default_redirect_port_is_38387() {
 #[test]
 fn begin_finish_authorize_roundtrip() {
     use std::io::Write as _;
+    let _guard = lock_loopback_port();
 
     let mut client = GoogleClient::with_transport(
         Box::new(Mock(Box::new(|spec| {
@@ -279,6 +288,7 @@ fn begin_finish_authorize_roundtrip() {
 
 #[test]
 fn pending_cancel_returns_cancelled() {
+    let _guard = lock_loopback_port();
     let mut client = GoogleClient::with_transport(
         Box::new(Mock(Box::new(|_| panic!("no http")))),
         "client-1",
@@ -292,4 +302,34 @@ fn pending_cancel_returns_cancelled() {
         handle.join().unwrap(),
         Err(thundoku_core::google::GoogleError::Cancelled)
     ));
+}
+
+/// リクエストが複数の write（TCP 分割）に分かれて届いても、クエリを読み切って
+/// 解析すること。単発 read だとクエリの途中で切れて state が空になり、有効な
+/// コールバックでも認証失敗になる（実際のブラウザでも起こり得る）。
+#[test]
+fn loopback_parses_request_split_across_writes() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = "split-state".to_string();
+    let handle = std::thread::spawn(move || receive_callback(listener, &state, None));
+
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    // クエリの途中で 3 つに分割して送る
+    stream.write_all(b"GET /callback?code=split-code&").unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    stream.write_all(b"state=split-state HTT").unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    stream
+        .write_all(b"P/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.contains("認証完了"), "認証完了ページが返ること");
+    assert_eq!(handle.join().unwrap().unwrap(), "split-code");
 }

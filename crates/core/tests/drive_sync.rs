@@ -579,3 +579,111 @@ fn encrypted_pack_imports_with_matching_identity() {
         b"SECRET"
     );
 }
+
+/// 所有者フィルタを構成できない（未ログイン等）ときは DB バックアップを
+/// アップロードしない。空の所有集合でエクスポートすると、Drive 上の既存
+/// バックアップを「本を含まない内容」で置き換えて復元手段を失うため。
+#[test]
+fn db_backup_is_not_replaced_when_owner_filter_is_unavailable() {
+    let env = TestEnv::new("backup-guard");
+    let mut drive = FakeDrive::new();
+    let original = br#"{"books":[{"id":"keep-me"}]}"#.to_vec();
+    let file_id = drive.seed("thundoku-backup.json", &original);
+    let db_path = env.packs().join("thundoku-shelf.db");
+
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: None,
+        owner_key: None,
+        folder_id: "folder-1",
+        db_path: Some(&db_path),
+    })
+    .unwrap();
+
+    assert!(
+        !outcome.database_backed_up,
+        "所有者不明のときは DB バックアップを上げない"
+    );
+    assert_eq!(drive.upload_count(), 0, "アップロードしないこと");
+    let kept = drive
+        .files
+        .get(&file_id)
+        .expect("既存バックアップが残ること");
+    assert_eq!(kept.bytes, original, "既存バックアップが置換されないこと");
+}
+
+/// 所有者フィルタが構成できるときは DB バックアップがアップロードされること
+/// （上のガードが通常経路を壊していないことの確認）。
+#[test]
+fn db_backup_is_uploaded_when_owner_filter_is_available() {
+    let env = TestEnv::new("backup-upload");
+    let mut drive = FakeDrive::new();
+    let key = [9u8; 32];
+    // 現在の sub に所有される本を 1 冊用意する
+    thundoku_core::db::books::insert(
+        &env.pool,
+        &thundoku_core::db::books::Book {
+            id: "b1".into(),
+            title: "自分の本".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "b1.pdf".into(),
+            file_size: 1,
+            opfs_path: "b1.opfspack".into(),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 0,
+            pack_id: Some("b1".into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-08-01 00:00:00".into(),
+            updated_at: "2026-08-01 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+    thundoku_core::db::books::set_owner_sub(
+        &env.pool,
+        "b1",
+        Some(thundoku_core::owner::encrypt(&key, "sub-1")),
+    )
+    .unwrap();
+    let db_path = env.packs().join("thundoku-shelf.db");
+
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("sub-1"),
+        owner_key: Some(&key),
+        folder_id: "folder-1",
+        db_path: Some(&db_path),
+    })
+    .unwrap();
+
+    assert!(
+        outcome.database_backed_up,
+        "バックアップがアップロードされること"
+    );
+    let uploaded = drive
+        .files
+        .get("id-thundoku-backup.json")
+        .expect("バックアップが存在すること");
+    let json = String::from_utf8(uploaded.bytes.clone()).unwrap();
+    assert!(json.contains("自分の本"), "所有する本が含まれること");
+}

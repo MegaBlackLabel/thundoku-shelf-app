@@ -109,7 +109,11 @@ impl BoothLoginView {
         let Ok(url) = webview.read(cx).raw().url() else {
             return false;
         };
-        log::debug!("booth login check: url={url}");
+        // URL のクエリ/フラグメントには認可コードやトークンが載り得るため落とす。
+        log::debug!(
+            "booth login check: url={}",
+            url.split(['?', '#']).next().unwrap_or(&url)
+        );
         let is_booth = url
             .parse::<url::Url>()
             .map(|u| u.host_str().is_some_and(|h| h.ends_with("booth.pm")))

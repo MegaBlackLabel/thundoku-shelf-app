@@ -250,9 +250,6 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             continue;
         }
         let local_path = packs_dir.join(format!("{pack_id}.{PACK_EXTENSION}"));
-        let local_changed = state
-            .as_ref()
-            .is_some_and(|s| local_newer_than(&local_path, &s.last_synced_at));
 
         let bytes = drive.download(&file.id)?;
         let reader = PackReader::open(&bytes)
@@ -265,7 +262,10 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             return Err(SyncError::IdentityRequired((*pack_id).to_string()));
         }
 
-        if local_changed && local_path.exists() {
+        // sync_state 行が無い場合（新規ダウンロード直後・state クリア後・DB 復元後）は
+        // local_changed が false になるため、条件にするとローカル専有の内容を退避せずに
+        // 上書きしてしまう。ローカルに実体がある限り必ず退避する。
+        if local_path.exists() {
             let backup = packs_dir.join(format!("{pack_id}.conflict-local.{PACK_EXTENSION}"));
             std::fs::copy(&local_path, &backup)?;
             outcome.conflicts.push((*pack_id).to_string());
@@ -274,7 +274,9 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
         std::fs::create_dir_all(packs_dir)?;
         let temp = downloads_dir.join(format!("{pack_id}.{PACK_EXTENSION}"));
         std::fs::write(&temp, &bytes)?;
-        std::fs::write(&local_path, &bytes)?;
+        // 直接 write だと書き込み途中のクラッシュで pack が壊れるため、
+        // 同一ファイルシステム内の rename で置換する（原子的）。
+        std::fs::rename(&temp, &local_path)?;
         import_book(
             pool,
             &reader,
@@ -356,7 +358,11 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
     // DB のテキストデータを JSON にまとめて `thundoku-backup.json` として
     // Drive にバックアップする。画像 base64 は含めず、md5 が変わったとき
     // だけアップロードする（200MB 級の DB ファイル全体は上げない）。
-    if db_path.is_some() {
+    // 所有者フィルタ（identity_sub / owner_key）を構成できないときは DB バックアップを
+    // 上げない。空の所有集合でエクスポートすると、Drive 上の既存バックアップを
+    // 「本を含まない内容」で置き換えてしまい、復元手段を失うため。
+    let can_backup_db = identity_sub.is_some() && owner_key.is_some();
+    if db_path.is_some() && can_backup_db {
         let json = crate::db::backup::export_json(pool, Some(&upload_ids))?;
         let bytes = json.into_bytes();
         let local_md5 = format!("{:x}", md5::compute(&bytes));
@@ -369,10 +375,16 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
                 "drive sync: uploading database backup ({} bytes)",
                 bytes.len()
             );
-            if let Some(file) = existing {
-                drive.delete(&file.id)?;
-            }
+            // 先に新しいバックアップを上げてから旧ファイルを消す。
+            // 削除→アップロードの順だと、途中で失敗したときに Drive 上の
+            // バックアップが消えたままになる（唯一のオフサイト退避を失う）。
             drive.upload_multipart(DB_BACKUP_NAME, folder_id, &bytes)?;
+            if let Some(file) = existing
+                && let Err(e) = drive.delete(&file.id)
+            {
+                // 旧ファイルが残っても新バックアップは存在するので致命的ではない。
+                log::warn!("drive sync: failed to delete previous backup: {e}");
+            }
             outcome.database_backed_up = true;
         } else {
             // データが変わらなくても、バックアップの更新日時が古いままに

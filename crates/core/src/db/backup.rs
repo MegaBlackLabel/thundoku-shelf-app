@@ -14,9 +14,11 @@ use crate::db::SqlitePool;
 /// エクスポート対象のテーブル（テキストデータのみ）。
 const TABLES: &[&str] = &[
     "books",
+    // tbf_events は bookshelf_items.event_id / checked_items.event_id から
+    // 参照されるため、必ず参照元より先に INSERT する（FK 順序）。
+    "tbf_events",
     "bookshelf_items",
     "checked_items",
-    "tbf_events",
     "book_contents",
     "content_formats",
     "reading_progress",
@@ -27,6 +29,9 @@ const TABLES: &[&str] = &[
     "imported_documents",
     "document_images",
     "book_first_events",
+    // 付箋メモ（ユーザーが書いたデータ）。ページ本文や解析結果と違い
+    // 復元できないため、バックアップ対象に含める。
+    "page_notes",
     "zenn_tag_metadata",
     "view_history",
 ];
@@ -42,13 +47,20 @@ pub fn export_json(
     book_ids: Option<&std::collections::HashSet<String>>,
 ) -> Result<String, sqlx::Error> {
     crate::db::block_on(async {
-        let mut conn = pool.acquire().await?;
+        // 複数テーブルを跨いで読み出すため、トランザクションで一貫した
+        // スナップショットから取り出す（並行書き込みでテーブル間が
+        // 食い違ったバックアップを作らない）。
+        let mut tx = pool.begin().await?;
         let mut payload = Map::new();
         for table in TABLES {
-            let rows = table_rows(&mut *conn, table, book_ids).await?;
+            let rows = table_rows(&mut *tx, table, book_ids).await?;
             payload.insert((*table).to_string(), Value::Array(rows));
         }
-        Ok(serde_json::to_string(&Value::Object(payload)).unwrap_or_default())
+        tx.commit().await?;
+        // 直列化に失敗したら空文字を返さない（空バックアップで Drive 上の
+        // 既存バックアップを置き換えてしまう事故を防ぐ）。
+        serde_json::to_string(&Value::Object(payload))
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))
     })
 }
 
@@ -62,7 +74,8 @@ pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
     let payload: serde_json::Value =
         serde_json::from_str(json).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
     crate::db::block_on(async {
-        let mut conn = pool.acquire().await?;
+        // 1 行でも失敗したら全て巻き戻す（部分復元を残さない）。
+        let mut tx = pool.begin().await?;
         for table in TABLES {
             let Some(rows) = payload.get(*table).and_then(serde_json::Value::as_array) else {
                 continue; // バックアップに無いテーブルはスキップ
@@ -71,10 +84,30 @@ pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
                 log::warn!("drive restore: no PK mapping for {table}, skipping");
                 continue;
             };
-            upsert_rows(&mut conn, table, pk, rows).await?;
+            // 競合判定は自然キーがあればそちらを使う（PK と別の UNIQUE 制約を
+            // 持つ表で、もう片方の制約違反により復元が失敗するのを防ぐ）。
+            let conflict = conflict_columns(table).unwrap_or(pk);
+            upsert_rows(&mut tx, table, pk, conflict, rows).await?;
         }
+        tx.commit().await?;
         Ok(())
     })
+}
+
+/// UPSERT の競合判定に使う列（既定は PRIMARY KEY）。
+///
+/// `PRIMARY KEY` とは別に自然キーの UNIQUE 制約を持つテーブルは、そちらを
+/// 同一性として扱う。片方だけで競合判定すると、もう片方の UNIQUE 違反で
+/// INSERT が失敗し（トランザクションのため復元全体がロールバックする）、
+/// 復元できなくなる。
+fn conflict_columns(table: &str) -> Option<&'static [&'static str]> {
+    match table {
+        // 付箋の同一性は (book, content, page)。id は端末ごとに生成され得るため
+        // （アプリ自身の upsert も `ON CONFLICT(book_id, content_id, page)` を使う）、
+        // id を競合判定に使うと別端末の同じ付箋を二重登録しようとして失敗する。
+        "page_notes" => Some(&["book_id", "content_id", "page"]),
+        other => pk_columns(other),
+    }
 }
 
 /// テーブルごとの PRIMARY KEY カラム（`TABLES` の定義と一致させる）。
@@ -94,6 +127,7 @@ fn pk_columns(table: &str) -> Option<&'static [&'static str]> {
         "imported_documents" => &["id"],
         "document_images" => &["id"],
         "book_first_events" => &["site_id", "database_id"],
+        "page_notes" => &["id"],
         "zenn_tag_metadata" => &["tag_name"],
         "view_history" => &["id"],
         _ => return None,
@@ -138,7 +172,7 @@ async fn table_rows(
                 bind_json = Some(json);
             }
             "reading_progress" | "page_views" | "book_tags" | "view_history"
-            | "imported_documents" | "book_contents" => {
+            | "imported_documents" | "book_contents" | "page_notes" => {
                 where_sql = " WHERE book_id IN (SELECT value FROM json_each(?))".into();
                 bind_json = Some(json);
             }
@@ -189,10 +223,11 @@ async fn upsert_rows(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
     pk: &[&str],
+    conflict_cols: &[&str],
     rows: &[serde_json::Value],
 ) -> Result<(), sqlx::Error> {
     // 画像（blob）カラムは対象外（エクスポート時と同じ除外リスト）
-    let cols: Vec<String> = {
+    let table_cols: Vec<String> = {
         let info = sqlx::query(&format!("PRAGMA table_info({table})"))
             .fetch_all(&mut *conn)
             .await?;
@@ -205,35 +240,67 @@ async fn upsert_rows(
         }
         names
     };
-    if cols.is_empty() {
+    if table_cols.is_empty() {
         return Ok(());
     }
-    let pk_set: std::collections::HashSet<&str> = pk.iter().copied().collect();
-    let col_list = cols.join(", ");
-    let update_cols: Vec<&str> = cols
-        .iter()
-        .filter(|c| !pk_set.contains(c.as_str()))
-        .map(|c| c.as_str())
-        .collect();
-    let update_set = update_cols
-        .iter()
-        .map(|c| format!("{c} = excluded.{c}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let conflict = pk.join(", ");
+    // 競合判定に使う列は UPDATE 対象から外す（同一性そのものなので書き換えない）
+    let conflict_set: std::collections::HashSet<&str> = conflict_cols.iter().copied().collect();
+    let conflict = conflict_cols.join(", ");
     for row in rows {
-        let sql = format!(
-            "INSERT INTO {table} ({col_list}) VALUES ({}) \
-             ON CONFLICT ({conflict}) DO UPDATE SET {update_set}",
-            cols.iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
+        let Some(obj) = row.as_object() else {
+            continue;
+        };
+        // PK / 競合判定列が欠けている行は INSERT しない（NULL を作らない）
+        if let Some(missing) = pk
+            .iter()
+            .chain(conflict_cols.iter())
+            .find(|k| !obj.contains_key(**k))
+        {
+            log::warn!("drive restore: {table} の行に必須列 {missing} が無いためスキップ");
+            continue;
+        }
+        // バックアップに含まれる列だけを書き込み対象にする。バックアップに
+        // 無い列を NULL で書くと、既存値の消失（NULL 上書き）や NOT NULL
+        // 制約違反になるため、欠落列はスキーマの DEFAULT に任せる。
+        let cols: Vec<&str> = table_cols
+            .iter()
+            .map(String::as_str)
+            .filter(|c| obj.contains_key(*c))
+            .collect();
+        if cols.is_empty() {
+            continue;
+        }
+        let update_cols: Vec<&str> = cols
+            .iter()
+            .copied()
+            .filter(|c| !conflict_set.contains(c))
+            .collect();
+        let col_list = cols.join(", ");
+        let placeholders = cols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = if update_cols.is_empty() {
+            format!(
+                "INSERT INTO {table} ({col_list}) VALUES ({placeholders}) \
+                 ON CONFLICT ({conflict}) DO NOTHING"
+            )
+        } else {
+            let update_set = update_cols
+                .iter()
+                .map(|c| format!("{c} = excluded.{c}"))
                 .collect::<Vec<_>>()
-                .join(", ")
-        );
+                .join(", ");
+            format!(
+                "INSERT INTO {table} ({col_list}) VALUES ({placeholders}) \
+                 ON CONFLICT ({conflict}) DO UPDATE SET {update_set}"
+            )
+        };
         let mut query = sqlx::query(&sql);
         for col in &cols {
-            let v = row.get(col.as_str()).cloned().unwrap_or(Value::Null);
+            let v = obj.get(*col).cloned().unwrap_or(Value::Null);
             match v {
                 Value::Null => {
                     query = query.bind(None::<String>);

@@ -164,14 +164,35 @@ pub fn receive_callback(
             Err(e) => return Err(GoogleError::Io(e.to_string())),
         }
     };
+    // macOS では accept したソケットが listener の非ブロッキング設定を継承する。
+    // そのままだと read がデータ到着前に即 EAGAIN を返し、有効なコールバックでも
+    // 認証が失敗する（起動直後のブラウザからの 1 発目で起きやすい）。
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| GoogleError::Io(e.to_string()))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(120)))
         .map_err(|e| GoogleError::Io(e.to_string()))?;
+    // リクエストは TCP の分割や書き手の複数 write で部分的に届き得る。1 回の
+    // read で打ち切るとクエリの途中で切れて state が空になり、有効なコールバック
+    // でも認証失敗になる。ヘッダ終端（\r\n\r\n）まで読み切る。
     let mut buffer = [0u8; 4096];
-    let read = stream
-        .read(&mut buffer)
-        .map_err(|e| GoogleError::Io(e.to_string()))?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    let mut filled = 0usize;
+    let request = loop {
+        if filled == buffer.len() {
+            break String::from_utf8_lossy(&buffer).into_owned();
+        }
+        let read = stream
+            .read(&mut buffer[filled..])
+            .map_err(|e| GoogleError::Io(e.to_string()))?;
+        if read == 0 {
+            break String::from_utf8_lossy(&buffer[..filled]).into_owned();
+        }
+        filled += read;
+        if buffer[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
+            break String::from_utf8_lossy(&buffer[..filled]).into_owned();
+        }
+    };
     let path = request
         .lines()
         .next()
@@ -397,7 +418,16 @@ impl GoogleClient {
     /// callback -> token exchange -> profile.
     pub fn authorize(&mut self) -> Result<GoogleProfile, GoogleError> {
         let pending = self.begin_authorize()?;
-        log::info!("google authorize url: {}", pending.url);
+        // 認可 URL には state（CSRF ノンス）と code_challenge が含まれる。
+        // ログに残すと不正コールバックの成立に使われ得るため、ホストと path だけにする。
+        log::info!(
+            "google authorize start: {}",
+            pending
+                .url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("https://accounts.google.com/o/oauth2/v2/auth")
+        );
         open_browser(&pending.url).map_err(|e| GoogleError::Io(e.to_string()))?;
         self.finish_authorize(pending)
     }

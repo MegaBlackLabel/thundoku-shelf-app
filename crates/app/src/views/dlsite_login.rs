@@ -110,7 +110,11 @@ impl DlsiteLoginView {
         let Ok(url) = webview.read(cx).raw().url() else {
             return false;
         };
-        log::debug!("dlsite login check: url={url}");
+        // URL のクエリ/フラグメントには認可コードやトークンが載り得るため落とす。
+        log::debug!(
+            "dlsite login check: url={}",
+            url.split(['?', '#']).next().unwrap_or(&url)
+        );
         // www ストア + login の Cookie を収集する。www の認証セッション（__DLsite_SID に
         // 加えて uid_jp / uhashjp）は「ログイン完了時の oauth2 コールバック」で確立される。
         // ここでは一切 auto-navigation しない（SSO 連鎖を中断するとゲスト __DLsite_SID の
