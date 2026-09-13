@@ -144,6 +144,21 @@ Drive 同期設定など）。
 - `page_views::add_dwell(book_id, page, secs)` で滞在秒数を加算
 - `page_views::for_book(book_id)` でページ毎の記録を取得
 
+### page_notes
+
+付箋（ページ単位のメモ）。**1 ページ 1 件**（`book_id + content_id + page` で一意）。
+
+| 列 | 型 | 説明 |
+|---|---|---|
+| id | TEXT PK | アプリが払い出す id（`note-{book_id}-{content_id}-{page}`） |
+| book_id | TEXT | `books.id`（ON DELETE CASCADE） |
+| content_id | TEXT | `book_contents.content_id`。`''` = 未指定（旧データ / 単一コンテンツ） |
+| page | INTEGER | **1-indexed** のページ番号（リーダーへは 0-indexed で渡す） |
+| memo | TEXT | メモ本文（空でも付箋としては存在する） |
+| spread_side | TEXT NULL | 付けたときの見開きの左右（`left` / `right`。単一表示は NULL） |
+| is_active | INTEGER | 付箋の ON / OFF。**OFF でもメモは残す**（付け直すと復元される） |
+| created_at / updated_at | TEXT | UTC（`CURRENT_TIMESTAMP`） |
+
 ### checked_items
 
 チェックリスト項目（サークルごと。`tbf_events` に関連）。
@@ -261,6 +276,18 @@ Zenn のタグメタデータ（`https://zenn.dev/api/tags` 相当から取得�
 ### book_first_events
 
 本に最初に関連したイベント（イベントフィルタ用）。
+
+### drive_sync_state
+
+Google Drive との同期状態（pack ごと）。
+
+| 列 | 型 | 説明 |
+|---|---|---|
+| pack_id | TEXT PK | pack の id |
+| drive_file_id | TEXT | Drive 側のファイル id |
+| md5 | TEXT | 同期時の md5（差分判定） |
+| modified_time | TEXT NULL | Drive 側の更新時刻 |
+| last_synced_at | TEXT | 最終同期（UTC） |
 
 ### product_sample_pages
 
