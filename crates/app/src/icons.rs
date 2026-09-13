@@ -2,8 +2,8 @@
 //!
 //! Web 版は `lucide-react` のアイコンを使っている。gpui-component にも
 //! lucide 由来のアイコンはあるが、Web 版で使われていて gpui-component に
-//! 無いもの（book-marked / library-big / history / bookmark / bookmark-filled /
-//! sticky-note /
+//! 無いもの（book-marked / library-big / history / book-open / arrow-right /
+//! bookmark / bookmark-filled / sticky-note /
 //! list-checks /
 //! refresh-cw / layout-grid / list / circle-user-round / log-in / log-out）は
 //! `assets/icons/*.svg` に lucide-react から生成した SVG を埋め込んで提供する。
@@ -27,6 +27,10 @@ pub enum AppIcon {
     LibraryBig,
     /// 閲覧履歴（HistoryIcon）
     History,
+    /// ビューアー（BookOpenIcon: 開いて閲覧する）
+    BookOpen,
+    /// 関連書籍へのショートカット（ArrowRightIcon: 移動）
+    ArrowRight,
     /// 付箋（しおり型の枠。BookmarkIcon）
     Bookmark,
     /// 付箋の塗り（しおり型。同じパスの `fill`。BookmarkFilledIcon）
@@ -77,6 +81,8 @@ impl IconNamed for AppIcon {
             Self::BookMarked => "icons/book-marked.svg".into(),
             Self::LibraryBig => "icons/library-big.svg".into(),
             Self::History => "icons/history.svg".into(),
+            Self::BookOpen => "icons/book-open.svg".into(),
+            Self::ArrowRight => "icons/arrow-right.svg".into(),
             Self::Bookmark => "icons/bookmark.svg".into(),
             Self::BookmarkFilled => "icons/bookmark-filled.svg".into(),
             Self::StickyNote => "icons/sticky-note.svg".into(),
@@ -123,6 +129,8 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
         "icons/book-marked.svg" => Some(include_bytes!("../assets/icons/book-marked.svg")),
         "icons/library-big.svg" => Some(include_bytes!("../assets/icons/library-big.svg")),
         "icons/history.svg" => Some(include_bytes!("../assets/icons/history.svg")),
+        "icons/book-open.svg" => Some(include_bytes!("../assets/icons/book-open.svg")),
+        "icons/arrow-right.svg" => Some(include_bytes!("../assets/icons/arrow-right.svg")),
         "icons/bookmark.svg" => Some(include_bytes!("../assets/icons/bookmark.svg")),
         "icons/sticky-note.svg" => Some(include_bytes!("../assets/icons/sticky-note.svg")),
         "icons/bookmark-filled.svg" => Some(include_bytes!("../assets/icons/bookmark-filled.svg")),
@@ -161,6 +169,8 @@ mod tests {
             AppIcon::BookMarked,
             AppIcon::LibraryBig,
             AppIcon::History,
+            AppIcon::BookOpen,
+            AppIcon::ArrowRight,
             AppIcon::Bookmark,
             AppIcon::BookmarkFilled,
             AppIcon::StickyNote,

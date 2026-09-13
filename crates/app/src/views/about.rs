@@ -15,6 +15,97 @@ use gpui_kit::{
 
 use crate::icons::AppIcon;
 
+/// 対象コンテンツの注意。**最も誤解されやすい点**なので説明画面の上部で強調して出す。
+const TARGET_NOTICE: &str = "本アプリが対象にするのは、購入済み・DRM の無い（非DRM）同人誌のみです。\
+                             購入していないコンテンツや、DRM で保護されたコンテンツは取り込めません。";
+
+/// ログイン手順の見出し（技術書典だけでなく各ストア共通の手順）。
+const LOGIN_SECTION_TITLE: &str = "ストアのログイン手順";
+
+/// 説明画面の「主な機能」に出す項目（タイトル / アイコン / 説明）。
+/// **実装済みの機能をここに並べる**（テスト `about_lists_the_implemented_features` が
+/// 主要機能の記載漏れを防ぐ）。
+const FEATURES: [(&str, AppIcon, &str); 13] = [
+    (
+        "本棚",
+        AppIcon::LibraryBig,
+        "購入済み書籍をカードとリストの 2 表示で一覧管理。未読・読書中・読了のステータス、\
+         タグ、サイト・イベント・お気に入りでの絞り込み、並び替え、キーワード検索に対応。\
+         操作の結果は右上の通知で確認できます。",
+    ),
+    (
+        "ビューアー",
+        AppIcon::BookOpen,
+        "PDF・画像（ZIP）・EPUB をアプリ内で閲覧。単一・見開き・スクロールの 3 表示、拡大縮小、\
+         ページ一覧とコンテンツ（PDF版 / 画像版）の切替、読書進捗の自動保存に対応。",
+    ),
+    (
+        "付箋",
+        AppIcon::StickyNote,
+        "ページ単位のメモ。リーダーのページ右上の付箋アイコンで付け外しでき、外してもメモは\
+         残ります。付箋画面ではページ画像つきの一覧とキーワード検索ができます。",
+    ),
+    (
+        "閲覧履歴",
+        AppIcon::History,
+        "読んだ日ごとに集約した履歴。期間とサイトで絞り込み、カード・リストの 2 表示で見られます。",
+    ),
+    (
+        "並び替えと絞り込み",
+        AppIcon::List,
+        "購入日・発売日・タイトル・最終閲覧日・閲覧回数・閲覧時間・サイズの 7 項目を昇順・降順で\
+         並び替え。データが無い項目はメニューに出しません。",
+    ),
+    (
+        "読書統計",
+        AppIcon::Database,
+        "1 ページごとの閲覧回数・滞在時間と、書籍ごとの閲覧セッションを記録。閲覧回数・累計閲覧\
+         時間・最終閲覧を統計として並び替えに使えます。",
+    ),
+    (
+        "チェックリスト",
+        AppIcon::ListChecks,
+        "イベントごとの購入管理。**現在は技術書典専用**（他ストアのイベントには未対応）。技術書典と\
+         同期、お気に入り登録、試し読み機能付き。",
+    ),
+    (
+        "ダウンロード管理",
+        AppIcon::Download,
+        "各ストア（技術書典・BOOTH・FANZA・DLsite）からのダウンロード状況を一元管理。\
+         完了・未完了・エラーの可視化と再試行ができます。",
+    ),
+    (
+        "Google Drive 同期",
+        AppIcon::HardDrive,
+        "書籍ファイルと本棚の DB を Google Drive と双方向同期。別の PC や Web 版と本棚を\
+         共有できます。",
+    ),
+    (
+        "関連書籍のショートカット",
+        AppIcon::ArrowRight,
+        "リスト行から同じサークル・同じ作者の本へすぐ移動できるショートカット。未ダウンロードの本は\
+         確認してから取り込み、完了後にそのまま開きます。",
+    ),
+    (
+        "自動タグ生成",
+        AppIcon::Tag,
+        "タグの追加・編集は全ストアで使えます。**自動生成は技術書典の同期時のみ**（他ストアは手動）。\
+         形態素解析による名詞抽出で、書籍の分類・検索を強力にサポートします。",
+    ),
+    (
+        "複数アカウントの切替",
+        AppIcon::CircleUserRound,
+        "Google アカウントを切替できます。データはアカウントごとに保持・属性付けされるため、\
+         切替で消えることはありません。",
+    ),
+    (
+        "対応ストア",
+        AppIcon::Cloud,
+        "技術書典・BOOTH・FANZA・DLsite の購入本を同期・管理。ストアごとにログインして本棚へ\
+         取り込めます。",
+    ),
+];
+
 pub struct AboutView;
 
 impl AboutView {
@@ -96,6 +187,32 @@ impl Render for AboutView {
                                                 "ネットで購入した同人誌を管理・閲覧するためのデスクトップアプリ",
                                             ),
                                     ),
+                            ),
+                    )
+                    // 対象コンテンツの注意（最も誤解されやすい点。上部で強調する）
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .rounded_xl()
+                            .border_1()
+                            .border_color(cx.theme().warning.opacity(0.35))
+                            .bg(cx.theme().warning.opacity(0.10))
+                            .p_4()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().warning)
+                                    .child("対象は購入済み・非DRM の同人誌のみです"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted_fg)
+                                    .line_height(relative(1.7))
+                                    .child(TARGET_NOTICE),
                             ),
                     )
                     // このアプリについて
@@ -200,39 +317,7 @@ impl Render for AboutView {
                                     .flex_wrap()
                                     .gap_4()
                                     .children(
-                                        [
-                                            (
-                                                "本棚",
-                                                AppIcon::LibraryBig,
-                                                "購入済み書籍の一覧管理。未読・読書中・読了のステータス管理、タグ付けによる分類、一括検索ができます。",
-                                            ),
-                                            (
-                                                "PDF リーダー",
-                                                AppIcon::BookMarked,
-                                                "アプリ内で PDF を閲覧。ページめくり、拡大縮小、見開き表示、読書進捗の自動保存・管理ができます。",
-                                            ),
-                                            (
-                                                "チェックリスト",
-                                                AppIcon::ListChecks,
-                                                "イベントごとの購入管理。Google ログイン後に同期ボタンから技術書典と同期、お気に入り登録、試し読み機能付き。",
-                                            ),
-                                            (
-                                                "ダウンロード管理",
-                                                AppIcon::Download,
-                                                "技術書典からのダウンロード状況を一元管理。完了・未完了・エラーの可視化と再試行ができます。",
-                                            ),
-                                            (
-                                                "Google Drive 同期",
-                                                AppIcon::HardDrive,
-                                                "書籍ファイルを Google Drive と双方向同期。別の PC や Web 版と本棚を共有できます。",
-                                            ),
-                                            (
-                                                "自動タグ生成",
-                                                AppIcon::Tag,
-                                                "ダウンロード時に自動でタグを生成したり、手動でタグを追加・編集したりできます。形態素解析による名詞抽出で、書籍の分類・検索を強力にサポートします。",
-                                            ),
-                                        ]
-                                        .into_iter()
+                                        FEATURES.into_iter()
                                         .map(|(title, icon, desc)| {
                                             let title: SharedString = title.into();
                                             let desc: SharedString = desc.into();
@@ -377,6 +462,8 @@ impl Render for AboutView {
                                             .children(
                                                 [
                                                     "Google ログイン後、本棚とチェックリストで技術書典のデータを同期できます",
+                                                    "BOOTH・FANZA・DLsite も、それぞれのログインから同期できます（本棚の同期ボタンから）",
+                                                    "複数の Google アカウントを切替できます（データはアカウントごとに保持されます）",
                                                     "複数デバイス間で購入履歴を共有できます（Google Drive 同期）",
                                                     "同期は各画面の同期ボタンから開始します",
                                                 ]
@@ -469,7 +556,7 @@ impl Render for AboutView {
                                 div()
                                     .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("技術書典ログインの手順"),
+                                    .child(LOGIN_SECTION_TITLE),
                             )
                             .child(
                                 div()
@@ -483,10 +570,11 @@ impl Render for AboutView {
                                     .gap_3()
                                     .children(
                                         [
-                                            "1. PC 版技術書典サイトで、同期したいアカウントでログイン済みであることを確認する",
-                                            "2. サイドバー下部のアカウントアイコン、または本棚のログインダイアログで「技術書典でログイン」を選ぶ",
-                                            "3. 技術書典のメールアドレスとパスワードを入力してログインする",
+                                            "1. 取り込みたいストアで、同期したいアカウントとしてログイン済みか確認する（技術書典は PC 版サイト）",
+                                            "2. サイドバー下部のアカウントアイコン、または本棚のログインダイアログで「〜でログイン」を選ぶ",
+                                            "3. そのストアの認証情報（メールアドレスとパスワードなど）を入力する",
                                             "4. 送信するとセッション登録が完了します",
+                                            "対応ストア: 技術書典 / BOOTH / FANZA / DLsite（ストアごとにログインしてください）",
                                         ]
                                         .into_iter()
                                         .map(|step| {
@@ -526,5 +614,110 @@ impl Render for AboutView {
                     ),
             ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn description(title: &str) -> &'static str {
+        FEATURES
+            .iter()
+            .find(|(name, _, _)| *name == title)
+            .map(|(_, _, desc)| *desc)
+            .unwrap_or_else(|| panic!("「{title}」が説明画面に無い"))
+    }
+
+    /// 説明画面の「主な機能」が実装済みの機能を網羅していること。
+    /// （説明画面は利用者向けの機能一覧なので、実装との乖離はそのまま誤情報になる）
+    #[test]
+    fn about_lists_the_implemented_features() {
+        let titles: Vec<&str> = FEATURES.iter().map(|(title, _, _)| *title).collect();
+        for expected in [
+            "本棚",
+            "ビューアー",
+            "付箋",
+            "閲覧履歴",
+            "並び替えと絞り込み",
+            "読書統計",
+            "チェックリスト",
+            "ダウンロード管理",
+            "Google Drive 同期",
+            "関連書籍のショートカット",
+            "自動タグ生成",
+            "複数アカウントの切替",
+            "対応ストア",
+        ] {
+            assert!(
+                titles.contains(&expected),
+                "説明画面に「{expected}」が無い: {titles:?}"
+            );
+        }
+        assert!(
+            !titles.contains(&"リーダー"),
+            "「リーダー」表記が残っている（ビューアーに統一した）: {titles:?}"
+        );
+        assert!(
+            !titles.iter().any(|title| title.contains("カルーセル")),
+            "「カルーセル」表記が残っている（ショートカットに変更した）: {titles:?}"
+        );
+    }
+
+    /// 古い記述（技術書典限定のダウンロード / PDF 限定のビューアー）が残っていないこと。
+    #[test]
+    fn about_describes_the_current_supported_formats_and_stores() {
+        let all = FEATURES
+            .iter()
+            .map(|(title, _, desc)| format!("{title} {desc}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for keyword in ["EPUB", "スクロール", "BOOTH", "FANZA", "DLsite"] {
+            assert!(all.contains(keyword), "説明文に {keyword} が無い: {all}");
+        }
+        assert!(
+            !all.contains("技術書典からのダウンロード"),
+            "ダウンロードの説明が技術書典限定のまま: {all}"
+        );
+        assert!(
+            !all.contains("アプリ内で PDF を閲覧"),
+            "ビューアーの説明が PDF 限定のまま: {all}"
+        );
+    }
+
+    /// 対象が「購入済み・非DRM の同人誌」であることを強く明記していること。
+    #[test]
+    fn about_states_the_non_drm_scope() {
+        assert!(
+            TARGET_NOTICE.contains("非DRM"),
+            "非DRM の明記が無い: {TARGET_NOTICE}"
+        );
+        assert!(
+            TARGET_NOTICE.contains("購入") && TARGET_NOTICE.contains("同人誌"),
+            "対象（購入済みの同人誌）が明記されていない: {TARGET_NOTICE}"
+        );
+        assert!(
+            TARGET_NOTICE.contains("DRM"),
+            "DRM 付きが対象外である旨が無い: {TARGET_NOTICE}"
+        );
+    }
+
+    /// ストア限定の機能にはその旨を書く（チェックリストと自動タグ生成は技術書典のみ）。
+    #[test]
+    fn about_marks_store_specific_features() {
+        assert!(
+            description("チェックリスト").contains("技術書典専用"),
+            "チェックリストが技術書典専用である旨が無い: {}",
+            description("チェックリスト")
+        );
+        let tags = description("自動タグ生成");
+        assert!(
+            tags.contains("技術書典") && tags.contains("自動"),
+            "自動タグ生成が技術書典のみである旨が無い: {tags}"
+        );
+        assert!(
+            LOGIN_SECTION_TITLE.contains("ストア"),
+            "ログイン手順の見出しが技術書典限定のまま: {LOGIN_SECTION_TITLE}"
+        );
     }
 }
