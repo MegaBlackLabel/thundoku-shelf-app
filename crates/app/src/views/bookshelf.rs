@@ -110,9 +110,9 @@ pub enum ViewMode {
 }
 
 /// お気に入りハートの丸ボタンの一辺。文字だけだと押しにくいのでクリック領域を広げる。
-const CHIP_HEART_BUTTON: f32 = 18.0;
+pub(crate) const CHIP_HEART_BUTTON: f32 = 18.0;
 /// 丸ボタンの中に置くハートアイコンの一辺。
-const CHIP_HEART_ICON: f32 = 12.0;
+pub(crate) const CHIP_HEART_ICON: f32 = 12.0;
 
 /// 絞り込み選択中の背景（半透明の青）。ライトの白背景でもダークの黒背景でも
 /// 「選択中」に見えるように、テーマ共通で半透明の青を重ねる。
@@ -282,7 +282,7 @@ struct ChipState {
 /// 集計表は `Arc` で共有するので、描画ごとのコピーは起こらない。
 /// 集計数は「そのタグを持つカード数」で、`reload` のたびに作り直す。
 #[derive(Clone)]
-struct TagOrder {
+pub(crate) struct TagOrder {
     /// 絞り込みで選択中のタグ。折りたたみ中でも見えるよう最優先で先頭に出す
     /// （解除すると集計数 / 名前順の元の位置に戻る）。
     selected: std::collections::HashSet<String>,
@@ -291,7 +291,7 @@ struct TagOrder {
 }
 
 impl TagOrder {
-    fn new(
+    pub(crate) fn new(
         favorite_tags: &[String],
         selected_tags: &[String],
         counts: std::sync::Arc<std::collections::HashMap<String, usize>>,
@@ -304,12 +304,12 @@ impl TagOrder {
     }
 
     /// 絞り込みで選択中のタグか（チップの選択色にも使う）。
-    fn is_selected(&self, tag: &str) -> bool {
+    pub(crate) fn is_selected(&self, tag: &str) -> bool {
         self.selected.contains(tag)
     }
 
     /// お気に入りタグか（ハートの塗り分けにも使う）。
-    fn is_favorite(&self, tag: &str) -> bool {
+    pub(crate) fn is_favorite(&self, tag: &str) -> bool {
         self.favorites.contains(tag)
     }
 
@@ -320,7 +320,7 @@ impl TagOrder {
 
     /// タグを表示順に並べ替えた新しい Vec を返す。
     /// 選択 / お気に入り / 集計数・名前で決まるので、同じ入力なら常に同じ順になる。
-    fn sorted(&self, tags: &[String]) -> Vec<String> {
+    pub(crate) fn sorted(&self, tags: &[String]) -> Vec<String> {
         let mut sorted = tags.to_vec();
         sorted.sort_by(|a, b| {
             self.is_selected(b)
@@ -336,7 +336,7 @@ impl TagOrder {
 /// タグ情報エリア（タグ列）の幅。行の幅 × `LIST_TAGS_W_RATIO` で、行の左右パディング
 /// （`p_2` の 8+8）を引いてから割合を掛ける。行の幅は窓幅からサイドバー（`SIDEBAR_W`）と
 /// ビューの左右パディング（`p_3` の 12+12）を引いたもの（カードの幅計算と同じ前提）。
-fn list_tag_area_width(window: &Window) -> f32 {
+pub(crate) fn list_tag_area_width(window: &Window) -> f32 {
     let row_width = window.bounds().size.width.as_f32() - SIDEBAR_W - 24.0;
     (row_width - 16.0) * LIST_TAGS_W_RATIO
 }
@@ -344,7 +344,7 @@ fn list_tag_area_width(window: &Window) -> f32 {
 /// 折りたたみ時にリストのタグ列へ出せるタグ数。個数の固定上限は持たず、
 /// **タグ列の幅 × 折り返し行数**から計算する（窓が広いほど多く出る）。
 /// タグの幅は GPUI のテキスト計測で実測する。
-fn list_tags_visible_count(
+pub(crate) fn list_tags_visible_count(
     window: &Window,
     theme: &gpui_kit::component::Theme,
     ordered: &[String],
@@ -369,10 +369,32 @@ fn list_tags_visible_count(
     }
 }
 
+/// 表示対象のローカル本（所有者フィルタ）。ログイン中は現在の sub の本、
+/// 未ログインは未所属（NULL）の本だけ。本棚と履歴で同じ判定を使う。
+pub(crate) fn owned_book_ids(state: &AppState) -> std::collections::HashSet<String> {
+    let db = &state.db_pool;
+    let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+    let key = state.secrets.db_key().ok();
+    match (google_sub, key) {
+        (Some(sub), Some(key)) => {
+            db::books::owned_book_ids(db, &key, Some(&sub)).unwrap_or_default()
+        }
+        // ログイン中だが key が無い → 復号不能なので表示しない。
+        (Some(_), None) => std::collections::HashSet::new(),
+        // 未ログイン → 未所属(NULL)。NULL 判定は key を使わないのでダミーで良い。
+        (None, key) => db::books::owned_book_ids(db, key.as_ref().unwrap_or(&[0u8; 32]), None)
+            .unwrap_or_default(),
+    }
+}
+
 /// タグチップのラベル（タグ名 / 「+n」）の幅を GPUI のテキスト計測で実測する。
 /// チップは `.text_xs()`（= rem の 0.75 倍）なので、フォントサイズは rem から求める。
 /// 計測結果は GPUI 側でフレーム単位にキャッシュされる（同じ文字列は次フレームで再利用）。
-fn tag_text_width(window: &Window, theme: &gpui_kit::component::Theme, text: &str) -> f32 {
+pub(crate) fn tag_text_width(
+    window: &Window,
+    theme: &gpui_kit::component::Theme,
+    text: &str,
+) -> f32 {
     let font_size = window.rem_size() * 0.75;
     let run = gpui_kit::TextRun {
         len: text.len(),
@@ -390,13 +412,17 @@ fn tag_text_width(window: &Window, theme: &gpui_kit::component::Theme, text: &st
 }
 
 /// タグチップ 1 個の幅（タグ名の実測幅 + チップの装飾）。
-fn tag_chip_width(window: &Window, theme: &gpui_kit::component::Theme, tag: &str) -> f32 {
+pub(crate) fn tag_chip_width(
+    window: &Window,
+    theme: &gpui_kit::component::Theme,
+    tag: &str,
+) -> f32 {
     tag_text_width(window, theme, tag) + CHIP_CHROME_W
 }
 
 /// 幅 `widths`（表示順）のチップを `row_width` の行に詰め、最後に使った行の使用幅と
 /// 個数を返す（`max_rows` 行を超えない）。
-fn packed_rows(widths: &[f32], row_width: f32, max_rows: usize) -> (usize, f32) {
+pub(crate) fn packed_rows(widths: &[f32], row_width: f32, max_rows: usize) -> (usize, f32) {
     let mut rows = 1usize;
     let mut used = 0.0f32;
     let mut count = 0usize;
@@ -423,7 +449,12 @@ fn packed_rows(widths: &[f32], row_width: f32, max_rows: usize) -> (usize, f32) 
 /// 幅の広い順（＝表示順）に詰めていき、`max_rows` 行に収まる個数を返す。最後に使った
 /// 行には末尾要素（タグ編集ボタン / 「+n」チップ）の幅 `trailing` を確保するので、
 /// 入らなければ 1 個ずつ減らす。幅が足りないときでも 1 個は出す（「+n」だけの行を作らない）。
-fn packed_tag_count(widths: &[f32], row_width: f32, max_rows: usize, trailing: f32) -> usize {
+pub(crate) fn packed_tag_count(
+    widths: &[f32],
+    row_width: f32,
+    max_rows: usize,
+    trailing: f32,
+) -> usize {
     if widths.is_empty() || max_rows == 0 || row_width <= 0.0 {
         return 0;
     }
@@ -439,7 +470,7 @@ fn packed_tag_count(widths: &[f32], row_width: f32, max_rows: usize, trailing: f
 }
 
 /// タグの折りたたみトグルのラベル。折りたたみ中は残り件数（「+n」）、展開中は「閉じる」。
-fn tag_toggle_label(hidden: usize, expanded: bool) -> String {
+pub(crate) fn tag_toggle_label(hidden: usize, expanded: bool) -> String {
     if expanded {
         "閉じる".to_string()
     } else {
@@ -449,7 +480,7 @@ fn tag_toggle_label(hidden: usize, expanded: bool) -> String {
 
 /// タグの使用数（タグ名 → そのタグを持つカード数）を数える。
 /// 同じカードに同じタグが複数あっても 1 冊として数える。
-fn count_tag_usage<'a>(
+pub(crate) fn count_tag_usage<'a>(
     cards: impl IntoIterator<Item = &'a [String]>,
 ) -> std::collections::HashMap<String, usize> {
     let mut counts = std::collections::HashMap::new();
@@ -878,7 +909,7 @@ impl BookshelfView {
     }
 
     /// グリッドの列数（Web と同じブレークポイント）
-    fn columns_for_width(window_width: f32) -> usize {
+    pub(crate) fn columns_for_width(window_width: f32) -> usize {
         if window_width >= 2560.0 {
             // 4K 等の超広幅では、タイル幅を理想値に近づけるよう列数を増やす
             // （固定 5 列だとタイルが横に間延びするため）。
@@ -1060,22 +1091,7 @@ impl BookshelfView {
             let packs_dir = state.packs_dir.clone();
             let thumbnails_dir = state.data_dir.join("thumbnails");
             // 所有者フィルタ：ログイン中は現在 sub の本、未ログインは未所属(NULL)の本だけ表示。
-            let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
-            let owned = {
-                let key = state.secrets.db_key().ok();
-                match (google_sub.clone(), key) {
-                    (Some(sub), Some(key)) => {
-                        db::books::owned_book_ids(db, &key, Some(&sub)).unwrap_or_default()
-                    }
-                    // ログイン中だが key が無い → 復号不能なので表示しない。
-                    (Some(_), None) => std::collections::HashSet::new(),
-                    // 未ログイン → 未所属(NULL)。NULL 判定は key を使わないのでダミーで良い。
-                    (None, key) => {
-                        db::books::owned_book_ids(db, key.as_ref().unwrap_or(&[0u8; 32]), None)
-                            .unwrap_or_default()
-                    }
-                }
-            };
+            let owned = owned_book_ids(state);
             let mut entries = Vec::new();
             for book in books::list(db)
                 .unwrap_or_default()
@@ -3676,10 +3692,23 @@ impl BookshelfView {
             };
             let chips = BookshelfView::render_tag_chips(
                 theme,
-                &handle,
                 tag_order,
                 &database_id,
                 &ordered[..visible],
+                {
+                    let handle = handle.clone();
+                    move |tag: &str, _window: &mut Window, cx: &mut App| {
+                        let tag = tag.to_string();
+                        handle.update(cx, |this, cx| this.toggle_tag(cx, &tag));
+                    }
+                },
+                {
+                    let handle = handle.clone();
+                    move |tag: &str, _window: &mut Window, cx: &mut App| {
+                        let tag = tag.to_string();
+                        handle.update(cx, |this, cx| this.toggle_favorite_tag(cx, &tag));
+                    }
+                },
             );
             let hidden = ordered.len() - visible;
             let mut tag_row = div()
@@ -3696,10 +3725,17 @@ impl BookshelfView {
             if tags_expanded || hidden > 0 {
                 tag_row = tag_row.child(BookshelfView::render_tag_toggle(
                     theme,
-                    &handle,
-                    &database_id,
+                    format!("tag-toggle-{database_id}"),
                     hidden,
                     tags_expanded,
+                    {
+                        let handle = handle.clone();
+                        let database_id = database_id.clone();
+                        move |_window, cx| {
+                            handle
+                                .update(cx, |this, cx| this.toggle_tag_expansion(&database_id, cx));
+                        }
+                    },
                 ));
             }
             tag_row
@@ -3904,25 +3940,26 @@ impl BookshelfView {
             .into_any_element()
     }
 
-    /// タグチップ行（Web の TagList 相当）。
-    /// 並び順は `tag_order`（お気に入り → 集計数の多い順 → 名前順）。
+    /// タグチップ行（Web の TagList 相当）。本棚と履歴で共用する。
+    /// 並び順は `tag_order`（選択中 → お気に入り → 集計数の多い順 → 名前順）。
     /// クリックで絞り込み選択（青）、ハートでお気に入り（ピンク / ♥）。
-    fn render_tag_chips(
+    pub(crate) fn render_tag_chips(
         theme: &gpui_kit::component::Theme,
-        handle: &gpui_kit::Entity<BookshelfView>,
         tag_order: &TagOrder,
         database_id: &str,
         tags: &[String],
+        on_click_tag: impl Fn(&str, &mut Window, &mut App) + Clone + 'static,
+        on_heart: impl Fn(&str, &mut Window, &mut App) + Clone + 'static,
     ) -> Vec<gpui_kit::AnyElement> {
-        let handle = handle.clone();
         tags.iter()
             .cloned()
             .map(|tag| {
                 let is_favorite = tag_order.is_favorite(&tag);
                 let is_selected = tag_order.is_selected(&tag);
-                let handle = handle.clone();
                 let tag_for_text = tag.clone();
                 let tag_for_heart = tag.clone();
+                let click_tag = on_click_tag.clone();
+                let click_heart = on_heart.clone();
                 let label_selector = format!("tag-label-{database_id}-{tag}");
                 let heart_selector = format!("tag-heart-{database_id}-{tag}");
                 let icon_selector = format!("{heart_selector}-icon");
@@ -3953,14 +3990,9 @@ impl BookshelfView {
                                 move || label_selector.clone()
                             })
                             .cursor_pointer()
-                            .on_click({
-                                let handle = handle.clone();
-                                move |_event, _window, cx| {
-                                    cx.stop_propagation();
-                                    handle.update(cx, |this, cx| {
-                                        this.toggle_tag(cx, &tag_for_text);
-                                    });
-                                }
+                            .on_click(move |_event, window, cx| {
+                                cx.stop_propagation();
+                                click_tag(&tag_for_text, window, cx);
                             })
                             .child(tag),
                     )
@@ -3982,14 +4014,9 @@ impl BookshelfView {
                             .hover(move |style| style.bg(palette.heart_button_hover))
                             .text_color(palette.heart(theme.muted_foreground, is_favorite))
                             .cursor_pointer()
-                            .on_click({
-                                let handle = handle.clone();
-                                move |_event, _window, cx| {
-                                    cx.stop_propagation();
-                                    handle.update(cx, |this, cx| {
-                                        this.toggle_favorite_tag(cx, &tag_for_heart);
-                                    });
-                                }
+                            .on_click(move |_event, window, cx| {
+                                cx.stop_propagation();
+                                click_heart(&tag_for_heart, window, cx);
                             })
                             // アイコンを丸の中心に置く（文字グリフのフォント依存のズレを避ける）
                             .child(
@@ -4450,16 +4477,13 @@ impl BookshelfView {
     /// タグ列の折りたたみトグル（「+n」/「閉じる」）。タグチップと同じ配色にして、
     /// タグ列の一部として見せる。クリックは行の動作（ビューアー / ダウンロード）へ
     /// 伝播させない。
-    fn render_tag_toggle(
+    pub(crate) fn render_tag_toggle(
         theme: &gpui_kit::component::Theme,
-        handle: &gpui_kit::Entity<BookshelfView>,
-        database_id: &str,
+        selector: String,
         hidden: usize,
         expanded: bool,
+        on_toggle: impl Fn(&mut Window, &mut App) + 'static,
     ) -> gpui_kit::AnyElement {
-        let selector = format!("tag-toggle-{database_id}");
-        let handle = handle.clone();
-        let id = database_id.to_string();
         let label = tag_toggle_label(hidden, expanded);
         let tooltip = if expanded {
             "タグを閉じる".to_string()
@@ -4483,9 +4507,9 @@ impl BookshelfView {
             .text_xs()
             .cursor_pointer()
             .hover(|style| style.bg(theme.muted_foreground.opacity(0.2)))
-            .on_click(move |_, _, cx| {
+            .on_click(move |_, window, cx| {
                 cx.stop_propagation();
-                handle.update(cx, |this, cx| this.toggle_tag_expansion(&id, cx));
+                on_toggle(window, cx);
             })
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .child(label)
@@ -4865,10 +4889,23 @@ impl BookshelfView {
                     };
                     let chips = BookshelfView::render_tag_chips(
                         cx.theme(),
-                        &handle,
                         tag_order,
                         &database_id,
                         &ordered[..visible],
+                        {
+                            let handle = handle.clone();
+                            move |tag: &str, _window: &mut Window, cx: &mut App| {
+                                let tag = tag.to_string();
+                                handle.update(cx, |this, cx| this.toggle_tag(cx, &tag));
+                            }
+                        },
+                        {
+                            let handle = handle.clone();
+                            move |tag: &str, _window: &mut Window, cx: &mut App| {
+                                let tag = tag.to_string();
+                                handle.update(cx, |this, cx| this.toggle_favorite_tag(cx, &tag));
+                            }
+                        },
                     );
                     // タグが多い本は列の中で折りたたむ（行の高さをタグ列に支配させない）。
                     // 「+n」で全件表示、「閉じる」で折りたたみへ戻す。
@@ -4889,10 +4926,18 @@ impl BookshelfView {
                     if expanded || hidden > 0 {
                         tag_row = tag_row.child(BookshelfView::render_tag_toggle(
                             cx.theme(),
-                            &handle,
-                            &database_id,
+                            format!("tag-toggle-{database_id}"),
                             hidden,
                             expanded,
+                            {
+                                let handle = handle.clone();
+                                let database_id = database_id.clone();
+                                move |_window, cx| {
+                                    handle.update(cx, |this, cx| {
+                                        this.toggle_tag_expansion(&database_id, cx)
+                                    });
+                                }
+                            },
                         ));
                     }
                     tag_row
@@ -5918,31 +5963,31 @@ pub(crate) fn cover_url_candidates(site_id: &str, stored_url: &str) -> Vec<Strin
 /// 表紙の幅が行ごとに変わり、右側のテキスト開始 X がずれる（ガタつきの原因）。
 const LIST_COVER_ASPECT: f32 = 3.0 / 2.0;
 /// 表紙エリアの高さ（固定）。行の高さはこの値 + 余白で決まる。
-const LIST_COVER_MIN_H: f32 = 133.0;
+pub(crate) const LIST_COVER_MIN_H: f32 = 133.0;
 /// 表紙エリアの幅（固定）。
-const LIST_COVER_W: f32 = LIST_COVER_MIN_H * LIST_COVER_ASPECT;
+pub(crate) const LIST_COVER_W: f32 = LIST_COVER_MIN_H * LIST_COVER_ASPECT;
 /// 情報列の幅（固定）。表紙と同じく、行ごとに開始 X がずれないようにする。
 /// タイトルの横に状態タグを並べるため、タイトルが折り返さない程度の幅を確保する。
-const LIST_INFO_W: f32 = 320.0;
+pub(crate) const LIST_INFO_W: f32 = 320.0;
 /// タグ情報エリアの幅（行の幅に対する割合）。タグはこの中で折り返す。
-const LIST_TAGS_W_RATIO: f32 = 0.20;
+pub(crate) const LIST_TAGS_W_RATIO: f32 = 0.20;
 /// サイドバーの幅。カード / リストの表示幅を窓幅から計算するときに差し引く。
-const SIDEBAR_W: f32 = 255.0;
+pub(crate) const SIDEBAR_W: f32 = 255.0;
 /// リストのタグ列で折り返してよい行数。表紙の高さ（`LIST_COVER_MIN_H` = 133px）に
 /// 収まる数にする（チップ 1 行 ≈ 29px の実測から 4 行 = 116px）。
 /// これ以上は行の高さがタグ列に支配され、固定サイズの表紙 / カルーセルとの間に
 /// 余白ができる（＝行が間延びする）。表示する個数はこの行数と**タグ列の幅**から計算する
 /// （`packed_tag_count`）。
-const LIST_TAG_MAX_ROWS: usize = 4;
+pub(crate) const LIST_TAG_MAX_ROWS: usize = 4;
 /// タグチップの装飾ぶんの幅（左右パディング 4+4・文字とハートの間隔 6・
 /// ハートの丸ボタン `CHIP_HEART_BUTTON` 18・枠線 1+1）。
-const CHIP_CHROME_W: f32 = 34.0;
+pub(crate) const CHIP_CHROME_W: f32 = 34.0;
 /// 折りたたみトグル（「+n」）の装飾ぶんの幅（左右パディング 4+4・枠線 1+1）。
-const TAG_TOGGLE_CHROME_W: f32 = 10.0;
+pub(crate) const TAG_TOGGLE_CHROME_W: f32 = 10.0;
 /// タグチップ同士の間隔（`gap_1`）。
-const TAG_CHIP_GAP: f32 = 4.0;
+pub(crate) const TAG_CHIP_GAP: f32 = 4.0;
 /// タグ編集ボタン（✎）の幅。
-const TAG_EDIT_BUTTON_W: f32 = 24.0;
+pub(crate) const TAG_EDIT_BUTTON_W: f32 = 24.0;
 /// カード（グリッド）のタグを折りたたむときの最大表示数。
 ///
 /// カードは行の高さを共有する（同じ行のカードは一番高いカードに揃う）ため、
@@ -5952,7 +5997,7 @@ const TAG_EDIT_BUTTON_W: f32 = 24.0;
 /// 長いタグ名（「長いタグ名前01」）だと 6 件 = 6 行・+149.0px まで伸びる。
 /// ここを既定の上限にして残りは「+n」に畳む（お気に入りタグは並び替えで先頭に
 /// 来るので折りたたまれない）。
-const CARD_TAGS_COLLAPSED_MAX: usize = 6;
+pub(crate) const CARD_TAGS_COLLAPSED_MAX: usize = 6;
 /// カルーセルに出す関連書籍の最大件数。
 const LIST_RELATED_LIMIT: usize = 5;
 /// カルーセルの 1 画面あたりの表示枚数（列幅をこの数で等分してサムネを埋める）。
@@ -5993,7 +6038,7 @@ fn related_book_indices(keys: &[(String, String)], index: usize, limit: usize) -
 /// 表紙エリア（3:2 の枠）の中に、画像を**比率のまま**収めた要素（切り抜きしない）。
 /// リストの表紙と関連書籍サムネイルで同じ見た目・同じ比率にするための共通処理。
 /// `selector` は画像要素のデバッグ用 id（テストが枠との比率を検証する）。
-fn cover_fit_inside_frame(
+pub(crate) fn cover_fit_inside_frame(
     cover: Option<&Arc<RenderImage>>,
     selector: String,
 ) -> gpui_kit::AnyElement {
@@ -6182,7 +6227,7 @@ fn seed_progress_if_absent(db: &db::SqlitePool, book_id: &str, total_pages: i64)
 /// 表紙画像を枠（`box_w` × `box_h`）に比率を保って収めた描画サイズを返す。
 /// 横長は幅いっぱい（高さは比率なり）、縦長は高さいっぱい（幅は比率なり）になる。
 /// 枠に合わせて拡大すると縦長の上下が切れるため、カード / リスト共通で使う。
-fn fit_cover_size(image_w: f32, image_h: f32, box_w: f32, box_h: f32) -> (f32, f32) {
+pub(crate) fn fit_cover_size(image_w: f32, image_h: f32, box_w: f32, box_h: f32) -> (f32, f32) {
     let image_w = image_w.max(1.0);
     let image_h = image_h.max(1.0);
     let scale = (box_w / image_w).min(box_h / image_h);
@@ -6388,12 +6433,12 @@ pub fn app_logo_image() -> Option<Arc<RenderImage>> {
 }
 
 /// 表紙画像が取得できなかったカード用の NoImage ダミー（グレー背景 + NoImage 表記）。
-fn no_image_cover() -> Option<Arc<RenderImage>> {
+pub(crate) fn no_image_cover() -> Option<Arc<RenderImage>> {
     let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 320' width='240' height='320'><rect width='240' height='320' fill='#e5e7eb'/><rect x='60' y='90' width='120' height='90' fill='none' stroke='#9ca3af' stroke-width='6'/><path d='M70 165 L100 135 L125 155 L150 130 L170 165 Z' fill='#9ca3af'/><text x='120' y='200' text-anchor='middle' font-family='sans-serif' font-size='16' font-weight='bold' fill='#6b7280'>NoImage</text></svg>";
     decode_bytes_to_render_image(svg.as_bytes())
 }
 
-fn placeholder_cover(title: &str, circle: &str) -> Option<Arc<RenderImage>> {
+pub(crate) fn placeholder_cover(title: &str, circle: &str) -> Option<Arc<RenderImage>> {
     let palette = [
         "#6366f1", "#ec4899", "#14b8a6", "#f59e0b", "#8b5cf6", "#06b6d4", "#ef4444", "#22c55e",
     ];
@@ -6456,7 +6501,7 @@ fn progress_ring_image(fraction: f32) -> Arc<RenderImage> {
 
 /// "技術書典20"-style compact label (mirrors the Web `formatEventLabel`:
 /// `^(?:TechBookFest|技術書典)\s*(\d+)$` case-insensitive).
-fn format_event_label(event_name: &str) -> String {
+pub(crate) fn format_event_label(event_name: &str) -> String {
     let trimmed = event_name.trim();
     let lower = trimmed.to_lowercase();
     for prefix in ["techbookfest", "技術書典"] {
@@ -6470,7 +6515,10 @@ fn format_event_label(event_name: &str) -> String {
     trimmed.to_string()
 }
 
-fn load_cover_image(packs_dir: &std::path::Path, book: &books::Book) -> Option<Arc<RenderImage>> {
+pub(crate) fn load_cover_image(
+    packs_dir: &std::path::Path,
+    book: &books::Book,
+) -> Option<Arc<RenderImage>> {
     let pack_id = book.pack_id.as_deref().unwrap_or(&book.id);
     let path = packs_dir.join(format!("{pack_id}.opfspack"));
     let bytes = std::fs::read(path).ok()?;
@@ -6499,7 +6547,7 @@ fn item_file_name(title: &str, item: &bookshelf::BookshelfItem) -> String {
 }
 
 /// 購入日を `YYYY/MM/DD` に正規化する（"2026年09月03日" / "2026-08-25 00:00:00" 対応）。
-fn format_purchase_date(raw: &str) -> String {
+pub(crate) fn format_purchase_date(raw: &str) -> String {
     let s = raw.trim();
     if s.contains('年') {
         let y = s.split('年').next().unwrap_or("");

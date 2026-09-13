@@ -7,6 +7,8 @@ actions!(
     [
         /// Switch the main area to the bookshelf.
         NavBookshelf,
+        /// Switch the main area to the viewing history.
+        NavHistory,
         /// Switch the main area to the checklist.
         NavChecklist,
         /// Switch the main area to the settings.
@@ -27,6 +29,8 @@ actions!(
         ToggleSidebar,
         /// Switch the main area to the bookshelf (メニュー用)。
         ShowBookshelf,
+        /// Switch the main area to the viewing history (メニュー用)。
+        ShowHistory,
         /// Switch the main area to the checklist (メニュー用)。
         ShowChecklist,
         /// Switch the main area to the settings (メニュー用)。

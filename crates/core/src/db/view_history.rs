@@ -4,6 +4,8 @@
 //! 途中でアプリを落とした場合に備え、閲覧中は `ended_at` を頻繁に
 //! 更新（touch）しておくことで、最後に読んでいた時刻まで記録される。
 
+use sqlx::Row;
+
 use crate::db::SqlitePool;
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -77,9 +79,171 @@ pub fn total_duration_secs(pool: &SqlitePool, book_id: &str) -> Result<i64, sqlx
     })
 }
 
+/// 履歴画面の 1 行 = 1 日 1 本の集約。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyHistory {
+    pub book_id: String,
+    /// ローカル日付（`YYYY-MM-DD`）。
+    pub day: String,
+    /// その日の最後の閲覧開始時刻（ローカル `YYYY-MM-DD HH:MM:SS`）。
+    pub last_started_at: String,
+    /// その日の閲覧時間の合計（秒）。
+    pub duration_secs: i64,
+    /// その日のセッション数。
+    pub sessions: i64,
+}
+
+/// 閲覧履歴を「1 日 1 本」に集約して、新しい日から順に返す。
+///
+/// `view_history` の時刻は `CURRENT_TIMESTAMP`（= UTC）なので、**ローカル時刻に直してから**
+/// 日付でまとめる（UTC で日付を切ると日本時間の朝が前日に入ってしまう）。
+/// 日をまたいだセッションは開始時刻の日に入れる。同時刻なら book_id 順で決定的に並ぶ。
+pub fn list_daily(pool: &SqlitePool) -> Result<Vec<DailyHistory>, sqlx::Error> {
+    use chrono::{Local, NaiveDateTime, TimeZone as _};
+    use std::collections::HashMap;
+
+    let rows = crate::db::block_on(async {
+        sqlx::query("SELECT book_id, started_at, ended_at FROM view_history")
+            .fetch_all(pool)
+            .await
+    })?;
+
+    let parse = |text: &str| -> Option<chrono::DateTime<Local>> {
+        NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|naive| Local.from_utc_datetime(&naive))
+    };
+
+    let mut by_day: HashMap<(String, String), DailyHistory> = HashMap::new();
+    for row in rows {
+        let book_id: String = row.get("book_id");
+        let started_at: String = row.get("started_at");
+        let ended_at: Option<String> = row.get("ended_at");
+        let Some(started) = parse(&started_at) else {
+            continue;
+        };
+        let day = started.format("%Y-%m-%d").to_string();
+        let last_started_at = started.format("%Y-%m-%d %H:%M:%S").to_string();
+        let duration = ended_at
+            .as_deref()
+            .and_then(parse)
+            .map(|ended| (ended - started).num_seconds().max(0))
+            .unwrap_or(0);
+        let entry = by_day
+            .entry((book_id.clone(), day.clone()))
+            .or_insert_with(|| DailyHistory {
+                book_id,
+                day,
+                last_started_at: last_started_at.clone(),
+                duration_secs: 0,
+                sessions: 0,
+            });
+        entry.duration_secs += duration;
+        entry.sessions += 1;
+        if last_started_at > entry.last_started_at {
+            entry.last_started_at = last_started_at;
+        }
+    }
+
+    let mut days: Vec<DailyHistory> = by_day.into_values().collect();
+    days.sort_by(|a, b| {
+        b.last_started_at
+            .cmp(&a.last_started_at)
+            .then_with(|| a.book_id.cmp(&b.book_id))
+    });
+    Ok(days)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 履歴画面用の集約: 1 日 1 本にまとめ、閲覧時間を合算し、新しい日から並べる。
+    /// 時刻は UTC（`CURRENT_TIMESTAMP`）なので、**ローカル日付**で日を切ることを確認する
+    /// （UTC 20:00 = 日本時間 翌 05:00 のような時刻を使う）。
+    #[test]
+    fn list_daily_groups_by_local_day_and_sums_durations() {
+        let pool = crate::db::test_pool();
+        for id in ["b1", "b2"] {
+            crate::db::books::insert(&pool, &test_book(id)).unwrap();
+        }
+        let insert = |id: &str, book: &str, started: &str, ended: &str| {
+            crate::db::block_on(async {
+                sqlx::query(
+                    "INSERT INTO view_history (id, book_id, started_at, ended_at) \
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(id)
+                .bind(book)
+                .bind(started)
+                .bind(ended)
+                .execute(&pool)
+                .await
+            })
+            .unwrap();
+        };
+        // b1: 同じローカル日に 2 セッション（10 分 + 20 分 = 30 分）
+        insert("s1", "b1", "2026-09-12 20:00:00", "2026-09-12 20:10:00");
+        insert("s2", "b1", "2026-09-12 20:30:00", "2026-09-12 20:50:00");
+        // b2: 別の日（ローカルでは前日）
+        insert("s3", "b2", "2026-09-11 20:00:00", "2026-09-11 20:30:00");
+
+        let days = list_daily(&pool).unwrap();
+        assert_eq!(days.len(), 2, "1 日 1 本に集約されていない");
+        assert_eq!(days[0].book_id, "b1", "新しい日が先頭に来ていない");
+        assert_eq!(days[0].sessions, 2);
+        assert_eq!(days[0].duration_secs, 1800, "閲覧時間が合算されていない");
+        assert_eq!(days[1].book_id, "b2");
+        assert_eq!(days[1].duration_secs, 1800);
+
+        // 日付は「UTC 文字列をローカルに直した日」になる（テスト側で同じ変換をして比較）
+        let local_day = |utc: &str| {
+            chrono::NaiveDateTime::parse_from_str(utc, "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc()
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        assert_eq!(days[0].day, local_day("2026-09-12 20:30:00"));
+        assert_eq!(days[1].day, local_day("2026-09-11 20:00:00"));
+        assert!(
+            days[0].day != "2026-09-12" || local_day("2026-09-12 20:30:00") == "2026-09-12",
+            "ローカル日付に変換されていない（UTC の日付で切っている）"
+        );
+    }
+
+    fn test_book(id: &str) -> crate::db::books::Book {
+        crate::db::books::Book {
+            id: id.into(),
+            title: "t".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "t.pdf".into(),
+            file_size: 1,
+            opfs_path: format!("{id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: None,
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-08-21 00:00:00".into(),
+            updated_at: "2026-08-21 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        }
+    }
 
     #[test]
     fn start_end_and_stats() {

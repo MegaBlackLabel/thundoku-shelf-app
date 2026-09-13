@@ -32,6 +32,7 @@ use crate::views::about::AboutView;
 use crate::views::auth::{AuthDialog, AuthProvider};
 use crate::views::bookshelf::BookshelfView;
 use crate::views::checklist::ChecklistView;
+use crate::views::history::HistoryView;
 use crate::views::reader::ReaderView;
 use crate::views::settings::SettingsView;
 use thundoku_core::db;
@@ -42,6 +43,7 @@ use thundoku_core::tbf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavTarget {
     Bookshelf,
+    History,
     Checklist,
     Settings,
     About,
@@ -59,6 +61,7 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("テーマを切り替え", crate::actions::ToggleTheme),
         MenuItem::separator(),
         MenuItem::action("本棚", crate::actions::ShowBookshelf),
+        MenuItem::action("閲覧履歴", crate::actions::ShowHistory),
         MenuItem::action("チェックリスト", crate::actions::ShowChecklist),
         MenuItem::action("設定", crate::actions::ShowSettings),
         MenuItem::action("説明", crate::actions::ShowAbout),
@@ -79,6 +82,7 @@ pub struct Workspace {
     /// 設定画面（ログアウト等のアクションを委譲）。
     pub settings: Entity<SettingsView>,
     pub bookshelf: Entity<BookshelfView>,
+    pub history: Entity<HistoryView>,
     checklist: Entity<ChecklistView>,
     about: Entity<AboutView>,
     /// Account/ログインパネル。
@@ -109,6 +113,7 @@ impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let settings = cx.new(SettingsView::new);
         let bookshelf = cx.new(BookshelfView::new);
+        let history = cx.new(HistoryView::new);
         let checklist = cx.new(ChecklistView::new);
         let about = cx.new(AboutView::new);
 
@@ -121,6 +126,7 @@ impl Workspace {
             toast_host_generation: 0,
             settings,
             bookshelf,
+            history,
             checklist,
             about,
             auth_panel_open: false,
@@ -293,6 +299,7 @@ impl Workspace {
     fn active_view(&self, _cx: &Context<Self>) -> AnyView {
         match self.active {
             NavTarget::Bookshelf => AnyView::from(self.bookshelf.clone()),
+            NavTarget::History => AnyView::from(self.history.clone()),
             NavTarget::Checklist => AnyView::from(self.checklist.clone()),
             NavTarget::Settings => AnyView::from(self.settings.clone()),
             NavTarget::About => AnyView::from(self.about.clone()),
@@ -310,6 +317,10 @@ impl Workspace {
         if had_reader {
             self.bookshelf.update(cx, |b, cx| b.reload(cx));
             self.refresh_unread_count(cx);
+        }
+        // 履歴は開いた時点のデータを出す（読書直後の新しいセッションを反映する）
+        if target == NavTarget::History {
+            self.history.update(cx, |h, cx| h.reload(cx));
         }
         // ナビゲーションを切り替えたらログイン中のダミー画面を終了する
         // （例: ブックマークアイコンで説明画面を開いたとき）。
@@ -1000,6 +1011,11 @@ impl Workspace {
         reg!(crate::actions::ToggleTheme, |this, cx| this.cycle_theme(cx));
         reg!(crate::actions::ShowBookshelf, |this, cx| {
             this.switch_to(NavTarget::Bookshelf, cx);
+            this.sidebar_open = true;
+            cx.notify();
+        });
+        reg!(crate::actions::ShowHistory, |this, cx| {
+            this.switch_to(NavTarget::History, cx);
             this.sidebar_open = true;
             cx.notify();
         });
@@ -1714,6 +1730,19 @@ impl Workspace {
                     })
                     .child(
                         self.nav_row(
+                            NavTarget::History,
+                            Icon::new(AppIcon::History)
+                                .size(px(24.0))
+                                .into_any_element(),
+                            "閲覧履歴",
+                            open,
+                            active,
+                            handle.clone(),
+                            cx,
+                        ),
+                    )
+                    .child(
+                        self.nav_row(
                             NavTarget::Checklist,
                             Icon::new(AppIcon::ListChecks)
                                 .size(px(24.0))
@@ -1867,6 +1896,7 @@ impl Workspace {
         let label = label.to_string();
         let id = match target {
             NavTarget::Bookshelf => "sidebar-nav-bookshelf",
+            NavTarget::History => "sidebar-nav-history",
             NavTarget::Checklist => "sidebar-nav-checklist",
             _ => "sidebar-nav-other",
         };
@@ -2290,6 +2320,88 @@ mod tests {
         });
         let after = ws.read_with(cx, |w, _| w.sidebar_open);
         assert_ne!(initial, after, "sidebar toggle must flip the open state");
+    }
+
+    /// サイドバーの「閲覧履歴」行が出て、クリックで履歴ビューへ切り替わること。
+    #[gpui_kit::test]
+    async fn sidebar_history_row_switches_to_the_history_view(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+        let row = visual
+            .debug_bounds("sidebar-nav-history")
+            .expect("サイドバーに閲覧履歴の行が出ていない");
+        visual.simulate_click(row.center(), gpui_kit::Modifiers::default());
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::History,
+            "閲覧履歴の行クリックで履歴ビューへ切り替わっていない"
+        );
+        draw(visual);
+        assert!(
+            visual.debug_bounds("history-root").is_some(),
+            "履歴ビューが描画されていない"
+        );
+    }
+
+    /// サイドバーのナビ行は「本棚 → 閲覧履歴 → チェックリスト」の順に並ぶ。
+    #[gpui_kit::test]
+    async fn sidebar_history_row_sits_after_the_bookshelf(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let bookshelf = visual
+            .debug_bounds("sidebar-nav-bookshelf")
+            .expect("本棚の行");
+        let history = visual
+            .debug_bounds("sidebar-nav-history")
+            .expect("閲覧履歴の行");
+        let checklist = visual
+            .debug_bounds("sidebar-nav-checklist")
+            .expect("チェックリストの行");
+        assert!(
+            bookshelf.origin.y < history.origin.y && history.origin.y < checklist.origin.y,
+            "並び順が 本棚 → 閲覧履歴 → チェックリスト になっていない"
+        );
     }
 
     #[gpui_kit::test]

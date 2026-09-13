@@ -2,9 +2,14 @@
 //!
 //! Web 版は `lucide-react` のアイコンを使っている。gpui-component にも
 //! lucide 由来のアイコンはあるが、Web 版で使われていて gpui-component に
-//! 無いもの（book-marked / library-big / list-checks / refresh-cw /
+//! 無いもの（book-marked / library-big / history / list-checks / refresh-cw /
 //! layout-grid / list / circle-user-round / log-in / log-out）は
 //! `assets/icons/*.svg` に lucide-react から生成した SVG を埋め込んで提供する。
+//!
+//! 埋め込んでいる SVG は [Lucide](https://lucide.dev)（ISC License,
+//! Copyright (c) Lucide Icons and Contributors）から取得したもの。ISC は
+//! 再配布時に著作権表示の保持を求めるため、この注記を残すこと
+//! （`assets/icons/*.svg` の生成元は lucide の各アイコン）。
 
 use std::borrow::Cow;
 
@@ -18,6 +23,8 @@ pub enum AppIcon {
     BookMarked,
     /// 本棚（LibraryBigIcon）
     LibraryBig,
+    /// 閲覧履歴（HistoryIcon）
+    History,
     /// チェックリスト（ListChecksIcon）
     ListChecks,
     /// 同期（RefreshCw）
@@ -61,6 +68,7 @@ impl IconNamed for AppIcon {
         match self {
             Self::BookMarked => "icons/book-marked.svg".into(),
             Self::LibraryBig => "icons/library-big.svg".into(),
+            Self::History => "icons/history.svg".into(),
             Self::ListChecks => "icons/list-checks.svg".into(),
             Self::RefreshCw => "icons/refresh-cw.svg".into(),
             Self::LayoutGrid => "icons/layout-grid.svg".into(),
@@ -103,6 +111,7 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
     match path {
         "icons/book-marked.svg" => Some(include_bytes!("../assets/icons/book-marked.svg")),
         "icons/library-big.svg" => Some(include_bytes!("../assets/icons/library-big.svg")),
+        "icons/history.svg" => Some(include_bytes!("../assets/icons/history.svg")),
         "icons/list-checks.svg" => Some(include_bytes!("../assets/icons/list-checks.svg")),
         "icons/refresh-cw.svg" => Some(include_bytes!("../assets/icons/refresh-cw.svg")),
         "icons/layout-grid.svg" => Some(include_bytes!("../assets/icons/layout-grid.svg")),
@@ -137,6 +146,7 @@ mod tests {
         let icons = [
             AppIcon::BookMarked,
             AppIcon::LibraryBig,
+            AppIcon::History,
             AppIcon::ListChecks,
             AppIcon::RefreshCw,
             AppIcon::LayoutGrid,

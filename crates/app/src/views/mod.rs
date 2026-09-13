@@ -6,6 +6,7 @@ pub mod checklist;
 pub mod dlsite_login;
 pub mod fanza_login;
 pub mod google_login;
+pub mod history;
 pub mod reader;
 pub mod settings;
 pub mod tag_edit;
