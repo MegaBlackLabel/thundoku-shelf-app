@@ -11,6 +11,7 @@ use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::tag::{Tag, TagVariant};
 use gpui_kit::component::theme::Colorize as _;
 use gpui_kit::component::tooltip::Tooltip;
@@ -251,6 +252,179 @@ struct BookEntry {
     cover: Option<Arc<RenderImage>>,
 }
 
+/// 並び替えの項目。既定は購入日（新しい順）で、従来の `causedAt DESC` と一致させる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SortField {
+    PurchaseDate,
+    ReleaseDate,
+    LastViewedAt,
+    ViewCount,
+    ViewSeconds,
+    FileSize,
+    Title,
+}
+
+impl SortField {
+    /// メニューに出す順。
+    const ALL: [SortField; 7] = [
+        SortField::PurchaseDate,
+        SortField::ReleaseDate,
+        SortField::Title,
+        SortField::LastViewedAt,
+        SortField::ViewCount,
+        SortField::ViewSeconds,
+        SortField::FileSize,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortField::PurchaseDate => "購入日",
+            SortField::ReleaseDate => "発売日",
+            SortField::LastViewedAt => "最終閲覧日",
+            SortField::ViewCount => "閲覧回数",
+            SortField::ViewSeconds => "閲覧時間",
+            SortField::FileSize => "サイズ",
+            SortField::Title => "タイトル",
+        }
+    }
+
+    /// 方向は「昇順/降順」ではなく項目に合った言葉にする（日付 = 新しい順 など）。
+    fn direction_label(self, ascending: bool) -> &'static str {
+        match self {
+            SortField::PurchaseDate | SortField::ReleaseDate | SortField::LastViewedAt => {
+                if ascending {
+                    "古い順"
+                } else {
+                    "新しい順"
+                }
+            }
+            SortField::ViewCount => {
+                if ascending {
+                    "少ない順"
+                } else {
+                    "多い順"
+                }
+            }
+            SortField::ViewSeconds => {
+                if ascending {
+                    "短い順"
+                } else {
+                    "長い順"
+                }
+            }
+            SortField::FileSize => {
+                if ascending {
+                    "小さい順"
+                } else {
+                    "大きい順"
+                }
+            }
+            SortField::Title => {
+                if ascending {
+                    "A→Z"
+                } else {
+                    "Z→A"
+                }
+            }
+        }
+    }
+
+    /// 項目を切り替えたときの既定方向（タイトルだけ A→Z、他は「大きい / 新しい」順）。
+    fn default_ascending(self) -> bool {
+        matches!(self, SortField::Title)
+    }
+
+    /// この項目が今のカード群で意味を持つか。データが無い項目はメニューに出さない
+    /// （発売日は DLsite だけが取得し、サイズはローカル本にしか無い）。
+    fn is_available(self, cards: &[ShelfCard]) -> bool {
+        match self {
+            SortField::ReleaseDate => cards.iter().any(|card| card.release_date().is_some()),
+            SortField::FileSize => cards.iter().any(|card| card.local.is_some()),
+            _ => true,
+        }
+    }
+
+    /// メニュー行の id / テスト用セレクタ。
+    fn slug(self) -> &'static str {
+        match self {
+            SortField::PurchaseDate => "purchase-date",
+            SortField::ReleaseDate => "release-date",
+            SortField::LastViewedAt => "last-viewed-at",
+            SortField::ViewCount => "view-count",
+            SortField::ViewSeconds => "view-seconds",
+            SortField::FileSize => "file-size",
+            SortField::Title => "title",
+        }
+    }
+}
+
+/// 日付文字列を比較できる `YYYYMMDD` に正規化する。
+///
+/// 購入日 / 発売日はサイトごとに形式が違うため、生の文字列では時系列に並ばない
+/// （技術書典 = RFC3339、BOOTH / DLsite = `YYYY/MM/DD`、FANZA = `YYYY年MM月DD日`）。
+/// 解析できない値は `None`（並びでは常に末尾）。
+pub(crate) fn date_sort_key(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // 日付部分だけ取り出す（`2026-04-12T09:16:36.410Z` と `2026/05/04 17:03` の両方）
+    let date_part = text.split(['T', ' ']).next().unwrap_or(text);
+    let normalized = date_part.replace(['年', '月'], "/").replace('日', "");
+    let parts: Vec<&str> = normalized.split(['/', '-']).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let year = parts[0].trim().parse::<u32>().ok()?;
+    let month = parts[1].trim().parse::<u32>().ok()?;
+    let day = parts[2].trim().parse::<u32>().ok()?;
+    Some(format!("{year:04}{month:02}{day:02}"))
+}
+
+/// ソートボタンのラベル（現在の項目と方向）。
+fn sort_label_for(field: SortField, ascending: bool) -> String {
+    format!(
+        "並び替え: {} {}",
+        field.label(),
+        field.direction_label(ascending)
+    )
+}
+
+/// ソートメニューで選んだ操作。
+#[derive(Debug, Clone, Copy)]
+enum SortAction {
+    Field(SortField),
+    Direction(bool),
+    Reset,
+}
+
+/// ソートの比較値。`None` は「値なし」= 方向に関係なく末尾に置く。
+enum SortValue {
+    Date(Option<String>),
+    Number(Option<i64>),
+    Text(String),
+}
+
+impl SortValue {
+    fn date(raw: Option<&str>) -> Self {
+        SortValue::Date(raw.and_then(date_sort_key))
+    }
+
+    fn is_missing(&self) -> bool {
+        matches!(self, SortValue::Date(None) | SortValue::Number(None))
+    }
+
+    /// 同じ項目内の比較（項目が同じなら型も揃う）。
+    fn cmp_same_kind(&self, other: &SortValue) -> std::cmp::Ordering {
+        match (self, other) {
+            (SortValue::Date(Some(a)), SortValue::Date(Some(b))) => a.cmp(b),
+            (SortValue::Number(Some(a)), SortValue::Number(Some(b))) => a.cmp(b),
+            (SortValue::Text(a), SortValue::Text(b)) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
 /// A single bookshelf card: a `bookshelf_items` row plus its resolved cover
 /// and optional local book (downloaded pack).
 #[derive(Clone)]
@@ -265,6 +439,54 @@ pub(crate) struct ShelfCard {
     cover_fetch_failed: bool,
     /// 関連書籍（同一サークル / 同一作者）の `shelf_cards` インデックス。`reload` で作る。
     related: Vec<usize>,
+    /// 閲覧回数（`view_history` のセッション数）。`reload` で一括取得する。
+    view_count: i64,
+    /// 累計閲覧時間（秒）。
+    view_seconds: i64,
+    /// 最後に開いた時刻。未閲覧は None。
+    last_viewed_at: Option<String>,
+}
+
+impl ShelfCard {
+    /// 購入日（リモート本棚を優先し、無ければローカル本の購入日）。
+    fn purchase_date(&self) -> Option<&str> {
+        non_empty(self.shelf.caused_at.as_deref()).or_else(|| {
+            self.local
+                .as_ref()
+                .and_then(|entry| non_empty(entry.book.purchase_date.as_deref()))
+        })
+    }
+
+    /// 発売日（サイト同期の値を優先し、無ければローカル本の値）。
+    fn release_date(&self) -> Option<&str> {
+        non_empty(self.shelf.release_date.as_deref()).or_else(|| {
+            self.local
+                .as_ref()
+                .and_then(|entry| non_empty(entry.book.release_date.as_deref()))
+        })
+    }
+
+    /// ソート項目に対応する比較値。
+    fn sort_value(&self, field: SortField) -> SortValue {
+        match field {
+            SortField::PurchaseDate => SortValue::date(self.purchase_date()),
+            SortField::ReleaseDate => SortValue::date(self.release_date()),
+            SortField::LastViewedAt => SortValue::date(self.last_viewed_at.as_deref()),
+            // 0 回 / 0 秒は「まだ読んでいない」という値として並べる（末尾固定にしない）
+            SortField::ViewCount => SortValue::Number(Some(self.view_count)),
+            SortField::ViewSeconds => SortValue::Number(Some(self.view_seconds)),
+            // サイズはローカル本にしか無い（未ダウンロードは値なし = 末尾）
+            SortField::FileSize => {
+                SortValue::Number(self.local.as_ref().map(|entry| entry.book.file_size))
+            }
+            SortField::Title => SortValue::Text(self.shelf.title.to_lowercase()),
+        }
+    }
+}
+
+/// 空文字を `None` として扱う（DB は空文字で「値なし」を表すことがある）。
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
 }
 
 /// カード / 行のチップ表示に必要な状態のスナップショット
@@ -572,6 +794,10 @@ pub struct BookshelfView {
     filtered: Vec<usize>,
     /// フィルタ条件が変わったら true（render で filtered を再計算）
     filtered_dirty: bool,
+    /// 並び替えの項目（既定: 購入日の新しい順 = 従来の並び）
+    sort_field: SortField,
+    /// 昇順か（既定は降順 = 新しい順 / 多い順）
+    sort_ascending: bool,
     /// 直前の検索文字列（変更検出用）
     last_search: String,
     /// 本棚グリッドの仮想化リスト状態
@@ -837,6 +1063,8 @@ impl BookshelfView {
             auto_download_started: false,
             filtered: Vec::new(),
             filtered_dirty: true,
+            sort_field: SortField::PurchaseDate,
+            sort_ascending: false,
             last_search: String::new(),
             list_state: gpui_kit::ListState::new(
                 0,
@@ -1099,6 +1327,8 @@ impl BookshelfView {
             let thumbnails_dir = state.data_dir.join("thumbnails");
             // 所有者フィルタ：ログイン中は現在 sub の本、未ログインは未所属(NULL)の本だけ表示。
             let owned = owned_book_ids(state);
+            // ソート用の閲覧統計（回数 / 累計秒 / 最終閲覧）を 1 クエリでまとめて取る
+            let view_stats = db::view_history::view_stats(db).unwrap_or_default();
             let mut entries = Vec::new();
             for book in books::list(db)
                 .unwrap_or_default()
@@ -1272,7 +1502,11 @@ impl BookshelfView {
                         .map(|entry| entry.tags.clone())
                         .unwrap_or_else(|| bookshelf::tags_of(shelf))
                 };
+                let stats = local.and_then(|entry| view_stats.get(&entry.book.id));
                 shelf_cards.push(ShelfCard {
+                    view_count: stats.map_or(0, |stats| stats.count),
+                    view_seconds: stats.map_or(0, |stats| stats.total_seconds),
+                    last_viewed_at: stats.and_then(|stats| stats.last_viewed_at.clone()),
                     shelf: shelf.clone(),
                     cover_fetch_failed: false,
                     local: local.map(|entry| {
@@ -1341,6 +1575,15 @@ impl BookshelfView {
                         cover: entry.cover.clone(),
                         cover_fetch_failed: false,
                         related: Vec::new(),
+                        view_count: view_stats
+                            .get(&entry.book.id)
+                            .map_or(0, |stats| stats.count),
+                        view_seconds: view_stats
+                            .get(&entry.book.id)
+                            .map_or(0, |stats| stats.total_seconds),
+                        last_viewed_at: view_stats
+                            .get(&entry.book.id)
+                            .and_then(|stats| stats.last_viewed_at.clone()),
                     });
                 }
             }
@@ -1366,6 +1609,11 @@ impl BookshelfView {
         ));
         self.entries = entries;
         self.shelf_items = shelf_items;
+        // サイトを切り替えて現在のソート項目が使えなくなったら既定（購入日）に戻す
+        if !self.sort_field.is_available(&shelf_cards) {
+            self.sort_field = SortField::PurchaseDate;
+            self.sort_ascending = false;
+        }
         self.shelf_cards = shelf_cards;
         self.all_tags = all_tags;
         self.tag_counts = tag_counts;
@@ -1637,12 +1885,234 @@ impl BookshelfView {
         .detach();
     }
 
-    /// Shelf cards visible under the current filters.
+    /// Shelf cards visible under the current filters（表示順 = ソート順）。
     fn visible_shelf_cards(&self, cx: &App) -> Vec<&ShelfCard> {
-        self.shelf_cards
+        let mut cards: Vec<&ShelfCard> = self
+            .shelf_cards
             .iter()
             .filter(|card| self.matches_filter(cx, card))
+            .collect();
+        cards.sort_by(|a, b| self.compare_cards(a, b));
+        cards
+    }
+
+    /// ソートの比較。同じ値のときはタイトル昇順で決定的に並べる
+    /// （従来の `ORDER BY ... , title ASC` と同じ）。
+    fn compare_cards(&self, a: &ShelfCard, b: &ShelfCard) -> std::cmp::Ordering {
+        let (a_value, b_value) = (a.sort_value(self.sort_field), b.sort_value(self.sort_field));
+        let base = match (a_value.is_missing(), b_value.is_missing()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            // 値なしは方向に関係なく末尾（`causedAt IS NULL` を末尾にしていたのと同じ）
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => {
+                let order = a_value.cmp_same_kind(&b_value);
+                if self.sort_ascending {
+                    order
+                } else {
+                    order.reverse()
+                }
+            }
+        };
+        base.then_with(|| {
+            a.shelf
+                .title
+                .to_lowercase()
+                .cmp(&b.shelf.title.to_lowercase())
+        })
+    }
+
+    /// フィルタ結果（`filtered`）を作り直す。表示順はソート順に揃える。
+    fn rebuild_filtered(&mut self, cx: &App) {
+        let mut indices: Vec<usize> = (0..self.shelf_cards.len())
+            .filter(|&i| self.matches_filter(cx, &self.shelf_cards[i]))
+            .collect();
+        indices.sort_by(|&a, &b| self.compare_cards(&self.shelf_cards[a], &self.shelf_cards[b]));
+        self.filtered = indices;
+        self.filtered_dirty = false;
+    }
+
+    /// ソート項目を選ぶ（ラジオ）。同じ項目を選び直しても方向は変えない
+    /// （方向は「方向」セクションのラジオで選ぶ）。
+    pub(crate) fn set_sort_field(&mut self, field: SortField, cx: &mut Context<Self>) {
+        if self.sort_field == field {
+            return;
+        }
+        self.sort_field = field;
+        self.sort_ascending = field.default_ascending();
+        self.filtered_dirty = true;
+        cx.notify();
+    }
+
+    /// 方向だけを変える。
+    fn set_sort_direction(&mut self, ascending: bool, cx: &mut Context<Self>) {
+        self.sort_ascending = ascending;
+        self.filtered_dirty = true;
+        cx.notify();
+    }
+
+    /// 既定（購入日の新しい順）に戻す。
+    fn reset_sort(&mut self, cx: &mut Context<Self>) {
+        self.sort_field = SortField::PurchaseDate;
+        self.sort_ascending = false;
+        self.filtered_dirty = true;
+        cx.notify();
+    }
+
+    /// 今のカード群で選べるソート項目（データが無い項目は出さない）。
+    fn available_sort_fields(&self) -> Vec<SortField> {
+        SortField::ALL
+            .iter()
+            .copied()
+            .filter(|field| field.is_available(&self.shelf_cards))
             .collect()
+    }
+
+    fn apply_sort_action(&mut self, action: SortAction, cx: &mut Context<Self>) {
+        match action {
+            SortAction::Field(field) => self.set_sort_field(field, cx),
+            SortAction::Direction(ascending) => self.set_sort_direction(ascending, cx),
+            SortAction::Reset => self.reset_sort(cx),
+        }
+    }
+
+    /// ソートメニューのラジオ行（gpui-kit の `Radio` を使う）。
+    fn sort_radio_row(
+        handle: &Entity<Self>,
+        popover: &Entity<gpui_kit::base::PopoverState>,
+        selector: String,
+        label: String,
+        checked: bool,
+        action: SortAction,
+    ) -> impl IntoElement {
+        let handle = handle.clone();
+        let popover = popover.clone();
+        div().debug_selector(move || selector.clone()).child(
+            Radio::new(SharedString::from(label.clone()))
+                .label(label)
+                .checked(checked)
+                .on_change(move |checked, window, cx| {
+                    if !*checked {
+                        return;
+                    }
+                    handle.update(cx, |this, cx| this.apply_sort_action(action, cx));
+                    // 単一選択なので、選んだらメニューを閉じる
+                    popover.update(cx, |state, cx| state.dismiss(window, cx));
+                }),
+        )
+    }
+
+    /// ソートメニューの実行行（ラジオでは無い操作。例: 既定に戻す）。
+    fn sort_action_row(
+        theme_secondary: Hsla,
+        handle: &Entity<Self>,
+        popover: &Entity<gpui_kit::base::PopoverState>,
+        selector: String,
+        label: String,
+        action: SortAction,
+    ) -> impl IntoElement {
+        let handle = handle.clone();
+        let popover = popover.clone();
+        let element_id = SharedString::from(selector.clone());
+        div()
+            .id(element_id)
+            .debug_selector(move || selector.clone())
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme_secondary))
+            .on_click(move |_, window, cx| {
+                handle.update(cx, |this, cx| this.apply_sort_action(action, cx));
+                popover.update(cx, |state, cx| state.dismiss(window, cx));
+            })
+            .child(div().text_sm().truncate().child(label))
+    }
+
+    /// 並び替えの Popover（項目 + 方向 + 既定に戻す）。
+    /// 項目は `fields` だけ出す（データが無い項目は呼び出し側で落とす）。
+    fn render_sort_popover(
+        theme: &gpui_kit::component::Theme,
+        handle: &Entity<Self>,
+        fields: Vec<SortField>,
+        current: SortField,
+        ascending: bool,
+    ) -> impl IntoElement {
+        let secondary = theme.secondary;
+        let popover_bg = theme.popover;
+        let muted = theme.muted_foreground;
+        let border = theme.border;
+        // content クロージャは 'static なので Entity を所有させる
+        let handle = handle.clone();
+        let label = sort_label_for(current, ascending);
+        let direction_labels = [
+            current.direction_label(false).to_string(),
+            current.direction_label(true).to_string(),
+        ];
+        div()
+            .relative()
+            .debug_selector(|| "bookshelf-sort".into())
+            .child(
+                Popover::new("bookshelf-sort-popover")
+                    .appearance(false)
+                    .anchor(Anchor::TopLeft)
+                    .trigger(
+                        Button::new("bookshelf-sort-button")
+                            .cursor_pointer()
+                            .label(label)
+                            .outline(),
+                    )
+                    .content(move |_state, _window, cx| {
+                        let popover = cx.entity();
+                        let field_rows = fields.iter().map(|field| {
+                            Self::sort_radio_row(
+                                &handle,
+                                &popover,
+                                format!("sort-item-{}", field.slug()),
+                                field.label().to_string(),
+                                *field == current,
+                                SortAction::Field(*field),
+                            )
+                        });
+                        let direction_rows = [false, true].into_iter().map(|asc| {
+                            Self::sort_radio_row(
+                                &handle,
+                                &popover,
+                                format!("sort-dir-{}", if asc { "asc" } else { "desc" }),
+                                direction_labels[usize::from(asc)].clone(),
+                                asc == ascending,
+                                SortAction::Direction(asc),
+                            )
+                        });
+                        div()
+                            .w(px(224.0))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .bg(popover_bg)
+                            .shadow_lg()
+                            .p_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().px_2().text_xs().text_color(muted).child("項目"))
+                            .children(field_rows)
+                            .child(div().my_1().h(px(1.0)).bg(border))
+                            .child(div().px_2().text_xs().text_color(muted).child("方向"))
+                            .children(direction_rows)
+                            .child(div().my_1().h(px(1.0)).bg(border))
+                            .child(Self::sort_action_row(
+                                secondary,
+                                &handle,
+                                &popover,
+                                "sort-reset".into(),
+                                "既定に戻す".into(),
+                                SortAction::Reset,
+                            ))
+                            .into_any_element()
+                    }),
+            )
+            .into_any_element()
     }
 
     /// 1 枚のカードが現在のフィルタ条件に一致するか（visible_shelf_cards と
@@ -3272,12 +3742,9 @@ impl BookshelfView {
     /// 指定した book_id のカードを選択状態にする。`filtered` 内で該当する
     /// カードを探し、見つかれば選択インデックスを更新する。
     fn select_book(&mut self, cx: &App, book_id: &str) {
-        // filtered が未構築なら再計算する。
+        // filtered が未構築なら再計算する（並びはソート順）。
         if self.filtered_dirty {
-            self.filtered = (0..self.shelf_cards.len())
-                .filter(|&i| self.matches_filter(cx, &self.shelf_cards[i]))
-                .collect();
-            self.filtered_dirty = false;
+            self.rebuild_filtered(cx);
         }
         if let Some(pos) = self.filtered.iter().position(|&card_idx| {
             self.shelf_cards[card_idx]
@@ -5111,10 +5578,7 @@ impl Render for BookshelfView {
             self.filtered_dirty = true;
         }
         if self.filtered_dirty {
-            self.filtered = (0..self.shelf_cards.len())
-                .filter(|&i| self.matches_filter(cx, &self.shelf_cards[i]))
-                .collect();
-            self.filtered_dirty = false;
+            self.rebuild_filtered(cx);
         }
         if !self.auto_download_started {
             self.auto_download_started = true;
@@ -5125,6 +5589,8 @@ impl Render for BookshelfView {
         }
         // 技術書典以外のサイト（BOOTH）ではイベント/タグ取得を非表示にする
         let is_booth = self.site_filter.as_deref() == Some("booth");
+        // イベントフィルタは技術書典の本棚の概念なので、それ以外のサイトでは出さない
+        let is_techbookfest = self.site_filter.as_deref() == Some("techbookfest");
         let visible: Vec<&ShelfCard> = self.visible_shelf_cards(cx);
         let visible_count = visible.len();
         let view_mode = self.view_mode;
@@ -5365,10 +5831,10 @@ impl Render for BookshelfView {
                                 }),
                             )
                             // イベントフィルタ（Web の eventDropdown 相当: Popover + チェックボックス行）。
-                            // 技術書典専用機能のため BOOTH フィルタ時は非表示
+                            // 技術書典の本棚の概念なので、技術書典以外のサイトでは出さない
                             .child(
                                 div()
-                                    .when(is_booth, |this| this.hidden())
+                                    .when(!is_techbookfest, |this| this.hidden())
                                     .relative()
                                     .debug_selector(|| "event-filter-trigger".into())
                                     .child(
@@ -5654,23 +6120,35 @@ impl Render for BookshelfView {
                             .flex_row()
                             .items_center()
                             .gap_2()
+                            // 並び替え（項目 + 方向。データが無い項目はメニューに出さない）
+                            .child(Self::render_sort_popover(
+                                cx.theme(),
+                                &handle,
+                                self.available_sort_fields(),
+                                self.sort_field,
+                                self.sort_ascending,
+                            ))
                             // タグ取得 ON/OFF（Web の tagFetchEnabled トグル、デフォルト OFF）
                             // 表示切替（Web の viewMode トグル: タイル/リスト）
                             .child(
-                                Button::new("bookshelf-view-toggle").cursor_pointer()
-                                    .icon(if view_mode == ViewMode::Card {
-                                        AppIcon::List
-                                    } else {
-                                        AppIcon::LayoutGrid
-                                    })
-                                    .outline().cursor_pointer().on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| {
-                                            this.toggle_view_mode(cx);
-                                        });
-                                    }
-                                }),
+                                div()
+                                    .debug_selector(|| "bookshelf-view-toggle".into())
+                                    .child(
+                                        Button::new("bookshelf-view-toggle").cursor_pointer()
+                                            .icon(if view_mode == ViewMode::Card {
+                                                AppIcon::List
+                                            } else {
+                                                AppIcon::LayoutGrid
+                                            })
+                                            .outline().cursor_pointer().on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.toggle_view_mode(cx);
+                                                });
+                                            }
+                                        }),
+                                    ),
                             )
                             .child(
                                 if is_booth {
@@ -6662,9 +7140,449 @@ mod tests {
     use gpui_kit::TestAppContext;
     use thundoku_core::import::{ImportPlan, MediaKind, PlannedContent, PlannedRendition};
 
-    use thundoku_core::db::{books, progress};
+    use thundoku_core::db::{books, progress, view_history};
 
     use super::*;
+
+    /// ソート検証用: 購入日 / 発売日を指定して本棚アイテムを seed する。
+    fn seed_sort_item(
+        cx: &mut TestAppContext,
+        site_id: &str,
+        database_id: &str,
+        title: &str,
+        caused_at: Option<&str>,
+        release_date: Option<&str>,
+    ) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            bookshelf::upsert(
+                db,
+                &bookshelf::BookshelfItem {
+                    site_id: site_id.into(),
+                    database_id: database_id.into(),
+                    title: title.into(),
+                    circle_name: "サークル".into(),
+                    author: String::new(),
+                    thumbnail_url: None,
+                    format: "PDF".into(),
+                    caused_at: caused_at.map(String::from),
+                    event_name: None,
+                    event_slug: None,
+                    event_id: None,
+                    file_name: None,
+                    download_url: None,
+                    is_downloadable: 1,
+                    is_checked: 0,
+                    is_purchased: 1,
+                    is_new: 0,
+                    is_active: 1,
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    hidden_at: None,
+                    tags_json: None,
+                    synced_at: "2026-08-21 00:00:00".into(),
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: release_date.map(String::from),
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    /// 閲覧セッションを N 回つくる（閲覧回数ソート用）。
+    fn seed_views(cx: &mut TestAppContext, book_id: &str, times: usize) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            for _ in 0..times {
+                let session = view_history::start(db, book_id).unwrap();
+                view_history::end(db, &session.id).unwrap();
+            }
+        });
+    }
+
+    /// 表示中のカードのタイトル（ソート検証用）。
+    fn visible_titles(view: &Entity<BookshelfView>, cx: &mut TestAppContext) -> Vec<String> {
+        view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.title.clone())
+                .collect()
+        })
+    }
+
+    /// その要素が実際に描かれているか（`hidden()` は 0x0 で登録されるため、
+    /// bounds の有無だけでは判定できない）。
+    fn rendered(visual: &mut gpui_kit::VisualTestContext, selector: &'static str) -> bool {
+        visual.debug_bounds(selector).is_some_and(|bounds| {
+            bounds.size.width.as_f32() > 0.0 && bounds.size.height.as_f32() > 0.0
+        })
+    }
+
+    /// 数フレーム描く（仮想化リストの測定のため）。
+    fn draw_frames(visual: &mut gpui_kit::VisualTestContext) {
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+    }
+
+    /// サイトごとに日付形式が違っても時系列に並べられるよう正規化する。
+    #[test]
+    fn date_sort_key_normalizes_every_site_date_format() {
+        // 技術書典 = RFC3339 / BOOTH = slash + 秒 / DLsite = slash + 分 / FANZA = 年月日
+        assert_eq!(
+            date_sort_key("2026-04-12T09:16:36.410Z").as_deref(),
+            Some("20260412")
+        );
+        assert_eq!(
+            date_sort_key("2026/05/04 17:03").as_deref(),
+            Some("20260504")
+        );
+        assert_eq!(date_sort_key("2026年09月03日").as_deref(), Some("20260903"));
+        assert_eq!(
+            date_sort_key("2025-06-17 16:00:00").as_deref(),
+            Some("20250617")
+        );
+        // 0 埋めして比較できるようにする
+        assert_eq!(date_sort_key("2026/9/3").as_deref(), Some("20260903"));
+        // 値なし / 解析できない値は None（並びでは末尾）
+        assert_eq!(date_sort_key(""), None);
+        assert_eq!(date_sort_key("   "), None);
+        assert_eq!(date_sort_key("日付なし"), None);
+
+        let mut keys: Vec<String> = [
+            "2026年09月03日",
+            "2025-06-17 16:00:00",
+            "2026-04-12T09:16:36.410Z",
+        ]
+        .iter()
+        .filter_map(|raw| date_sort_key(raw))
+        .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["20250617", "20260412", "20260903"],
+            "時系列に並ぶ"
+        );
+    }
+
+    /// 購入日ソート: 形式が混ざった全サイトでも時系列になる（既定 = 新しい順）。
+    #[gpui_kit::test]
+    async fn sort_by_purchase_date_orders_across_site_formats(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_sort_item(
+            cx,
+            "techbookfest",
+            "db-1",
+            "TBF の本",
+            Some("2026-04-12T09:16:36.410Z"),
+            None,
+        );
+        seed_sort_item(
+            cx,
+            "fanza",
+            "db-2",
+            "FANZA の本",
+            Some("2026年09月03日"),
+            None,
+        );
+        seed_sort_item(
+            cx,
+            "booth",
+            "db-3",
+            "BOOTH の本",
+            Some("2026/05/04 17:03"),
+            None,
+        );
+        seed_sort_item(
+            cx,
+            "booth",
+            "db-4",
+            "古い本",
+            Some("2025-06-17 16:00:00"),
+            None,
+        );
+        let view = cx.new(BookshelfView::new);
+        assert_eq!(
+            visible_titles(&view, cx),
+            vec!["FANZA の本", "BOOTH の本", "TBF の本", "古い本"],
+            "既定は購入日の新しい順"
+        );
+        // 方向は「方向」セクションで選ぶ（同じ項目を選び直しても方向は変わらない）
+        view.update(cx, |this, cx| {
+            this.set_sort_direction(true, cx);
+            this.set_sort_field(SortField::PurchaseDate, cx);
+        });
+        assert!(
+            view.read_with(cx, |this, _| this.sort_ascending),
+            "同じ項目を選び直すと方向が戻ってしまっている"
+        );
+        assert_eq!(
+            visible_titles(&view, cx),
+            vec!["古い本", "TBF の本", "BOOTH の本", "FANZA の本"],
+            "昇順は古い順"
+        );
+        // 値なし（購入日なし）は方向に関係なく末尾
+        seed_sort_item(cx, "booth", "db-5", "日付なしの本", None, None);
+        view.update(cx, |this, cx| {
+            this.reload(cx);
+            this.set_sort_field(SortField::PurchaseDate, cx);
+            this.set_sort_direction(false, cx);
+        });
+        assert_eq!(
+            visible_titles(&view, cx).last().map(String::as_str),
+            Some("日付なしの本"),
+            "値なしは末尾"
+        );
+    }
+
+    /// 閲覧回数ソート: 多い順 / 少ない順。0 回は「0」として並ぶ（末尾固定ではない）。
+    #[gpui_kit::test]
+    async fn sort_by_view_count_orders_desc_and_asc(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        for (db_id, book_id, title, views) in [
+            ("db-1", "b1", "2 回の本", 2),
+            ("db-2", "b2", "5 回の本", 5),
+            ("db-3", "b3", "0 回の本", 0),
+        ] {
+            seed_sort_item(cx, "fanza", db_id, title, Some("2026年01月01日"), None);
+            seed_book(cx, book_id, title, "サークル");
+            link_book_to_shelf(cx, book_id, db_id);
+            seed_views(cx, book_id, views);
+        }
+        let view = cx.new(BookshelfView::new);
+        // 閲覧回数の多い順
+        view.update(cx, |this, cx| this.set_sort_field(SortField::ViewCount, cx));
+        assert_eq!(
+            visible_titles(&view, cx),
+            vec!["5 回の本", "2 回の本", "0 回の本"],
+            "閲覧回数の多い順"
+        );
+        // 少ない順
+        view.update(cx, |this, cx| this.set_sort_direction(true, cx));
+        assert_eq!(
+            visible_titles(&view, cx),
+            vec!["0 回の本", "2 回の本", "5 回の本"],
+            "閲覧回数の少ない順"
+        );
+    }
+
+    /// データが無い項目はメニューに出さない（発売日 = DLsite のみ / サイズ = ローカルのみ）。
+    #[gpui_kit::test]
+    async fn sort_fields_are_unavailable_without_data(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_sort_item(
+            cx,
+            "fanza",
+            "db-1",
+            "FANZA の本",
+            Some("2026年01月01日"),
+            None,
+        );
+        seed_sort_item(
+            cx,
+            "dlsite",
+            "db-2",
+            "DLsite の本",
+            Some("2026/01/02"),
+            None,
+        );
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE bookshelf_items SET release_date = '2025-06-17 16:00:00' WHERE database_id = 'db-2'")
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        let available =
+            |field: SortField| view.read_with(cx, |this, _| field.is_available(&this.shelf_cards));
+        // 発売日は dlsite の 1 冊だけ → 出る
+        assert!(available(SortField::ReleaseDate), "発売日ありなら出る");
+        // ローカル本が無いのでサイズは出ない
+        assert!(
+            !available(SortField::FileSize),
+            "ローカル本が無ければサイズは出ない"
+        );
+        // 常に出る項目
+        for field in [
+            SortField::PurchaseDate,
+            SortField::ViewCount,
+            SortField::ViewSeconds,
+            SortField::LastViewedAt,
+            SortField::Title,
+        ] {
+            assert!(available(field), "{:?} は常に出る", field.label());
+        }
+        // 発売日を消すと出なくなる
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE bookshelf_items SET release_date = NULL")
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
+        });
+        view.update(cx, |this, cx| this.reload(cx));
+        assert!(
+            !view.read_with(cx, |this, _| SortField::ReleaseDate
+                .is_available(&this.shelf_cards)),
+            "発売日が無ければ出さない"
+        );
+        // ローカル本を紐付けるとサイズが出る
+        seed_book(cx, "b1", "FANZA の本", "サークル");
+        link_book_to_shelf(cx, "b1", "db-1");
+        view.update(cx, |this, cx| this.reload(cx));
+        assert!(
+            view.read_with(cx, |this, _| SortField::FileSize
+                .is_available(&this.shelf_cards)),
+            "ローカル本があればサイズは出る"
+        );
+    }
+
+    /// ソートボタンは表示切替の左隣に置く。イベントフィルタは技術書典のときだけ出す。
+    #[gpui_kit::test]
+    async fn sort_button_sits_left_of_view_toggle_and_event_hides_outside_tbf(
+        cx: &mut TestAppContext,
+    ) {
+        // ツールバーは 2 段目に 10 個以上のコントロールが並ぶため、実際に使う幅で見る
+
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_sort_item(
+            cx,
+            "fanza",
+            "db-1",
+            "FANZA の本",
+            Some("2026年01月01日"),
+            None,
+        );
+        seed_shelf_item(cx, "db-2", "技術書典の本", "サークル", None);
+        let view = cx.new(BookshelfView::new);
+        view.update(cx, |this, cx| this.set_site_filter(cx, Some("fanza")));
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1280.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+
+        let sort = visual
+            .debug_bounds("bookshelf-sort")
+            .expect("ソートボタンが出ていない");
+        let toggle = visual
+            .debug_bounds("bookshelf-view-toggle")
+            .expect("表示切替が出ていない");
+        assert!(
+            sort.origin.x.as_f32() + sort.size.width.as_f32() <= toggle.origin.x.as_f32() + 1.0,
+            "ソートボタンが表示切替の左に無い: sort_right={} toggle_left={}",
+            sort.origin.x.as_f32() + sort.size.width.as_f32(),
+            toggle.origin.x.as_f32()
+        );
+        // ツールバーが溢れて表示切替が画面外に出ていない
+        assert!(
+            toggle.origin.x.as_f32() + toggle.size.width.as_f32() <= 1280.0,
+            "ツールバーが溢れて表示切替が画面外: toggle_right={}",
+            toggle.origin.x.as_f32() + toggle.size.width.as_f32()
+        );
+        assert!(
+            !rendered(&mut *visual, "event-filter-trigger"),
+            "FANZA でイベントフィルタが出ている"
+        );
+        assert!(
+            rendered(&mut *visual, "bookshelf-sort"),
+            "FANZA でソートボタンが出ていない"
+        );
+
+        // 技術書典に切り替えるとイベントフィルタが出る
+        view.update(cx, |this, cx| {
+            this.set_site_filter(cx, Some("techbookfest"))
+        });
+        draw_frames(&mut *visual);
+        assert!(
+            rendered(&mut *visual, "event-filter-trigger"),
+            "技術書典でイベントフィルタが出ていない"
+        );
+
+        // ソートポップオーバーから項目と方向を選ぶと並びが変わる
+        view.update(cx, |this, cx| this.set_site_filter(cx, None));
+        seed_sort_item(
+            cx,
+            "fanza",
+            "db-3",
+            "新しい本",
+            Some("2026年12月31日"),
+            None,
+        );
+        view.update(cx, |this, cx| this.reload(cx));
+        draw_frames(&mut *visual);
+        let sort = visual.debug_bounds("bookshelf-sort").expect("ソートボタン");
+        visual.simulate_click(sort.center(), gpui_kit::Modifiers::default());
+        draw_frames(&mut *visual);
+        let item = visual
+            .debug_bounds("sort-item-view-count")
+            .expect("閲覧回数の項目が出ていない");
+        visual.simulate_click(item.center(), gpui_kit::Modifiers::default());
+        draw_frames(&mut *visual);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.sort_field),
+            SortField::ViewCount,
+            "ポップオーバーから閲覧回数を選べていない"
+        );
+        // 単一選択なのでメニューは閉じる
+        assert!(
+            !rendered(&mut *visual, "sort-item-view-count"),
+            "項目を選んでもメニューが閉じていない"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| sort_label_for(
+                this.sort_field,
+                this.sort_ascending
+            )),
+            "並び替え: 閲覧回数 多い順",
+            "ボタンのラベルに現在の項目と方向が出ていない"
+        );
+
+        // ラジオなので、選択済みの項目を選び直しても状態は変わらない（方向も維持）
+        view.update(cx, |this, cx| this.set_sort_direction(true, cx));
+        let sort = visual.debug_bounds("bookshelf-sort").expect("ソートボタン");
+        visual.simulate_click(sort.center(), gpui_kit::Modifiers::default());
+        draw_frames(&mut *visual);
+        let item = visual
+            .debug_bounds("sort-item-view-count")
+            .expect("閲覧回数の項目が出ていない");
+        visual.simulate_click(item.center(), gpui_kit::Modifiers::default());
+        draw_frames(&mut *visual);
+        assert_eq!(
+            (
+                view.read_with(cx, |this, _| this.sort_field),
+                view.read_with(cx, |this, _| this.sort_ascending),
+            ),
+            (SortField::ViewCount, true),
+            "選択済みの項目を選び直すと状態が変わっている"
+        );
+    }
 
     /// サイトを指定して本棚アイテムを seed する（`seed_shelf_item` は技術書典固定のため）。
     fn seed_shelf_item_for_site(
@@ -10481,10 +11399,14 @@ mod tests {
         cx.update(AppState::init_test);
         seed_shelf_item_with_event(cx, "db-1", "本1", "サークルA", "技術書典18");
         let view = cx.new(BookshelfView::new);
+        // イベントフィルタは技術書典の本棚のときだけ出る（他のサイトでは非表示）
+        view.update(cx, |this, cx| {
+            this.set_site_filter(cx, Some("techbookfest"))
+        });
         let window = cx.open_window(
             gpui_kit::Size {
-                width: gpui_kit::px(900.0),
-                height: gpui_kit::px(600.0),
+                width: gpui_kit::px(1280.0),
+                height: gpui_kit::px(800.0),
             },
             |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );

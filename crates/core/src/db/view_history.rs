@@ -65,6 +65,47 @@ pub fn view_count(pool: &SqlitePool, book_id: &str) -> Result<i64, sqlx::Error> 
     })
 }
 
+/// 1 冊ぶんの閲覧統計（本棚のソート用）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewStats {
+    /// 閲覧回数（セッション数）
+    pub count: i64,
+    /// 累計閲覧時間（秒）
+    pub total_seconds: i64,
+    /// 最後に開いた時刻（ended_at が無ければ started_at）
+    pub last_viewed_at: Option<String>,
+}
+
+/// 全書籍の閲覧統計を 1 クエリでまとめて取る（本棚のソート用。0 回の本は行が無い）。
+pub fn view_stats(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<String, ViewStats>, sqlx::Error> {
+    crate::db::block_on(async {
+        let rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
+            "SELECT book_id, COUNT(*), \
+             CAST(COALESCE(SUM(CAST(julianday(COALESCE(ended_at, started_at)) - \
+               julianday(started_at) AS REAL) * 86400), 0) AS INTEGER), \
+             MAX(COALESCE(ended_at, started_at)) \
+             FROM view_history GROUP BY book_id",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(book_id, count, total_seconds, last_viewed_at)| {
+                (
+                    book_id,
+                    ViewStats {
+                        count,
+                        total_seconds,
+                        last_viewed_at,
+                    },
+                )
+            })
+            .collect())
+    })
+}
+
 /// 累計閲覧時間（秒）。ended_at - started_at の合計。
 pub fn total_duration_secs(pool: &SqlitePool, book_id: &str) -> Result<i64, sqlx::Error> {
     crate::db::block_on(async {
@@ -161,6 +202,66 @@ mod tests {
     /// 履歴画面用の集約: 1 日 1 本にまとめ、閲覧時間を合算し、新しい日から並べる。
     /// 時刻は UTC（`CURRENT_TIMESTAMP`）なので、**ローカル日付**で日を切ることを確認する
     /// （UTC 20:00 = 日本時間 翌 05:00 のような時刻を使う）。
+    #[test]
+    fn view_stats_returns_count_duration_and_last_view_per_book() {
+        let pool = crate::db::test_pool();
+        for id in ["b1", "b2", "b3"] {
+            crate::db::books::insert(&pool, &test_book(id)).unwrap();
+        }
+        // b1 は 2 回、b2 は 1 回（touch のみ = ended_at あり）、b3 は 0 回
+        for _ in 0..2 {
+            let session = start(&pool, "b1").unwrap();
+            end(&pool, &session.id).unwrap();
+        }
+        let session = start(&pool, "b2").unwrap();
+        touch(&pool, &session.id).unwrap();
+
+        let stats = view_stats(&pool).unwrap();
+        let b1 = stats.get("b1").expect("b1 の行");
+        assert_eq!(b1.count, 2, "b1 は 2 回");
+        assert!(b1.last_viewed_at.is_some(), "最終閲覧が入る");
+        assert!(!b1.last_viewed_at.as_deref().unwrap().is_empty());
+        let b2 = stats.get("b2").expect("b2 の行");
+        assert_eq!(b2.count, 1, "b2 は 1 回");
+        assert!(!stats.contains_key("b3"), "0 回の本は行を作らない");
+
+        // 最終閲覧は新しいセッションで更新される（開始時刻で比較できる）
+        let b1_last = b1.last_viewed_at.clone().unwrap();
+        let session = start(&pool, "b1").unwrap();
+        end(&pool, &session.id).unwrap();
+        let stats = view_stats(&pool).unwrap();
+        let b1 = stats.get("b1").expect("b1 の行");
+        assert_eq!(b1.count, 3, "3 回目");
+        assert!(
+            b1.last_viewed_at.as_deref().unwrap() >= b1_last.as_str(),
+            "最終閲覧が巻き戻った: {} < {b1_last}",
+            b1.last_viewed_at.as_deref().unwrap()
+        );
+    }
+
+    #[test]
+    fn view_stats_sums_session_seconds() {
+        let pool = crate::db::test_pool();
+        crate::db::books::insert(&pool, &test_book("b1")).unwrap();
+        let session = start(&pool, "b1").unwrap();
+        // 10 分前 + 5 分前 のセッションを作る（ended_at を直接更新）
+        crate::db::block_on(async {
+            sqlx::query("UPDATE view_history SET started_at = ?1, ended_at = ?2 WHERE id = ?3")
+                .bind("2026-09-01 10:00:00")
+                .bind("2026-09-01 10:10:00")
+                .bind(&session.id)
+                .execute(&pool)
+                .await
+        })
+        .unwrap();
+        let stats = view_stats(&pool).unwrap();
+        assert_eq!(
+            stats.get("b1").unwrap().total_seconds,
+            600,
+            "10 分 = 600 秒"
+        );
+    }
+
     #[test]
     fn list_daily_groups_by_local_day_and_sums_durations() {
         let pool = crate::db::test_pool();
