@@ -4,6 +4,43 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use rand::RngCore;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// プロセス内キャッシュ（`service:user` → secret）。
+///
+/// keychain の読み出しは OS の許可ダイアログを伴い得る。とくに開発ビルドは
+/// 再ビルドのたびにバイナリの署名が変わり、アイテムの ACL が無効化されるため
+/// 毎回確認される。`db_key()` のように本棚・履歴・ノートの表示経路から何度も
+/// 読まれる値ではダイアログが連続してしまうので、プロセス内で 1 度読んだら
+/// 使い回す（`save` / `delete` ではキャッシュも更新する）。
+fn cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_key(service: &str, user: &str) -> String {
+    format!("{service}:{user}")
+}
+
+fn cache_get(key: &str) -> Option<Option<String>> {
+    let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
+    guard.get(key).cloned()
+}
+
+fn cache_put(key: String, value: Option<String>) {
+    cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, value);
+}
+
+fn cache_remove(key: &str) {
+    cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(key);
+}
 
 pub const SERVICE: &str = "com.megablacklabel.thundoku-shelf";
 pub const USER_TECHBOOKFEST: &str = "techbookfest";
@@ -42,27 +79,39 @@ impl SecretStore {
             .map_err(|e| SecretError::Keyring(e.to_string()))?;
         entry
             .set_password(secret)
-            .map_err(|e| SecretError::Keyring(e.to_string()))
+            .map_err(|e| SecretError::Keyring(e.to_string()))?;
+        cache_put(cache_key(self.service, user), Some(secret.to_string()));
+        Ok(())
     }
 
     pub fn load(&self, user: &str) -> Result<Option<String>, SecretError> {
+        let key = cache_key(self.service, user);
+        if let Some(hit) = cache_get(&key) {
+            return Ok(hit);
+        }
         let entry = keyring::Entry::new(self.service, user)
             .map_err(|e| SecretError::Keyring(e.to_string()))?;
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(SecretError::Keyring(e.to_string())),
-        }
+        let value = match entry.get_password() {
+            Ok(secret) => Some(secret),
+            Err(keyring::Error::NoEntry) => None,
+            // 一過性の失敗は覚えない（次回に再試行させる）
+            Err(e) => return Err(SecretError::Keyring(e.to_string())),
+        };
+        cache_put(key, value.clone());
+        Ok(value)
     }
 
     pub fn delete(&self, user: &str) -> Result<(), SecretError> {
         let entry = keyring::Entry::new(self.service, user)
             .map_err(|e| SecretError::Keyring(e.to_string()))?;
-        match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
+        let result = match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(SecretError::Keyring(e.to_string())),
+        };
+        if result.is_ok() {
+            cache_remove(&cache_key(self.service, user));
         }
+        result
     }
 
     /// `books.owner_sub` の暗号化用ローカル鍵（32 byte）。無ければ新規生成して保存する。
