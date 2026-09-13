@@ -28,6 +28,9 @@ use crate::actions::CloseReader;
 use crate::icons::AppIcon;
 use thundoku_core::db::documents::DocumentImage;
 
+/// 付箋アイコンの一辺（px）。ボタン、アイコン、単一表示の位置計算で共有する。
+pub const NOTE_ICON_SIZE: f32 = 28.0;
+
 pub const AUTOPLAY_MIN_MS: u64 = 3000;
 pub const AUTOPLAY_MAX_MS: u64 = 30000;
 pub const AUTOPLAY_DEFAULT_MS: u64 = 5000;
@@ -381,6 +384,10 @@ pub struct ImageViewer {
     page_list_state: gpui_kit::ListState,
     /// 名前を編集中のコンテンツ id（空 = 編集していない）。
     renaming_content: Option<String>,
+    /// 付箋（ページ単位のメモ）を使うか。本の閲覧のみ true（試し読みでは出さない）。
+    notes_enabled: bool,
+    /// 付箋が付いているページ（0-indexed）。ページ右上の付箋アイコンの色に使う。
+    noted_pages: std::collections::HashSet<usize>,
     /// 名前入力（メニューの切替行にインライン表示する。1 つを使い回す）。
     rename_input: Option<Entity<InputState>>,
     _rename_subscription: Option<Subscription>,
@@ -525,6 +532,8 @@ impl ImageViewer {
             inertia_generation: 0,
             last_zoom_toggle: None,
             active_panel: None,
+            notes_enabled: false,
+            noted_pages: std::collections::HashSet::new(),
             page_input: None,
             thumbs_loading: std::collections::HashSet::new(),
             thumb_order: std::collections::VecDeque::new(),
@@ -1231,6 +1240,19 @@ impl ImageViewer {
         }
     }
 
+    /// 付箋を有効 / 無効にする（本の閲覧のみ有効）。`noted` は付箋が付いているページ
+    /// （0-indexed）で、ページ右上のアイコンの色に使う。
+    pub fn set_notes(
+        &mut self,
+        enabled: bool,
+        noted: std::collections::HashSet<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notes_enabled = enabled;
+        self.noted_pages = noted;
+        cx.notify();
+    }
+
     pub fn set_page(&mut self, cx: &mut Context<Self>, page: usize) {
         if page == self.current_page {
             return;
@@ -1292,6 +1314,119 @@ impl ImageViewer {
         } else {
             vec![self.current_page]
         }
+    }
+
+    /// ページ画像の上端に重ねる付箋ボタン（しおり型の枠だけ）。
+    ///
+    /// - 表示 / 非表示はトップバー・ボトムドックと同じ条件
+    ///   （`overlay_visible && !zoomed`）に揃える
+    /// - 付箋ありは青系で塗り、未付箋は半透明の灰色の枠のみ
+    /// - クリックすると `NotePageRequest` を投げ、親（`ReaderView`）がダイアログを開く
+    ///
+    /// `anchor` = `Some((left, top))` のときはその座標（実際に描かれている画像の左上）に置く。
+    /// 単一表示では画像が枠いっぱいとは限らない（contain で中央寄せ）ため、
+    /// 呼び出し側が画像の矩形を計算して渡す。`None` はページ枠の上端・右端（Scroll / Spread）。
+    fn render_note_button(&self, index: usize, anchor: Option<(f32, f32)>) -> gpui_kit::AnyElement {
+        // トップバー / ボトムドックと同じ表示条件（拡大中も隠す）
+        if !self.notes_enabled || !self.overlay_visible || self.zoomed {
+            return div().into_any_element();
+        }
+        // 単一表示は呼び出し側（画像の矩形を知っている）が置くので、ここでは出さない
+        if self.mode == ViewMode::Single && anchor.is_none() {
+            return div().into_any_element();
+        }
+        let noted = self.noted_pages.contains(&index);
+        // 見開きのときは左右どちらに表示しているかも送る（開き直しで同じ側に出すため）
+        let side = {
+            let pair = self.spread_pages();
+            (pair.len() == 2).then(|| {
+                if pair.first() == Some(&index) {
+                    thundoku_core::db::notes::SpreadSide::Left
+                } else {
+                    thundoku_core::db::notes::SpreadSide::Right
+                }
+            })
+        };
+        let page = index as i64 + 1;
+        // 画像の上端に合わせる。枠だけなので背景は置かない。
+        let mut button = div()
+            .id(gpui_kit::ElementId::Name(SharedString::from(format!(
+                "viewer-note-{index}"
+            ))))
+            .debug_selector(move || format!("viewer-note-{index}"))
+            .absolute();
+        button = match anchor {
+            Some((left, top)) => button.left(px(left)).top(px(top)),
+            // 画像の上端にぴったり合わせる。上辺の線はアイコンのアセット側で描いておらず、
+            // deferred では画像のクリップが効かない（はみ出すと見えてしまう）ため食い込ませない
+            None => button.top_0().right_0(),
+        };
+        // z-order: deferred にすると「レイアウトはその場・描画は最後」になるため、
+        // トップバー / ボトムドックやページ送りのナビ帯より上でクリックを受けられる。
+        gpui_kit::deferred(
+            button
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(NOTE_ICON_SIZE))
+                .h(px(NOTE_ICON_SIZE))
+                .cursor_pointer()
+                // ON / OFF で形は同じ（しおりの枠）。色だけ変える（ON = 青系）
+                .text_color(if noted {
+                    gpui_kit::Hsla::from(gpui_kit::rgb(0x2563eb))
+                } else {
+                    gpui_kit::Hsla::from(gpui_kit::rgb(0x64748b))
+                })
+                .opacity(if noted { 1.0 } else { 0.7 })
+                .hover(|style| style.opacity(1.0))
+                // ページのダブルクリック拡大・ページ送りナビに伝播させない
+                .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.defer(move |cx| {
+                        cx.dispatch_action(&crate::actions::NotePageRequest {
+                            page,
+                            side: side.map(|side| {
+                                SharedString::from(match side {
+                                    thundoku_core::db::notes::SpreadSide::Left => "left",
+                                    thundoku_core::db::notes::SpreadSide::Right => "right",
+                                })
+                            }),
+                        });
+                    });
+                })
+                // 付箋あり: 中を半透明の青で塗る（同じ形の塗りアイコンを重ねる）
+                .when(noted, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(NOTE_ICON_SIZE))
+                            .h(px(NOTE_ICON_SIZE))
+                            .debug_selector({
+                                let selector = format!("viewer-note-fill-{index}");
+                                move || selector.clone()
+                            })
+                            .child(
+                                gpui_kit::component::Icon::new(
+                                    crate::icons::AppIcon::BookmarkFilled,
+                                )
+                                .size(px(NOTE_ICON_SIZE))
+                                .opacity(0.35),
+                            ),
+                    )
+                })
+                // 枠は ON / OFF とも同じ（しおりの枠）
+                .child(
+                    gpui_kit::component::Icon::new(crate::icons::AppIcon::Bookmark)
+                        .size(px(NOTE_ICON_SIZE)),
+                )
+                .into_any_element(),
+        )
+        .into_any_element()
     }
 
     fn ensure_loaded(&mut self, cx: &mut Context<Self>, index: usize) {
@@ -1813,6 +1948,8 @@ impl ImageViewer {
                         .size_full()
                         .bg(viewer_bg())
                         .overflow_hidden()
+                        .relative()
+                        .child(self.render_note_button(index, None))
                         // ダブルクリックで拡大トグル、拡大中はドラッグでパン
                         .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
@@ -1912,6 +2049,8 @@ impl ImageViewer {
                         .size_full()
                         .bg(viewer_bg())
                         .overflow_hidden()
+                        .relative()
+                        .child(self.render_note_button(index, None))
                         // ダブルクリックで拡大（通常時でも効くようにここにも付ける）
                         .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
@@ -1947,6 +2086,8 @@ impl ImageViewer {
                 // （pack が無い / 壊れている = 再ダウンロードが必要）
                 Some(error) => div()
                     .size_full()
+                    .relative()
+                    .child(self.render_note_button(index, None))
                     .bg(viewer_bg())
                     .flex()
                     .flex_col()
@@ -1968,6 +2109,8 @@ impl ImageViewer {
                 // 「止まってる感じ」を出さない（数十 ms で画像に差し替わる）
                 None => div()
                     .size_full()
+                    .relative()
+                    .child(self.render_note_button(index, None))
                     .bg(viewer_bg())
                     .flex()
                     .items_center()
@@ -2106,298 +2249,330 @@ impl Render for ImageViewer {
                     });
                 })
         };
-        let main = if mode == ViewMode::Scroll {
-            let rendered: Vec<gpui_kit::AnyElement> = pages
-                .iter()
-                .map(|index| {
-                    // 各ページはコンテナ幅にフィットした高さ（アスペクト比）で
-                    // 縦に連続させる。size_full だと flex が縮めて重なりに見える。
-                    let (width, height) = self.loader.page_size(*index).unwrap_or((0, 0));
-                    let aspect = if width > 0 && height > 0 {
-                        width as f32 / height as f32
-                    } else {
-                        100.0 / 141.0
-                    };
-                    // 表示幅の 80% で中央寄せ（Web 版の scroll モード相当）
-                    div()
-                        .w_full()
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(gpui_kit::Length::Definite(
-                                    gpui_kit::DefiniteLength::Fraction(0.8),
-                                ))
-                                .aspect_ratio(aspect)
-                                .bg(viewer_bg())
-                                .overflow_hidden()
-                                .child(self.render_page(muted, *index, zoom_progress)),
-                        )
-                        .into_any_element()
-                })
-                .collect();
-            div()
-                .id("viewer-scroll")
-                .size_full()
-                .flex()
-                .flex_col()
-                .track_scroll(&scroll_handle)
-                .overflow_y_scroll()
-                .children(rendered)
-                .into_any_element()
-        } else if mode == ViewMode::Spread {
-            // 見開き: 2 枚の画像をそれぞれのアスペクト比で隙間なく並べ、
-            // 全体をウィンドウの中央に配置する（Web 版の見開きと同じ）。
-            // アトミック表示: 両ページが揃うまでは表示しない（片方だけ先に
-            // 出て後からもう片方、という 2 段階表示を防ぐ。数十 ms で揃う）
-            let spread_ready = pages
-                .iter()
-                .all(|&index| self.images.get(index).is_some_and(|slot| slot.is_some()));
-            // 各ページのサイズを明示してペア全体を 1 枚の画像のように扱う
-            // （h_full / aspect_ratio は flex のレイアウトで縮みがちなため使わない）
-            let vwp = gpui_kit::Point::new(
-                window.bounds().size.width.as_f32(),
-                window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
-            );
-            let ch = vwp.y;
-            let animated_scale = 1.0 + (self.zoom_scale - 1.0) * zoom_progress;
-            // ペア（2 枚分）の合計アスペクト比
-            let total_aspect: f32 = pages
-                .iter()
-                .map(|index| {
-                    let (w, h) = self.loader.page_size(*index).unwrap_or((0, 0));
-                    if w > 0 && h > 0 {
-                        w as f32 / h as f32
-                    } else {
-                        100.0 / 141.0
-                    }
-                })
-                .sum();
-            // ペア全体をウィンドウにフィットさせる（高さ基準で幅が出るが、
-            // 横が溢れる場合は幅基準に落とす）。これが表示上の基準サイズ
-            let fit = (vwp.x / (ch * total_aspect)).min(1.0);
-            let base_h = ch * fit;
-            let rendered: Vec<gpui_kit::AnyElement> = pages
-                .iter()
-                .map(|index| {
-                    let (width, height) = self.loader.page_size(*index).unwrap_or((0, 0));
-                    let aspect = if width > 0 && height > 0 {
-                        width as f32 / height as f32
-                    } else {
-                        100.0 / 141.0
-                    };
-                    // ページボックスで包まず画像を直接並べる（見開きが
-                    // 1 枚の画像として隙間なく表示される）
-                    if spread_ready {
-                        self.images[*index]
-                            .clone()
-                            .map(|image| {
-                                img(image)
-                                    .object_fit(gpui_kit::ObjectFit::Fill)
-                                    .flex_shrink_0()
-                                    .w(px(base_h * aspect * animated_scale))
-                                    .h(px(base_h * animated_scale))
-                                    .into_any_element()
-                            })
-                            .unwrap_or_else(|| {
-                                div()
-                                    .w(px(base_h * aspect * animated_scale))
-                                    .h(px(base_h * animated_scale))
-                                    .bg(gpui_kit::white())
-                                    .into_any_element()
-                            })
-                    } else {
+        let main =
+            if mode == ViewMode::Scroll {
+                let rendered: Vec<gpui_kit::AnyElement> = pages
+                    .iter()
+                    .map(|index| {
+                        // 各ページはコンテナ幅にフィットした高さ（アスペクト比）で
+                        // 縦に連続させる。size_full だと flex が縮めて重なりに見える。
+                        let (width, height) = self.loader.page_size(*index).unwrap_or((0, 0));
+                        let aspect = if width > 0 && height > 0 {
+                            width as f32 / height as f32
+                        } else {
+                            100.0 / 141.0
+                        };
+                        // 表示幅の 80% で中央寄せ（Web 版の scroll モード相当）
                         div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .w(gpui_kit::Length::Definite(
+                                        gpui_kit::DefiniteLength::Fraction(0.8),
+                                    ))
+                                    .aspect_ratio(aspect)
+                                    .bg(viewer_bg())
+                                    .overflow_hidden()
+                                    .child(self.render_page(muted, *index, zoom_progress)),
+                            )
+                            .into_any_element()
+                    })
+                    .collect();
+                div()
+                    .id("viewer-scroll")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .track_scroll(&scroll_handle)
+                    .overflow_y_scroll()
+                    .children(rendered)
+                    .into_any_element()
+            } else if mode == ViewMode::Spread {
+                // 見開き: 2 枚の画像をそれぞれのアスペクト比で隙間なく並べ、
+                // 全体をウィンドウの中央に配置する（Web 版の見開きと同じ）。
+                // アトミック表示: 両ページが揃うまでは表示しない（片方だけ先に
+                // 出て後からもう片方、という 2 段階表示を防ぐ。数十 ms で揃う）
+                let spread_ready = pages
+                    .iter()
+                    .all(|&index| self.images.get(index).is_some_and(|slot| slot.is_some()));
+                // 各ページのサイズを明示してペア全体を 1 枚の画像のように扱う
+                // （h_full / aspect_ratio は flex のレイアウトで縮みがちなため使わない）
+                let vwp = gpui_kit::Point::new(
+                    window.bounds().size.width.as_f32(),
+                    window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
+                );
+                let ch = vwp.y;
+                let animated_scale = 1.0 + (self.zoom_scale - 1.0) * zoom_progress;
+                // ペア（2 枚分）の合計アスペクト比
+                let total_aspect: f32 = pages
+                    .iter()
+                    .map(|index| {
+                        let (w, h) = self.loader.page_size(*index).unwrap_or((0, 0));
+                        if w > 0 && h > 0 {
+                            w as f32 / h as f32
+                        } else {
+                            100.0 / 141.0
+                        }
+                    })
+                    .sum();
+                // ペア全体をウィンドウにフィットさせる（高さ基準で幅が出るが、
+                // 横が溢れる場合は幅基準に落とす）。これが表示上の基準サイズ
+                let fit = (vwp.x / (ch * total_aspect)).min(1.0);
+                let base_h = ch * fit;
+                let rendered: Vec<gpui_kit::AnyElement> = pages
+                    .iter()
+                    .map(|index| {
+                        let (width, height) = self.loader.page_size(*index).unwrap_or((0, 0));
+                        let aspect = if width > 0 && height > 0 {
+                            width as f32 / height as f32
+                        } else {
+                            100.0 / 141.0
+                        };
+                        // ページボックスで包まず画像を直接並べる（見開きが
+                        // 1 枚の画像として隙間なく表示される）
+                        // ページ画像 1 枚ぶんの箱（見開きの隙間を保つため、画像は箱いっぱいに
+                        // 描く）。箱の中にページ右上の付箋アイコンを重ねる。
+                        let page_image: gpui_kit::AnyElement = if spread_ready {
+                            self.images[*index]
+                                .clone()
+                                .map(|image| {
+                                    img(image)
+                                        .object_fit(gpui_kit::ObjectFit::Fill)
+                                        .w(px(base_h * aspect * animated_scale))
+                                        .h(px(base_h * animated_scale))
+                                        .into_any_element()
+                                })
+                                .unwrap_or_else(|| {
+                                    div()
+                                        .w(px(base_h * aspect * animated_scale))
+                                        .h(px(base_h * animated_scale))
+                                        .bg(gpui_kit::white())
+                                        .into_any_element()
+                                })
+                        } else {
+                            div()
+                                .w(px(base_h * aspect * animated_scale))
+                                .h(px(base_h * animated_scale))
+                                .bg(gpui_kit::white())
+                                .into_any_element()
+                        };
+                        div()
+                            .debug_selector({
+                                let selector = format!("viewer-page-box-{index}");
+                                move || selector.clone()
+                            })
+                            .relative()
+                            .flex_shrink_0()
                             .w(px(base_h * aspect * animated_scale))
                             .h(px(base_h * animated_scale))
-                            .bg(gpui_kit::white())
+                            .child(page_image)
+                            .child(self.render_note_button(*index, None))
                             .into_any_element()
-                    }
-                })
-                .collect();
-            // 見開き全体を 1 枚の画像と見立てて拡大する（左右それぞれが
-            // バラバラに拡大しないように、ペア全体を 1 つの単位でスケールする）
-            let pan = self.pan_offset;
-            // 見開き全体でズーム（ダブルクリック）とドラッグパンを受け付ける
-            let handle = self.self_handle.clone().expect("viewer handle");
-            // justify_center + margin パンはオーバーフロー方向と喧嘩して
-            // 片側が表示されないため、absolute の left/top で中央から
-            // パンする（画像の端まで確実に見られる）
-            let pair_w = base_h * total_aspect * animated_scale;
-            let pair_h = base_h * animated_scale;
-            let pair_left = (vwp.x - pair_w) / 2.0 + pan.x;
-            let pair_top = (vwp.y - pair_h) / 2.0 + pan.y;
-            div()
-                .size_full()
-                .relative()
-                .overflow_hidden()
-                .on_mouse_down(gpui_kit::MouseButton::Left, {
-                    let handle = handle.clone();
-                    move |event, _window, cx| {
-                        let position = gpui_kit::Point::new(
-                            event.position.x.as_f32(),
-                            event.position.y.as_f32(),
-                        );
-                        let now = std::time::Instant::now();
-                        let is_double = handle
-                            .read(cx)
-                            .last_click_at
-                            .map(|t| now.duration_since(t).as_millis() < 400)
-                            .unwrap_or(false);
-                        handle.update(cx, |this, cx| {
-                            this.last_click_at = Some(now);
-                            if is_double {
-                                // 見開きはペア全体を拡大（2 倍ずつ）
-                                this.toggle_zoom(cx);
-                                this.last_click_at = None;
-                            } else {
-                                this.start_pan(position);
-                            }
-                        });
-                    }
-                })
-                .on_mouse_move({
-                    let handle = handle.clone();
-                    move |event, window, cx| {
-                        // 見開きペアの表示サイズ（幅 = コンテナ高さ × 合計アスペクト比）
-                        // を拡大して可動範囲を計算する
-                        let vwp = gpui_kit::Point::new(
-                            window.bounds().size.width.as_f32(),
-                            window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
-                        );
-                        let max = gpui_kit::Point::new(
-                            ((base_h * total_aspect * animated_scale - vwp.x) / 2.0).max(0.0),
-                            ((base_h * animated_scale - vwp.y) / 2.0).max(0.0),
-                        );
-                        handle.update(cx, |this, cx| {
-                            if this.drag_start.is_some() {
-                                this.update_pan(
-                                    gpui_kit::Point::new(
-                                        event.position.x.as_f32(),
-                                        event.position.y.as_f32(),
-                                    ),
-                                    max,
-                                );
-                            }
-                            cx.notify();
-                        });
-                    }
-                })
-                .on_mouse_up(gpui_kit::MouseButton::Left, {
-                    let handle = handle.clone();
-                    move |_, _window, cx| {
-                        handle.update(cx, |this, cx| this.end_pan(cx));
-                    }
-                })
-                .on_mouse_up_out(gpui_kit::MouseButton::Left, {
-                    let handle = handle.clone();
-                    move |_, _window, cx| {
-                        handle.update(cx, |this, cx| this.end_pan(cx));
-                    }
-                })
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(pair_left))
-                        .top(px(pair_top))
-                        .flex()
-                        .flex_row()
-                        .gap(px(0.0))
-                        .children(rendered),
-                )
-                .into_any_element()
-        } else {
-            // 単一モード: 左右 10% のクリックナビを画像の上に重ねる
-            // （画像はコンテナに contain で収まるため、表示サイズを
-            // アスペクト比から計算してエッジ領域を配置する）。
-            // ズーム中はナビを出さない（Web の showEdgeNav と同じ）。
-            let (pw, ph) = self.loader.page_size(self.current_page).unwrap_or((0, 0));
-            let aspect = if pw > 0 && ph > 0 {
-                pw as f32 / ph as f32
-            } else {
-                100.0 / 141.0
-            };
-            let win = window.bounds();
-            let cw = win.size.width.as_f32();
-            let ch = win.size.height.as_f32() - WIN_TITLE_BAR_HEIGHT;
-            let img_w = if cw / ch > aspect { ch * aspect } else { cw };
-            let img_h = if img_w > 0.0 { img_w / aspect } else { 0.0 };
-            let img_left = ((cw - img_w) / 2.0).max(0.0);
-            let img_top = ((ch - img_h) / 2.0).max(0.0);
-            let edge_w = (img_w * 0.1).max(40.0);
-            div()
-                .size_full()
-                .relative()
-                .child(self.render_page(muted, self.current_page, zoom_progress))
-                .when(!self.zoomed, |this| {
-                    this.child(
+                    })
+                    .collect();
+                // 見開き全体を 1 枚の画像と見立てて拡大する（左右それぞれが
+                // バラバラに拡大しないように、ペア全体を 1 つの単位でスケールする）
+                let pan = self.pan_offset;
+                // 見開き全体でズーム（ダブルクリック）とドラッグパンを受け付ける
+                let handle = self.self_handle.clone().expect("viewer handle");
+                // justify_center + margin パンはオーバーフロー方向と喧嘩して
+                // 片側が表示されないため、absolute の left/top で中央から
+                // パンする（画像の端まで確実に見られる）
+                let pair_w = base_h * total_aspect * animated_scale;
+                let pair_h = base_h * animated_scale;
+                let pair_left = (vwp.x - pair_w) / 2.0 + pan.x;
+                let pair_top = (vwp.y - pair_h) / 2.0 + pan.y;
+                div()
+                    .size_full()
+                    .relative()
+                    .overflow_hidden()
+                    .on_mouse_down(gpui_kit::MouseButton::Left, {
+                        let handle = handle.clone();
+                        move |event, _window, cx| {
+                            let position = gpui_kit::Point::new(
+                                event.position.x.as_f32(),
+                                event.position.y.as_f32(),
+                            );
+                            let now = std::time::Instant::now();
+                            let is_double = handle
+                                .read(cx)
+                                .last_click_at
+                                .map(|t| now.duration_since(t).as_millis() < 400)
+                                .unwrap_or(false);
+                            handle.update(cx, |this, cx| {
+                                this.last_click_at = Some(now);
+                                if is_double {
+                                    // 見開きはペア全体を拡大（2 倍ずつ）
+                                    this.toggle_zoom(cx);
+                                    this.last_click_at = None;
+                                } else {
+                                    this.start_pan(position);
+                                }
+                            });
+                        }
+                    })
+                    .on_mouse_move({
+                        let handle = handle.clone();
+                        move |event, window, cx| {
+                            // 見開きペアの表示サイズ（幅 = コンテナ高さ × 合計アスペクト比）
+                            // を拡大して可動範囲を計算する
+                            let vwp = gpui_kit::Point::new(
+                                window.bounds().size.width.as_f32(),
+                                window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
+                            );
+                            let max = gpui_kit::Point::new(
+                                ((base_h * total_aspect * animated_scale - vwp.x) / 2.0).max(0.0),
+                                ((base_h * animated_scale - vwp.y) / 2.0).max(0.0),
+                            );
+                            handle.update(cx, |this, cx| {
+                                if this.drag_start.is_some() {
+                                    this.update_pan(
+                                        gpui_kit::Point::new(
+                                            event.position.x.as_f32(),
+                                            event.position.y.as_f32(),
+                                        ),
+                                        max,
+                                    );
+                                }
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .on_mouse_up(gpui_kit::MouseButton::Left, {
+                        let handle = handle.clone();
+                        move |_, _window, cx| {
+                            handle.update(cx, |this, cx| this.end_pan(cx));
+                        }
+                    })
+                    .on_mouse_up_out(gpui_kit::MouseButton::Left, {
+                        let handle = handle.clone();
+                        move |_, _window, cx| {
+                            handle.update(cx, |this, cx| this.end_pan(cx));
+                        }
+                    })
+                    .child(
                         div()
-                            .id("viewer-edge-left")
+                            .absolute()
+                            .left(px(pair_left))
+                            .top(px(pair_top))
+                            .flex()
+                            .flex_row()
+                            .gap(px(0.0))
+                            .children(rendered),
+                    )
+                    .into_any_element()
+            } else {
+                // 単一モード: 左右 10% のクリックナビを画像の上に重ねる
+                // （画像はコンテナに contain で収まるため、表示サイズを
+                // アスペクト比から計算してエッジ領域を配置する）。
+                // ズーム中はナビを出さない（Web の showEdgeNav と同じ）。
+                let (pw, ph) = self.loader.page_size(self.current_page).unwrap_or((0, 0));
+                let aspect = if pw > 0 && ph > 0 {
+                    pw as f32 / ph as f32
+                } else {
+                    100.0 / 141.0
+                };
+                let win = window.bounds();
+                let cw = win.size.width.as_f32();
+                let ch = win.size.height.as_f32() - WIN_TITLE_BAR_HEIGHT;
+                let img_w = if cw / ch > aspect { ch * aspect } else { cw };
+                let img_h = if img_w > 0.0 { img_w / aspect } else { 0.0 };
+                let img_left = ((cw - img_w) / 2.0).max(0.0);
+                let img_top = ((ch - img_h) / 2.0).max(0.0);
+                let edge_w = (img_w * 0.1).max(40.0);
+                // 付箋アイコンの一辺（この分だけ右端から内側へ寄せる）
+                let note_size = NOTE_ICON_SIZE;
+                div()
+                    .size_full()
+                    .relative()
+                    .child(self.render_page(muted, self.current_page, zoom_progress))
+                    // 付箋は実際に描かれている画像の上端・右端に合わせる（ナビ帯より上）
+                    .child(
+                        // absolute が位置指定そのもの（あとから relative を呼ぶと上書きされる）
+                        div()
                             .absolute()
                             .left(px(img_left))
                             .top(px(img_top))
-                            .w(px(edge_w))
+                            .w(px(img_w))
                             .h(px(img_h))
-                            .cursor(gpui_kit::CursorStyle::PointingHand)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            // 非ホバーは透明、ホバーで半透明オーバーレイ + アイコン表示
-                            .opacity(0.0)
-                            .hover(|style| style.bg(gpui_kit::rgba(0x0000001f)).opacity(1.0))
-                            .child(
-                                Icon::new(IconName::ChevronLeft)
-                                    .size(px(28.0))
-                                    .text_color(gpui_kit::rgba(0x00000099)),
-                            )
-                            .on_mouse_down(gpui_kit::MouseButton::Left, {
-                                let handle = handle.clone();
-                                move |event, _window, cx| {
-                                    handle.update(cx, |this, cx| {
-                                        if event.modifiers.shift {
-                                            this.prev_page_shift(cx);
-                                        } else {
-                                            this.prev_page(cx);
-                                        }
-                                    });
-                                }
-                            }),
+                            .child(self.render_note_button(
+                                self.current_page,
+                                Some((img_w - note_size, 0.0)),
+                            )),
                     )
-                    .child(
-                        div()
-                            .id("viewer-edge-right")
-                            .absolute()
-                            .left(px(img_left + img_w - edge_w))
-                            .top(px(img_top))
-                            .w(px(edge_w))
-                            .h(px(img_h))
-                            .cursor(gpui_kit::CursorStyle::PointingHand)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .opacity(0.0)
-                            .hover(|style| style.bg(gpui_kit::rgba(0x0000001f)).opacity(1.0))
-                            .child(
-                                Icon::new(IconName::ChevronRight)
-                                    .size(px(28.0))
-                                    .text_color(gpui_kit::rgba(0x00000099)),
-                            )
-                            .on_mouse_down(gpui_kit::MouseButton::Left, {
-                                let handle = handle.clone();
-                                move |event, _window, cx| {
-                                    handle.update(cx, |this, cx| {
-                                        if event.modifiers.shift {
-                                            this.next_page_shift(cx);
-                                        } else {
-                                            this.next_page(cx);
-                                        }
-                                    });
-                                }
-                            }),
-                    )
-                })
-                .into_any_element()
-        };
+                    .when(!self.zoomed, |this| {
+                        this.child(
+                            div()
+                                .id("viewer-edge-left")
+                                .debug_selector(|| "viewer-edge-left".into())
+                                .absolute()
+                                .left(px(img_left))
+                                .top(px(img_top))
+                                .w(px(edge_w))
+                                .h(px(img_h))
+                                .cursor(gpui_kit::CursorStyle::PointingHand)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                // 非ホバーは透明、ホバーで半透明オーバーレイ + アイコン表示
+                                .opacity(0.0)
+                                .hover(|style| style.bg(gpui_kit::rgba(0x0000001f)).opacity(1.0))
+                                .child(
+                                    Icon::new(IconName::ChevronLeft)
+                                        .size(px(28.0))
+                                        .text_color(gpui_kit::rgba(0x00000099)),
+                                )
+                                .on_mouse_down(gpui_kit::MouseButton::Left, {
+                                    let handle = handle.clone();
+                                    move |event, _window, cx| {
+                                        handle.update(cx, |this, cx| {
+                                            if event.modifiers.shift {
+                                                this.prev_page_shift(cx);
+                                            } else {
+                                                this.prev_page(cx);
+                                            }
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("viewer-edge-right")
+                                .debug_selector(|| "viewer-edge-right".into())
+                                .absolute()
+                                .left(px(img_left + img_w - edge_w))
+                                .top(px(img_top))
+                                .w(px(edge_w))
+                                .h(px(img_h))
+                                .cursor(gpui_kit::CursorStyle::PointingHand)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .opacity(0.0)
+                                .hover(|style| style.bg(gpui_kit::rgba(0x0000001f)).opacity(1.0))
+                                .child(
+                                    Icon::new(IconName::ChevronRight)
+                                        .size(px(28.0))
+                                        .text_color(gpui_kit::rgba(0x00000099)),
+                                )
+                                .on_mouse_down(gpui_kit::MouseButton::Left, {
+                                    let handle = handle.clone();
+                                    move |event, _window, cx| {
+                                        handle.update(cx, |this, cx| {
+                                            if event.modifiers.shift {
+                                                this.next_page_shift(cx);
+                                            } else {
+                                                this.next_page(cx);
+                                            }
+                                        });
+                                    }
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            };
 
         // キーボードショートカットを効かせるため、ルートにフォーカスを
         // 紐付けてキーイベントを受け取る。背景は本の白と区別できる薄グレー。

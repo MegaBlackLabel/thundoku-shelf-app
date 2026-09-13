@@ -7,9 +7,12 @@ use std::time::Instant;
 use gpui_kit::Styled as _;
 use gpui_kit::Subscription;
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, IntoElement, ParentElement, ReadGlobal as _, Render,
-    SharedString, Window, div,
+    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
+    ReadGlobal as _, Render, SharedString, Window, div,
 };
 use thundoku_core::db;
 
@@ -36,6 +39,20 @@ pub struct ReaderView {
     last_pages: Vec<usize>,
     /// ページ毎の滞在計測開始時刻（現在の表示を開き始めた時刻）。
     last_page_at: Option<Instant>,
+    /// 付箋ダイアログの編集中の下書き（表示中のみ Some）。
+    note_draft: Option<NoteDraft>,
+    /// アクションで要求された付箋の (ページ, 見開き側)。`InputState` の生成に window が
+    /// 必要なため、render で下書きにする（本棚の `pending_tag_edit` と同じ作法）。
+    note_request: Option<(i64, Option<db::notes::SpreadSide>)>,
+}
+
+/// 付箋ダイアログの下書き（1 ページ 1 件）。
+struct NoteDraft {
+    /// 1-indexed のページ番号。
+    page: i64,
+    /// 付けたときの見開きの左右（単一表示は None）。
+    side: Option<db::notes::SpreadSide>,
+    input: gpui_kit::Entity<InputState>,
 }
 
 impl ReaderView {
@@ -222,6 +239,38 @@ impl ReaderView {
                     .and_then(|(_, format_id)| format_id.clone()),
             )
         });
+        // 付箋（ページ単位のメモ）を有効にする。付済みページを渡してページ画像の
+        // アイコンの色に反映させる（試し読みでは有効にしない）
+        {
+            let content_str = selection
+                .as_ref()
+                .map(|(content_id, _)| content_id.clone())
+                .unwrap_or_default();
+            let state = AppState::global(cx);
+            let noted =
+                db::notes::noted_pages(&state.db_pool, &book_id, &content_str).unwrap_or_default();
+            viewer.update(cx, |viewer, cx| viewer.set_notes(true, noted, cx));
+        }
+        // ページ右上の付箋アイコン → ダイアログを開く（保存はダイアログの OK）
+        {
+            let handle = cx.entity();
+            App::on_action(
+                cx,
+                move |action: &crate::actions::NotePageRequest, cx: &mut App| {
+                    let (page, side) = (
+                        action.page,
+                        action
+                            .side
+                            .as_deref()
+                            .and_then(db::notes::SpreadSide::parse),
+                    );
+                    handle.update(cx, |this, cx| {
+                        this.note_request = Some((page, side));
+                        cx.notify();
+                    });
+                },
+            );
+        }
         // 閲覧履歴のセッションを開始する（途中で落ちた場合に備え ended_at は
         // 開始時刻で初期化された状態で作成される）
         let view_session_id = {
@@ -267,6 +316,8 @@ impl ReaderView {
             view_session_id,
             last_pages: initial_pages,
             last_page_at: Some(Instant::now()),
+            note_draft: None,
+            note_request: None,
         }
     }
 
@@ -307,6 +358,8 @@ impl ReaderView {
             // 試し読みはページ毎記録しない（book_id が None）
             last_pages: vec![0],
             last_page_at: None,
+            note_draft: None,
+            note_request: None,
         }
     }
 
@@ -417,6 +470,84 @@ impl ReaderView {
 
     /// ページ毎の閲覧回数・滞在時間を記録する。
     /// 表示ページ集合（`spread_pages()`）が変わったときのみ記録する。
+    /// 付箋ダイアログの下書きを作る（要求があれば）。`InputState` に window が要るため
+    /// render から呼ぶ。既に付いているページはメモを読み込んで編集する。
+    fn ensure_note_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((page, requested_side)) = self.note_request.take() else {
+            return;
+        };
+        let Some(book_id) = self.book_id.clone() else {
+            return;
+        };
+        let content = self.content_key();
+        let existing = {
+            let state = AppState::global(cx);
+            db::notes::get_for_page(&state.db_pool, &book_id, &content, page)
+                .ok()
+                .flatten()
+        };
+        // 付箋が付いているページを押したら **解除**（メモは残すので、付け直すと戻る）。
+        // ダイアログは出さない。
+        if existing.as_ref().is_some_and(|note| note.is_active) {
+            let state = AppState::global(cx);
+            let pool = &state.db_pool;
+            if let Err(error) = db::notes::set_active(pool, &book_id, &content, page, false) {
+                log::warn!("付箋の解除に失敗: {error}");
+            }
+            let noted = db::notes::noted_pages(pool, &book_id, &content).unwrap_or_default();
+            let viewer = self.viewer.clone();
+            viewer.update(cx, |viewer, cx| viewer.set_notes(true, noted, cx));
+            return;
+        }
+        // 既存の付箋があれば、そのときの見開き側を優先する（メモの編集で側を失わない）
+        let side = existing
+            .as_ref()
+            .and_then(|note| note.spread_side)
+            .or(requested_side);
+        let memo = existing.map(|note| note.memo).unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("メモ"));
+        let draft = NoteDraft { page, side, input };
+        let input = draft.input.clone();
+        draft
+            .input
+            .update(cx, |state, cx| state.set_value(memo, window, cx));
+        let _ = input;
+        self.note_draft = Some(draft);
+    }
+
+    /// 付箋ダイアログの OK。メモを保存してアイコンの色を更新する。
+    fn save_note_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.note_draft.take() else {
+            return;
+        };
+        let Some(book_id) = self.book_id.clone() else {
+            return;
+        };
+        let content = self.content_key();
+        let memo = draft.input.read(cx).value().to_string();
+        {
+            let state = AppState::global(cx);
+            let pool = &state.db_pool;
+            // 本・コンテンツ・ページから決まる安定した id（同じページは 1 件のまま）
+            let id = format!("note-{book_id}-{content}-{}", draft.page);
+            let note = db::notes::PageNoteInput {
+                id: &id,
+                book_id: &book_id,
+                content_id: &content,
+                page: draft.page,
+                memo: &memo,
+                spread_side: draft.side,
+            };
+            if let Err(error) = db::notes::upsert(pool, &note) {
+                log::warn!("付箋の保存に失敗: {error}");
+            }
+            let noted = db::notes::noted_pages(pool, &book_id, &content).unwrap_or_default();
+            let viewer = self.viewer.clone();
+            viewer.update(cx, |viewer, cx| viewer.set_notes(true, noted, cx));
+        }
+        cx.notify();
+    }
+
     /// 見開きモードでは表示中の左右両ページを計上する（右ページも抜けない）。
     fn record_page_view(&mut self, viewer: Entity<ImageViewer>, cx: &mut Context<Self>) {
         let Some(book_id) = self.book_id.clone() else {
@@ -587,11 +718,48 @@ fn load_content_entries(db: &thundoku_core::db::SqlitePool, book_id: &str) -> Ve
 }
 
 impl Render for ReaderView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_note_draft(window, cx);
+        let handle = cx.entity();
         div()
             .size_full()
             .bg(cx.theme().background)
             .child(self.viewer.clone())
+            // 付箋ダイアログ（ページ右上のアイコンから開く）
+            .child(if let Some(draft) = self.note_draft.as_ref() {
+                let input = draft.input.clone();
+                let page = draft.page;
+                {
+                    Dialog::new(cx)
+                        .title(div().child("このページに付箋を付けました"))
+                        .content(move |content, _window, _cx| {
+                            content
+                                .child(div().text_xs().child(format!("{page} ページ")))
+                                .child(Input::new(&input).cursor_text().w_full())
+                        })
+                        .footer(
+                            div().flex().flex_row().justify_end().gap_2().child(
+                                div().debug_selector(|| "note-save".into()).child(
+                                    Button::new("note-save")
+                                        .cursor_pointer()
+                                        .primary()
+                                        .label("OK")
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.save_note_draft(cx)
+                                                });
+                                            }
+                                        }),
+                                ),
+                            ),
+                        )
+                        .into_any_element()
+                }
+            } else {
+                div().into_any_element()
+            })
     }
 }
 
@@ -601,6 +769,228 @@ mod tests {
     use gpui_kit::TestAppContext;
     use thundoku_core::db::documents;
     use thundoku_core::db::page_views;
+
+    /// ページ画像の右上の付箋アイコン → ダイアログ → OK で、そのページに付箋が保存される。
+    /// 見開きのときは左右どちらに表示していたかも一緒に保存する。
+    #[gpui_kit::test]
+    async fn note_icon_saves_a_note_for_the_page(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 3 ページの本（付箋は 1 ページ単位）
+        seed_book_with_pages(cx, "b1", "付箋の本", 3);
+        let view = cx.new(|cx| ReaderView::for_book(cx, "b1".into()));
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+        // ページ画像のロードを待つ（ロード中はページコンテナが出ない）
+        cx.run_until_parked();
+        draw(visual);
+        cx.run_until_parked();
+        draw(visual);
+
+        // 1 ページ目の右上に付箋アイコンが出る
+        let button = visual
+            .debug_bounds("viewer-note-0")
+            .expect("付箋アイコンが出ていない");
+        assert!(
+            visual.debug_bounds("viewer-note-1").is_none(),
+            "表示していないページの付箋アイコンが出ている"
+        );
+        // 単一表示では「実際に描かれている画像」の上端・右端に合わせる
+        // （ページ送りのナビ帯と同じ矩形計算を使うので、その帯と一致する）
+        let edge = visual
+            .debug_bounds("viewer-edge-right")
+            .expect("右のページ送り帯が出ていない");
+        assert!(
+            // 上辺の線はアセット側で描いていないので、画像の上端にぴったり合わせる
+            (button.origin.y.as_f32() - edge.origin.y.as_f32()).abs() < 1.0
+                // 一辺は定数（ボタンとアイコンで共有）と一致する
+                && (button.size.width.as_f32()
+                    - crate::components::image_viewer::NOTE_ICON_SIZE)
+                    .abs()
+                    < 1.0
+                && ((button.origin.x.as_f32() + button.size.width.as_f32())
+                    - (edge.origin.x.as_f32() + edge.size.width.as_f32()))
+                .abs()
+                    < 1.0,
+            "付箋アイコンが画像の上端・右端に合っていない: button=({}, {}) edge=({}, {})",
+            button.origin.x.as_f32(),
+            button.origin.y.as_f32(),
+            edge.origin.x.as_f32(),
+            edge.origin.y.as_f32()
+        );
+        // 付箋アイコンはナビ帯より上で受ける（押してもページ送りしない）
+        visual.simulate_click(button.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.viewer.read(cx).current_page()),
+            0,
+            "付箋アイコンのクリックがページ送りへ伝播している"
+        );
+        // ダイアログが開き、OK で保存される
+        assert!(
+            view.read_with(cx, |this, _| this.note_draft.is_some()),
+            "付箋ダイアログが開いていない"
+        );
+        let ok = visual
+            .debug_bounds("note-save")
+            .expect("OK ボタンが出ていない");
+        visual.simulate_click(ok.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+
+        let pool = cx.update(|cx| AppState::global(cx).db_pool.clone());
+        let notes = db::notes::list_newest_first(&pool).unwrap();
+        assert_eq!(notes.len(), 1, "付箋が保存されていない");
+        assert_eq!(notes[0].book_id, "b1");
+        assert_eq!(notes[0].page, 1, "1-indexed のページ番号になっていない");
+        assert!(view.read_with(cx, |this, _| this.note_draft.is_none()));
+        // 付箋アイコンはトップバー / ボトムドックと同じ表示・非表示に従う
+        view.update(cx, |this, cx| {
+            this.viewer.update(cx, |viewer, cx| viewer.hide_overlay(cx));
+        });
+        draw(visual);
+        assert!(
+            visual.debug_bounds("viewer-note-0").is_none(),
+            "バーを隠しても付箋アイコンが残っている"
+        );
+        view.update(cx, |this, cx| {
+            this.viewer.update(cx, |viewer, cx| viewer.show_overlay(cx));
+        });
+        draw(visual);
+        assert!(
+            visual.debug_bounds("viewer-note-0").is_some(),
+            "バーを出しても付箋アイコンが戻らない"
+        );
+
+        // 付箋 ON のアイコンを押すと解除される（メモは残る = DB に keep・アイコンは OFF に戻る）
+        assert!(
+            visual.debug_bounds("viewer-note-fill-0").is_some(),
+            "付箋ありのアイコンに塗りが出ていない"
+        );
+        let on_button = visual
+            .debug_bounds("viewer-note-0")
+            .expect("付箋アイコンが出ていない");
+        visual.simulate_click(on_button.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        let pool = cx.update(|cx| AppState::global(cx).db_pool.clone());
+        assert!(
+            db::notes::noted_pages(&pool, "b1", "").unwrap().is_empty(),
+            "ON のアイコンを押しても解除されていない"
+        );
+        // メモは残る（内容が保たれることは core の detaching_keeps_the_memo... で検証）
+        assert!(
+            db::notes::get_for_page(&pool, "b1", "", 1)
+                .unwrap()
+                .is_some(),
+            "解除でメモまで消えている"
+        );
+        assert!(
+            visual.debug_bounds("viewer-note-fill-0").is_none(),
+            "解除してもアイコンが ON のまま"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.note_draft.is_none()),
+            "解除でダイアログが開いている"
+        );
+
+        // 保存後はアイコンが「付箋あり」になり、次に開くとメモが読み込まれる
+        draw(visual);
+        let button = visual
+            .debug_bounds("viewer-note-0")
+            .expect("付箋アイコンが出ていない");
+        visual.simulate_click(button.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert!(
+            view.read_with(cx, |this, _| this
+                .note_draft
+                .as_ref()
+                .map(|draft| draft.page))
+                == Some(1),
+            "既存の付箋を編集で開けていない"
+        );
+    }
+
+    /// 見開き表示のときは、付箋を付けたページが左右どちらだったかも保存する
+    /// （「本を見る」で同じ側に開くために使う）。
+    #[gpui_kit::test]
+    async fn note_records_the_spread_side(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book_with_pages(cx, "b1", "見開きの本", 4);
+        let view = cx.new(|cx| ReaderView::for_book(cx, "b1".into()));
+        // 見開き（右→左の日本の本）にする
+        view.update(cx, |this, cx| {
+            this.viewer.update(cx, |viewer, cx| {
+                viewer.set_mode(cx, crate::components::image_viewer::ViewMode::Spread)
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+        cx.run_until_parked();
+        // 見開き 1 ページ目（= 右ページ）の付箋アイコンから保存する
+        let button = visual
+            .debug_bounds("viewer-note-0")
+            .expect("付箋アイコンが出ていない");
+        // アイコンは画像（ページ枠）の上端・右端に合わせる
+        let page = visual
+            .debug_bounds("viewer-page-box-0")
+            .expect("見開きのページ枠が出ていない");
+        assert!(
+            // 画像（ページ枠）の上端にぴったり合わせる
+            (button.origin.y.as_f32() - page.origin.y.as_f32()).abs() < 1.0
+                && (button.origin.x.as_f32() + button.size.width.as_f32()
+                    - (page.origin.x.as_f32() + page.size.width.as_f32()))
+                .abs()
+                    < 1.0,
+            "付箋アイコンが画像の上端・右端に合っていない: button={:?} page={:?}",
+            (button.origin.x.as_f32(), button.origin.y.as_f32()),
+            (page.origin.x.as_f32(), page.origin.y.as_f32())
+        );
+        visual.simulate_click(button.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        let ok = visual
+            .debug_bounds("note-save")
+            .expect("OK ボタンが出ていない");
+        visual.simulate_click(ok.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+
+        let pool = cx.update(|cx| AppState::global(cx).db_pool.clone());
+        let notes = db::notes::list_newest_first(&pool).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].spread_side.is_some(),
+            "見開きの左右が保存されていない（単一表示扱い）"
+        );
+    }
 
     fn book_row(id: &str, title: &str, file_name: &str) -> db::books::Book {
         db::books::Book {

@@ -60,6 +60,17 @@ pub struct OpenSampleReader {
     pub item_id: SharedString,
 }
 
+/// 表示中のページに付箋を付ける（ビューアのページ右上の付箋アイコンから）。
+/// ダイアログを開くところまでで、保存はダイアログの OK で行う。
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, gpui_kit::Action)]
+#[action(namespace = thundoku, no_json)]
+pub struct NotePageRequest {
+    /// 1-indexed のページ番号（`reading_progress` と同じ）。
+    pub page: i64,
+    /// 見開きの左右（"left" / "right"。単一表示は None）。
+    pub side: Option<SharedString>,
+}
+
 /// Edit the manual tags of a book.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, gpui_kit::Action)]
 #[action(namespace = thundoku, no_json)]

@@ -12,6 +12,7 @@ pub mod checklist;
 pub mod contents;
 pub mod documents;
 pub mod favorites;
+pub mod notes;
 pub mod page_views;
 pub mod progress;
 pub mod samples;
@@ -282,6 +283,31 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         )
         .execute(&mut *conn)
         .await?;
+        // 付箋（ページ単位のメモ）。開発中のためマイグレーションファイルは作らず、
+        // 他の後発テーブルと同様に IF NOT EXISTS で冪等に適用する。
+        // 1 ページ 1 件（book_id + content_id + page で一意）。spread_side は付けたときの
+        // 見開きの左右（単一表示は NULL）で、「本を見る」から同じ側に開くために使う。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS page_notes (               id TEXT PRIMARY KEY,               book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,               content_id TEXT NOT NULL DEFAULT '',               page INTEGER NOT NULL,               memo TEXT NOT NULL DEFAULT '',               spread_side TEXT,               is_active INTEGER NOT NULL DEFAULT 1,               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,               UNIQUE (book_id, content_id, page)             );             CREATE INDEX IF NOT EXISTS idx_page_notes_book ON page_notes(book_id)",
+        )
+        .execute(&mut *conn)
+        .await?;
+        // 既に page_notes がある DB 向け: 付箋の ON / OFF 列を足す（IF NOT EXISTS では
+        // 列は増えないため、pragma で確認してから ALTER する）
+        {
+            let has_is_active: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('page_notes') WHERE name = 'is_active'",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if !has_is_active {
+                sqlx::query(
+                    "ALTER TABLE page_notes ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+                )
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
         // サークル / 作者のお気に入り（タグのお気に入り `favorite_tags` と同じ
         // チップのハート）。開発中のためマイグレーションファイルは作らず、
         // 他の後発テーブルと同様に IF NOT EXISTS で冪等に適用する。

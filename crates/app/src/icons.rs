@@ -2,8 +2,9 @@
 //!
 //! Web 版は `lucide-react` のアイコンを使っている。gpui-component にも
 //! lucide 由来のアイコンはあるが、Web 版で使われていて gpui-component に
-//! 無いもの（book-marked / library-big / history / list-checks / refresh-cw /
-//! layout-grid / list / circle-user-round / log-in / log-out）は
+//! 無いもの（book-marked / library-big / history / bookmark / bookmark-filled /
+//! list-checks /
+//! refresh-cw / layout-grid / list / circle-user-round / log-in / log-out）は
 //! `assets/icons/*.svg` に lucide-react から生成した SVG を埋め込んで提供する。
 //!
 //! 埋め込んでいる SVG は [Lucide](https://lucide.dev)（ISC License,
@@ -25,6 +26,10 @@ pub enum AppIcon {
     LibraryBig,
     /// 閲覧履歴（HistoryIcon）
     History,
+    /// 付箋（しおり型の枠。BookmarkIcon）
+    Bookmark,
+    /// 付箋の塗り（しおり型。同じパスの `fill`。BookmarkFilledIcon）
+    BookmarkFilled,
     /// チェックリスト（ListChecksIcon）
     ListChecks,
     /// 同期（RefreshCw）
@@ -69,6 +74,8 @@ impl IconNamed for AppIcon {
             Self::BookMarked => "icons/book-marked.svg".into(),
             Self::LibraryBig => "icons/library-big.svg".into(),
             Self::History => "icons/history.svg".into(),
+            Self::Bookmark => "icons/bookmark.svg".into(),
+            Self::BookmarkFilled => "icons/bookmark-filled.svg".into(),
             Self::ListChecks => "icons/list-checks.svg".into(),
             Self::RefreshCw => "icons/refresh-cw.svg".into(),
             Self::LayoutGrid => "icons/layout-grid.svg".into(),
@@ -112,6 +119,8 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
         "icons/book-marked.svg" => Some(include_bytes!("../assets/icons/book-marked.svg")),
         "icons/library-big.svg" => Some(include_bytes!("../assets/icons/library-big.svg")),
         "icons/history.svg" => Some(include_bytes!("../assets/icons/history.svg")),
+        "icons/bookmark.svg" => Some(include_bytes!("../assets/icons/bookmark.svg")),
+        "icons/bookmark-filled.svg" => Some(include_bytes!("../assets/icons/bookmark-filled.svg")),
         "icons/list-checks.svg" => Some(include_bytes!("../assets/icons/list-checks.svg")),
         "icons/refresh-cw.svg" => Some(include_bytes!("../assets/icons/refresh-cw.svg")),
         "icons/layout-grid.svg" => Some(include_bytes!("../assets/icons/layout-grid.svg")),
@@ -147,6 +156,8 @@ mod tests {
             AppIcon::BookMarked,
             AppIcon::LibraryBig,
             AppIcon::History,
+            AppIcon::Bookmark,
+            AppIcon::BookmarkFilled,
             AppIcon::ListChecks,
             AppIcon::RefreshCw,
             AppIcon::LayoutGrid,
