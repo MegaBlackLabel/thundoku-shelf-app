@@ -12,7 +12,6 @@ pub struct ReadingProgress {
     /// Set once the last page has been reached; never cleared afterwards.
     pub finished_at: Option<String>,
     pub last_read_at: String,
-    pub scroll_position: f64,
 }
 
 impl ReadingProgress {
@@ -70,8 +69,8 @@ pub fn get_for(
 ) -> Result<Option<ReadingProgress>, sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query_as::<_, ReadingProgress>(
-            "SELECT book_id, content_id, current_page, total_pages, finished_at, last_read_at, \
-             scroll_position FROM reading_progress WHERE book_id = ?1 AND content_id = ?2",
+            "SELECT book_id, content_id, current_page, total_pages, finished_at, last_read_at \
+             FROM reading_progress WHERE book_id = ?1 AND content_id = ?2",
         )
         .bind(book_id)
         .bind(content_id)
@@ -92,7 +91,8 @@ pub fn upsert(pool: &SqlitePool, progress: &ReadingProgress) -> Result<(), sqlx:
     crate::db::block_on(async {
         sqlx::query(
             "INSERT INTO reading_progress (book_id, content_id, current_page, total_pages, \
-             finished_at, last_read_at, scroll_position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             finished_at, last_read_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(book_id, content_id) DO UPDATE SET
                current_page = excluded.current_page,
                total_pages = excluded.total_pages,
@@ -109,7 +109,6 @@ pub fn upsert(pool: &SqlitePool, progress: &ReadingProgress) -> Result<(), sqlx:
         .bind(progress.total_pages)
         .bind(&finished_at)
         .bind(&progress.last_read_at)
-        .bind(progress.scroll_position)
         .execute(pool)
         .await?;
         Ok(())
@@ -157,7 +156,6 @@ mod tests {
             total_pages: total,
             finished_at: finished.then(|| "2026-01-01 00:00:00".to_string()),
             last_read_at: "2026-01-01 00:00:00".into(),
-            scroll_position: 0.0,
         };
 
         // 進捗なし = 未読
@@ -244,7 +242,6 @@ mod tests {
                 total_pages: Some(3),
                 finished_at: Some("2026-09-11 00:00:00".into()),
                 last_read_at: stamp.clone(),
-                scroll_position: 0.0,
             },
         )
         .unwrap();
@@ -261,7 +258,6 @@ mod tests {
                 total_pages: Some(5),
                 finished_at: None,
                 last_read_at: stamp.clone(),
-                scroll_position: 0.0,
             },
         )
         .unwrap();
@@ -325,7 +321,6 @@ mod tests {
             total_pages: Some(10),
             finished_at: None,
             last_read_at: "2026-08-21 00:00:00".into(),
-            scroll_position: 0.0,
         };
         upsert(&pool, &base).unwrap();
         assert_eq!(get(&pool, "b1").unwrap().unwrap().finished_at, None);

@@ -45,16 +45,6 @@ pub fn end(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
 }
 
 /// 閲覧セッションの ended_at を現在時刻に更新する（強制終了対策の heartbeat）。
-pub fn touch(pool: &SqlitePool, session_id: &str) -> Result<(), sqlx::Error> {
-    crate::db::block_on(async {
-        sqlx::query("UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(session_id)
-            .execute(pool)
-            .await
-            .map(|_| ())
-    })
-}
-
 /// 閲覧回数（セッション数）。
 pub fn view_count(pool: &SqlitePool, book_id: &str) -> Result<i64, sqlx::Error> {
     crate::db::block_on(async {
@@ -202,6 +192,18 @@ mod tests {
     /// 履歴画面用の集約: 1 日 1 本にまとめ、閲覧時間を合算し、新しい日から並べる。
     /// 時刻は UTC（`CURRENT_TIMESTAMP`）なので、**ローカル日付**で日を切ることを確認する
     /// （UTC 20:00 = 日本時間 翌 05:00 のような時刻を使う）。
+    /// セッションを「途中で落ちた」状態にする（ended_at だけ更新）。
+    /// アプリ本体では使わないため、テスト専用のヘルパとしてここに置く。
+    fn touch_session(pool: &SqlitePool, session_id: &str) {
+        crate::db::block_on(async {
+            sqlx::query("UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?")
+                .bind(session_id)
+                .execute(pool)
+                .await
+        })
+        .unwrap();
+    }
+
     #[test]
     fn view_stats_returns_count_duration_and_last_view_per_book() {
         let pool = crate::db::test_pool();
@@ -214,7 +216,7 @@ mod tests {
             end(&pool, &session.id).unwrap();
         }
         let session = start(&pool, "b2").unwrap();
-        touch(&pool, &session.id).unwrap();
+        touch_session(&pool, &session.id);
 
         let stats = view_stats(&pool).unwrap();
         let b1 = stats.get("b1").expect("b1 の行");
@@ -393,7 +395,7 @@ mod tests {
 
         // 2 回目の閲覧（touch のみ = 途中で落ちたケース）
         let session2 = start(&pool, "b1").unwrap();
-        touch(&pool, &session2.id).unwrap();
+        touch_session(&pool, &session2.id);
         assert_eq!(view_count(&pool, "b1").unwrap(), 2);
         assert!(total_duration_secs(&pool, "b1").unwrap() >= 0);
     }

@@ -408,6 +408,9 @@ pub struct ImageViewer {
     loading: std::collections::HashSet<usize>,
     /// 追い出した画像（CPU 側は既に手放し済み。GPU 解放は render で行う）
     pending_image_drops: Vec<Arc<RenderImage>>,
+    /// GPU から解放した画像の累計（`window.drop_image` を呼んだ回数）。
+    /// テストと診断のための観測点（GPU メモリ自体は headless では観測できない）。
+    images_released_to_gpu: usize,
     /// スクロールモードで同時に保持するデコード済みページのバイト予算。
     /// 1 ページが数十 MiB になる本で全ページ持つと数 GB になるため、表示中ページの
     /// 前後だけをこの予算内で保持し、外れたページは解放する（テストから小さくできる）。
@@ -574,6 +577,7 @@ impl ImageViewer {
             _page_slider_subscription: None,
             loading: std::collections::HashSet::new(),
             pending_image_drops: Vec::new(),
+            images_released_to_gpu: 0,
             page_cache_budget: SCROLL_CACHE_BUDGET_BYTES,
             scroll_top_initialized: false,
             self_handle: None,
@@ -856,6 +860,7 @@ impl ImageViewer {
     fn release_evicted_images(&mut self, window: &mut Window) {
         for image in std::mem::take(&mut self.pending_image_drops) {
             let _ = window.drop_image(image);
+            self.images_released_to_gpu += 1;
         }
     }
 
@@ -1314,8 +1319,11 @@ impl ImageViewer {
         // スクロールモードは全ページを保持したままにする（クリアしない）。
         if self.mode != ViewMode::Scroll {
             for (index, slot) in self.images.iter_mut().enumerate() {
-                if index.abs_diff(self.current_page) > 30 {
-                    *slot = None;
+                if index.abs_diff(self.current_page) > 30
+                    && let Some(image) = slot.take()
+                {
+                    // GPU のテクスチャも解放する（window が要るので render で行う）
+                    self.pending_image_drops.push(image);
                 }
             }
         }
@@ -3425,6 +3433,71 @@ mod tests {
         assert!(!page0, "離れたページが解放されていない");
         assert!(page18, "移動後の表示中ページが保持されていない");
         assert!(kept(cx) <= 13, "保持数が予算を超えている: {} 枚", kept(cx));
+    }
+
+    /// キャッシュ検証用のダミー画像。
+    fn dummy_image(seed: usize) -> std::sync::Arc<RenderImage> {
+        let pixel =
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([(seed % 255) as u8, 0, 0, 255]));
+        std::sync::Arc::new(RenderImage::new([image::Frame::new(pixel)]))
+    }
+
+    /// 追い出したページ画像は GPU からも解放する（`drop_image` は window が要るので
+    /// キューに積み、render で解放する）。修正前は `Arc` を落とすだけで、
+    /// GPU の sprite atlas に window 寿命まで残っていた。
+    #[gpui_kit::test]
+    async fn evicted_page_images_are_released_from_the_gpu(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 40);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // まだ描画せずに（＝GPU 解放前の状態で）追い出しを起こす
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                // 全ページに画像が載っている状態を作り、現在ページを 39 へ飛ばす
+                for index in 0..this.images.len() {
+                    this.images[index] = Some(dummy_image(index));
+                }
+                this.current_page = 39;
+                this.after_page_change(cx);
+            });
+        });
+        let (retained, queued) = view.read_with(cx, |this, _| {
+            (
+                this.images.iter().filter(|slot| slot.is_some()).count(),
+                this.pending_image_drops.len(),
+            )
+        });
+        assert!(
+            retained <= 31,
+            "±30 を超えたページが解放されていない: {retained} 枚"
+        );
+        let _ = queued;
+
+        // 描画するとキューが捌けて解放される（キューが溜まり続けない）
+        for _ in 0..2 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let released = view.read_with(cx, |this, _| this.images_released_to_gpu);
+        assert!(
+            released >= 40 - retained,
+            "追い出した画像が GPU から解放されていない: released={released} evicted={}",
+            40 - retained
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this.pending_image_drops.len()),
+            0,
+            "GPU 解放キューが描画で捌けていない"
+        );
     }
 
     /// ビューアーが強参照の循環で解放されないバグの回帰テスト。

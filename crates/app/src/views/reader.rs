@@ -156,13 +156,16 @@ impl ReaderView {
                 let book_str = book_id.to_string();
                 let content_str = self.content_key();
                 let state = AppState::global(cx);
+                // 見開きは 2 ページを同時に表示しているので**均等に配分**する。
+                // 同じ秒数を両方に足すと合計が実時間の約 2 倍になる。
+                let share = secs / self.last_pages.len().max(1) as f64;
                 for page in &self.last_pages {
                     let _ = db::page_views::add_dwell(
                         &state.db_pool,
                         &book_str,
                         &content_str,
                         *page as i64 + 1,
-                        secs,
+                        share,
                     );
                 }
             }
@@ -632,13 +635,15 @@ impl ReaderView {
             let secs = now.duration_since(started).as_secs_f64();
             if secs > 0.0 {
                 let content_str = self.content_key();
+                // 見開きは 2 ページを同時に表示しているので**均等に配分**する
+                let share = secs / self.last_pages.len().max(1) as f64;
                 for page in &self.last_pages {
                     let _ = db::page_views::add_dwell(
                         db,
                         &book_str,
                         &content_str,
                         *page as i64 + 1,
-                        secs,
+                        share,
                     );
                 }
             }
@@ -683,7 +688,6 @@ impl ReaderView {
                 total_pages: Some(total_pages),
                 finished_at,
                 last_read_at: timestamp,
-                scroll_position: 0.0,
             },
         );
     }
@@ -1635,7 +1639,6 @@ mod tests {
                     total_pages: Some(3),
                     finished_at: None,
                     last_read_at: "2026-01-01 00:00:00".into(),
-                    scroll_position: 0.0,
                 },
             )
             .unwrap();
@@ -1878,6 +1881,88 @@ mod tests {
         assert!(
             rows[2].total_seconds >= 0.0,
             "closing finalizes last page dwell"
+        );
+    }
+
+    /// 見開きの滞在時間は左右に**均等配分**する（合計が実時間になる）。
+    /// 以前は同じ秒数を両方に加算していて、合計が実時間の約 2 倍になっていた。
+    #[gpui_kit::test]
+    async fn spread_dwell_is_split_between_pages(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let _ = db::settings::set(&state.db_pool, "viewer.mode", "spread");
+        });
+        seed_book_with_pages(cx, "b3", "本3", 4);
+        let reader = cx.new(|cx| ReaderView::for_book(cx, "b3".to_string()));
+
+        // 見開き [0, 1] を 10 秒表示していた状態を作って確定する
+        cx.update(|cx| {
+            reader.update(cx, |r, cx| {
+                r.last_pages = vec![0, 1];
+                r.last_page_at =
+                    Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+                r.end_session(cx);
+            });
+        });
+        cx.run_until_parked();
+        let rows = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            page_views::for_book(&state.db_pool, "b3").unwrap()
+        });
+        let left = rows
+            .iter()
+            .find(|row| row.page_number == 1)
+            .expect("page 1");
+        let right = rows
+            .iter()
+            .find(|row| row.page_number == 2)
+            .expect("page 2");
+        assert!(
+            (4.0..=6.0).contains(&left.total_seconds),
+            "左ページに実時間の半分が入っていない: {}",
+            left.total_seconds
+        );
+        assert!(
+            (4.0..=6.0).contains(&right.total_seconds),
+            "右ページに実時間の半分が入っていない: {}",
+            right.total_seconds
+        );
+        assert!(
+            left.total_seconds + right.total_seconds <= 12.0,
+            "合計が実時間を超えている（2 重計上）: {}",
+            left.total_seconds + right.total_seconds
+        );
+
+        // ページ送りでも同じ（前の表示ページ集合を離れるときの計上も均等配分）
+        let before: Vec<f64> = rows.iter().map(|row| row.total_seconds).collect();
+        cx.update(|cx| {
+            reader.update(cx, |r, cx| {
+                r.last_pages = vec![0, 1];
+                r.last_page_at =
+                    Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+                let viewer = r.viewer.clone();
+                viewer.update(cx, |v, cx| v.next_page(cx));
+            });
+        });
+        cx.run_until_parked();
+        let rows = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            page_views::for_book(&state.db_pool, "b3").unwrap()
+        });
+        let gained = |page: i64| {
+            let row = rows
+                .iter()
+                .find(|row| row.page_number == page)
+                .expect("page");
+            row.total_seconds - before[(page - 1) as usize]
+        };
+        assert!(
+            (4.0..=6.0).contains(&gained(1)) && (4.0..=6.0).contains(&gained(2)),
+            "ページ送り時に均等配分されていない: 1={} 2={}",
+            gained(1),
+            gained(2)
         );
     }
 

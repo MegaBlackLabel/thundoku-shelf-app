@@ -432,7 +432,6 @@ mod tests {
                 total_pages: Some(120),
                 finished_at: None,
                 last_read_at: "2026-08-23 09:00:00".into(),
-                scroll_position: 0.0,
             },
         )
         .unwrap();
@@ -541,7 +540,6 @@ mod tests {
                     total_pages: Some(10),
                     finished_at: None,
                     last_read_at: "2026-01-01 00:00:00".into(),
-                    scroll_position: 0.0,
                 },
             )
             .unwrap();

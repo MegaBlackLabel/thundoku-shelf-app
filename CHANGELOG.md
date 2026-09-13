@@ -157,6 +157,15 @@
   1 行でも多く本を表示するため）
 
 ### Fixed
+- 仕様書の作成中に見つかった不整合を修正: **並び替えの永続化**（`bookshelf.sort_field` /
+  `bookshelf.sort_ascending` に保存し起動時に復元）/ **タグ絞り込みが未ダウンロード本に効かない**
+  （本棚アイテムの `tags_json` も対象に）/ **見開きの滞在時間が 2 倍に計上**（左右へ均等配分）/
+  **単一・見開きモードの追い出しで GPU テクスチャが残る**（`drop_image` を追加）/
+  **`view_history::touch` が未使用**（削除してテスト専用ヘルパへ）/
+  **`reading_progress.scroll_position` が常に 0**（Rust 側のフィールドを削除）
+- Drive の保存先フォルダがアカウント別でない点を `docs/account-switch.md` に明記（実装は単一キー）
+- 古いテスト（`migrate_creates_all_schema_tables`）の期待表に `page_notes` を追加
+
 
 - ビューアーを閉じた後にビジー状態になる問題（全件 reload → 該当カードのみ更新）
 - 未読の本が最終ページから開く問題（初期ページのアンダーフロー対策）

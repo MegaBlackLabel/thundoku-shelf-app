@@ -39,6 +39,7 @@ fn migrate_creates_all_schema_tables() {
             "favorite_entities",
             "favorite_tags",
             "imported_documents",
+            "page_notes",
             "page_views",
             "product_sample_pages",
             "reading_progress",
@@ -975,7 +976,6 @@ fn reading_progress_roundtrip() {
         total_pages: Some(42),
         finished_at: None,
         last_read_at: "2026-08-21 01:00:00".into(),
-        scroll_position: 0.5,
     };
     progress::upsert(&pool, &progress).unwrap();
     let loaded = progress::get(&pool, "book-1").unwrap().unwrap();
@@ -1523,7 +1523,6 @@ fn progress_is_scoped_per_content() {
         total_pages: Some(total),
         finished_at: None,
         last_read_at: stamp.into(),
-        scroll_position: 0.0,
     };
     progress::upsert(&pool, &mk("c1", 5, 10)).unwrap();
     progress::upsert(&pool, &mk("c2", 2, 3)).unwrap();

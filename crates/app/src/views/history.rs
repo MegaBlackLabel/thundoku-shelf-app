@@ -1660,7 +1660,6 @@ mod tests {
                         total_pages: total,
                         finished_at: finished.then(|| "2026-01-01 00:00:00".to_string()),
                         last_read_at: "2026-01-01 00:00:00".into(),
-                        scroll_position: 0.0,
                     },
                 )
                 .unwrap();

@@ -107,7 +107,7 @@ Drive 同期設定など）。
 | total_pages | INTEGER | 全ページ数 |
 | finished_at | TEXT | 読了日時。一度セットすると戻っても維持 |
 | last_read_at | TEXT | 最終閲覧日時 |
-| scroll_position | REAL | スクロールモードの位置 |
+| scroll_position | REAL | **旧フィールド**。アプリは読み書きしない（常に既定値 0）。互換のため列は残している |
 
 ### view_history
 
@@ -122,7 +122,7 @@ Drive 同期設定など）。
 | ended_at | TEXT | 終了時刻（閲覧中は最後に操作した時刻に更新される heartbeat） |
 
 - `view_history::start(book_id)` で開始（ended_at は開始時刻で初期化）
-- `view_history::touch(session_id)` をページ操作のたびに実行（強制終了対策）
+- 表示中ページ集合が変わったときに前の集合の滞在時間を確定し、セッションの終了は `end(session_id)` で記録する（`touch` という関数は無い。強制終了時はセッションが `ended_at` 未設定のまま残る）
 - `view_history::end(session_id)` で終了時刻記録
 - `view_count(book_id)` / `total_duration_secs(book_id)` で集計
 

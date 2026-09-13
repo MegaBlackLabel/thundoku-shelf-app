@@ -344,6 +344,11 @@ impl SortField {
         }
     }
 
+    /// 永続化された slug から復元する（`slug` の逆）。
+    fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|field| field.slug() == slug)
+    }
+
     /// メニュー行の id / テスト用セレクタ。
     fn slug(self) -> &'static str {
         match self {
@@ -1035,6 +1040,8 @@ impl BookshelfView {
                 })
                 .ok();
         });
+        // 並び替えは前回の設定を復元する（表示モードと同じ扱い）
+        let sort = Self::load_sort(&Self::app_state(cx).db_pool);
         let mut view = Self {
             entries: Vec::new(),
             shelf_items: Vec::new(),
@@ -1070,8 +1077,8 @@ impl BookshelfView {
             auto_download_started: false,
             filtered: Vec::new(),
             filtered_dirty: true,
-            sort_field: SortField::PurchaseDate,
-            sort_ascending: false,
+            sort_field: sort.0,
+            sort_ascending: sort.1,
             last_search: String::new(),
             pending_download_confirm: None,
             pending_open_after_download: None,
@@ -1947,6 +1954,36 @@ impl BookshelfView {
         self.filtered_dirty = false;
     }
 
+    /// 並び替え設定の保存キー（表示モードと同じく DB の settings に置く）。
+    const SORT_FIELD_KEY: &'static str = "bookshelf.sort_field";
+    const SORT_ASCENDING_KEY: &'static str = "bookshelf.sort_ascending";
+
+    /// 並び替え設定を保存する（次回起動で復元される）。
+    fn persist_sort(&self, cx: &App) {
+        let pool = &Self::app_state(cx).db_pool;
+        let _ = db::settings::set(pool, Self::SORT_FIELD_KEY, self.sort_field.slug());
+        let _ = db::settings::set(
+            pool,
+            Self::SORT_ASCENDING_KEY,
+            if self.sort_ascending { "1" } else { "0" },
+        );
+    }
+
+    /// 保存された並び替え設定（無ければ既定）。
+    fn load_sort(pool: &sqlx::SqlitePool) -> (SortField, bool) {
+        let field = db::settings::get(pool, Self::SORT_FIELD_KEY)
+            .ok()
+            .flatten()
+            .and_then(|slug| SortField::from_slug(&slug))
+            .unwrap_or(SortField::PurchaseDate);
+        let ascending = db::settings::get(pool, Self::SORT_ASCENDING_KEY)
+            .ok()
+            .flatten()
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        (field, ascending)
+    }
+
     /// ソート項目を選ぶ（ラジオ）。同じ項目を選び直しても方向は変えない
     /// （方向は「方向」セクションのラジオで選ぶ）。
     pub(crate) fn set_sort_field(&mut self, field: SortField, cx: &mut Context<Self>) {
@@ -1956,6 +1993,7 @@ impl BookshelfView {
         self.sort_field = field;
         self.sort_ascending = field.default_ascending();
         self.filtered_dirty = true;
+        self.persist_sort(cx);
         cx.notify();
     }
 
@@ -1963,6 +2001,7 @@ impl BookshelfView {
     fn set_sort_direction(&mut self, ascending: bool, cx: &mut Context<Self>) {
         self.sort_ascending = ascending;
         self.filtered_dirty = true;
+        self.persist_sort(cx);
         cx.notify();
     }
 
@@ -1971,6 +2010,7 @@ impl BookshelfView {
         self.sort_field = SortField::PurchaseDate;
         self.sort_ascending = false;
         self.filtered_dirty = true;
+        self.persist_sort(cx);
         cx.notify();
     }
 
@@ -2168,11 +2208,15 @@ impl BookshelfView {
             return false;
         }
         if !self.selected_tags.is_empty() {
-            let card_tags: Vec<String> = card
+            // ローカル本のタグに加えて、本棚アイテム（同期で得た tags_json）のタグも見る。
+            // 未ダウンロード本はローカルタグを持たないため、これが無いとチップが出ていても
+            // タグ絞り込みにヒットしない（タグ候補の一覧は tags_of を使って作っている）。
+            let mut card_tags: Vec<String> = card
                 .local
                 .as_ref()
                 .map(|e| e.tags.clone())
                 .unwrap_or_default();
+            card_tags.extend(bookshelf::tags_of(&card.shelf));
             if !self
                 .selected_tags
                 .iter()
@@ -6959,7 +7003,6 @@ fn seed_progress_if_absent(db: &db::SqlitePool, book_id: &str, total_pages: i64)
             total_pages: Some(total_pages),
             finished_at: None,
             last_read_at: "2026-01-01 00:00:00".to_string(),
-            scroll_position: 0.0,
         },
     );
 }
@@ -8176,6 +8219,76 @@ mod tests {
         );
     }
 
+    /// 未ダウンロード本でも、本棚アイテムのタグ（tags_json）でタグ絞り込みできる。
+    /// 以前はローカル本のタグしか見ておらず、チップが出ていても絞り込みにヒットしなかった。
+    #[gpui_kit::test]
+    async fn tag_filter_matches_shelf_item_tags(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_sort_item(cx, "fanza", "db-1", "未ダウンロード本", None, None);
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            thundoku_core::db::block_on(async {
+                sqlx::query(
+                    "UPDATE bookshelf_items SET tags_json = '[\"タグA\"]' WHERE database_id = 'db-1'",
+                )
+                .execute(db)
+                .await
+            })
+            .unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        assert_eq!(
+            visible_titles(&view, cx),
+            vec!["未ダウンロード本".to_string()],
+            "タグ無しの状態で表示されていない"
+        );
+        view.update(cx, |this, cx| {
+            this.selected_tags = vec!["タグA".to_string()];
+            this.filtered_dirty = true;
+            cx.notify();
+        });
+        assert_eq!(
+            visible_titles(&view, cx),
+            vec!["未ダウンロード本".to_string()],
+            "本棚アイテムのタグで絞り込めていない（ローカル本のタグしか見ていない）"
+        );
+    }
+
+    /// 並び替えの設定は永続化され、次に開いたときも復元される。
+    #[gpui_kit::test]
+    async fn sort_setting_persists_across_views(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本1", "サークルA");
+        let view = cx.new(BookshelfView::new);
+        view.update(cx, |this, cx| {
+            this.set_sort_field(SortField::ViewCount, cx);
+            this.set_sort_direction(true, cx);
+        });
+        // 別のインスタンス（＝次回起動相当）でも同じ並び替えになる
+        let reopened = cx.new(BookshelfView::new);
+        assert_eq!(
+            (
+                reopened.read_with(cx, |this, _| this.sort_field),
+                reopened.read_with(cx, |this, _| this.sort_ascending),
+            ),
+            (SortField::ViewCount, true),
+            "並び替えの設定が永続化・復元されていない"
+        );
+        // 既定に戻した場合も保存される
+        view.update(cx, |this, cx| this.reset_sort(cx));
+        let reopened = cx.new(BookshelfView::new);
+        assert_eq!(
+            (
+                reopened.read_with(cx, |this, _| this.sort_field),
+                reopened.read_with(cx, |this, _| this.sort_ascending),
+            ),
+            (SortField::PurchaseDate, false),
+            "既定に戻した設定が永続化されていない"
+        );
+    }
+
     /// 通知: ダウンロードを開始できないときは Error として伝える（開く約束は残さない）。
     #[gpui_kit::test]
     async fn download_start_failure_notifies_with_error(cx: &mut TestAppContext) {
@@ -8414,7 +8527,6 @@ mod tests {
                     total_pages: total,
                     finished_at: None,
                     last_read_at: "2026-08-21 00:00:00".into(),
-                    scroll_position: 0.0,
                 },
             )
             .unwrap();
@@ -8434,7 +8546,6 @@ mod tests {
                     total_pages: Some(10),
                     finished_at: Some("2026-08-21 00:00:00".into()),
                     last_read_at: "2026-08-21 00:00:00".into(),
-                    scroll_position: 0.0,
                 },
             )
             .unwrap();
