@@ -386,6 +386,9 @@ pub struct ImageViewer {
     renaming_content: Option<String>,
     /// 付箋（ページ単位のメモ）を使うか。本の閲覧のみ true（試し読みでは出さない）。
     notes_enabled: bool,
+    /// 付箋ダイアログが開いているか。開いている間はキーボード操作のため自分に
+    /// フォーカスを**取り戻さない**（入力欄からフォーカスを奪ってしまうため）。
+    note_dialog_open: bool,
     /// 付箋が付いているページ（0-indexed）。ページ右上の付箋アイコンの色に使う。
     noted_pages: std::collections::HashSet<usize>,
     /// 名前入力（メニューの切替行にインライン表示する。1 つを使い回す）。
@@ -533,6 +536,7 @@ impl ImageViewer {
             last_zoom_toggle: None,
             active_panel: None,
             notes_enabled: false,
+            note_dialog_open: false,
             noted_pages: std::collections::HashSet::new(),
             page_input: None,
             thumbs_loading: std::collections::HashSet::new(),
@@ -1250,6 +1254,12 @@ impl ImageViewer {
     ) {
         self.notes_enabled = enabled;
         self.noted_pages = noted;
+        cx.notify();
+    }
+
+    /// 付箋ダイアログの開閉を伝える（開いている間は自分にフォーカスを取り戻さない）。
+    pub fn set_note_dialog_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.note_dialog_open = open;
         cx.notify();
     }
 
@@ -2133,7 +2143,8 @@ impl Render for ImageViewer {
             .into_iter()
             .flatten()
             .any(|input| input.read(cx).focus_handle(cx).is_focused(window));
-        if !input_focused && !self.focus_handle.is_focused(window) {
+        // 付箋ダイアログの入力中はフォーカスを奪わない（奪うとメモが打ち込めない）
+        if !input_focused && !self.note_dialog_open && !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
         let total = self.loader.page_count();

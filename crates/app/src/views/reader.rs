@@ -4,16 +4,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use gpui_kit::Styled as _;
 use gpui_kit::Subscription;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
     ReadGlobal as _, Render, SharedString, Window, div,
 };
+use gpui_kit::{Focusable as _, Styled as _};
 use thundoku_core::db;
 
 use crate::app_state::AppState;
@@ -44,6 +44,8 @@ pub struct ReaderView {
     /// アクションで要求された付箋の (ページ, 見開き側)。`InputState` の生成に window が
     /// 必要なため、render で下書きにする（本棚の `pending_tag_edit` と同じ作法）。
     note_request: Option<(i64, Option<db::notes::SpreadSide>)>,
+    /// メモ入力の確定（Enter）を拾う購読。下書きを作り直すたびに差し替える。
+    note_subscription: Option<gpui_kit::Subscription>,
 }
 
 /// 付箋ダイアログの下書き（1 ページ 1 件）。
@@ -318,6 +320,7 @@ impl ReaderView {
             last_page_at: Some(Instant::now()),
             note_draft: None,
             note_request: None,
+            note_subscription: None,
         }
     }
 
@@ -360,6 +363,7 @@ impl ReaderView {
             last_page_at: None,
             note_draft: None,
             note_request: None,
+            note_subscription: None,
         }
     }
 
@@ -551,6 +555,20 @@ impl ReaderView {
             .or(requested_side);
         let memo = existing.map(|note| note.memo).unwrap_or_default();
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("メモ"));
+        // ダイアログを開いたらそのまま打ち込めるよう、入力欄にフォーカスを当てる
+        // （当てないとキーがビューアに渡り、ページ送りのショートカットが動いてしまう）
+        let focus = input.focus_handle(cx);
+        let viewer = self.viewer.clone();
+        viewer.update(cx, |viewer, cx| viewer.set_note_dialog_open(true, cx));
+        window.focus(&focus, cx);
+        // Enter で OK（保存して閉じる）。入力欄の確定イベントを使う
+        let subscription =
+            cx.subscribe(&input, |this: &mut Self, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.save_note_draft(cx);
+                }
+            });
+        self.note_subscription = Some(subscription);
         let draft = NoteDraft { page, side, input };
         let input = draft.input.clone();
         draft
@@ -570,6 +588,8 @@ impl ReaderView {
         };
         let content = self.content_key();
         let memo = draft.input.read(cx).value().to_string();
+        let viewer = self.viewer.clone();
+        viewer.update(cx, |viewer, cx| viewer.set_note_dialog_open(false, cx));
         {
             let state = AppState::global(cx);
             let pool = &state.db_pool;
@@ -778,7 +798,7 @@ impl Render for ReaderView {
                         .content(move |content, _window, _cx| {
                             content
                                 .child(div().text_xs().child(format!("{page} ページ")))
-                                .child(Input::new(&input).cursor_text().w_full())
+                                .child(Input::new(&input).cursor_text().w(gpui_kit::px(360.0)))
                         })
                         .footer(
                             div().flex().flex_row().justify_end().gap_2().child(
@@ -945,6 +965,9 @@ mod tests {
             view.read_with(cx, |this, _| this.note_draft.is_some()),
             "付箋ダイアログが開いていない"
         );
+        // ダイアログを開いたらそのまま入力できる（フォーカスが入力欄に当たっている）
+        visual.simulate_keystrokes("memo1");
+        draw(visual);
         let ok = visual
             .debug_bounds("note-save")
             .expect("OK ボタンが出ていない");
@@ -954,6 +977,10 @@ mod tests {
         let pool = cx.update(|cx| AppState::global(cx).db_pool.clone());
         let notes = db::notes::list_newest_first(&pool).unwrap();
         assert_eq!(notes.len(), 1, "付箋が保存されていない");
+        assert_eq!(
+            notes[0].memo, "memo1",
+            "入力したメモが保存されていない（入力欄にフォーカスが当たっていない）"
+        );
         assert_eq!(notes[0].book_id, "b1");
         assert_eq!(notes[0].page, 1, "1-indexed のページ番号になっていない");
         assert!(view.read_with(cx, |this, _| this.note_draft.is_none()));
@@ -1020,6 +1047,21 @@ mod tests {
                 .map(|draft| draft.page))
                 == Some(1),
             "既存の付箋を編集で開けていない"
+        );
+        // Enter で OK（保存して閉じる）
+        visual.simulate_keystrokes("enter");
+        draw(visual);
+        assert!(
+            view.read_with(cx, |this, _| this.note_draft.is_none()),
+            "Enter でダイアログが閉じていない"
+        );
+        assert_eq!(
+            db::notes::get_for_page(&pool, "b1", "", 1)
+                .unwrap()
+                .expect("Enter で付箋が消えている")
+                .memo,
+            "memo1",
+            "Enter でメモが保存されていない"
         );
     }
 
