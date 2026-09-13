@@ -221,7 +221,13 @@ fn row_to_note(row: sqlx::sqlite::SqliteRow) -> PageNote {
 mod tests {
     use super::*;
 
-    fn note<'a>(id: &'a str, book: &'a str, content: &'a str, page: i64, memo: &'a str) -> PageNoteInput<'a> {
+    fn note<'a>(
+        id: &'a str,
+        book: &'a str,
+        content: &'a str,
+        page: i64,
+        memo: &'a str,
+    ) -> PageNoteInput<'a> {
         PageNoteInput {
             id,
             book_id: book,
@@ -359,13 +365,18 @@ mod tests {
         upsert(&pool, &note("n1", "b1", "", 1, "1 ページ目")).unwrap();
         upsert(&pool, &note("n2", "b1", "", 4, "4 ページ目")).unwrap();
 
-        let found = get_for_page(&pool, "b1", "", 4).unwrap().expect("4 ページ目の付箋");
+        let found = get_for_page(&pool, "b1", "", 4)
+            .unwrap()
+            .expect("4 ページ目の付箋");
         assert_eq!(found.memo, "4 ページ目");
         assert!(get_for_page(&pool, "b1", "", 2).unwrap().is_none());
 
         // ページ番号は 1-indexed で保存し、リーダーには 0-indexed で返す
         let pages = noted_pages(&pool, "b1", "").unwrap();
-        assert!(pages.contains(&0) && pages.contains(&3), "印が合わない: {pages:?}");
+        assert!(
+            pages.contains(&0) && pages.contains(&3),
+            "印が合わない: {pages:?}"
+        );
 
         delete(&pool, &found.id).unwrap();
         assert_eq!(list_newest_first(&pool).unwrap().len(), 1);
