@@ -800,6 +800,11 @@ pub struct BookshelfView {
     sort_ascending: bool,
     /// 直前の検索文字列（変更検出用）
     last_search: String,
+    /// 未ダウンロード本のダウンロード確認（はい / いいえ）
+    pending_download_confirm: Option<bookshelf::BookshelfItem>,
+    /// ダウンロード完了後に開く本（リモート本棚の database_id）。
+    /// 「はい」でダウンロードを始めた本・すでにダウンロード中の本を記録する。
+    pending_open_after_download: Option<String>,
     /// お気に入り自動ダウンロードの待ち行列（同時実行数を絞るため）
     auto_download_queue: Vec<bookshelf::BookshelfItem>,
     /// いま走っている自動ダウンロードの件数
@@ -1070,6 +1075,8 @@ impl BookshelfView {
             sort_field: SortField::PurchaseDate,
             sort_ascending: false,
             last_search: String::new(),
+            pending_download_confirm: None,
+            pending_open_after_download: None,
             auto_download_queue: Vec::new(),
             auto_download_running: 0,
             list_state: gpui_kit::ListState::new(
@@ -3175,11 +3182,8 @@ impl BookshelfView {
                 if succeeded {
                     this.reload(cx);
                 }
-                // 自動ダウンロードは枠が空いたら待ち行列の次を開始する
-                if auto {
-                    this.auto_download_running = this.auto_download_running.saturating_sub(1);
-                    this.pump_auto_downloads(cx);
-                }
+                // 完了待ちの本があれば開く（取り込みメッセージを出した後）
+                this.finish_download(cx, &database_id, succeeded, auto);
                 cx.notify();
             });
             log::info!(
@@ -3767,13 +3771,71 @@ impl BookshelfView {
         item: &bookshelf::BookshelfItem,
     ) {
         if self.download_states.contains_key(database_id) {
+            // 取り込み中にクリックされたら、終わったら開くようにしておく
+            self.pending_open_after_download = Some(database_id.to_string());
+            self.toast = Some("ダウンロード中です。完了したら開きます".into());
+            cx.notify();
             return;
         }
         if let Some(book_id) = book_id {
             self.open_book(cx, &book_id);
         } else {
-            self.download_item(cx, item.clone());
+            // 未ダウンロード本は勝手に取り込まず、確認してから
+            self.pending_download_confirm = Some(item.clone());
+            cx.notify();
         }
+    }
+
+    /// ダウンロード確認で「はい」: ダウンロードを開始し、完了後に開く対象として記録する。
+    fn confirm_download(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.pending_download_confirm.take() else {
+            return;
+        };
+        self.pending_open_after_download = Some(item.database_id.clone());
+        if !self.start_download(cx, item.clone(), false) {
+            // 同期中などで開始できなかった（開始できていないのに開く約束はしない）
+            self.pending_open_after_download = None;
+            self.toast = Some(
+                "いまはダウンロードを開始できません（同期中など）。少し待ってからもう一度".into(),
+            );
+        }
+        cx.notify();
+    }
+
+    /// ダウンロード確認で「いいえ」。
+    fn cancel_download_confirm(&mut self, cx: &mut Context<Self>) {
+        self.pending_download_confirm = None;
+        cx.notify();
+    }
+
+    /// ダウンロード完了時の後処理。トースト（取り込みメッセージ）は呼び出し側で設定済み。
+    /// 完了待ちの本があれば**成功時だけ**ビューアーを開く（`reload` の後に呼ぶ）。
+    fn finish_download(
+        &mut self,
+        cx: &mut Context<Self>,
+        database_id: &str,
+        succeeded: bool,
+        auto: bool,
+    ) {
+        if auto {
+            self.auto_download_running = self.auto_download_running.saturating_sub(1);
+            self.pump_auto_downloads(cx);
+        }
+        if self.pending_open_after_download.as_deref() != Some(database_id) {
+            return;
+        }
+        self.pending_open_after_download = None;
+        if succeeded && let Some(book_id) = self.local_book_id_for(database_id) {
+            self.open_book(cx, &book_id);
+        }
+    }
+
+    /// リモート本棚の `database_id` に対応するローカル本の id（取り込み済みのときだけ）。
+    fn local_book_id_for(&self, database_id: &str) -> Option<String> {
+        self.shelf_cards
+            .iter()
+            .find(|card| card.shelf.database_id == database_id)
+            .and_then(|card| card.local.as_ref().map(|entry| entry.book.id.clone()))
     }
 
     fn open_book(&mut self, cx: &mut Context<Self>, book_id: &str) {
@@ -5701,6 +5763,8 @@ impl Render for BookshelfView {
         let busy = self.sync_busy > 0;
         let toast = self.toast.clone();
         let error = self.error.clone();
+        // 未ダウンロード本のダウンロード確認（はい / いいえ）
+        let pending_download_confirm = self.pending_download_confirm.clone();
         // 取り込み確認モーダル（§6.3）: 要約だけなので clone して描画に使う
         let pending_import = self.pending_import.as_ref().map(|pending| {
             (
@@ -6507,6 +6571,63 @@ impl Render for BookshelfView {
                                                 });
                                             }
                                         }),
+                                ),
+                        )
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                },
+            )
+            // 未ダウンロード本のダウンロード確認（関連カルーセル / 行から）
+            .child(
+                if let Some(item) = pending_download_confirm {
+                    let yes_handle = handle.clone();
+                    let no_handle = handle.clone();
+                    let title = item.title.clone();
+                    Dialog::new(cx)
+                        .title(div().child("未ダウンロードです。ダウンロードしますか？"))
+                        .content(move |content, _window, _cx| {
+                            content.child(div().text_sm().child(title.clone()))
+                        })
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "download-confirm-no".into())
+                                        .child(
+                                            Button::new("download-confirm-no")
+                                                .cursor_pointer()
+                                                .label("いいえ")
+                                                .on_click({
+                                                    let handle = no_handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.cancel_download_confirm(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "download-confirm-yes".into())
+                                        .child(
+                                            Button::new("download-confirm-yes")
+                                                .cursor_pointer()
+                                                .primary()
+                                                .label("はい")
+                                                .on_click({
+                                                    let handle = yes_handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.confirm_download(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        ),
                                 ),
                         )
                         .into_any_element()
@@ -8854,8 +8975,10 @@ mod tests {
 
     /// 関連書籍のサムネイルをクリックすると、その本を開く / ダウンロードする
     /// （行クリックと同じ経路）。
+    /// 関連サムネイルで未ダウンロード本をクリックしたら、勝手に取り込まず確認する。
+    /// 「はい」でダウンロードを開始し、完了したらビューアーを開く。
     #[gpui_kit::test]
-    async fn related_thumbnail_click_starts_the_download(cx: &mut TestAppContext) {
+    async fn related_thumbnail_click_asks_before_downloading(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
@@ -8885,9 +9008,140 @@ mod tests {
             .debug_bounds("list-related-db-1-0")
             .expect("関連サムネイルが描画されている");
         visual.simulate_click(item.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(cx, |this, _| this.download_states.contains_key("db-2")),
+            "確認せずにダウンロードが始まっている"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_download_confirm
+                .as_ref()
+                .map(|item| item.database_id.clone())),
+            Some("db-2".to_string()),
+            "ダウンロード確認の状態になっていない"
+        );
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        // 「はい」でダウンロード開始 + 完了後に開く対象として記録される
+        let yes = visual
+            .debug_bounds("download-confirm-yes")
+            .expect("確認ダイアログの「はい」が出ていない");
+        visual.simulate_click(yes.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
         assert!(
             view.read_with(cx, |this, _| this.download_states.contains_key("db-2")),
-            "関連サムネイルのクリックでダウンロードが始まっていない"
+            "「はい」でダウンロードが始まっていない"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this.pending_open_after_download.clone()),
+            Some("db-2".to_string()),
+            "完了後に開く対象が記録されていない"
+        );
+    }
+
+    /// 確認で「いいえ」を選んだら何も起きない（ダウンロードも開始しない）。
+    #[gpui_kit::test]
+    async fn related_download_confirm_cancel_starts_nothing(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                this.pending_download_confirm = Some(
+                    this.shelf_cards
+                        .iter()
+                        .find(|card| card.shelf.database_id == "db-2")
+                        .map(|card| card.shelf.clone())
+                        .expect("db-2 のカード"),
+                );
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let no = visual
+            .debug_bounds("download-confirm-no")
+            .expect("確認ダイアログの「いいえ」が出ていない");
+        visual.simulate_click(no.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |this, _| this.pending_download_confirm.is_none()),
+            "「いいえ」で確認が閉じていない"
+        );
+        assert!(
+            !view.read_with(cx, |this, _| this.download_states.contains_key("db-2")),
+            "「いいえ」なのにダウンロードが始まっている"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.pending_open_after_download.is_none()),
+            "「いいえ」なのに開く対象が記録されている"
+        );
+    }
+
+    /// ダウンロードが成功したら、完了待ちの本をビューアーで開く（失敗時は開かない）。
+    #[gpui_kit::test]
+    async fn download_completion_opens_the_book_only_on_success(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_book(cx, "b1", "本1", "サークルA");
+        link_book_to_shelf(cx, "b1", "db-1");
+        let opened: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = opened.clone();
+        cx.update(|cx| {
+            App::on_action(cx, move |action: &OpenReader, _cx: &mut App| {
+                recorder.lock().unwrap().push(action.book_id.to_string());
+            });
+        });
+        let view = cx.new(BookshelfView::new);
+
+        // 失敗したときは開かない（完了待ちは解除する）
+        view.update(cx, |this, cx| {
+            this.pending_open_after_download = Some("db-1".into());
+            this.finish_download(cx, "db-1", false, false);
+        });
+        cx.run_until_parked();
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "失敗したのにビューアーを開いている"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.pending_open_after_download.is_none()),
+            "失敗時に完了待ちが解除されていない"
+        );
+
+        // 成功したら開く
+        view.update(cx, |this, cx| {
+            this.pending_open_after_download = Some("db-1".into());
+            this.finish_download(cx, "db-1", true, false);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            opened.lock().unwrap().clone(),
+            vec!["b1".to_string()],
+            "成功時にビューアーが開かれていない"
         );
     }
 
