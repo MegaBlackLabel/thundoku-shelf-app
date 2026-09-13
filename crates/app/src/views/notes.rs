@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
+use gpui_kit::AppContext as _;
+use gpui_kit::Focusable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Icon};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -29,6 +32,7 @@ use crate::views::bookshelf::{
 use crate::views::history::shelf_event_text;
 
 /// 付箋 1 件の表示に必要な情報（DB の付箋 + 本の情報 + ページ画像）。
+#[derive(Clone)]
 struct NoteRow {
     note: db::notes::PageNote,
     book: books::Book,
@@ -53,6 +57,27 @@ pub struct NotesView {
     expanded_tag_rows: std::collections::HashSet<String>,
     focus_handle: FocusHandle,
     focus_initialized: bool,
+    /// メモ編集中の下書き（編集中のみ Some）。
+    memo_draft: Option<MemoDraft>,
+    /// メモ入力の確定（Enter）を拾う購読。
+    memo_subscription: Option<gpui_kit::Subscription>,
+}
+
+/// メモ編集の下書き（行の中に直接入力欄を出す）。
+struct MemoDraft {
+    book_id: String,
+    content_id: String,
+    page: i64,
+    /// 付箋の見開き側は編集で失わないように保持する。
+    spread_side: Option<db::notes::SpreadSide>,
+    input: Entity<InputState>,
+}
+
+impl MemoDraft {
+    /// この行を編集中か（本 + レンディション + ページで 1 件）。
+    fn is_for(&self, book_id: &str, content_id: &str, page: i64) -> bool {
+        self.book_id == book_id && self.content_id == content_id && self.page == page
+    }
 }
 
 impl NotesView {
@@ -67,6 +92,8 @@ impl NotesView {
             expanded_tag_rows: std::collections::HashSet::new(),
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
+            memo_draft: None,
+            memo_subscription: None,
         };
         view.reload(cx);
         view
@@ -168,6 +195,59 @@ impl NotesView {
         loader.load_thumb(index).ok()
     }
 
+    /// メモの編集を開く（✎。既存のメモを読み込んで、そのまま打ち替えられる）。
+    fn open_memo_editor(&mut self, window: &mut Window, row: &NoteRow, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("メモ"));
+        // Enter で OK（保存して閉じる）
+        let subscription =
+            cx.subscribe(&input, |this: &mut Self, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.save_memo(cx);
+                }
+            });
+        self.memo_subscription = Some(subscription);
+        let memo = row.note.memo.clone();
+        input.update(cx, |state, cx| state.set_value(memo, window, cx));
+        // 開いたらそのまま打ち替えられるようフォーカスを当てる
+        let focus = input.focus_handle(cx);
+        window.focus(&focus, cx);
+        self.memo_draft = Some(MemoDraft {
+            book_id: row.book.id.clone(),
+            content_id: row.note.content_id.clone(),
+            page: row.note.page,
+            spread_side: row.note.spread_side,
+            input,
+        });
+        cx.notify();
+    }
+
+    /// メモを保存する（付箋の ON / OFF・登録日・見開き側はそのまま）。
+    fn save_memo(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.memo_draft.take() else {
+            return;
+        };
+        let memo = draft.input.read(cx).value().to_string();
+        {
+            let state = AppState::global(cx);
+            let pool = &state.db_pool;
+            // リーダーと同じ id 規約（同じ付箋を更新する）
+            let id = format!("note-{}-{}-{}", draft.book_id, draft.content_id, draft.page);
+            let note = db::notes::PageNoteInput {
+                id: &id,
+                book_id: &draft.book_id,
+                content_id: &draft.content_id,
+                page: draft.page,
+                memo: &memo,
+                spread_side: draft.spread_side,
+            };
+            if let Err(error) = db::notes::upsert(pool, &note) {
+                log::warn!("メモの保存に失敗: {error}");
+            }
+        }
+        self.reload(cx);
+        cx.notify();
+    }
+
     /// タグの絞り込みをトグルする（チップの文字クリック。本棚と同じ）。
     fn toggle_tag(&mut self, tag: &str, cx: &mut Context<Self>) {
         if let Some(index) = self.selected_tags.iter().position(|t| t == tag) {
@@ -248,14 +328,19 @@ impl NotesView {
     }
 
     /// メモの表示（空メモは出さない）。
-    fn render_memo(theme: &gpui_kit::component::Theme, memo: &str) -> Option<AnyElement> {
+    fn render_memo(
+        theme: &gpui_kit::component::Theme,
+        memo: &str,
+        note_id: &str,
+    ) -> Option<AnyElement> {
         let memo = memo.trim();
         if memo.is_empty() {
             return None;
         }
+        let selector = format!("notes-memo-{note_id}");
         Some(
             div()
-                .debug_selector(|| "notes-memo".into())
+                .debug_selector(move || selector.clone())
                 .w_full()
                 .rounded_md()
                 .bg(theme.secondary)
@@ -265,6 +350,54 @@ impl NotesView {
                 .child(memo.to_string())
                 .into_any_element(),
         )
+    }
+
+    /// メモの編集ボタン（✎。タグ編集ボタンと同じ見た目）。
+    fn render_memo_edit_button(
+        theme: &gpui_kit::component::Theme,
+        handle: &Entity<Self>,
+        row: &NoteRow,
+    ) -> AnyElement {
+        let note_id = format!("{}-{}", row.book.id, row.note.page);
+        let selector = format!("notes-memo-edit-{note_id}");
+        div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .w(px(24.0))
+            .h(px(24.0))
+            .rounded_full()
+            .bg(theme.background)
+            .text_color(theme.muted_foreground)
+            .text_sm()
+            .child("✎")
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.secondary))
+            .on_click({
+                let handle = handle.clone();
+                let row = row.note.clone();
+                let book_id = row.book_id.clone();
+                move |_event, window, cx| {
+                    cx.stop_propagation();
+                    handle.update(cx, |this, cx| {
+                        // 行の情報が要るので、最新の rows から該当の付箋を探して開く
+                        let target = this
+                            .rows
+                            .iter()
+                            .find(|candidate| {
+                                candidate.book.id == book_id && candidate.note.page == row.page
+                            })
+                            .cloned();
+                        if let Some(target) = target {
+                            this.open_memo_editor(window, &target, cx);
+                        }
+                    });
+                }
+            })
+            .into_any_element()
     }
 
     /// サークル / 作者のチップ（本棚と同じ見た目: 値 + 右端のハート）。
@@ -464,6 +597,12 @@ impl NotesView {
             .clone()
             .or_else(|| placeholder_cover(&row.book.title, &row.book.circle_name));
         let state_selector = format!("notes-state-{note_id}");
+        // 編集中の行はメモ欄を入力欄 + OK ボタンに差し替える
+        let editor = self
+            .memo_draft
+            .as_ref()
+            .filter(|draft| draft.is_for(&row.book.id, &row.note.content_id, page))
+            .map(|draft| draft.input.clone());
 
         div()
             .id(SharedString::from(format!("notes-row-{note_id}")))
@@ -591,10 +730,7 @@ impl NotesView {
                                 "付箋登録日: {}",
                                 local_date_label(&row.note.created_at)
                             )),
-                    )
-                    .when_some(Self::render_memo(theme, &row.note.memo), |this, memo| {
-                        this.child(memo)
-                    }),
+                    ),
             )
             // 3 列目: タグ（本棚の行と同じ幅の取り方）
             .child(
@@ -614,7 +750,58 @@ impl NotesView {
                         tags_expanded,
                     )),
             )
-            // 4 列目: 本を見る（該当ページ・見開き側で開く）。
+            // 4 列目: メモ（タグ列の右。残り幅いっぱいに広げる）
+            .child(
+                div()
+                    .debug_selector({
+                        let selector = format!("notes-memo-area-{note_id}");
+                        move || selector.clone()
+                    })
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_1()
+                    .when_some(editor.clone(), |this, input| {
+                        let save_selector = format!("notes-memo-save-{note_id}");
+                        let save_id = format!("notes-memo-save-{note_id}");
+                        let handle = handle.clone();
+                        this.child(
+                            div()
+                                .debug_selector({
+                                    let selector = format!("notes-memo-input-{note_id}");
+                                    move || selector.clone()
+                                })
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&input).cursor_text()),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(move || save_selector.clone())
+                                .flex_shrink_0()
+                                .child(
+                                    Button::new(SharedString::from(save_id))
+                                        .cursor_pointer()
+                                        .primary()
+                                        .label("OK")
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            handle.update(cx, |this, cx| this.save_memo(cx));
+                                        }),
+                                ),
+                        )
+                    })
+                    .when(editor.is_none(), |this| {
+                        this.when_some(
+                            Self::render_memo(theme, &row.note.memo, &note_id),
+                            |this, memo| this.child(div().flex_1().min_w_0().child(memo)),
+                        )
+                        .child(Self::render_memo_edit_button(theme, handle, row))
+                    }),
+            )
+            // 5 列目: 本を見る（該当ページ・見開き側で開く）。
             // 行の高さいっぱいに広げ、押せることが分かるよう塗りボタンにする。
             .child(
                 div()
@@ -711,6 +898,16 @@ impl Render for NotesView {
             .on_key_down({
                 let handle = cx.entity();
                 move |event: &KeyDownEvent, _window, cx| {
+                    // メモ編集中の ESC は編集を閉じる（保存しない）
+                    if event.keystroke.key.as_str() == "escape"
+                        && handle.read(cx).memo_draft.is_some()
+                    {
+                        handle.update(cx, |this, cx| {
+                            this.memo_draft = None;
+                            cx.notify();
+                        });
+                        return;
+                    }
                     // ESC でタグ絞り込みを解除する
                     if event.keystroke.key.as_str() == "escape" {
                         handle.update(cx, |this, cx| {
@@ -789,7 +986,6 @@ impl Render for NotesView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::AppContext as _;
 
     /// 付箋画面: 追加が新しい順に、ページ画像・メモ・付箋登録日・「本を見る」付きで並ぶ。
     #[gpui_kit::test]
@@ -870,8 +1066,9 @@ mod tests {
             "notes-info-b2-7",
             "notes-created-b2-7",
             "notes-tag-area-b2-7",
+            "notes-memo-area-b2-7",
+            "notes-memo-b2-7",
             "notes-open-b2-7",
-            "notes-memo",
         ] {
             assert!(
                 visual.debug_bounds(selector).is_some(),
@@ -888,6 +1085,206 @@ mod tests {
             "本を見るボタンが行の高さいっぱいになっていない: {} (期待 {expected})",
             open.size.height.as_f32()
         );
+        // メモはタグ列の右にあり、残り幅いっぱい（タグ列より広い）
+        let tag_area = visual.debug_bounds("notes-tag-area-b2-7").expect("タグ列");
+        let memo_area = visual.debug_bounds("notes-memo-area-b2-7").expect("メモ列");
+        assert!(
+            memo_area.origin.x > tag_area.origin.x,
+            "メモがタグ列の右に無い: tag={} memo={}",
+            tag_area.origin.x.as_f32(),
+            memo_area.origin.x.as_f32()
+        );
+        assert!(
+            memo_area.size.width.as_f32() > tag_area.size.width.as_f32(),
+            "メモの幅がタグ列より広くなっていない: tag={} memo={}",
+            tag_area.size.width.as_f32(),
+            memo_area.size.width.as_f32()
+        );
+        // メモ列は本を見るボタンの左端まで届く（残り幅を埋める）
+        let open = visual.debug_bounds("notes-open-b2-7").expect("本を見る");
+        assert!(
+            (memo_area.origin.x.as_f32() + memo_area.size.width.as_f32() - open.origin.x.as_f32())
+                .abs()
+                < 24.0,
+            "メモ列が残り幅を埋めていない: memo_right={} open_left={}",
+            memo_area.origin.x.as_f32() + memo_area.size.width.as_f32(),
+            open.origin.x.as_f32()
+        );
+        // メモの ✎ はメモの右（タグ編集ボタンと同じ見た目の丸ボタン）で、押すと編集できる
+        let memo = visual.debug_bounds("notes-memo-b2-7").expect("メモ");
+        let pencil = visual
+            .debug_bounds("notes-memo-edit-b2-7")
+            .expect("メモの ✎ が出ていない");
+        assert!(
+            pencil.origin.x.as_f32() >= memo.origin.x.as_f32() + memo.size.width.as_f32() - 1.0,
+            "✎ がメモの右に無い: memo_right={} pencil={}",
+            memo.origin.x.as_f32() + memo.size.width.as_f32(),
+            pencil.origin.x.as_f32()
+        );
+        assert!(
+            (pencil.size.width.as_f32() - 24.0).abs() < 1.0
+                && (pencil.size.height.as_f32() - 24.0).abs() < 1.0,
+            "✎ がタグ編集ボタンと同じ大きさでない: {}x{}",
+            pencil.size.width.as_f32(),
+            pencil.size.height.as_f32()
+        );
+        visual.simulate_click(pencil.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        draw_notes(&mut *visual);
+        assert!(
+            view.read_with(cx, |this, _| this.memo_draft.is_some()),
+            "✎ でメモ編集が開かない"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.memo_draft.as_ref().map(|draft| draft
+                .input
+                .read(cx)
+                .value()
+                .to_string())),
+            Some("新しいメモ".to_string()),
+            "既存のメモが読み込まれていない"
+        );
+        // ダイアログではなく、行の中に入力欄 + OK が出る
+        let editor = visual
+            .debug_bounds("notes-memo-input-b2-7")
+            .expect("行の中のメモ入力欄が出ていない");
+        let save = visual
+            .debug_bounds("notes-memo-save-b2-7")
+            .expect("行の中の OK ボタンが出ていない");
+        assert!(
+            editor.origin.x.as_f32() >= row.origin.x.as_f32()
+                && editor.origin.x.as_f32() + editor.size.width.as_f32()
+                    <= row.origin.x.as_f32() + row.size.width.as_f32()
+                && editor.origin.y.as_f32() >= row.origin.y.as_f32()
+                && editor.origin.y.as_f32() + editor.size.height.as_f32()
+                    <= row.origin.y.as_f32() + row.size.height.as_f32(),
+            "入力欄が行の中に無い（ダイアログになっている）: editor={:?} row={:?}",
+            (editor.origin.x.as_f32(), editor.origin.y.as_f32()),
+            (row.origin.x.as_f32(), row.origin.y.as_f32())
+        );
+        assert!(
+            save.origin.x.as_f32() >= editor.origin.x.as_f32() + editor.size.width.as_f32() - 1.0,
+            "OK が入力欄の右に無い: editor_right={} save={}",
+            editor.origin.x.as_f32() + editor.size.width.as_f32(),
+            save.origin.x.as_f32()
+        );
+        assert!(
+            editor.size.height.as_f32() <= 48.0,
+            "入力欄が行いっぱいに引き伸ばされている: {}",
+            editor.size.height.as_f32()
+        );
+        // 編集中はメモ本体と ✎ は消える（入力欄に置き換わる）
+        assert!(
+            visual.debug_bounds("notes-memo-b2-7").is_none()
+                && visual.debug_bounds("notes-memo-edit-b2-7").is_none(),
+            "編集中もメモ本体 / ✎ が残っている"
+        );
+        // 打ち替えて Enter で保存（付箋の ON/OFF・登録日・見開き側はそのまま）
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                let input = this.memo_draft.as_ref().expect("下書き").input.clone();
+                input.update(cx, |state, cx| {
+                    state.set_value("書き換えたメモ", window, cx);
+                });
+            });
+        });
+        visual.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |this, _| this.memo_draft.is_none()),
+            "Enter でメモ編集が閉じていない"
+        );
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let pool = &state.db_pool;
+            let note = db::notes::get_for_page(pool, "b2", "", 7)
+                .unwrap()
+                .expect("付箋が消えている");
+            assert_eq!(note.memo, "書き換えたメモ", "メモが保存されていない");
+            assert!(note.is_active, "メモの編集で付箋の ON が外れている");
+            assert_eq!(
+                note.spread_side,
+                Some(db::notes::SpreadSide::Left),
+                "メモの編集で見開き側が失われている"
+            );
+        });
+        draw_notes(&mut *visual);
+        assert!(
+            visual.debug_bounds("notes-memo-b2-7").is_some(),
+            "編集後も行が残っていない"
+        );
+        assert!(
+            visual.debug_bounds("notes-memo-edit-b2-7").is_some()
+                && visual.debug_bounds("notes-memo-input-b2-7").is_none(),
+            "保存後に ✎ に戻っていない"
+        );
+        // ✎ → ESC はキャンセル（メモは変わらない）
+        let pencil = visual
+            .debug_bounds("notes-memo-edit-b2-7")
+            .expect("メモの ✎");
+        visual.simulate_click(pencil.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        draw_notes(&mut *visual);
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                let input = this.memo_draft.as_ref().expect("下書き").input.clone();
+                input.update(cx, |state, cx| {
+                    state.set_value("破棄されるメモ", window, cx);
+                });
+            });
+        });
+        visual.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        draw_notes(&mut *visual);
+        assert!(
+            view.read_with(cx, |this, _| this.memo_draft.is_none()),
+            "ESC でメモ編集が閉じていない"
+        );
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let pool = &state.db_pool;
+            let note = db::notes::get_for_page(pool, "b2", "", 7)
+                .unwrap()
+                .expect("付箋が消えている");
+            assert_eq!(
+                note.memo, "書き換えたメモ",
+                "ESC でメモが保存されてしまった"
+            );
+        });
+        // もう一度 ✎ → OK ボタンでも保存できる
+        let pencil = visual
+            .debug_bounds("notes-memo-edit-b2-7")
+            .expect("メモの ✎");
+        visual.simulate_click(pencil.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        draw_notes(&mut *visual);
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                let input = this.memo_draft.as_ref().expect("下書き").input.clone();
+                input.update(cx, |state, cx| {
+                    state.set_value("OK で保存", window, cx);
+                });
+            });
+        });
+        draw_notes(&mut *visual);
+        let save = visual
+            .debug_bounds("notes-memo-save-b2-7")
+            .expect("行の中の OK ボタン");
+        visual.simulate_click(save.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |this, _| this.memo_draft.is_none()),
+            "OK でメモ編集が閉じていない"
+        );
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let pool = &state.db_pool;
+            let note = db::notes::get_for_page(pool, "b2", "", 7)
+                .unwrap()
+                .expect("付箋が消えている");
+            assert_eq!(note.memo, "OK で保存", "OK でメモが保存されていない");
+        });
+        draw_notes(&mut *visual);
         // 情報列は本棚と同じ 320px 固定
         let info = visual.debug_bounds("notes-info-b2-7").expect("情報列");
         assert!(
@@ -903,6 +1300,16 @@ mod tests {
             visual.debug_bounds("notes-open-b2-7").is_some(),
             "本を見るを押した後も画面が保たれていない"
         );
+    }
+
+    /// 数フレーム描く（行の測定とダイアログの反映のため）。
+    fn draw_notes(visual: &mut gpui_kit::VisualTestContext) {
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
     }
 
     fn test_book(id: &str) -> db::books::Book {
