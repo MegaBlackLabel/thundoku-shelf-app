@@ -2059,8 +2059,18 @@ mod tests {
             })
             .unwrap();
         });
-        // 「今日」と「昨日」のセッション（UTC の now から作る = ローカルでは今日 / 昨日）
-        let now = Utc::now() - Duration::hours(1);
+        // 「今日」と「昨日」のセッション。**ローカルの正午**を基準にする
+        // （実行時刻がローカル深夜だと「1 時間前」が前日になり、テストが日付で落ちるため）
+        let now = {
+            chrono::Local::now()
+                .date_naive()
+                .and_hms_opt(12, 0, 0)
+                .expect("正午")
+                .and_local_timezone(chrono::Local)
+                .single()
+                .expect("ローカル時刻")
+                .with_timezone(&Utc)
+        };
         add_session(cx, "s1", "b1", now, 10);
         add_session(cx, "s2", "b1", now - Duration::minutes(30), 5);
         add_session(cx, "s3", "b2", now - Duration::days(1), 20);

@@ -35,7 +35,7 @@ use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE, UreqTransport};
 use crate::actions::{
     DeleteBook, EditBookTags, HideBook, OpenAuth, OpenAuthProvider, OpenReader, SyncDrive,
 };
-use crate::app_state::AppState;
+use crate::app_state::{AppState, ToastKind};
 use crate::icons::AppIcon;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -822,8 +822,6 @@ pub struct BookshelfView {
     focus_initialized: bool,
     /// 選択中のカード（filtered 内のインデックス）
     selected_index: Option<usize>,
-    error: Option<String>,
-    toast: Option<String>,
 }
 
 /// 取り込みの成功結果（読み飛ばしたエントリの警告付き）。
@@ -1090,8 +1088,6 @@ impl BookshelfView {
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
             selected_index: Some(0),
-            error: None,
-            toast: None,
         };
         view.reload(cx);
         view
@@ -1690,7 +1686,7 @@ impl BookshelfView {
             pending.len()
         );
         // 処理中であることを提示する（同期完了トーストの後に出る）
-        self.toast = Some("書籍情報を展開中です".into());
+        crate::app_state::set_toast_kind(cx, ToastKind::Info, "書籍情報を展開中です");
         cx.notify();
         let state = Self::app_state(cx);
         let tbf_client = state.tbf.clone();
@@ -1886,11 +1882,17 @@ impl BookshelfView {
                 this.cover_fetch_retried = false;
                 if ok == 0 {
                     // エラーは赤の 1 行だけ表示する（toast と重複させない）
-                    this.toast = None;
-                    this.error = Some(format!("表紙を取得できませんでした（{fail} 件）"));
+                    crate::app_state::set_toast_kind(
+                        cx,
+                        ToastKind::Error,
+                        format!("表紙を取得できませんでした（{fail} 件）"),
+                    );
                 } else {
-                    crate::app_state::set_toast(cx, "書籍情報の展開が完了しました");
-                    this.error = None;
+                    crate::app_state::set_toast_kind(
+                        cx,
+                        ToastKind::Success,
+                        "書籍情報の展開が完了しました",
+                    );
                 }
                 cx.notify();
             });
@@ -2251,7 +2253,11 @@ impl BookshelfView {
     pub fn sync_booth(&mut self, cx: &mut Context<Self>) {
         let logged_in = *AppState::global(cx).booth_logged_in.lock();
         if !logged_in {
-            self.toast = Some("BOOTH にログインしてから同期してください".into());
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "BOOTH にログインしてから同期してください",
+            );
             cx.defer(move |cx| {
                 cx.dispatch_action(&OpenAuthProvider {
                     provider: crate::views::auth::AuthProvider::Booth,
@@ -2262,8 +2268,7 @@ impl BookshelfView {
         }
         log::info!("sync_booth: 開始");
         self.sync_busy += 1;
-        self.error = None;
-        self.toast = Some("BOOTH サイトのデータを取得中です".into());
+        crate::app_state::set_toast_kind(cx, ToastKind::Info, "BOOTH サイトのデータを取得中です");
         let handle = cx.entity();
         let state = Self::app_state(cx);
         let session = state.booth_session.lock().clone();
@@ -2445,12 +2450,16 @@ impl BookshelfView {
                 match result {
                     Ok(count) => {
                         log::info!("sync_booth: 完了（{count} 件）");
-                        this.toast = Some(format!("BOOTH サイトから {count} 件取得しました"));
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            ToastKind::Success,
+                            format!("BOOTH サイトから {count} 件取得しました"),
+                        );
                         this.reload(cx);
                     }
                     Err(message) => {
                         log::error!("sync_booth failed: {message}");
-                        this.error = Some(message.clone());
+                        crate::app_state::set_toast_kind(cx, ToastKind::Error, message.clone());
                         if message.contains("not logged in") {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&OpenAuthProvider {
@@ -2470,7 +2479,11 @@ impl BookshelfView {
     pub fn sync_fanza(&mut self, cx: &mut Context<Self>) {
         let logged_in = *AppState::global(cx).fanza_logged_in.lock();
         if !logged_in {
-            self.toast = Some("FANZA にログインしてから同期してください".into());
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "FANZA にログインしてから同期してください",
+            );
             cx.defer(move |cx| {
                 cx.dispatch_action(&OpenAuthProvider {
                     provider: crate::views::auth::AuthProvider::Fanza,
@@ -2481,8 +2494,7 @@ impl BookshelfView {
         }
         log::info!("sync_fanza: 開始");
         self.sync_busy += 1;
-        self.error = None;
-        self.toast = Some("FANZA サイトのデータを取得中です".into());
+        crate::app_state::set_toast_kind(cx, ToastKind::Info, "FANZA サイトのデータを取得中です");
         let handle = cx.entity();
         let state = Self::app_state(cx);
         let session = state.fanza_session.lock().clone();
@@ -2515,12 +2527,16 @@ impl BookshelfView {
                 match result {
                     Ok(count) => {
                         log::info!("sync_fanza: 完了（{count} 件）");
-                        this.toast = Some(format!("FANZA サイトから {count} 件取得しました"));
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            ToastKind::Success,
+                            format!("FANZA サイトから {count} 件取得しました"),
+                        );
                         this.reload(cx);
                     }
                     Err(message) => {
                         log::error!("sync_fanza failed: {message}");
-                        this.error = Some(message.clone());
+                        crate::app_state::set_toast_kind(cx, ToastKind::Error, message.clone());
                         if message.contains("not logged in") || message.contains("セッション")
                         {
                             cx.defer(move |cx| {
@@ -2541,7 +2557,11 @@ impl BookshelfView {
     pub fn sync_dlsite(&mut self, cx: &mut Context<Self>) {
         let logged_in = *AppState::global(cx).dlsite_logged_in.lock();
         if !logged_in {
-            self.toast = Some("DLsite にログインしてから同期してください".into());
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "DLsite にログインしてから同期してください",
+            );
             cx.defer(move |cx| {
                 cx.dispatch_action(&OpenAuthProvider {
                     provider: crate::views::auth::AuthProvider::Dlsite,
@@ -2552,8 +2572,7 @@ impl BookshelfView {
         }
         log::info!("sync_dlsite: 開始");
         self.sync_busy += 1;
-        self.error = None;
-        self.toast = Some("DLsite サイトのデータを取得中です".into());
+        crate::app_state::set_toast_kind(cx, ToastKind::Info, "DLsite サイトのデータを取得中です");
         let handle = cx.entity();
         let state = Self::app_state(cx);
         let session = state.dlsite_session.lock().clone();
@@ -2586,12 +2605,16 @@ impl BookshelfView {
                 match result {
                     Ok(count) => {
                         log::info!("sync_dlsite: 完了（{count} 件）");
-                        this.toast = Some(format!("DLsite サイトから {count} 件取得しました"));
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            ToastKind::Success,
+                            format!("DLsite サイトから {count} 件取得しました"),
+                        );
                         this.reload(cx);
                     }
                     Err(message) => {
                         log::error!("sync_dlsite failed: {message}");
-                        this.error = Some(message.clone());
+                        crate::app_state::set_toast_kind(cx, ToastKind::Error, message.clone());
                         if message.contains("not logged in") || message.contains("セッション")
                         {
                             cx.defer(move |cx| {
@@ -2612,15 +2635,18 @@ impl BookshelfView {
     pub fn sync_tbf(&mut self, cx: &mut Context<Self>) {
         let logged_in = *AppState::global(cx).tbf_logged_in.lock();
         if !logged_in {
-            self.toast = Some("ログインしてから同期してください".into());
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "ログインしてから同期してください",
+            );
             cx.defer(move |cx| cx.dispatch_action(&OpenAuth));
             cx.notify();
             return;
         }
         log::info!("sync_tbf: 開始");
         self.sync_busy += 1;
-        self.error = None;
-        self.toast = Some("技術書典サイトのデータを取得中です".into());
+        crate::app_state::set_toast_kind(cx, ToastKind::Info, "技術書典サイトのデータを取得中です");
         let handle = cx.entity();
         let state = Self::app_state(cx);
         let tbf_client = state.tbf.clone();
@@ -2656,12 +2682,16 @@ impl BookshelfView {
                 match result {
                     Ok(count) => {
                         log::info!("sync_tbf: 完了（{count} 件）");
-                        this.toast = Some(format!("技術書典サイトから {count} 件取得しました"));
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            ToastKind::Success,
+                            format!("技術書典サイトから {count} 件取得しました"),
+                        );
                         this.reload(cx);
                     }
                     Err(message) => {
                         log::error!("sync_tbf failed: {message}");
-                        this.error = Some(message.clone());
+                        crate::app_state::set_toast_kind(cx, ToastKind::Error, message.clone());
                         if message.contains("session expired") {
                             cx.defer(move |cx| cx.dispatch_action(&OpenAuth));
                         }
@@ -2694,7 +2724,6 @@ impl BookshelfView {
         if Self::is_exit_uploading(cx) {
             return false;
         }
-        self.error = None;
         let database_id = item.database_id.clone();
         self.download_states
             .insert(database_id.clone(), DownloadState::Downloading(0.0));
@@ -3174,10 +3203,17 @@ impl BookshelfView {
                 this.download_states.remove(&database_id);
                 let (toast, error) = download_messages(&result);
                 let succeeded = result.is_ok();
-                this.toast = toast;
-                this.error = error;
-                if let Some(error) = &this.error {
-                    log::warn!("download_item: 失敗しました: {error}");
+                if let Some(message) = error {
+                    log::warn!("download_item: 失敗しました: {message}");
+                    crate::app_state::set_toast_kind(cx, ToastKind::Error, message);
+                } else if let Some(message) = toast {
+                    // 成功 = Success / キャンセルなど = Info
+                    let kind = if succeeded {
+                        ToastKind::Success
+                    } else {
+                        ToastKind::Info
+                    };
+                    crate::app_state::set_toast_kind(cx, kind, message);
                 }
                 if succeeded {
                     this.reload(cx);
@@ -3322,7 +3358,7 @@ impl BookshelfView {
             let path = state.packs_dir.join(format!("{book_id}.opfspack"));
             let _ = std::fs::remove_file(path);
         }
-        self.toast = Some("本を削除しました".into());
+        crate::app_state::set_toast_kind(cx, ToastKind::Success, "本を削除しました");
         self.reload(cx);
     }
 
@@ -3339,12 +3375,12 @@ impl BookshelfView {
         // 表紙取得中・同期中は `download_item` が無視するので、完了後に実行するよう積む。
         if self.fetching_covers || self.sync_busy > 0 {
             self.pending_download = Some(card.shelf.clone());
-            self.toast = Some("表紙の取得後に再取得します".into());
+            crate::app_state::set_toast_kind(cx, ToastKind::Info, "表紙の取得後に再取得します");
             cx.notify();
             return;
         }
         self.download_item(cx, card.shelf.clone());
-        self.toast = Some("再取得を開始しました".into());
+        crate::app_state::set_toast_kind(cx, ToastKind::Info, "再取得を開始しました");
         cx.notify();
     }
 
@@ -3726,7 +3762,7 @@ impl BookshelfView {
             return;
         };
         let Some(session) = session else {
-            self.toast = Some("FANZA にログインしてください".into());
+            crate::app_state::set_toast_kind(cx, ToastKind::Info, "FANZA にログインしてください");
             cx.notify();
             return;
         };
@@ -3743,7 +3779,11 @@ impl BookshelfView {
                 added += 1;
             }
         }
-        self.toast = Some(format!("ジャンルを再取得しました（{added} 件追加）"));
+        crate::app_state::set_toast_kind(
+            cx,
+            ToastKind::Success,
+            format!("ジャンルを再取得しました（{added} 件追加）"),
+        );
         cx.notify();
     }
 
@@ -3773,7 +3813,11 @@ impl BookshelfView {
         if self.download_states.contains_key(database_id) {
             // 取り込み中にクリックされたら、終わったら開くようにしておく
             self.pending_open_after_download = Some(database_id.to_string());
-            self.toast = Some("ダウンロード中です。完了したら開きます".into());
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "ダウンロード中です。完了したら開きます",
+            );
             cx.notify();
             return;
         }
@@ -3795,8 +3839,10 @@ impl BookshelfView {
         if !self.start_download(cx, item.clone(), false) {
             // 同期中などで開始できなかった（開始できていないのに開く約束はしない）
             self.pending_open_after_download = None;
-            self.toast = Some(
-                "いまはダウンロードを開始できません（同期中など）。少し待ってからもう一度".into(),
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Error,
+                "いまはダウンロードを開始できません（同期中など）。少し待ってからもう一度",
             );
         }
         cx.notify();
@@ -5761,8 +5807,6 @@ impl Render for BookshelfView {
         let selected_tags = self.selected_tags.clone();
         let read_filter = self.read_filter;
         let busy = self.sync_busy > 0;
-        let toast = self.toast.clone();
-        let error = self.error.clone();
         // 未ダウンロード本のダウンロード確認（はい / いいえ）
         let pending_download_confirm = self.pending_download_confirm.clone();
         // 取り込み確認モーダル（§6.3）: 要約だけなので clone して描画に使う
@@ -5790,7 +5834,9 @@ impl Render for BookshelfView {
             .flex()
             .flex_col()
             .gap_2()
-            .p_3()
+            // 下は余白を取らない（1 行でも多く本を出す）
+            .px_3()
+            .pt_3()
             .bg(cx.theme().background)
             // 1 段目: サイト情報（選択中のサイトに応じて表示）
             .child({
@@ -6445,22 +6491,9 @@ impl Render for BookshelfView {
                             .into_any_element(),
                     }),
             )
-            .child(if let Some(toast) = toast {
-                div().text_sm().child(toast).into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            .child(if let Some(error) = error {
-                div()
-                    .text_sm()
-                    .text_color(gpui_kit::red())
-                    .child(error)
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            // 取り込み確認モーダル（§6.3: 曖昧な構造のときだけ）
-            .child(
+            // 取り込み確認モーダル（§6.3: 曖昧な構造のときだけ）。
+            // 出ていないときは child を足さない（gap ぶんの空きが出て下が狭くなる）
+            .children(
                 if let Some((title, choices, selected)) = pending_import {
                     let handle = handle.clone();
                     let content_handle = handle.clone();
@@ -6574,12 +6607,13 @@ impl Render for BookshelfView {
                                 ),
                         )
                         .into_any_element()
+                        .into()
                 } else {
-                    div().into_any_element()
+                    None
                 },
             )
             // 未ダウンロード本のダウンロード確認（関連カルーセル / 行から）
-            .child(
+            .children(
                 if let Some(item) = pending_download_confirm {
                     let yes_handle = handle.clone();
                     let no_handle = handle.clone();
@@ -6631,8 +6665,9 @@ impl Render for BookshelfView {
                                 ),
                         )
                         .into_any_element()
+                        .into()
                 } else {
-                    div().into_any_element()
+                    None
                 },
             )
     }
@@ -8070,6 +8105,124 @@ mod tests {
             })
             .unwrap();
         });
+    }
+
+    /// 下部に無駄な余白を作らない（本をできるだけ表示する）。
+    /// 以前は下部パディングと、非表示ダイアログぶんの gap で 28px 空いていた。
+    #[gpui_kit::test]
+    async fn grid_reaches_the_bottom_of_the_view(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        for i in 0..6 {
+            seed_book(cx, &format!("b{i}"), &format!("本{i}"), "サークルA");
+        }
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let root = visual.debug_bounds("bookshelf-root").expect("root");
+        let grid = visual.debug_bounds("bookshelf-grid").expect("grid");
+        let root_bottom = root.origin.y.as_f32() + root.size.height.as_f32();
+        let grid_bottom = grid.origin.y.as_f32() + grid.size.height.as_f32();
+        assert!(
+            root_bottom - grid_bottom <= 1.0,
+            "グリッドの下に余白がある: root_bottom={root_bottom} grid_bottom={grid_bottom}"
+        );
+    }
+
+    /// 通知: ダウンロードを開始できないときは Error として伝える（開く約束は残さない）。
+    #[gpui_kit::test]
+    async fn download_start_failure_notifies_with_error(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_sort_item(cx, "fanza", "db-1", "本1", None, None);
+        let view = cx.new(BookshelfView::new);
+        view.update(cx, |this, cx| {
+            // 同期中は開始できない
+            this.sync_busy = 1;
+            this.pending_download_confirm = Some(
+                this.shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "db-1")
+                    .map(|card| card.shelf.clone())
+                    .expect("db-1"),
+            );
+            this.confirm_download(cx);
+        });
+        let (kind, message) = cx.update(|cx| {
+            let state = AppState::global(cx);
+            (*state.toast_kind.lock(), state.toast_message.lock().clone())
+        });
+        assert_eq!(kind, ToastKind::Error, "開始失敗が Error になっていない");
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("開始できません")),
+            "開始できない旨のメッセージが出ていない: {message:?}"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.pending_open_after_download.is_none()),
+            "開始できていないのに開く約束が残っている"
+        );
+        assert!(
+            !view.read_with(cx, |this, _| this.download_states.contains_key("db-1")),
+            "開始できないのにダウンロード状態が作られている"
+        );
+    }
+
+    /// 通知: すでにダウンロード中の本を開こうとしたら Info として伝える。
+    #[gpui_kit::test]
+    async fn clicking_a_downloading_book_notifies_info(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_sort_item(cx, "fanza", "db-1", "本1", None, None);
+        let view = cx.new(BookshelfView::new);
+        view.update(cx, |this, cx| {
+            this.download_states
+                .insert("db-1".to_string(), DownloadState::Downloading(0.0));
+            this.open_or_download(
+                cx,
+                "db-1",
+                None,
+                &this
+                    .shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "db-1")
+                    .map(|card| card.shelf.clone())
+                    .expect("db-1"),
+            );
+        });
+        let (kind, message) = cx.update(|cx| {
+            let state = AppState::global(cx);
+            (*state.toast_kind.lock(), state.toast_message.lock().clone())
+        });
+        assert_eq!(
+            kind,
+            ToastKind::Info,
+            "ダウンロード中の案内が Info になっていない"
+        );
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("ダウンロード中")),
+            "ダウンロード中の案内が出ていない: {message:?}"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this.pending_open_after_download.clone()),
+            Some("db-1".to_string()),
+            "完了後に開く対象が記録されていない"
+        );
     }
 
     /// お気に入りの自動ダウンロードは同時数に上限を設ける。

@@ -18,7 +18,8 @@ use crate::components::dialog::{dialog_surface, fade_dialog};
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode};
+use gpui_kit::component::notification::NotificationType;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode, WindowExt as _};
 use gpui_kit::{
     AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
     SharedString, Window, div, px,
@@ -1144,57 +1145,33 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let handle = cx.entity();
 
-        let toast = AppState::global(cx).toast_message.lock().clone();
-        let toast_generation = *AppState::global(cx).toast_generation.lock();
+        // メッセージは gpui-kit の Notification（右上のトースト）で出す。
+        // 自前のバーは廃止した（自動で消える・種別ごとに色が付く・履歴が残る）。
+        let (toast, toast_kind, toast_generation) = {
+            let state = AppState::global(cx);
+            (
+                state.toast_message.lock().clone(),
+                *state.toast_kind.lock(),
+                *state.toast_generation.lock(),
+            )
+        };
         if self.toast_host_generation != toast_generation {
             self.toast_host_generation = toast_generation;
-            if toast.is_some() {
-                let generation = toast_generation;
-                cx.spawn(async move |_window, cx| {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(3000))
-                        .await;
-                    cx.update(|cx| {
-                        if *AppState::global(cx).toast_generation.lock() == generation {
-                            crate::app_state::clear_toast(cx);
-                        }
-                    });
-                })
-                .detach();
+            if let Some(message) = toast {
+                let kind = match toast_kind {
+                    crate::app_state::ToastKind::Info => NotificationType::Info,
+                    crate::app_state::ToastKind::Success => NotificationType::Success,
+                    crate::app_state::ToastKind::Error => NotificationType::Error,
+                };
+                window.push_notification((kind, message), cx);
             }
+            // 表示は Notification が持つので、こちらの状態はすぐ消す（世代は残して再表示を防ぐ）
+            crate::app_state::clear_toast(cx);
         }
-
-        let toast_el = if let Some(message) = &toast {
-            // 設定画面のスクロール要素より上に表示するため deferred レイヤー。
-            gpui_kit::deferred(
-                div()
-                    .id("toast")
-                    .absolute()
-                    .top(px(80.0))
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .px_4()
-                            .py_2()
-                            .rounded_lg()
-                            .shadow_md()
-                            .bg(theme.primary)
-                            .text_color(theme.primary_foreground)
-                            .text_sm()
-                            .child(message.clone()),
-                    ),
-            )
-            .into_any_element()
-        } else {
-            div().into_any_element()
-        };
 
         // ログイン中は専用のダミー画面を表示する（SettingsView を描画せず、
         // WebView 作成時の RefCell 競合を回避）。
@@ -1239,7 +1216,7 @@ impl Render for Workspace {
              .child({
                 #[cfg(windows)]
                 {
-                    Self::win_title_bar(_window, &theme).into_any_element()
+                    Self::win_title_bar(window, &theme).into_any_element()
                 }
                 #[cfg(not(windows))]
                 div().into_any_element()
@@ -1291,7 +1268,10 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
-            .child(toast_el)
+            // gpui-kit の Notification レイヤー（右上に出る。既定 5 秒で自動的に消える）
+            .children(gpui_kit::component::Root::render_notification_layer(
+                window, cx,
+            ))
             .child(if self.auth_panel_open {
                 let panel = self.account_panel(cx);
                 gpui_kit::deferred(
@@ -1541,7 +1521,7 @@ impl Render for Workspace {
                                     }),
                             )
                     );
-                fade_dialog(_window, cx, self.exit_upload_prompt, content).into_any_element()
+                fade_dialog(window, cx, self.exit_upload_prompt, content).into_any_element()
                 .into_any_element()
             } else {
                 div().into_any_element()
@@ -2423,6 +2403,69 @@ mod tests {
 
     /// サイドバーに「付箋」の行が出て、閲覧履歴の下・チェックリストの上に並び、
     /// クリックで付箋画面に切り替わる。
+    /// 通知: メッセージは gpui-kit の Notification として出す（自前のトーストバーは廃止）。
+    /// 同じメッセージが世代ごとに 1 回だけ積まれることも確認する。
+    #[gpui_kit::test]
+    async fn toast_is_delivered_as_a_notification(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        let notification_count = |visual: &mut gpui_kit::VisualTestContext| {
+            visual.update(|window, cx| {
+                window
+                    .root::<gpui_kit::component::Root>()
+                    .expect("root")
+                    .expect("root view")
+                    .read(cx)
+                    .notification
+                    .read(cx)
+                    .notifications()
+                    .len()
+            })
+        };
+        draw(visual);
+        assert_eq!(notification_count(visual), 0, "最初から通知が出ている");
+
+        cx.update(|cx| {
+            crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Success, "テスト通知")
+        });
+        draw(visual);
+        assert_eq!(
+            notification_count(visual),
+            1,
+            "メッセージが通知になっていない"
+        );
+
+        // 追加で描画しても同じメッセージが重複して積まれない（世代で 1 回だけ）
+        draw(visual);
+        assert_eq!(
+            notification_count(visual),
+            1,
+            "同じメッセージが重複して通知されている"
+        );
+
+        // エラーは種別つきで別の通知になる
+        cx.update(|cx| {
+            crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Error, "失敗しました")
+        });
+        draw(visual);
+        assert_eq!(notification_count(visual), 2, "2 件目の通知が出ていない");
+    }
+
     #[gpui_kit::test]
     async fn sidebar_notes_row_opens_the_notes_screen(cx: &mut TestAppContext) {
         let ws = setup(cx);

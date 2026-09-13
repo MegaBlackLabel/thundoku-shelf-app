@@ -59,6 +59,8 @@ pub struct AppState {
     pub dlsite_logged_in: Arc<Mutex<bool>>,
     /// アプリ全体のトーストメッセージ（workspace が表示する）
     pub toast_message: Arc<Mutex<Option<String>>>,
+    /// トーストの種別（gpui-kit の Notification に流すときの Info / Success / Error）
+    pub toast_kind: Arc<Mutex<ToastKind>>,
     /// トーストの世代（新メッセージごとに増える。タイマー再起動用）
     pub toast_generation: Arc<Mutex<u64>>,
     /// トーストホストを持つ workspace（トースト表示時の notify 用）
@@ -243,6 +245,7 @@ impl AppState {
             dlsite_session: Arc::new(Mutex::new(dlsite_session)),
             dlsite_logged_in: Arc::new(Mutex::new(dlsite_logged_in)),
             toast_message: Arc::new(Mutex::new(None)),
+            toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
             toast_generation: Arc::new(Mutex::new(0)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
@@ -301,6 +304,7 @@ impl AppState {
             dlsite_session: Arc::new(Mutex::new(None)),
             dlsite_logged_in: Arc::new(Mutex::new(false)),
             toast_message: Arc::new(Mutex::new(None)),
+            toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
             toast_generation: Arc::new(Mutex::new(0)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
@@ -325,6 +329,22 @@ pub fn default_client_id() -> String {
 
 /// アプリ全体のトーストを表示する（workspace のトーストホストが 3 秒で消す）。
 /// トーストホスト（workspace）を notify して再レンダリングを促す。
+/// 通知の種別（gpui-kit の `NotificationType` に対応）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToastKind {
+    #[default]
+    Info,
+    Success,
+    Error,
+}
+
+/// 種別つきでメッセージを積む（表示は `Workspace` が Notification に流す）。
+pub fn set_toast_kind(cx: &mut App, kind: ToastKind, message: impl Into<String>) {
+    let state = AppState::global(cx);
+    *state.toast_kind.lock() = kind;
+    set_toast(cx, message);
+}
+
 pub fn set_toast(cx: &mut App, message: impl Into<String>) {
     // workspace（トーストホスト）は notify 用に先に取り出しておく
     let ws = {
