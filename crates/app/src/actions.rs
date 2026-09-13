@@ -31,6 +31,8 @@ actions!(
         ShowBookshelf,
         /// Switch the main area to the viewing history (メニュー用)。
         ShowHistory,
+        /// Switch the main area to the page notes (付箋) screen (メニュー用)。
+        ShowNotes,
         /// Switch the main area to the checklist (メニュー用)。
         ShowChecklist,
         /// Switch the main area to the settings (メニュー用)。
@@ -58,6 +60,19 @@ pub struct OpenReader {
 #[action(namespace = thundoku, no_json)]
 pub struct OpenSampleReader {
     pub item_id: SharedString,
+}
+
+/// 付箋から本を開く（指定ページ + 見開きの左右を復元する）。
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, gpui_kit::Action)]
+#[action(namespace = thundoku, no_json)]
+pub struct OpenReaderAtPage {
+    pub book_id: SharedString,
+    /// 1-indexed のページ番号。
+    pub page: i64,
+    /// 表示するコンテンツ（未指定 = `''`）。
+    pub content_id: SharedString,
+    /// 付けたときの見開きの左右（"left" / "right"。単一表示は None）。
+    pub side: Option<SharedString>,
 }
 
 /// 表示中のページに付箋を付ける（ビューアのページ右上の付箋アイコンから）。

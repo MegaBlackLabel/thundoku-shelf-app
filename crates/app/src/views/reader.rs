@@ -470,6 +470,53 @@ impl ReaderView {
 
     /// ページ毎の閲覧回数・滞在時間を記録する。
     /// 表示ページ集合（`spread_pages()`）が変わったときのみ記録する。
+    /// 付箋から開く: 指定ページ（1-indexed）を、付けたときの見開きの左右で開く。
+    pub fn for_book_at(
+        cx: &mut Context<Self>,
+        book_id: String,
+        page: i64,
+        content_id: String,
+        side: Option<db::notes::SpreadSide>,
+    ) -> Self {
+        let mut reader = Self::for_book(cx, book_id);
+        // 別のコンテンツ（別冊など）の付箋なら、そのコンテンツへ切り替える
+        if !content_id.is_empty() {
+            reader.switch_selection(cx, Some(content_id), None);
+            reader.refresh_notes(cx);
+        }
+        let target = (page - 1).max(0) as usize;
+        let viewer = reader.viewer.clone();
+        if side.is_some() {
+            // 見開きで読んでいた付箋は見開きで開く
+            viewer.update(cx, |viewer, cx| {
+                viewer.set_mode(cx, crate::components::image_viewer::ViewMode::Spread);
+            });
+        }
+        viewer.update(cx, |viewer, cx| viewer.set_page(cx, target));
+        if let Some(side) = side {
+            // 狙った側に来ていなければ 1 ページ戻す（見開きの左右を合わせる）
+            let pair = viewer.read(cx).spread_pages();
+            let on_left = pair.first() == Some(&target);
+            let want_left = side == db::notes::SpreadSide::Left;
+            if on_left != want_left && target > 0 {
+                viewer.update(cx, |viewer, cx| viewer.set_page(cx, target - 1));
+            }
+        }
+        reader
+    }
+
+    /// 付箋が付いているページの印を、表示中のコンテンツで読み直す。
+    fn refresh_notes(&self, cx: &mut Context<Self>) {
+        let Some(book_id) = self.book_id.clone() else {
+            return;
+        };
+        let content = self.content_key();
+        let state = AppState::global(cx);
+        let noted = db::notes::noted_pages(&state.db_pool, &book_id, &content).unwrap_or_default();
+        let viewer = self.viewer.clone();
+        viewer.update(cx, |viewer, cx| viewer.set_notes(true, noted, cx));
+    }
+
     /// 付箋ダイアログの下書きを作る（要求があれば）。`InputState` に window が要るため
     /// render から呼ぶ。既に付いているページはメモを読み込んで編集する。
     fn ensure_note_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -494,9 +541,7 @@ impl ReaderView {
             if let Err(error) = db::notes::set_active(pool, &book_id, &content, page, false) {
                 log::warn!("付箋の解除に失敗: {error}");
             }
-            let noted = db::notes::noted_pages(pool, &book_id, &content).unwrap_or_default();
-            let viewer = self.viewer.clone();
-            viewer.update(cx, |viewer, cx| viewer.set_notes(true, noted, cx));
+            self.refresh_notes(cx);
             return;
         }
         // 既存の付箋があれば、そのときの見開き側を優先する（メモの編集で側を失わない）
@@ -541,10 +586,8 @@ impl ReaderView {
             if let Err(error) = db::notes::upsert(pool, &note) {
                 log::warn!("付箋の保存に失敗: {error}");
             }
-            let noted = db::notes::noted_pages(pool, &book_id, &content).unwrap_or_default();
-            let viewer = self.viewer.clone();
-            viewer.update(cx, |viewer, cx| viewer.set_notes(true, noted, cx));
         }
+        self.refresh_notes(cx);
         cx.notify();
     }
 
@@ -769,6 +812,62 @@ mod tests {
     use gpui_kit::TestAppContext;
     use thundoku_core::db::documents;
     use thundoku_core::db::page_views;
+
+    /// 付箋から開くと、指定ページが**付けたときの見開き側**に来る（左右の調整込み）。
+    #[gpui_kit::test]
+    async fn for_book_at_restores_the_page_and_the_spread_side(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book_with_pages(cx, "b1", "付箋の本", 10);
+
+        // 5 ページ目を「左側」で開いていた付箋 → 5 ページ目（index 4）が左に来る
+        let view = cx.new(|cx| {
+            ReaderView::for_book_at(
+                cx,
+                "b1".into(),
+                5,
+                String::new(),
+                Some(db::notes::SpreadSide::Left),
+            )
+        });
+        let (mode, pages) = view.read_with(cx, |this, cx| {
+            (
+                this.viewer.read(cx).mode(),
+                this.viewer.read(cx).spread_pages(),
+            )
+        });
+        assert_eq!(
+            mode,
+            crate::components::image_viewer::ViewMode::Spread,
+            "見開きで開いていない"
+        );
+        assert!(
+            pages.contains(&4),
+            "指定ページが表示範囲に入っていない: {pages:?}"
+        );
+        assert_eq!(
+            pages.first(),
+            Some(&4),
+            "指定ページが左側に来ていない: {pages:?}"
+        );
+
+        // 「右側」で開いていた付箋 → 右に来る（左ページは 1 つ前）
+        let view = cx.new(|cx| {
+            ReaderView::for_book_at(
+                cx,
+                "b1".into(),
+                5,
+                String::new(),
+                Some(db::notes::SpreadSide::Right),
+            )
+        });
+        let pages = view.read_with(cx, |this, cx| this.viewer.read(cx).spread_pages());
+        assert_eq!(
+            pages.get(1),
+            Some(&4),
+            "指定ページが右側に来ていない: {pages:?}"
+        );
+    }
 
     /// ページ画像の右上の付箋アイコン → ダイアログ → OK で、そのページに付箋が保存される。
     /// 見開きのときは左右どちらに表示していたかも一緒に保存する。

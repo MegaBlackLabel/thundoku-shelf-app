@@ -33,6 +33,7 @@ use crate::views::auth::{AuthDialog, AuthProvider};
 use crate::views::bookshelf::BookshelfView;
 use crate::views::checklist::ChecklistView;
 use crate::views::history::HistoryView;
+use crate::views::notes::NotesView;
 use crate::views::reader::ReaderView;
 use crate::views::settings::SettingsView;
 use thundoku_core::db;
@@ -44,6 +45,7 @@ use thundoku_core::tbf;
 pub enum NavTarget {
     Bookshelf,
     History,
+    Notes,
     Checklist,
     Settings,
     About,
@@ -62,6 +64,7 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action("本棚", crate::actions::ShowBookshelf),
         MenuItem::action("閲覧履歴", crate::actions::ShowHistory),
+        MenuItem::action("付箋", crate::actions::ShowNotes),
         MenuItem::action("チェックリスト", crate::actions::ShowChecklist),
         MenuItem::action("設定", crate::actions::ShowSettings),
         MenuItem::action("説明", crate::actions::ShowAbout),
@@ -83,6 +86,7 @@ pub struct Workspace {
     pub settings: Entity<SettingsView>,
     pub bookshelf: Entity<BookshelfView>,
     pub history: Entity<HistoryView>,
+    pub notes: Entity<NotesView>,
     checklist: Entity<ChecklistView>,
     about: Entity<AboutView>,
     /// Account/ログインパネル。
@@ -114,6 +118,7 @@ impl Workspace {
         let settings = cx.new(SettingsView::new);
         let bookshelf = cx.new(BookshelfView::new);
         let history = cx.new(HistoryView::new);
+        let notes = cx.new(NotesView::new);
         let checklist = cx.new(ChecklistView::new);
         let about = cx.new(AboutView::new);
 
@@ -127,6 +132,7 @@ impl Workspace {
             settings,
             bookshelf,
             history,
+            notes,
             checklist,
             about,
             auth_panel_open: false,
@@ -300,6 +306,7 @@ impl Workspace {
         match self.active {
             NavTarget::Bookshelf => AnyView::from(self.bookshelf.clone()),
             NavTarget::History => AnyView::from(self.history.clone()),
+            NavTarget::Notes => AnyView::from(self.notes.clone()),
             NavTarget::Checklist => AnyView::from(self.checklist.clone()),
             NavTarget::Settings => AnyView::from(self.settings.clone()),
             NavTarget::About => AnyView::from(self.about.clone()),
@@ -321,6 +328,9 @@ impl Workspace {
         // 履歴は開いた時点のデータを出す（読書直後の新しいセッションを反映する）
         if target == NavTarget::History {
             self.history.update(cx, |h, cx| h.reload(cx));
+        }
+        if target == NavTarget::Notes {
+            self.notes.update(cx, |n, cx| n.reload(cx));
         }
         // ナビゲーションを切り替えたらログイン中のダミー画面を終了する
         // （例: ブックマークアイコンで説明画面を開いたとき）。
@@ -617,6 +627,20 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 付箋から本を開く（指定ページ + 見開きの左右を復元する）。
+    pub fn open_reader_at(
+        &mut self,
+        cx: &mut Context<Self>,
+        book_id: String,
+        page: i64,
+        content_id: String,
+        side: Option<thundoku_core::db::notes::SpreadSide>,
+    ) {
+        let reader = cx.new(|cx| ReaderView::for_book_at(cx, book_id, page, content_id, side));
+        self.reader = Some(reader);
+        cx.notify();
+    }
+
     /// サンプルページ（チェックリストの試し読み）を開く。
     pub fn open_sample_reader(&mut self, cx: &mut Context<Self>, item_id: String) {
         let reader = cx.new(|cx| ReaderView::for_sample(cx, item_id));
@@ -638,6 +662,8 @@ impl Workspace {
         // 読書で進んだ進捗・読了フラグを本棚カードと未読バッジに反映する
         // （reload しないと本棚キャッシュが開く前のまま残り、
         //  読了済みなのに未読・1/XX 表示が残ってしまう）
+        // リーダーで付箋を付け外しした結果を付箋画面にも反映する
+        self.notes.update(cx, |n, cx| n.reload(cx));
         if let Some(book_id) = book_id {
             self.bookshelf.update(cx, |b, cx| {
                 b.reload(cx);
@@ -1015,6 +1041,26 @@ impl Workspace {
             this.sidebar_open = true;
             cx.notify();
         });
+        reg!(crate::actions::ShowNotes, |this, cx| {
+            this.switch_to(NavTarget::Notes, cx);
+            this.sidebar_open = true;
+            cx.notify();
+        });
+        reg_with!(
+            crate::actions::OpenReaderAtPage,
+            |action: &crate::actions::OpenReaderAtPage,
+             this: &mut Workspace,
+             cx: &mut Context<Workspace>| this.open_reader_at(
+                cx,
+                action.book_id.to_string(),
+                action.page,
+                action.content_id.to_string(),
+                action
+                    .side
+                    .as_deref()
+                    .and_then(thundoku_core::db::notes::SpreadSide::parse),
+            )
+        );
         reg!(crate::actions::ShowChecklist, |this, cx| {
             this.switch_to(NavTarget::Checklist, cx);
             this.sidebar_open = true;
@@ -1739,6 +1785,19 @@ impl Workspace {
                     )
                     .child(
                         self.nav_row(
+                            NavTarget::Notes,
+                            Icon::new(AppIcon::StickyNote)
+                                .size(px(24.0))
+                                .into_any_element(),
+                            "付箋",
+                            open,
+                            active,
+                            handle.clone(),
+                            cx,
+                        ),
+                    )
+                    .child(
+                        self.nav_row(
                             NavTarget::Checklist,
                             Icon::new(AppIcon::ListChecks)
                                 .size(px(24.0))
@@ -1893,6 +1952,7 @@ impl Workspace {
         let id = match target {
             NavTarget::Bookshelf => "sidebar-nav-bookshelf",
             NavTarget::History => "sidebar-nav-history",
+            NavTarget::Notes => "sidebar-nav-notes",
             NavTarget::Checklist => "sidebar-nav-checklist",
             _ => "sidebar-nav-other",
         };
@@ -2358,6 +2418,56 @@ mod tests {
         assert!(
             visual.debug_bounds("history-root").is_some(),
             "履歴ビューが描画されていない"
+        );
+    }
+
+    /// サイドバーに「付箋」の行が出て、閲覧履歴の下・チェックリストの上に並び、
+    /// クリックで付箋画面に切り替わる。
+    #[gpui_kit::test]
+    async fn sidebar_notes_row_opens_the_notes_screen(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+        let history = visual
+            .debug_bounds("sidebar-nav-history")
+            .expect("閲覧履歴の行");
+        let notes = visual
+            .debug_bounds("sidebar-nav-notes")
+            .expect("付箋の行が出ていない");
+        let checklist = visual
+            .debug_bounds("sidebar-nav-checklist")
+            .expect("チェックリストの行");
+        assert!(
+            history.origin.y < notes.origin.y && notes.origin.y < checklist.origin.y,
+            "並び順が 閲覧履歴 → 付箋 → チェックリスト になっていない"
+        );
+        visual.simulate_click(notes.center(), gpui_kit::Modifiers::default());
+        assert_eq!(ws.read_with(cx, |w, _| w.active), NavTarget::Notes);
+        draw(visual);
+        assert!(
+            visual.debug_bounds("notes-root").is_some(),
+            "付箋画面が描画されていない"
         );
     }
 

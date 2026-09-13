@@ -3,6 +3,7 @@
 //! Web 版は `lucide-react` のアイコンを使っている。gpui-component にも
 //! lucide 由来のアイコンはあるが、Web 版で使われていて gpui-component に
 //! 無いもの（book-marked / library-big / history / bookmark / bookmark-filled /
+//! sticky-note /
 //! list-checks /
 //! refresh-cw / layout-grid / list / circle-user-round / log-in / log-out）は
 //! `assets/icons/*.svg` に lucide-react から生成した SVG を埋め込んで提供する。
@@ -30,6 +31,8 @@ pub enum AppIcon {
     Bookmark,
     /// 付箋の塗り（しおり型。同じパスの `fill`。BookmarkFilledIcon）
     BookmarkFilled,
+    /// 付箋（サイドバー用のふせん型。StickyNoteIcon）
+    StickyNote,
     /// チェックリスト（ListChecksIcon）
     ListChecks,
     /// 同期（RefreshCw）
@@ -76,6 +79,7 @@ impl IconNamed for AppIcon {
             Self::History => "icons/history.svg".into(),
             Self::Bookmark => "icons/bookmark.svg".into(),
             Self::BookmarkFilled => "icons/bookmark-filled.svg".into(),
+            Self::StickyNote => "icons/sticky-note.svg".into(),
             Self::ListChecks => "icons/list-checks.svg".into(),
             Self::RefreshCw => "icons/refresh-cw.svg".into(),
             Self::LayoutGrid => "icons/layout-grid.svg".into(),
@@ -120,6 +124,7 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
         "icons/library-big.svg" => Some(include_bytes!("../assets/icons/library-big.svg")),
         "icons/history.svg" => Some(include_bytes!("../assets/icons/history.svg")),
         "icons/bookmark.svg" => Some(include_bytes!("../assets/icons/bookmark.svg")),
+        "icons/sticky-note.svg" => Some(include_bytes!("../assets/icons/sticky-note.svg")),
         "icons/bookmark-filled.svg" => Some(include_bytes!("../assets/icons/bookmark-filled.svg")),
         "icons/list-checks.svg" => Some(include_bytes!("../assets/icons/list-checks.svg")),
         "icons/refresh-cw.svg" => Some(include_bytes!("../assets/icons/refresh-cw.svg")),
@@ -158,6 +163,7 @@ mod tests {
             AppIcon::History,
             AppIcon::Bookmark,
             AppIcon::BookmarkFilled,
+            AppIcon::StickyNote,
             AppIcon::ListChecks,
             AppIcon::RefreshCw,
             AppIcon::LayoutGrid,

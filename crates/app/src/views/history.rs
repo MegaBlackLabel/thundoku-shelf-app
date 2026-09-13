@@ -1363,7 +1363,7 @@ fn day_bar_bg(theme: &gpui_kit::component::Theme) -> gpui_kit::Hsla {
 }
 
 /// 本棚と同じ表記の「イベント名 or 購入日」。紐づく本棚アイテムが無ければイベント不明。
-fn shelf_event_text(shelf: Option<&db::bookshelf::BookshelfItem>) -> String {
+pub(crate) fn shelf_event_text(shelf: Option<&db::bookshelf::BookshelfItem>) -> String {
     let Some(shelf) = shelf else {
         return "イベント不明".to_string();
     };
