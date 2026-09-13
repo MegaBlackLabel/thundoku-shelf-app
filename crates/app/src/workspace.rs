@@ -447,7 +447,7 @@ impl Workspace {
         let site_filter = self.bookshelf.update(cx, |b, _| b.site_filter());
         // 所有している本（同期済みの本棚アイテム）から算出する。
         // - 非表示の本は除外
-        // - ダウンロード済み: 進捗で未読判定（current_page == 0 かつ未完読）
+        // - ダウンロード済み: 進捗から `ReadingState` で判定（未読 / 読書中 / 読了）
         // - 未ダウンロード: 未読としてカウント
         let count = bookshelf::list_all(&db)
             .map(|items| {
@@ -467,14 +467,10 @@ impl Workspace {
                         match book {
                             Some(book) => {
                                 let progress = progress::get(&db, &book.id).ok().flatten();
-                                match progress {
-                                    Some(p) => {
-                                        p.current_page == 0
-                                            && p.total_pages.is_some()
-                                            && p.finished_at.is_none()
-                                    }
-                                    None => true,
-                                }
+                                // 表示・フィルタと同じ判定（未読 = 進捗が無い / 1 ページ目も
+                                // 読んでいない）。読書中は未読に数えない。
+                                progress::ReadingState::from_progress(progress.as_ref())
+                                    == progress::ReadingState::Unread
                             }
                             None => true,
                         }

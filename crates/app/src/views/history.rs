@@ -124,7 +124,8 @@ struct HistoryItem {
     book: books::Book,
     /// 本棚と同じ表記のイベント名（技術書典）/ 購入日（BOOTH / FANZA / DLsite）/ イベント不明。
     event_text: String,
-    is_read: bool,
+    /// 読書状態（未読 / 読書中 / 読了）。判定は本棚と同じ `ReadingState` に集約する。
+    reading_state: progress::ReadingState,
     progress: Option<(i64, Option<i64>)>,
     /// 本棚と同じタグ列を出すためのタグ（ローカル本の `book_tags`）。
     tags: Vec<String>,
@@ -257,10 +258,9 @@ impl HistoryView {
                         .is_some_and(|name| name == book.file_name)
                     || (!item.title.is_empty() && item.title == book.title)
             });
-            let is_read = progress::get(pool, &book.id)
-                .ok()
-                .flatten()
-                .is_some_and(|p| p.finished_at.is_some());
+            let reading_state = progress::ReadingState::from_progress(
+                progress::get(pool, &book.id).ok().flatten().as_ref(),
+            );
             let tags: Vec<String> = db::tags::list_for_book(pool, &book.id)
                 .unwrap_or_default()
                 .into_iter()
@@ -281,7 +281,7 @@ impl HistoryView {
                     .or_else(|| placeholder_cover(&book.title, &book.circle_name)),
                 book: book.clone(),
                 event_text: shelf_event_text(shelf),
-                is_read,
+                reading_state,
                 progress: progress::get(pool, &book.id)
                     .ok()
                     .flatten()
@@ -754,7 +754,7 @@ impl HistoryView {
                 }
                 None => div().w_full().h_full().bg(theme.muted).into_any_element(),
             })
-            // 左上: 未読 / 既読（本棚のカードと同じバッジ）
+            // 左上: 未読 / 読書中 / 読了（本棚のカードと同じバッジ）
             .child({
                 let mut badge = div()
                     .absolute()
@@ -767,16 +767,20 @@ impl HistoryView {
                 if fits_width {
                     badge = badge.rounded_tl_lg();
                 }
-                if item.is_read {
-                    badge
+                match item.reading_state {
+                    progress::ReadingState::Read => badge
                         .bg(gpui_kit::rgb(0xd1fae5))
                         .text_color(gpui_kit::rgb(0x047857))
-                        .child("読了")
-                } else {
-                    badge
+                        .child("読了"),
+                    // 読書中は青系（未読の黄 / 読了の緑と区別する）
+                    progress::ReadingState::Reading => badge
+                        .bg(gpui_kit::rgb(0xe0f2fe))
+                        .text_color(gpui_kit::rgb(0x0369a1))
+                        .child("読書中"),
+                    progress::ReadingState::Unread => badge
                         .bg(gpui_kit::rgb(0xfef3c7))
                         .text_color(gpui_kit::rgb(0xb45309))
-                        .child("未読")
+                        .child("未読"),
                 }
                 .into_any_element()
             })
@@ -1260,20 +1264,42 @@ impl HistoryView {
             .gap_2()
             .child(
                 div()
+                    .debug_selector({
+                        let selector = format!(
+                            "history-state-{}-{database_id}",
+                            match item.reading_state {
+                                progress::ReadingState::Read => "read",
+                                progress::ReadingState::Reading => "reading",
+                                progress::ReadingState::Unread => "unread",
+                            }
+                        );
+                        move || selector.clone()
+                    })
                     .px_1()
                     .py_0p5()
                     .rounded_md()
                     .text_xs()
-                    .when(item.is_read, |this| {
+                    .when(item.reading_state == progress::ReadingState::Read, |this| {
                         this.bg(gpui_kit::rgb(0xd1fae5))
                             .text_color(gpui_kit::rgb(0x047857))
                             .child("読了")
                     })
-                    .when(!item.is_read, |this| {
-                        this.bg(gpui_kit::rgb(0xfef3c7))
-                            .text_color(gpui_kit::rgb(0xb45309))
-                            .child("未読")
-                    }),
+                    .when(
+                        item.reading_state == progress::ReadingState::Reading,
+                        |this| {
+                            this.bg(gpui_kit::rgb(0xe0f2fe))
+                                .text_color(gpui_kit::rgb(0x0369a1))
+                                .child("読書中")
+                        },
+                    )
+                    .when(
+                        item.reading_state == progress::ReadingState::Unread,
+                        |this| {
+                            this.bg(gpui_kit::rgb(0xfef3c7))
+                                .text_color(gpui_kit::rgb(0xb45309))
+                                .child("未読")
+                        },
+                    ),
             )
             .child(Self::render_heart(theme, handle, item, 24.0))
             .into_any_element()
@@ -1598,6 +1624,75 @@ mod tests {
             page_count: None,
             age_rating: None,
             series_name: None,
+        }
+    }
+
+    /// 読書状態は 未読 / 読書中 / 読了 の 3 状態（本棚と同じ `ReadingState`）。
+    /// 途中まで読んだ本が「未読」に丸められないことを確かめる。
+    #[gpui_kit::test]
+    async fn history_shows_reading_state(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::{Duration, Utc};
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        for (id, title) in [("b1", "未読の本"), ("b2", "途中の本"), ("b3", "読了の本")]
+        {
+            seed_book(cx, id, title, "techbookfest");
+        }
+        cx.update(|cx| {
+            let pool = &crate::app_state::AppState::global(cx).db_pool;
+            let progress = |book: &str, page: i64, total: Option<i64>, finished: bool| {
+                progress::upsert(
+                    pool,
+                    &progress::ReadingProgress {
+                        book_id: book.into(),
+                        content_id: String::new(),
+                        current_page: page,
+                        total_pages: total,
+                        finished_at: finished.then(|| "2026-01-01 00:00:00".to_string()),
+                        last_read_at: "2026-01-01 00:00:00".into(),
+                        scroll_position: 0.0,
+                    },
+                )
+                .unwrap();
+            };
+            // b1 は進捗なし（未読）、b2 は途中（読書中）、b3 は最終ページ（読了）
+            progress("b2", 8, Some(10), false);
+            progress("b3", 10, Some(10), true);
+        });
+        let now = Utc::now() - Duration::hours(1);
+        add_session(cx, "s1", "b1", now, 10);
+        add_session(cx, "s2", "b2", now - Duration::minutes(10), 10);
+        add_session(cx, "s3", "b3", now - Duration::minutes(20), 10);
+
+        let view = cx.new(HistoryView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // リスト形式（状態チップにデバッグ id がある）で確認する
+        view.update(cx, |this, cx| {
+            this.view_mode = ViewMode::List;
+            cx.notify();
+        });
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        for (selector, expected) in [
+            ("history-state-unread-b1", "未読"),
+            ("history-state-reading-b2", "読書中"),
+            ("history-state-read-b3", "読了"),
+        ] {
+            assert!(
+                visual.debug_bounds(selector).is_some(),
+                "{expected} の状態チップが出ていない（{selector}）"
+            );
         }
     }
 

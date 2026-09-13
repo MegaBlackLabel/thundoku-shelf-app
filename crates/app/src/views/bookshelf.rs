@@ -41,6 +41,8 @@ use crate::icons::AppIcon;
 pub enum ReadFilter {
     All,
     Unread,
+    /// 途中まで読んだ（最終ページには達していない）
+    Reading,
     Read,
     Favorite,
 }
@@ -241,7 +243,8 @@ impl ChipPalette {
 struct BookEntry {
     book: books::Book,
     tags: Vec<String>,
-    is_read: bool,
+    /// 読書状態（未読 / 読書中 / 読了）。判定は `ReadingState` に集約する。
+    reading_state: progress::ReadingState,
     /// (current_page, total_pages) — None when no reading progress exists.
     progress: Option<(i64, Option<i64>)>,
     /// Decoded thumbnail/cover image.
@@ -1025,7 +1028,11 @@ impl BookshelfView {
     pub(crate) fn progress_for_book(&self, book_id: &str) -> Option<(i64, Option<i64>, bool)> {
         self.entries.iter().find(|e| e.book.id == book_id).map(|e| {
             let (current, total) = e.progress.unwrap_or((0, None));
-            (current, total, e.is_read)
+            (
+                current,
+                total,
+                e.reading_state == progress::ReadingState::Read,
+            )
         })
     }
 
@@ -1106,7 +1113,7 @@ impl BookshelfView {
                 let progress = progress::get(db, &book.id).ok().flatten();
                 // 一度でも最終ページまで表示したら読了（finished_at が立つと戻っても維持）。
                 // upsert 時に最終ページ到達で finished_at がセットされる。
-                let is_read = progress.as_ref().is_some_and(|p| p.finished_at.is_some());
+                let reading_state = progress::ReadingState::from_progress(progress.as_ref());
                 // ダウンロード直後は reading_progress が無いため、インポート時の
                 // total_pages（imported_documents）から表示用の進捗を作る。
                 // ページ数は 1-indexed（未読 = 1 ページ目）
@@ -1124,7 +1131,7 @@ impl BookshelfView {
                 entries.push(BookEntry {
                     book,
                     tags,
-                    is_read,
+                    reading_state,
                     progress: progress_tuple,
                     cover,
                 });
@@ -1272,7 +1279,7 @@ impl BookshelfView {
                         Box::new(BookEntry {
                             book: entry.book.clone(),
                             tags: entry.tags.clone(),
-                            is_read: entry.is_read,
+                            reading_state: entry.reading_state,
                             progress: entry.progress,
                             cover: entry.cover.clone(),
                         })
@@ -1701,8 +1708,17 @@ impl BookshelfView {
         }
         match self.read_filter {
             ReadFilter::All => true,
-            ReadFilter::Unread => !card.local.as_ref().is_some_and(|e| e.is_read),
-            ReadFilter::Read => card.local.as_ref().is_some_and(|e| e.is_read),
+            // 未読 / 読書中 / 既読（読了）は `ReadingState` の 3 状態で分ける
+            ReadFilter::Unread => {
+                card.local.as_ref().map(|e| e.reading_state) == Some(progress::ReadingState::Unread)
+            }
+            ReadFilter::Reading => {
+                card.local.as_ref().map(|e| e.reading_state)
+                    == Some(progress::ReadingState::Reading)
+            }
+            ReadFilter::Read => {
+                card.local.as_ref().map(|e| e.reading_state) == Some(progress::ReadingState::Read)
+            }
             ReadFilter::Favorite => card.shelf.is_favorite == 1,
         }
     }
@@ -3322,7 +3338,10 @@ impl BookshelfView {
             }
         });
         let local = card.local.as_ref();
-        let is_read = local.map(|e| e.is_read).unwrap_or(false);
+        let reading_state = local
+            .map(|e| e.reading_state)
+            .unwrap_or(progress::ReadingState::Unread);
+        let is_read = reading_state == progress::ReadingState::Read;
         let is_downloaded = local.is_some();
         let is_favorite = shelf.is_favorite == 1;
         let progress_text = local.and_then(|e| {
@@ -3395,18 +3414,23 @@ impl BookshelfView {
                 if fits_width {
                     badge = badge.rounded_tl_lg();
                 }
-                if is_read {
-                    badge
+                match reading_state {
+                    progress::ReadingState::Read => badge
                         .bg(gpui_kit::rgb(0xd1fae5))
                         .text_color(gpui_kit::rgb(0x047857))
                         .text_xs()
-                        .child("読了")
-                } else {
-                    badge
+                        .child("読了"),
+                    // 読書中は青系（未読の黄 / 読了の緑と区別する）
+                    progress::ReadingState::Reading => badge
+                        .bg(gpui_kit::rgb(0xe0f2fe))
+                        .text_color(gpui_kit::rgb(0x0369a1))
+                        .text_xs()
+                        .child("読書中"),
+                    progress::ReadingState::Unread => badge
                         .bg(gpui_kit::rgb(0xfef3c7))
                         .text_color(gpui_kit::rgb(0xb45309))
                         .text_xs()
-                        .child("未読")
+                        .child("未読"),
                 }
                 .into_any_element()
             })
@@ -4308,13 +4332,13 @@ impl BookshelfView {
             .into_any_element()
     }
 
-    /// 状態（未読 / 既読 / ダウンロード済み / お気に入り）をタイトルの横に出す。
+    /// 状態（未読 / 読書中 / 既読 / ダウンロード済み / お気に入り）をタイトルの横に出す。
     ///
-    /// 文字タグは短い「未読 / 既読」だけにする（「ダウンロード済み」「お気に入り」は
+    /// 文字タグは短い「未読 / 読書中 / 既読」だけにする（「ダウンロード済み」「お気に入り」は
     /// 長くて変な折り返しになるためアイコン + tooltip で出す）。
     /// 配色は「注意が必要なものだけ色を付ける」方針:
-    /// 未読 = 落ち着いた灰色、既読 = 緑、未ダウンロード = 黄、ダウンロード済み = 緑、
-    /// お気に入り = ピンク（カードのハートと同じ色味）。
+    /// 未読 = 落ち着いた灰色、**読書中 = 情報色（Info）**、既読 = 緑、未ダウンロード = 黄、
+    /// ダウンロード済み = 緑、お気に入り = ピンク（カードのハートと同じ色味）。
     fn render_status_tags(
         card: &ShelfCard,
         theme: &gpui_kit::component::Theme,
@@ -4322,22 +4346,34 @@ impl BookshelfView {
     ) -> Vec<gpui_kit::AnyElement> {
         let database_id = card.shelf.database_id.as_str();
         let downloaded = card.local.is_some();
-        let read = card
+        // 未読 / 読書中 / 既読（読了）の 3 状態（判定は `ReadingState` に集約）
+        let state = card
             .local
             .as_ref()
-            .map(|entry| entry.is_read)
-            .unwrap_or(false);
+            .map(|entry| entry.reading_state)
+            .unwrap_or(progress::ReadingState::Unread);
         let mut tags = Vec::with_capacity(3);
         if downloaded {
-            if read {
-                tags.push(status_tag(database_id, "read", "既読", TagVariant::Success));
-            } else {
-                tags.push(status_tag(
-                    database_id,
-                    "unread",
-                    "未読",
-                    TagVariant::Secondary,
-                ));
+            match state {
+                progress::ReadingState::Read => {
+                    tags.push(status_tag(database_id, "read", "既読", TagVariant::Success));
+                }
+                progress::ReadingState::Reading => {
+                    tags.push(status_tag(
+                        database_id,
+                        "reading",
+                        "読書中",
+                        TagVariant::Info,
+                    ));
+                }
+                progress::ReadingState::Unread => {
+                    tags.push(status_tag(
+                        database_id,
+                        "unread",
+                        "未読",
+                        TagVariant::Secondary,
+                    ));
+                }
             }
             tags.push(status_icon(
                 database_id,
@@ -5272,6 +5308,25 @@ impl Render for BookshelfView {
                                     move |_, _window, cx| {
                                         handle.update(cx, |this, cx| {
                                             this.set_read_filter(cx, ReadFilter::Unread)
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                {
+                                    let mut button =
+                                        Button::new("filter-reading").cursor_pointer().label("読書中");
+                                    if read_filter == ReadFilter::Reading {
+                                        button = button.primary();
+                                    }
+                                    button
+                                }
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| {
+                                            this.set_read_filter(cx, ReadFilter::Reading)
                                         });
                                     }
                                 }),
@@ -8809,14 +8864,18 @@ mod tests {
         assert_eq!(sel, Some(Some("book-2".to_string())));
     }
 
+    /// 既読 / 読書中 / 未読 のフィルタは `ReadingState` の 3 状態で分かれる
+    /// （途中まで読んだ本は「未読」ではなく「読書中」に入る）。
     #[gpui_kit::test]
-    async fn read_filter_separates_unread(cx: &mut TestAppContext) {
+    async fn read_filter_separates_unread_reading_and_read(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "既読本", "サークルA");
-        seed_book(cx, "b2", "未読本", "サークルB");
-        seed_progress(cx, "b1", 10, Some(10)); // read
-        seed_progress(cx, "b2", 2, Some(10)); // unread
+        seed_book(cx, "b2", "読書中の本", "サークルB");
+        seed_book(cx, "b3", "未読の本", "サークルC");
+        seed_progress(cx, "b1", 10, Some(10)); // 読了
+        seed_progress(cx, "b2", 2, Some(10)); // 読書中（進捗はあるが最終ページ未満）
+        // b3 は進捗なし = 未読
         // map local books to shelf items via tbf_product_id
         cx.update(|cx| {
             let state = AppState::global(cx);
@@ -8833,14 +8892,21 @@ mod tests {
                     .await
             })
             .unwrap();
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = 'db-3' WHERE id = 'b3'")
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
         });
         seed_shelf_item(cx, "db-1", "既読本", "サークルA", None);
-        seed_shelf_item(cx, "db-2", "未読本", "サークルB", None);
+        seed_shelf_item(cx, "db-2", "読書中の本", "サークルB", None);
+        seed_shelf_item(cx, "db-3", "未読の本", "サークルC", None);
         let view = cx.new(BookshelfView::new);
 
         assert_eq!(
             view.read_with(cx, |v, cx| v.visible_shelf_cards(cx).len()),
-            2
+            3
         );
         cx.update(|cx| view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Read)));
         let read = view.read_with(cx, |this, cx| {
@@ -8850,6 +8916,18 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(read, vec!["db-1".to_string()]);
+        // 読書中: 途中まで読んだ本だけ
+        cx.update(|cx| {
+            view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Reading));
+        });
+        let reading = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(reading, vec!["db-2".to_string()]);
+        // 未読: 進捗が無い本だけ（読書中は含めない）
         cx.update(|cx| view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Unread)));
         let unread = view.read_with(cx, |this, cx| {
             this.visible_shelf_cards(cx)
@@ -8857,7 +8935,7 @@ mod tests {
                 .map(|card| card.shelf.database_id.clone())
                 .collect::<Vec<_>>()
         });
-        assert_eq!(unread, vec!["db-2".to_string()]);
+        assert_eq!(unread, vec!["db-3".to_string()]);
     }
 
     #[test]
@@ -9422,8 +9500,10 @@ mod tests {
         );
     }
 
+    /// 読書状態は 未読 / 読書中 / 読了 の 3 状態（判定は core の `ReadingState`）。
+    /// 最終ページまで読んだ本は読了、途中の本は**読書中**（以前は「未読」に丸めていた）。
     #[gpui_kit::test]
-    async fn last_page_marks_book_as_read(cx: &mut TestAppContext) {
+    async fn reading_state_splits_unread_reading_and_read(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "b1", "本1", "サークルA");
@@ -9448,25 +9528,50 @@ mod tests {
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
         seed_shelf_item(cx, "db-2", "本2", "サークルB", None);
         let view = cx.new(BookshelfView::new);
-        // 最終ページ（index 10 / total 10、1-indexed）まで表示した本は読了
-        let read = view.read_with(cx, |this, _| {
-            this.shelf_cards
-                .iter()
-                .find(|c| c.shelf.database_id == "db-1")
-                .and_then(|c| c.local.as_ref())
-                .map(|e| e.is_read)
-                .unwrap_or(false)
+        let state_of = |database_id: &str| {
+            view.read_with(cx, |this, _| {
+                this.shelf_cards
+                    .iter()
+                    .find(|c| c.shelf.database_id == database_id)
+                    .and_then(|c| c.local.as_ref())
+                    .map(|e| e.reading_state)
+            })
+        };
+        assert_eq!(
+            state_of("db-1"),
+            Some(progress::ReadingState::Read),
+            "最終ページまで読んだ本が読了になっていない"
+        );
+        assert_eq!(
+            state_of("db-2"),
+            Some(progress::ReadingState::Reading),
+            "途中の本が読書中になっていない"
+        );
+        // 未読フィルタには読書中が入らない（3 状態で分ける）
+        cx.update(|cx| {
+            view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Unread));
         });
-        assert!(read, "last page must mark the book as read");
-        let unread = view.read_with(cx, |this, _| {
-            this.shelf_cards
-                .iter()
-                .find(|c| c.shelf.database_id == "db-2")
-                .and_then(|c| c.local.as_ref())
-                .map(|e| e.is_read)
-                .unwrap_or(true)
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.visible_shelf_cards(cx).len()),
+            0,
+            "未読フィルタに読書中の本が残っている"
+        );
+        cx.update(|cx| {
+            view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Reading));
         });
-        assert!(!unread, "mid-book must stay unread");
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.visible_shelf_cards(cx).len()),
+            1,
+            "読書中フィルタで途中の本だけになっていない"
+        );
+        cx.update(|cx| {
+            view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Read));
+        });
+        assert_eq!(
+            view.read_with(cx, |this, cx| this.visible_shelf_cards(cx).len()),
+            1,
+            "既読フィルタで読了の本だけになっていない"
+        );
     }
 
     #[gpui_kit::test]

@@ -251,15 +251,12 @@ impl SettingsView {
         let (mut unread, mut reading, mut read) = (0usize, 0usize, 0usize);
         for book in &books {
             let progress = db::progress::get(db, &book.id).ok().flatten();
-            match progress {
-                Some(p)
-                    if p.total_pages
-                        .is_some_and(|total| p.current_page + 1 >= total) =>
-                {
-                    read += 1;
-                }
-                Some(p) if p.current_page > 0 => reading += 1,
-                _ => unread += 1,
+            // 判定は core の `ReadingState` に集約する（3 状態の定義を 2 か所に持たない）。
+            // 以前は `current_page + 1 >= total` で判定しており、1 ページ早く読了になっていた。
+            match db::progress::ReadingState::from_progress(progress.as_ref()) {
+                db::progress::ReadingState::Read => read += 1,
+                db::progress::ReadingState::Reading => reading += 1,
+                db::progress::ReadingState::Unread => unread += 1,
             }
         }
         self.status_counts = (unread, reading, read);

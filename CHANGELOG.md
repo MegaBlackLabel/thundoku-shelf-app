@@ -80,6 +80,12 @@
 
 ### Changed
 
+- **読書状態を 未読 / 読書中 / 読了 の 3 状態に統一**（判定は core の
+  `ReadingState::from_progress` 1 か所）: 本棚のカードバッジ・リスト行の状態チップ
+  （読書中は青）・フィルタ（**未読 / 読書中 / 既読** の 3 択に拡張）・履歴画面・設定の
+  冊数集計が同じ判定を通る。途中まで読んだ本は今まで「未読」に丸められていた。
+  あわせて設定の集計が `current_page + 1 >= total_pages` で **1 ページ早く読了**に
+  なっていたのを修正（デスクトップの進捗は 1-indexed）
 - `gpui-kit` の依存元を crates.io（0.6.1）から上流リポジトリの main（rev 固定
   `84f57fdfcb4910623fb0bb7f795b077e249f9271`）へ変更。**`Carousel`（Multiple Item）が
   未リリース**（0.6.1 の `gpui-component` に carousel モジュールが無い）ため、

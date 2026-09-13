@@ -24,6 +24,35 @@ impl ReadingProgress {
     }
 }
 
+/// 本の読書状態。**表示・フィルタ・集計はこの 1 か所で判定する**
+/// （本棚のバッジ / 行の状態チップ / 履歴 / 設定の冊数集計がすべてここを通る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadingState {
+    /// 進捗が無い / 1 ページ目も読んでいない。
+    Unread,
+    /// 途中まで読んだ（最終ページには達していない）。
+    Reading,
+    /// 最終ページまで読んだ。
+    Read,
+}
+
+impl ReadingState {
+    /// 進捗から読書状態を決める。
+    ///
+    /// - **読了**: `finished_at` が立っている（リーダーが最終ページ到達でセットする）、
+    ///   または `current_page >= total_pages`（`finished_at` を持たない旧データの救済）
+    /// - **読書中**: 1 ページ目以降を読んでいる（`current_page > 0`。1-indexed なので
+    ///   本を開いただけでは行が作られず、未読のままになる）
+    /// - **未読**: 進捗が無い / `current_page == 0`
+    pub fn from_progress(progress: Option<&ReadingProgress>) -> Self {
+        match progress {
+            Some(p) if p.finished_at.is_some() || p.is_finished() => ReadingState::Read,
+            Some(p) if p.current_page > 0 => ReadingState::Reading,
+            _ => ReadingState::Unread,
+        }
+    }
+}
+
 /// **既定表示（優先）コンテンツ**の進捗を返す（本棚カード・未読数・統計用）。
 /// コンテンツ情報を持たない旧データは `content_id = ''` の行を見る。
 pub fn get(pool: &SqlitePool, book_id: &str) -> Result<Option<ReadingProgress>, sqlx::Error> {
@@ -117,6 +146,53 @@ pub fn delete_for_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 読書状態の判定（唯一の定義）。境界を全部押さえる。
+    #[test]
+    fn reading_state_covers_the_boundaries() {
+        let progress = |current_page: i64, total: Option<i64>, finished: bool| ReadingProgress {
+            book_id: "b1".into(),
+            content_id: String::new(),
+            current_page,
+            total_pages: total,
+            finished_at: finished.then(|| "2026-01-01 00:00:00".to_string()),
+            last_read_at: "2026-01-01 00:00:00".into(),
+            scroll_position: 0.0,
+        };
+
+        // 進捗なし = 未読
+        assert_eq!(ReadingState::from_progress(None), ReadingState::Unread);
+        // 開いただけ（current_page = 0）は未読のまま
+        assert_eq!(
+            ReadingState::from_progress(Some(&progress(0, Some(10), false))),
+            ReadingState::Unread
+        );
+        // 1 ページ目以降を読んだら読書中
+        assert_eq!(
+            ReadingState::from_progress(Some(&progress(1, Some(10), false))),
+            ReadingState::Reading
+        );
+        // 最終ページの 1 つ手前はまだ読書中（旧・設定の集計はここを読了にしていた）
+        assert_eq!(
+            ReadingState::from_progress(Some(&progress(9, Some(10), false))),
+            ReadingState::Reading
+        );
+        // 最終ページ到達 = 読了
+        assert_eq!(
+            ReadingState::from_progress(Some(&progress(10, Some(10), false))),
+            ReadingState::Read
+        );
+        // finished_at があれば読了（ページ数が食い違っていても読了を優先）
+        assert_eq!(
+            ReadingState::from_progress(Some(&progress(1, Some(10), true))),
+            ReadingState::Read
+        );
+        // 総ページ数が無い本（PDF 以外 / 旧データ）でも「読んだ」ことは分かる
+        assert_eq!(
+            ReadingState::from_progress(Some(&progress(3, None, false))),
+            ReadingState::Reading
+        );
+    }
 
     /// §8.2: 優先コンテンツを変えると、カードが見る行が変わるので誤った読了バッジが残らない。
     /// （進捗がコンテンツ単位の行に分かれたことで自然に満たされる）
