@@ -6128,7 +6128,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opfspack"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes-gcm",
  "crc32fast",
@@ -9059,7 +9059,7 @@ dependencies = [
 
 [[package]]
 name = "thundoku-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -9093,7 +9093,7 @@ dependencies = [
 
 [[package]]
 name = "thundoku-shelf"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
