@@ -255,7 +255,9 @@ impl ReaderView {
         }
         // ページ右上の付箋アイコン → ダイアログを開く（保存はダイアログの OK）
         {
-            let handle = cx.entity();
+            // 弱参照にする: App::on_action の listener はアプリ寿命で残り解除 API が無いため、
+            // 強参照を掴むと閉じたリーダー（と中のページ画像・pack バイト列）が解放されない。
+            let handle = cx.entity().downgrade();
             App::on_action(
                 cx,
                 move |action: &crate::actions::NotePageRequest, cx: &mut App| {
@@ -266,7 +268,7 @@ impl ReaderView {
                             .as_deref()
                             .and_then(db::notes::SpreadSide::parse),
                     );
-                    handle.update(cx, |this, cx| {
+                    let _ = handle.update(cx, |this, cx| {
                         this.note_request = Some((page, side));
                         cx.notify();
                     });
@@ -886,6 +888,26 @@ mod tests {
             pages.get(1),
             Some(&4),
             "指定ページが右側に来ていない: {pages:?}"
+        );
+    }
+
+    /// リーダーも解放されること。修正前は `App::on_action` のグローバル listener が
+    /// 強参照を持ち、本を閉じても ReaderView（と中の画像・pack バイト列）が残っていた。
+    #[gpui_kit::test]
+    async fn reader_is_dropped_when_closed(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book_with_pages(cx, "b1", "解放の本", 3);
+        let weak = {
+            let reader = cx.new(|cx| ReaderView::for_book(cx, "b1".into()));
+            let weak = reader.downgrade();
+            drop(reader);
+            weak
+        };
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "ReaderView が解放されていない（action listener リーク）"
         );
     }
 

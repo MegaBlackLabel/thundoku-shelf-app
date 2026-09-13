@@ -406,8 +406,14 @@ pub struct ImageViewer {
     scroll_top_initialized: bool,
     /// ロード中のページ（二重ロード防止）。
     loading: std::collections::HashSet<usize>,
-    /// 自身のエンティティハンドル（render_page は &self のため）
-    self_handle: Option<gpui_kit::Entity<ImageViewer>>,
+    /// スクロールモードで同時に保持するデコード済みページのバイト予算。
+    /// 1 ページが数十 MiB になる本で全ページ持つと数 GB になるため、表示中ページの
+    /// 前後だけをこの予算内で保持し、外れたページは解放する（テストから小さくできる）。
+    page_cache_budget: usize,
+    /// 自身のエンティティハンドル（render_page は &self のため）。
+    /// **弱参照にする**: 強参照の自己参照は循環になり、ビューアーが永久に解放されない
+    /// （ページ画像・pack バイト列ごとメモリに残る）。
+    self_handle: Option<gpui_kit::WeakEntity<ImageViewer>>,
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
     /// ページめくり方向（Web の pageTurnDirection 相当）。true = 右→左（日本の本）
@@ -424,6 +430,17 @@ pub struct ImageViewer {
     pending_action: Option<(String, Option<String>)>,
     /// ページ画像を読めなかった理由（pack 欠損・破損など）。0 件なら `None`。
     load_error: Option<String>,
+}
+
+/// スクロールモードで保持するデコード済みページのバイト予算（既定 384MiB）。
+/// 1 ページ 47MiB の本なら前後 8 ページ程度、16MiB の本なら前後 24 ページ程度を残す。
+pub const SCROLL_CACHE_BUDGET_BYTES: usize = 384 * 1024 * 1024;
+
+/// ページ 1 枚のデコード後のバイト数（RGBA = w×h×4）。寸法が不明なら None。
+fn decoded_page_bytes(loader: &dyn PageLoader, index: usize) -> Option<usize> {
+    loader
+        .page_size(index)
+        .map(|(width, height)| width as usize * height as usize * 4)
 }
 
 impl ImageViewer {
@@ -554,17 +571,20 @@ impl ImageViewer {
             page_slider: None,
             _page_slider_subscription: None,
             loading: std::collections::HashSet::new(),
+            page_cache_budget: SCROLL_CACHE_BUDGET_BYTES,
             scroll_top_initialized: false,
             self_handle: None,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
         };
-        viewer.self_handle = Some(cx.entity());
+        viewer.self_handle = Some(cx.entity().downgrade());
         if saved_mode == ViewMode::Scroll {
-            // scroll モードで開いた場合は全ページを先にロードする
-            // （表示中に順次読み込む。現在ページだけだと
-            // 「読み込み中のまま」になるため）
-            for index in 0..viewer.images.len() {
+            // scroll モードで開いた場合は**表示中ページの前後だけ**を先にロードする。
+            // 全ページを読むと 1 ページ 16MiB 平均・47MiB の本もあり、1 冊で数 GB になる。
+            // スクロールで可視になったページは render 側で順次ロードする。
+            let radius = viewer.scroll_keep_radius();
+            let last = (viewer.current_page + radius).min(viewer.images.len().saturating_sub(1));
+            for index in viewer.current_page.saturating_sub(radius)..=last {
                 viewer.ensure_loaded(cx, index);
             }
             // 途中まで読んでいた場合はそのページまでスクロールを復元する
@@ -1309,6 +1329,42 @@ impl ImageViewer {
         }
     }
 
+    /// 表示中ページを中心に、予算内で残すページ数（半径）。
+    fn scroll_keep_radius(&self) -> usize {
+        let per_page = decoded_page_bytes(self.loader.as_ref(), self.current_page)
+            .unwrap_or(4 * 1024 * 1024)
+            .max(1);
+        // 前後で 2 倍になるので半分ずつ。最低 1 は残す（隣を消すとスクロールがカクつく）
+        (self.page_cache_budget / per_page / 2).max(1)
+    }
+
+    /// スクロールモードのページキャッシュを整える: 表示中ページの前後だけを残し、
+    /// 離れたページは CPU（`Arc<RenderImage>`）と GPU（window の sprite atlas）両方から解放する。
+    /// 戻り値は残した範囲 `(first, last)`。
+    fn trim_scroll_cache(&mut self, window: &mut Window, cx: &mut Context<Self>) -> (usize, usize) {
+        let total = self.loader.page_count();
+        if total == 0 {
+            return (0, 0);
+        }
+        let radius = self.scroll_keep_radius();
+        let first = self.current_page.saturating_sub(radius);
+        let last = (self.current_page + radius).min(total - 1);
+        for index in 0..self.images.len() {
+            if (first..=last).contains(&index) {
+                continue;
+            }
+            if let Some(image) = self.images[index].take() {
+                // GPU 側のテクスチャも解放する（atlas は明示的に消すまで残る）
+                let _ = window.drop_image(image);
+            }
+        }
+        // 残した範囲だけ読み込んでおく（スクロールで可視になったページを順次ロードする）
+        for index in first..=last {
+            self.ensure_loaded(cx, index);
+        }
+        (first, last)
+    }
+
     /// (left, right) page pair; right is `None` when out of range.
     pub fn spread_pages(&self) -> Vec<usize> {
         if self.mode == ViewMode::Spread {
@@ -1970,12 +2026,14 @@ impl ImageViewer {
                                 );
                                 let now = std::time::Instant::now();
                                 let is_double = handle
-                                    .read(cx)
-                                    .last_click_at
-                                    .map(|t| now.duration_since(t).as_millis() < 400)
+                                    .read_with(cx, |this, _| {
+                                        this.last_click_at
+                                            .map(|t| now.duration_since(t).as_millis() < 400)
+                                            .unwrap_or(false)
+                                    })
                                     .unwrap_or(false);
                                 log::info!("viewer click: is_double={is_double}");
-                                handle.update(cx, |this, cx| {
+                                let _ = handle.update(cx, |this, cx| {
                                     this.last_click_at = Some(now);
                                     if is_double {
                                         // ダブルクリック = 拡大のみ（2 倍ずつ大きく）
@@ -2003,7 +2061,7 @@ impl ImageViewer {
                                     window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT,
                                 );
                                 let max = pan_max_for(pan_scale, vwp, pan_aspect);
-                                handle.update(cx, |this, cx| {
+                                let _ = handle.update(cx, |this, cx| {
                                     if this.drag_start.is_some() {
                                         this.update_pan(
                                             gpui_kit::Point::new(
@@ -2020,13 +2078,13 @@ impl ImageViewer {
                         .on_mouse_up(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |_, _window, cx| {
-                                handle.update(cx, |this, cx| this.end_pan(cx));
+                                let _ = handle.update(cx, |this, cx| this.end_pan(cx));
                             }
                         })
                         .on_mouse_up_out(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |_, _window, cx| {
-                                handle.update(cx, |this, cx| this.end_pan(cx));
+                                let _ = handle.update(cx, |this, cx| this.end_pan(cx));
                             }
                         })
                         .child(
@@ -2067,11 +2125,13 @@ impl ImageViewer {
                             move |_event, _window, cx| {
                                 let now = std::time::Instant::now();
                                 let is_double = handle
-                                    .read(cx)
-                                    .last_click_at
-                                    .map(|t| now.duration_since(t).as_millis() < 400)
+                                    .read_with(cx, |this, _| {
+                                        this.last_click_at
+                                            .map(|t| now.duration_since(t).as_millis() < 400)
+                                            .unwrap_or(false)
+                                    })
                                     .unwrap_or(false);
-                                handle.update(cx, |this, cx| {
+                                let _ = handle.update(cx, |this, cx| {
                                     this.last_click_at = Some(now);
                                     if is_double {
                                         this.toggle_zoom(cx);
@@ -2167,6 +2227,9 @@ impl Render for ImageViewer {
                 self.last_scroll_page = top;
                 self.current_page = top;
             }
+            // 表示中ページの前後だけを保持する（離れたページは CPU / GPU とも解放し、
+            // 可視になったページを順次ロードする）。全ページ保持だと数 GB になる。
+            self.trim_scroll_cache(window, cx);
         }
         let current = self.current_page + 1;
         let mode = self.mode;
@@ -2408,11 +2471,13 @@ impl Render for ImageViewer {
                             );
                             let now = std::time::Instant::now();
                             let is_double = handle
-                                .read(cx)
-                                .last_click_at
-                                .map(|t| now.duration_since(t).as_millis() < 400)
+                                .read_with(cx, |this, _| {
+                                    this.last_click_at
+                                        .map(|t| now.duration_since(t).as_millis() < 400)
+                                        .unwrap_or(false)
+                                })
                                 .unwrap_or(false);
-                            handle.update(cx, |this, cx| {
+                            let _ = handle.update(cx, |this, cx| {
                                 this.last_click_at = Some(now);
                                 if is_double {
                                     // 見開きはペア全体を拡大（2 倍ずつ）
@@ -2437,7 +2502,7 @@ impl Render for ImageViewer {
                                 ((base_h * total_aspect * animated_scale - vwp.x) / 2.0).max(0.0),
                                 ((base_h * animated_scale - vwp.y) / 2.0).max(0.0),
                             );
-                            handle.update(cx, |this, cx| {
+                            let _ = handle.update(cx, |this, cx| {
                                 if this.drag_start.is_some() {
                                     this.update_pan(
                                         gpui_kit::Point::new(
@@ -2454,13 +2519,13 @@ impl Render for ImageViewer {
                     .on_mouse_up(gpui_kit::MouseButton::Left, {
                         let handle = handle.clone();
                         move |_, _window, cx| {
-                            handle.update(cx, |this, cx| this.end_pan(cx));
+                            let _ = handle.update(cx, |this, cx| this.end_pan(cx));
                         }
                     })
                     .on_mouse_up_out(gpui_kit::MouseButton::Left, {
                         let handle = handle.clone();
                         move |_, _window, cx| {
-                            handle.update(cx, |this, cx| this.end_pan(cx));
+                            let _ = handle.update(cx, |this, cx| this.end_pan(cx));
                         }
                     })
                     .child(
@@ -3233,6 +3298,8 @@ mod tests {
     struct FakeLoader {
         count: usize,
         png: Vec<u8>,
+        /// 申告するページ寸法（メモリ計算に使う。大きい本を模すため変えられる）
+        size: (u32, u32),
     }
 
     impl PageLoader for FakeLoader {
@@ -3241,7 +3308,7 @@ mod tests {
         }
 
         fn page_size(&self, _index: usize) -> Option<(u32, u32)> {
-            Some((100, 140))
+            Some(self.size)
         }
 
         fn load(&self, _index: usize) -> Result<Arc<RenderImage>, String> {
@@ -3258,7 +3325,108 @@ mod tests {
             }
         });
         let png = make_png(100, 140);
-        cx.new(|cx| ImageViewer::new(cx, Arc::new(FakeLoader { count, png }), "テスト本", 0, None))
+        cx.new(|cx| {
+            ImageViewer::new(
+                cx,
+                Arc::new(FakeLoader {
+                    count,
+                    png,
+                    size: (100, 140),
+                }),
+                "テスト本",
+                0,
+                None,
+            )
+        })
+    }
+
+    /// スクロールモードは全ページを持たず、**表示中ページの前後だけ**を予算内で保持する。
+    /// 1 ページが数十 MiB になる本では全ページ保持が数 GB になるため。
+    #[gpui_kit::test]
+    async fn scroll_mode_keeps_only_pages_near_the_visible_one(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| {
+            if cx.try_global::<crate::app_state::AppState>().is_none() {
+                crate::app_state::AppState::init_test(cx);
+            }
+        });
+        // 保存済みの表示モードを「スクロール」にしてから開く（DB 設定で復元される）
+        cx.update(|cx| {
+            let db = &crate::app_state::AppState::global(cx).db_pool;
+            thundoku_core::db::settings::set(db, "viewer.mode", "scroll").unwrap();
+        });
+        // 1 ページ 4000x4000 = 64MiB 相当と申告する 20 ページの本（PNG 自体は小さい）
+        let view = cx.new(|cx| {
+            ImageViewer::new(
+                cx,
+                Arc::new(FakeLoader {
+                    count: 20,
+                    png: make_png(100, 140),
+                    size: (4000, 4000),
+                }),
+                "大きい本",
+                0,
+                None,
+            )
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        cx.run_until_parked();
+        let kept = |cx: &mut TestAppContext| {
+            view.read_with(cx, |this, _| {
+                this.images.iter().filter(|image| image.is_some()).count()
+            })
+        };
+        assert!(kept(cx) >= 3, "表示中ページが保持されていない");
+        assert!(
+            kept(cx) <= 13,
+            "スクロールで全ページ保持している: {} 枚",
+            kept(cx)
+        );
+
+        // 表示中ページを進めると、離れたページは解放される
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                this.current_page = 18;
+                this.trim_scroll_cache(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let (page0, page18) = view.read_with(cx, |this, _| {
+            (this.images[0].is_some(), this.images[18].is_some())
+        });
+        assert!(!page0, "離れたページが解放されていない");
+        assert!(page18, "移動後の表示中ページが保持されていない");
+        assert!(kept(cx) <= 13, "保持数が予算を超えている: {} 枚", kept(cx));
+    }
+
+    /// ビューアーが強参照の循環で解放されないバグの回帰テスト。
+    /// 強参照が全部消えたら drop されること（修正前は `self_handle` の自己参照で残った）。
+    #[gpui_kit::test]
+    async fn viewer_is_dropped_when_no_strong_handle_remains(cx: &mut TestAppContext) {
+        let weak = {
+            let view = viewer(cx, 3);
+            let weak = view.downgrade();
+            drop(view);
+            weak
+        };
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "ImageViewer が解放されていない（自己参照リーク）"
+        );
     }
 
     #[gpui_kit::test]
@@ -3744,6 +3912,7 @@ mod tests {
 
         // 別コンテンツ相当のローダーへ差し替える
         let loader = Arc::new(FakeLoader {
+            size: (100, 140),
             count: 2,
             png: make_png(100, 140),
         });

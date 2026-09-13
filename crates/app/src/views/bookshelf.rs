@@ -800,6 +800,10 @@ pub struct BookshelfView {
     sort_ascending: bool,
     /// 直前の検索文字列（変更検出用）
     last_search: String,
+    /// お気に入り自動ダウンロードの待ち行列（同時実行数を絞るため）
+    auto_download_queue: Vec<bookshelf::BookshelfItem>,
+    /// いま走っている自動ダウンロードの件数
+    auto_download_running: usize,
     /// 本棚グリッドの仮想化リスト状態
     list_state: gpui_kit::ListState,
     /// リスト表示のスクロール追跡（選択行のスクロール連動用）
@@ -1066,6 +1070,8 @@ impl BookshelfView {
             sort_field: SortField::PurchaseDate,
             sort_ascending: false,
             last_search: String::new(),
+            auto_download_queue: Vec::new(),
+            auto_download_running: 0,
             list_state: gpui_kit::ListState::new(
                 0,
                 gpui_kit::ListAlignment::Top,
@@ -2662,13 +2668,24 @@ impl BookshelfView {
 
     /// 技術書典の本をダウンロードしてインポートする。
     pub fn download_item(&mut self, cx: &mut Context<Self>, item: bookshelf::BookshelfItem) {
+        self.start_download(cx, item, false);
+    }
+
+    /// ダウンロードを開始する。`auto` = お気に入りの自動ダウンロード（終わったら
+    /// 待ち行列の次の 1 件を開始する）。開始できたら true。
+    fn start_download(
+        &mut self,
+        cx: &mut Context<Self>,
+        item: bookshelf::BookshelfItem,
+        auto: bool,
+    ) -> bool {
         // 書籍情報の展開中・同期中はダウンロード処理がバッティングするため無視する
         if self.fetching_covers || self.sync_busy > 0 {
-            return;
+            return false;
         }
         // 終了時アップロード中はダウンロードを開始しない
         if Self::is_exit_uploading(cx) {
-            return;
+            return false;
         }
         self.error = None;
         let database_id = item.database_id.clone();
@@ -3158,6 +3175,11 @@ impl BookshelfView {
                 if succeeded {
                     this.reload(cx);
                 }
+                // 自動ダウンロードは枠が空いたら待ち行列の次を開始する
+                if auto {
+                    this.auto_download_running = this.auto_download_running.saturating_sub(1);
+                    this.pump_auto_downloads(cx);
+                }
                 cx.notify();
             });
             log::info!(
@@ -3166,9 +3188,17 @@ impl BookshelfView {
             );
         })
         .detach();
+        true
     }
 
+    /// 同時に走らせる自動ダウンロードの上限。1 件ごとにダウンロード本体 +
+    /// 取り込みバッファ（最大 8 並列デコード + pack 出力）を抱えるため、無制限だと
+    /// 大型作品が複数あると数 GB のピークになる。
+    const MAX_AUTO_DOWNLOADS: usize = 2;
+
     /// 起動時: お気に入りの未ダウンロード本を自動でダウンロードする。
+    /// 同時実行数は `MAX_AUTO_DOWNLOADS` に絞り、残りは待ち行列に積んで
+    /// 1 件終わるごとに次を開始する。
     fn auto_download_favorites(&mut self, cx: &mut Context<Self>) {
         let favorites: Vec<bookshelf::BookshelfItem> = {
             let state = Self::app_state(cx);
@@ -3188,11 +3218,32 @@ impl BookshelfView {
                 .filter_map(|b| b.tbf_product_id)
                 .collect()
         };
-        for item in favorites {
-            if downloaded_ids.contains(&item.database_id) || item.is_downloadable == 0 {
-                continue;
+        let queue: Vec<bookshelf::BookshelfItem> = favorites
+            .into_iter()
+            .filter(|item| !downloaded_ids.contains(&item.database_id) && item.is_downloadable != 0)
+            .collect();
+        if queue.is_empty() {
+            return;
+        }
+        log::info!(
+            "auto_download_favorites: {} 件（同時 {} 件まで）",
+            queue.len(),
+            Self::MAX_AUTO_DOWNLOADS
+        );
+        self.auto_download_queue = queue;
+        self.pump_auto_downloads(cx);
+    }
+
+    /// 待ち行列から空きぶんだけ自動ダウンロードを開始する。
+    fn pump_auto_downloads(&mut self, cx: &mut Context<Self>) {
+        while self.auto_download_running < Self::MAX_AUTO_DOWNLOADS {
+            let Some(item) = self.auto_download_queue.first().cloned() else {
+                return;
+            };
+            self.auto_download_queue.remove(0);
+            if self.start_download(cx, item, true) {
+                self.auto_download_running += 1;
             }
-            self.download_item(cx, item);
         }
     }
 
@@ -7898,6 +7949,38 @@ mod tests {
             })
             .unwrap();
         });
+    }
+
+    /// お気に入りの自動ダウンロードは同時数に上限を設ける。
+    /// 1 件ごとにダウンロード本体 + 取り込みバッファ（最大 8 並列デコード + pack 出力）を
+    /// 抱えるため、無制限に同時実行すると数 GB のピークになる。
+    #[gpui_kit::test]
+    async fn auto_download_limits_concurrency(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 未ダウンロードのお気に入りを 5 冊用意する
+        for index in 0..5 {
+            let database_id = format!("db-{index}");
+            seed_sort_item(cx, "fanza", &database_id, &format!("本{index}"), None, None);
+            cx.update(|cx| {
+                let db = &AppState::global(cx).db_pool;
+                bookshelf::set_favorite(db, "fanza", &database_id, true).unwrap();
+            });
+        }
+        let view = cx.new(BookshelfView::new);
+        view.update(cx, |this, cx| this.auto_download_favorites(cx));
+        let (running, queued) = view.read_with(cx, |this, _| {
+            (this.auto_download_running, this.auto_download_queue.len())
+        });
+        assert!(
+            running <= 2,
+            "同時に走る自動ダウンロードが制限されていない: {running}"
+        );
+        assert_eq!(
+            running + queued,
+            5,
+            "開始済み + 待ち行列が全件になっていない: running={running} queued={queued}"
+        );
     }
 
     /// 作者名つきの本棚アイテムを seed する（作者絞り込みテスト用）。
