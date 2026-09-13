@@ -10,7 +10,7 @@ use gpui_kit::AppContext as _;
 use gpui_kit::Focusable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme as _, Icon};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
@@ -53,6 +53,8 @@ pub struct NotesView {
     tag_counts: Arc<std::collections::HashMap<String, usize>>,
     /// タグ絞り込み（本棚と同じ OR 条件）。空 = すべて。
     selected_tags: Vec<String>,
+    /// 検索欄（メモ / タイトル / サークル / 著者。本棚と同じく 1 文字ごとに反映）。
+    search_state: Option<Entity<InputState>>,
     /// タグ列を展開している本（「+n」→「閉じる」）。
     expanded_tag_rows: std::collections::HashSet<String>,
     focus_handle: FocusHandle,
@@ -89,6 +91,7 @@ impl NotesView {
             favorite_tags: Vec::new(),
             tag_counts: Arc::new(std::collections::HashMap::new()),
             selected_tags: Vec::new(),
+            search_state: None,
             expanded_tag_rows: std::collections::HashSet::new(),
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
@@ -320,9 +323,56 @@ impl NotesView {
         cx.defer(move |cx| cx.dispatch_action(&action));
     }
 
-    /// タグ絞り込みを解除する（ESC / 「全項目」ボタン）。
-    fn clear_filters(&mut self, cx: &mut Context<Self>) {
+    /// 検索欄を用意する（本棚と同じ作法。レイアウトに window が要る）。
+    fn ensure_search_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_state.is_none() {
+            self.search_state = Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder("検索（メモ・タイトル・サークル・著者）")
+            }));
+        }
+    }
+
+    /// 検索文字列（未入力なら None）。
+    fn current_search(&self, cx: &App) -> Option<String> {
+        self.search_state
+            .as_ref()
+            .map(|state| state.read(cx).value().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    /// 検索に一致するか（メモ・タイトル・サークル名・著者名。本棚と同じ前方一致の緩い検索）。
+    fn matches_search(&self, row: &NoteRow, cx: &App) -> bool {
+        let Some(query) = self.current_search(cx) else {
+            return true;
+        };
+        let query = query.to_lowercase();
+        let haystack = format!(
+            "{} {} {} {}",
+            row.note.memo, row.book.title, row.book.circle_name, row.book.author
+        )
+        .to_lowercase();
+        haystack.contains(&query)
+    }
+
+    /// 表示中の行（タグ絞り込み + 検索。追加が新しい順のまま）。
+    fn visible_note_rows<'a>(&'a self, cx: &App) -> Vec<&'a NoteRow> {
+        self.rows
+            .iter()
+            .filter(|row| self.matches_search(row, cx))
+            .collect()
+    }
+
+    /// 何かの絞り込みが効いているか（「絞込中 ✕」表示と ESC の解除対象）。
+    fn is_filtering(&self, cx: &App) -> bool {
+        !self.selected_tags.is_empty() || self.current_search(cx).is_some()
+    }
+
+    /// 絞り込みを解除する（ESC / 「全項目」ボタン）。
+    fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_tags.clear();
+        if let Some(state) = self.search_state.clone() {
+            state.update(cx, |state, cx| state.set_value("", window, cx));
+        }
         self.reload(cx);
         cx.notify();
     }
@@ -862,6 +912,7 @@ fn local_date_label(utc: &str) -> String {
 
 impl Render for NotesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_search_state(window, cx);
         if !self.focus_initialized {
             self.focus_initialized = true;
             window.focus(&self.focus_handle, cx);
@@ -873,11 +924,12 @@ impl Render for NotesView {
             &self.selected_tags,
             self.tag_counts.clone(),
         );
-        let count = self.rows.len();
-        let filtering = !self.selected_tags.is_empty();
+        let visible = self.visible_note_rows(cx);
+        let count = visible.len();
+        let filtering = self.is_filtering(cx);
+        let searching = self.current_search(cx).is_some();
 
-        let rows: Vec<AnyElement> = self
-            .rows
+        let rows: Vec<AnyElement> = visible
             .iter()
             .map(|row| {
                 self.render_row(
@@ -897,7 +949,7 @@ impl Render for NotesView {
             .track_focus(&self.focus_handle)
             .on_key_down({
                 let handle = cx.entity();
-                move |event: &KeyDownEvent, _window, cx| {
+                move |event: &KeyDownEvent, window, cx| {
                     // メモ編集中の ESC は編集を閉じる（保存しない）
                     if event.keystroke.key.as_str() == "escape"
                         && handle.read(cx).memo_draft.is_some()
@@ -908,12 +960,12 @@ impl Render for NotesView {
                         });
                         return;
                     }
-                    // ESC でタグ絞り込みを解除する
+                    // ESC で絞り込み（タグ / 検索）を解除する
                     if event.keystroke.key.as_str() == "escape" {
                         handle.update(cx, |this, cx| {
-                            if !this.selected_tags.is_empty() {
+                            if this.is_filtering(cx) {
                                 cx.stop_propagation();
-                                this.clear_filters(cx);
+                                this.clear_filters(window, cx);
                             }
                         });
                     }
@@ -943,22 +995,44 @@ impl Render for NotesView {
                             .text_color(theme.muted_foreground)
                             .child(format!("{count}件")),
                     )
-                    .when(filtering, |this| {
-                        this.child(
-                            div().debug_selector(|| "notes-clear-filters".into()).child(
-                                Button::new("notes-clear-filters")
-                                    .cursor_pointer()
-                                    .primary()
-                                    .label("全項目")
-                                    .on_click({
-                                        let handle = handle.clone();
-                                        move |_, _, cx| {
-                                            handle.update(cx, |this, cx| this.clear_filters(cx));
-                                        }
-                                    }),
+                    .child(
+                        div().debug_selector(|| "notes-clear-filters".into()).child(
+                            Button::new("notes-clear-filters")
+                                .cursor_pointer()
+                                .primary()
+                                .label(if filtering {
+                                    "絞込中 ✕"
+                                } else {
+                                    "全項目"
+                                })
+                                .tooltip("絞り込みを解除（ESC）")
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, window, cx| {
+                                        handle
+                                            .update(cx, |this, cx| this.clear_filters(window, cx));
+                                    }
+                                }),
+                        ),
+                    )
+                    // 解除ボタンの隣に検索（本棚と同じ: 左に Search アイコン、1 文字ごとに反映）
+                    .child(
+                        div().debug_selector(|| "notes-search".into()).child(
+                            Input::new(
+                                self.search_state
+                                    .as_ref()
+                                    .expect("render で ensure_search_state 済み"),
+                            )
+                            .cursor_text()
+                            .w(px(320.0))
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .size(px(14.0))
+                                    .text_color(cx.theme().muted_foreground),
                             ),
-                        )
-                    }),
+                        ),
+                    )
+                    .child(div().flex_1()),
             )
             .child(
                 div()
@@ -973,9 +1047,14 @@ impl Render for NotesView {
                     .when(rows.is_empty(), |this| {
                         this.child(
                             div()
+                                .debug_selector(|| "notes-empty".into())
                                 .text_sm()
                                 .text_color(theme.muted_foreground)
-                                .child("まだ付箋がありません"),
+                                .child(if searching {
+                                    "一致する付箋がありません"
+                                } else {
+                                    "まだ付箋がありません"
+                                }),
                         )
                     })
                     .children(rows),
@@ -1300,6 +1379,189 @@ mod tests {
             visual.debug_bounds("notes-open-b2-7").is_some(),
             "本を見るを押した後も画面が保たれていない"
         );
+    }
+
+    /// 検索: メモ / タイトル / サークル / 著者で絞り込める（1 文字ごとに反映・ESC で解除）。
+    #[gpui_kit::test]
+    async fn notes_screen_filters_by_search(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let pool = &state.db_pool;
+            for (id, title, circle, author) in [
+                ("b1", "Rust の本", "サークルA", "田中"),
+                ("b2", "React 入門", "サークルB", "佐藤"),
+            ] {
+                db::books::insert(
+                    pool,
+                    &db::books::Book {
+                        id: id.into(),
+                        title: title.into(),
+                        circle_name: circle.into(),
+                        author: author.into(),
+                        ..test_book(id)
+                    },
+                )
+                .unwrap();
+            }
+            for (id, book_id, page, memo) in [
+                ("n1", "b1", 3, "所有権のメモ"),
+                ("n2", "b2", 7, "フックのメモ"),
+            ] {
+                db::notes::upsert(
+                    pool,
+                    &db::notes::PageNoteInput {
+                        id,
+                        book_id,
+                        content_id: "",
+                        page,
+                        memo,
+                        spread_side: None,
+                    },
+                )
+                .unwrap();
+            }
+        });
+
+        let view = cx.new(NotesView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_notes(&mut *visual);
+
+        // 既定は全件（追加が新しい順）
+        assert_eq!(visible_ids(&view, cx), vec!["b2-7", "b1-3"]);
+        for selector in ["notes-row-b1-3", "notes-row-b2-7"] {
+            assert!(
+                visual.debug_bounds(selector).is_some(),
+                "{selector} が出ていない"
+            );
+        }
+        // 未絞り込みでも解除ボタンは出る（本棚と同じ「全項目」）
+        assert!(visual.debug_bounds("notes-clear-filters").is_some());
+        // 検索欄は本棚と同じ幅で、解除ボタンの隣（右）に並ぶ
+        let search = visual
+            .debug_bounds("notes-search")
+            .expect("検索欄が出ていない");
+        let clear = visual.debug_bounds("notes-clear-filters").expect("全項目");
+        assert!(
+            (search.size.width.as_f32() - 320.0).abs() < 1.5,
+            "検索欄の幅が本棚と違う: {}",
+            search.size.width.as_f32()
+        );
+        let gap = search.origin.x.as_f32() - (clear.origin.x.as_f32() + clear.size.width.as_f32());
+        assert!(
+            (0.0..=24.0).contains(&gap),
+            "検索欄が解除ボタンの隣に無い: gap={gap} clear_right={} search={}",
+            clear.origin.x.as_f32() + clear.size.width.as_f32(),
+            search.origin.x.as_f32()
+        );
+
+        // メモ / タイトル（大文字小文字は無視）/ サークル / 著者で絞り込める
+        for (query, expected, hidden) in [
+            ("フック", "b2-7", "b1-3"),
+            ("rust", "b1-3", "b2-7"),
+            ("サークルA", "b1-3", "b2-7"),
+            ("佐藤", "b2-7", "b1-3"),
+        ] {
+            set_search(&view, &mut *visual, query);
+            assert_eq!(visible_ids(&view, cx), vec![expected], "{query} の絞り込み");
+            assert!(
+                row_rendered(&mut *visual, expected),
+                "{query}: {expected} が出ていない"
+            );
+            assert!(
+                !row_rendered(&mut *visual, hidden),
+                "{query}: {hidden} が残っている"
+            );
+        }
+
+        // 一致なしは空の案内を出す
+        set_search(&view, &mut *visual, "存在しない付箋");
+        assert!(visible_ids(&view, cx).is_empty());
+        assert!(
+            visual.debug_bounds("notes-empty").is_some(),
+            "一致なしの案内が出ていない"
+        );
+        assert!(
+            visual.debug_bounds("notes-row-b1-3").is_none()
+                && visual.debug_bounds("notes-row-b2-7").is_none(),
+            "一致なしでも行が残っている"
+        );
+
+        // 実際のタイプでも 1 文字ごとに反映される（明示的な再描画を挟まずに検証）
+        set_search(&view, &mut *visual, "");
+        {
+            let state = view.read_with(cx, |this, _| this.search_state.clone().expect("検索欄"));
+            visual.update(|window, cx| {
+                let focus = state.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            });
+        }
+        visual.simulate_keystrokes("react");
+        cx.run_until_parked();
+        assert!(
+            row_rendered(&mut *visual, "b2-7"),
+            "タイプしただけで絞り込まれていない（React の本が出ていない）"
+        );
+        assert!(
+            !row_rendered(&mut *visual, "b1-3"),
+            "タイプしただけで絞り込まれていない（Rust の本が残っている）"
+        );
+
+        // ESC で検索を解除して全件に戻る（入力欄も空になる）
+        visual.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        draw_notes(&mut *visual);
+        assert!(
+            view.read_with(cx, |this, cx| this.current_search(cx))
+                .is_none(),
+            "ESC で検索が解除されていない"
+        );
+        assert_eq!(visible_ids(&view, cx), vec!["b2-7", "b1-3"]);
+        for selector in ["notes-row-b1-3", "notes-row-b2-7"] {
+            assert!(
+                visual.debug_bounds(selector).is_some(),
+                "{selector} が戻っていない"
+            );
+        }
+    }
+
+    /// その行が描画されているか（`debug_bounds` は `&'static str` を取るので動的 id は
+    /// リークさせて渡す。テスト内なので数バイトで済む）。
+    fn row_rendered(visual: &mut gpui_kit::VisualTestContext, id: &str) -> bool {
+        let selector: &'static str = Box::leak(format!("notes-row-{id}").into_boxed_str());
+        visual.debug_bounds(selector).is_some()
+    }
+
+    /// 表示中の行 id（本 + ページ。絞り込み後も追加が新しい順のまま）。
+    fn visible_ids(view: &Entity<NotesView>, cx: &mut gpui_kit::TestAppContext) -> Vec<String> {
+        view.read_with(cx, |this, cx| {
+            this.visible_note_rows(cx)
+                .iter()
+                .map(|row| format!("{}-{}", row.book.id, row.note.page))
+                .collect()
+        })
+    }
+
+    /// 検索欄に文字を入れる（実際の入力と同じ `InputState` 経由）。
+    fn set_search(view: &Entity<NotesView>, visual: &mut gpui_kit::VisualTestContext, query: &str) {
+        let view = view.clone();
+        let query = query.to_string();
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                this.ensure_search_state(window, cx);
+                let state = this.search_state.clone().expect("検索欄");
+                state.update(cx, |state, cx| state.set_value(query.clone(), window, cx));
+            });
+        });
+        draw_notes(visual);
     }
 
     /// 数フレーム描く（行の測定とダイアログの反映のため）。
