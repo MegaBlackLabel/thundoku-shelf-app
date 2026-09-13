@@ -41,8 +41,20 @@ struct NoteRow {
     reading_state: progress::ReadingState,
     progress: Option<(i64, Option<i64>)>,
     tags: Vec<String>,
-    /// 付箋を付けたページの画像（縮小）。
-    page_image: Option<Arc<RenderImage>>,
+}
+
+/// サムネイルを保持する上限。1 枚 ≒ 0.2MB（幅 200px に縮小済み）なので 64 枚で 13MB 程度。
+/// 付箋画面は行を仮想化しない（表示中の全行が描画される）ため、件数に関わらず
+/// 常駐するページ画像をこの数に抑える。
+const MAX_THUMB_CACHE: usize = 64;
+
+/// まだ読んでいないサムネイルの読み込み要求（描く行 1 件分）。
+struct ThumbRequest {
+    /// [`NotesView::thumb_key`]（本 + ページ）。
+    key: String,
+    book_id: String,
+    content_id: String,
+    page: i64,
 }
 
 pub struct NotesView {
@@ -51,6 +63,13 @@ pub struct NotesView {
     favorite_authors: Vec<String>,
     favorite_tags: Vec<String>,
     tag_counts: Arc<std::collections::HashMap<String, usize>>,
+    /// 表示中の行のページ画像（サムネイル）。上限つき（`MAX_THUMB_CACHE`）の LRU で、
+    /// キーは [`Self::thumb_key`]（本 + ページ）。
+    thumb_cache: std::collections::HashMap<String, Arc<RenderImage>>,
+    /// サムネイルを読んだ順（上限を超えたら先頭 = 最も古いものから捨てる）。
+    thumb_order: std::collections::VecDeque<String>,
+    /// デコードを要求したキー。上限で捨てた行を読み直さないための記録（[`Self::ensure_thumb_loaded`]）。
+    thumb_requested: std::collections::HashSet<String>,
     /// タグ絞り込み（本棚と同じ OR 条件）。空 = すべて。
     selected_tags: Vec<String>,
     /// 検索欄（メモ / タイトル / サークル / 著者。本棚と同じく 1 文字ごとに反映）。
@@ -90,6 +109,9 @@ impl NotesView {
             favorite_authors: Vec::new(),
             favorite_tags: Vec::new(),
             tag_counts: Arc::new(std::collections::HashMap::new()),
+            thumb_cache: std::collections::HashMap::new(),
+            thumb_order: std::collections::VecDeque::new(),
+            thumb_requested: std::collections::HashSet::new(),
             selected_tags: Vec::new(),
             search_state: None,
             expanded_tag_rows: std::collections::HashSet::new(),
@@ -137,8 +159,9 @@ impl NotesView {
             {
                 continue;
             }
+            // サムネイルはここでは読まない（全付箋ぶんのページ画像を常駐させないため）。
+            // 描画で必要になった行だけ `ensure_thumb_loaded` が背景で読む。
             rows.push(NoteRow {
-                page_image: Self::load_page_image(cx, pool, book, &note),
                 book: book.clone(),
                 event_text: shelf_event_text(shelf),
                 reading_state: progress::ReadingState::from_progress(
@@ -164,38 +187,83 @@ impl NotesView {
         self.rows = rows;
     }
 
-    /// 付箋を付けたページの画像（ページ一覧と同じ縮小経路: `load_thumb`）。
-    /// ページ画像は pack の復号が要るため、リーダーと同じ identity を渡す。
-    fn load_page_image(
-        cx: &Context<Self>,
-        pool: &db::SqlitePool,
-        book: &books::Book,
-        note: &db::notes::PageNote,
-    ) -> Option<Arc<RenderImage>> {
+    /// 行ごとのページ画像のキー（本 + ページ。`notes-page-<id>` などの id と同じ）。
+    fn thumb_key(row: &NoteRow) -> String {
+        format!("{}-{}", row.book.id, row.note.page)
+    }
+
+    /// 付箋を付けたページのサムネイルを背景でデコードする（1 行につき 1 回だけ）。
+    ///
+    /// 付箋画面は行を仮想化していないため、描画のたびに表示中の全行がここを通る。
+    /// キャッシュ（`thumb_cache`）は上限つきで古い行から捨てるが、捨てた行を読み直すと
+    /// 「描画 → デコード → notify → 描画」が終わらなくなる。そのため一度要求したキーは
+    /// `thumb_requested` に残して再要求しない（捨てられた行はプレースホルダのまま表示する）。
+    fn ensure_thumb_loaded(
+        &mut self,
+        window: &Window,
+        request: ThumbRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let ThumbRequest {
+            key,
+            book_id,
+            content_id,
+            page,
+        } = request;
+        if self.thumb_cache.contains_key(&key) || !self.thumb_requested.insert(key.clone()) {
+            return;
+        }
         let state = AppState::global(cx);
-        let content = (!note.content_id.is_empty()).then_some(note.content_id.as_str());
-        let images = db::documents::images_for_selection(pool, &book.id, content, None)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|image| image.image_type == "page")
-            .collect::<Vec<_>>();
-        let loader = PackPageLoader {
-            images,
-            packs_dir: state.packs_dir.clone(),
-            db: pool.clone(),
-            identity: state
-                .google_profile
-                .lock()
-                .as_ref()
-                .map(|profile| opfspack::Identity {
-                    sub: profile.sub.clone(),
-                    pack_id: book.id.clone(),
-                }),
-            pack_bytes: std::sync::OnceLock::new(),
-            pack_key: std::sync::OnceLock::new(),
-        };
-        let index = (note.page - 1).max(0) as usize;
-        loader.load_thumb(index).ok()
+        let pool = state.db_pool.clone();
+        let packs_dir = state.packs_dir.clone();
+        // ページ画像は pack の復号が要るため、リーダーと同じ identity を渡す
+        let identity = state
+            .google_profile
+            .lock()
+            .as_ref()
+            .map(|profile| opfspack::Identity {
+                sub: profile.sub.clone(),
+                pack_id: book_id.clone(),
+            });
+        // pack の復号 + 画像展開は重いので背景で回し、終わったら notify で描き直す
+        let task = cx.background_executor().spawn(async move {
+            load_note_thumb(&pool, packs_dir, identity, &book_id, &content_id, page)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            // ビュー / ウィンドウが既に破棄されていれば何もしない
+            // （テクスチャはウィンドウごと落ちるので、ここで解放する必要はない）
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(image) => this.cache_thumb(window, key.clone(), image),
+                    // 1 枚読めなくても画面は壊さない（プレースホルダのまま）
+                    Err(error) => log::warn!("付箋のページ画像を読めません: {error}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// サムネイルをキャッシュに入れる（上限を超えたら古い順に捨てる）。
+    fn cache_thumb(&mut self, window: &mut Window, key: String, image: Arc<RenderImage>) {
+        self.thumb_cache.insert(key.clone(), image);
+        self.thumb_order.push_back(key);
+        self.evict_thumbs(window);
+    }
+
+    /// サムネイルの保持数を上限（`MAX_THUMB_CACHE`）に収める（読んだ順に古いものから捨てる）。
+    /// `Arc<RenderImage>` を捨てるだけでは GPU 側のテクスチャ（sprite atlas）が残るため、
+    /// `window.drop_image` で明示的に消す。
+    fn evict_thumbs(&mut self, window: &mut Window) {
+        while self.thumb_order.len() > MAX_THUMB_CACHE {
+            let Some(oldest) = self.thumb_order.pop_front() else {
+                break;
+            };
+            if let Some(image) = self.thumb_cache.remove(&oldest) {
+                let _ = window.drop_image(image);
+            }
+        }
     }
 
     /// メモの編集を開く（✎。既存のメモを読み込んで、そのまま打ち替えられる）。
@@ -408,7 +476,7 @@ impl NotesView {
         handle: &Entity<Self>,
         row: &NoteRow,
     ) -> AnyElement {
-        let note_id = format!("{}-{}", row.book.id, row.note.page);
+        let note_id = Self::thumb_key(row);
         let selector = format!("notes-memo-edit-{note_id}");
         div()
             .id(SharedString::from(selector.clone()))
@@ -638,13 +706,14 @@ impl NotesView {
         tag_order: &TagOrder,
         tags_expanded: bool,
     ) -> AnyElement {
-        let database_id = row.book.id.clone();
-        let note_id = format!("{database_id}-{}", row.note.page);
+        let note_id = Self::thumb_key(row);
         let page = row.note.page;
-        // 表紙枠には付箋を付けたページの画像を収める（無ければプレースホルダ）
-        let page_image = row
-            .page_image
-            .clone()
+        // 表紙枠には付箋を付けたページの画像を収める。
+        // まだ読めていない行（上限で捨てられた行を含む）はプレースホルダを出す
+        let page_image = self
+            .thumb_cache
+            .get(&note_id)
+            .cloned()
             .or_else(|| placeholder_cover(&row.book.title, &row.book.circle_name));
         let state_selector = format!("notes-state-{note_id}");
         // 編集中の行はメモ欄を入力欄 + OK ボタンに差し替える
@@ -900,6 +969,33 @@ impl NotesView {
     }
 }
 
+/// 付箋を付けたページのサムネイルを pack からデコードする（背景実行用）。
+/// リーダーのページ一覧と同じ縮小経路（`images_for_selection` → `load_thumb`）を 1 行分たどる。
+fn load_note_thumb(
+    pool: &db::SqlitePool,
+    packs_dir: std::path::PathBuf,
+    identity: Option<opfspack::Identity>,
+    book_id: &str,
+    content_id: &str,
+    page: i64,
+) -> Result<Arc<RenderImage>, String> {
+    let content = (!content_id.is_empty()).then_some(content_id);
+    let images = db::documents::images_for_selection(pool, book_id, content, None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|image| image.image_type == "page")
+        .collect::<Vec<_>>();
+    let loader = PackPageLoader {
+        images,
+        packs_dir,
+        db: pool.clone(),
+        identity,
+        pack_bytes: std::sync::OnceLock::new(),
+        pack_key: std::sync::OnceLock::new(),
+    };
+    loader.load_thumb((page - 1).max(0) as usize)
+}
+
 /// `YYYY-MM-DD HH:MM:SS`（UTC）をローカルの「YYYY年MM月DD日」にする。
 fn local_date_label(utc: &str) -> String {
     use chrono::{Local, NaiveDateTime, TimeZone as _};
@@ -924,6 +1020,25 @@ impl Render for NotesView {
             &self.selected_tags,
             self.tag_counts.clone(),
         );
+        // 今フレームで描く行のページ画像を（必要なら）背景で読み始める。
+        // 行を仮想化していないので表示中の全行がここを通る（保持数は `MAX_THUMB_CACHE` で頭打ち）。
+        let pending: Vec<ThumbRequest> =
+            self.visible_note_rows(cx)
+                .into_iter()
+                .filter_map(|row| {
+                    let key = Self::thumb_key(row);
+                    (!self.thumb_cache.contains_key(&key) && !self.thumb_requested.contains(&key))
+                        .then(|| ThumbRequest {
+                            key,
+                            book_id: row.book.id.clone(),
+                            content_id: row.note.content_id.clone(),
+                            page: row.note.page,
+                        })
+                })
+                .collect();
+        for request in pending {
+            self.ensure_thumb_loaded(window, request, cx);
+        }
         let visible = self.visible_note_rows(cx);
         let count = visible.len();
         let filtering = self.is_filtering(cx);
@@ -1531,6 +1646,58 @@ mod tests {
                 "{selector} が戻っていない"
             );
         }
+    }
+
+    /// 付箋のサムネイルは上限つきキャッシュ（`MAX_THUMB_CACHE`）で持ち、全件を常駐させない。
+    /// pack の読み込みは非同期なので、上限の不変条件はキャッシュ挿入を直接呼んで検証する
+    /// （実 I/O を待つと並列実行時に不安定になり、時間もかかるため）。
+    #[gpui_kit::test]
+    async fn notes_thumb_cache_stays_within_limit(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(NotesView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // 上限より 6 件多く入れる
+        let extra = 6;
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                for index in 0..MAX_THUMB_CACHE + extra {
+                    this.cache_thumb(window, format!("key-{index}"), dummy_image(index));
+                }
+                cx.notify();
+            });
+        });
+        let (cached, ordered) = view.read_with(cx, |this, _| {
+            (this.thumb_cache.len(), this.thumb_order.len())
+        });
+        assert_eq!(cached, MAX_THUMB_CACHE, "上限を超えて保持している");
+        assert_eq!(ordered, MAX_THUMB_CACHE, "LRU の順序数が上限を超えている");
+        // 古い方から捨てられ、新しい方は残る（はみ出した 6 件 = key-0..=key-5 が消える）
+        let (old_gone, boundary_kept, recent_kept) = view.read_with(cx, |this, _| {
+            (
+                this.thumb_cache.contains_key("key-0"),
+                this.thumb_cache.contains_key(&format!("key-{extra}")),
+                this.thumb_cache
+                    .contains_key(&format!("key-{}", MAX_THUMB_CACHE + extra - 1)),
+            )
+        });
+        assert!(!old_gone, "最も古いサムネイルが捨てられていない");
+        assert!(boundary_kept, "上限内のサムネイルまで捨てている");
+        assert!(recent_kept, "新しいサムネイルが残っていない");
+    }
+
+    /// キャッシュ用のダミー画像（中身は問わない）。
+    fn dummy_image(seed: usize) -> std::sync::Arc<gpui_kit::RenderImage> {
+        let pixel =
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([(seed % 255) as u8, 0, 0, 255]));
+        std::sync::Arc::new(gpui_kit::RenderImage::new([image::Frame::new(pixel)]))
     }
 
     /// その行が描画されているか（`debug_bounds` は `&'static str` を取るので動的 id は

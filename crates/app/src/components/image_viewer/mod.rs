@@ -406,6 +406,8 @@ pub struct ImageViewer {
     scroll_top_initialized: bool,
     /// ロード中のページ（二重ロード防止）。
     loading: std::collections::HashSet<usize>,
+    /// 追い出した画像（CPU 側は既に手放し済み。GPU 解放は render で行う）
+    pending_image_drops: Vec<Arc<RenderImage>>,
     /// スクロールモードで同時に保持するデコード済みページのバイト予算。
     /// 1 ページが数十 MiB になる本で全ページ持つと数 GB になるため、表示中ページの
     /// 前後だけをこの予算内で保持し、外れたページは解放する（テストから小さくできる）。
@@ -571,6 +573,7 @@ impl ImageViewer {
             page_slider: None,
             _page_slider_subscription: None,
             loading: std::collections::HashSet::new(),
+            pending_image_drops: Vec::new(),
             page_cache_budget: SCROLL_CACHE_BUDGET_BYTES,
             scroll_top_initialized: false,
             self_handle: None,
@@ -840,9 +843,19 @@ impl ImageViewer {
             let Some(oldest) = self.thumb_order.pop_front() else {
                 break;
             };
-            if let Some(slot) = self.thumbs.get_mut(oldest) {
-                *slot = None;
+            if let Some(slot) = self.thumbs.get_mut(oldest)
+                && let Some(image) = slot.take()
+            {
+                // GPU のテクスチャは明示的に消すまで残る（window が要るので render で解放する）
+                self.pending_image_drops.push(image);
             }
+        }
+    }
+
+    /// 追い出した画像を GPU（sprite atlas）からも解放する。render から呼ぶ。
+    fn release_evicted_images(&mut self, window: &mut Window) {
+        for image in std::mem::take(&mut self.pending_image_drops) {
+            let _ = window.drop_image(image);
         }
     }
 
@@ -2204,6 +2217,8 @@ impl Render for ImageViewer {
             .flatten()
             .any(|input| input.read(cx).focus_handle(cx).is_focused(window));
         // 付箋ダイアログの入力中はフォーカスを奪わない（奪うとメモが打ち込めない）
+        // 追い出した画像を GPU からも解放する（window が要るのでここで行う）
+        self.release_evicted_images(window);
         if !input_focused && !self.note_dialog_open && !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }

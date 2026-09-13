@@ -227,6 +227,10 @@ impl HistoryView {
         let mut days: Vec<HistoryDay> = Vec::new();
         let mut sites: Vec<String> = Vec::new();
         let mut count = 0;
+        // 表紙は同じ本が複数の日に出るので、この reload 内でデコード結果を共有する
+        // （1 冊 1 回。以前は日ごとに 1MB の表紙をデコードし直していた）
+        let mut cover_cache: std::collections::HashMap<String, Option<Arc<RenderImage>>> =
+            std::collections::HashMap::new();
         for session in sessions {
             // 期間フィルタ（日付単位）
             if !self.period.contains(&session.day, &today) {
@@ -275,10 +279,16 @@ impl HistoryView {
             let item = HistoryItem {
                 // 本棚と同じ順: サイトのサムネイルキャッシュ → pack の表紙 → プレースホルダ。
                 // 以前は pack の表紙しか見ておらず、本棚と違う絵が出ていた。
-                cover: shelf
-                    .and_then(|item| load_cached_cover(&thumbnails_dir, item))
-                    .or_else(|| load_cover_image(&packs_dir, book))
-                    .or_else(|| placeholder_cover(&book.title, &book.circle_name)),
+                // 同じ本は 1 回だけデコードして共有する（上の cover_cache）。
+                cover: cover_cache
+                    .entry(book.id.clone())
+                    .or_insert_with(|| {
+                        shelf
+                            .and_then(|item| load_cached_cover(&thumbnails_dir, item))
+                            .or_else(|| load_cover_image(&packs_dir, book))
+                            .or_else(|| placeholder_cover(&book.title, &book.circle_name))
+                    })
+                    .clone(),
                 book: book.clone(),
                 event_text: shelf_event_text(shelf),
                 reading_state,
@@ -2007,6 +2017,64 @@ mod tests {
     }
 
     /// 閲覧セッションを入れる（`started_at` / `ended_at` は UTC の `YYYY-MM-DD HH:MM:SS`）。
+    /// 同じ本が複数の日に出ても、表紙は 1 冊 1 回だけデコードして共有する。
+    /// 以前は日ごとにデコードし直していた（同じ本を何日も読むと 1MB × 日数）。
+    #[gpui_kit::test]
+    async fn repeated_books_share_one_decoded_cover(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::{Duration, Utc};
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book(cx, "b1", "共有の本", "fanza");
+        // 本棚アイテムに紐付け、サムネイルの PNG を置く（表紙が実際にデコードされるように）
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let pool = &state.db_pool;
+            db::bookshelf::upsert(pool, &test_shelf_item("db-1")).unwrap();
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = 'db-1' WHERE id = 'b1'")
+                    .execute(pool)
+                    .await
+            })
+            .unwrap();
+            let thumbnails = state.data_dir.join("thumbnails");
+            std::fs::create_dir_all(&thumbnails).unwrap();
+            let path =
+                super::super::bookshelf::cover_cache_path(&thumbnails, "techbookfest", "db-1");
+            let image = image::RgbImage::from_pixel(240, 320, image::Rgb([10, 20, 30]));
+            image::DynamicImage::ImageRgb8(image)
+                .save(&path)
+                .expect("サムネイルを書き込む");
+        });
+        // ローカルの正午を基準にする（実行時刻で日付がずれないように）
+        let noon = chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("正午")
+            .and_local_timezone(chrono::Local)
+            .single()
+            .expect("ローカル")
+            .with_timezone(&Utc);
+        add_session(cx, "s1", "b1", noon, 10);
+        add_session(cx, "s2", "b1", noon - Duration::days(1), 5);
+        let view = cx.new(HistoryView::new);
+        let (days, covers) = view.read_with(cx, |this, _| {
+            (
+                this.days.len(),
+                this.days
+                    .iter()
+                    .flat_map(|day| day.items.iter())
+                    .filter_map(|item| item.cover.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(days, 2, "2 日分の履歴になっていない");
+        assert_eq!(covers.len(), 2, "表紙が 2 件揃っていない");
+        assert!(
+            std::sync::Arc::ptr_eq(&covers[0], &covers[1]),
+            "同じ本の表紙が日に何度もデコードされている"
+        );
+    }
+
     fn add_session(
         cx: &mut gpui_kit::TestAppContext,
         id: &str,

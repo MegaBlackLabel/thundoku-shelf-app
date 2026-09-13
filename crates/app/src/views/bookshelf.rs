@@ -7175,7 +7175,23 @@ pub fn app_logo_image() -> Option<Arc<RenderImage>> {
 /// 表紙画像が取得できなかったカード用の NoImage ダミー（グレー背景 + NoImage 表記）。
 pub(crate) fn no_image_cover() -> Option<Arc<RenderImage>> {
     let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 320' width='240' height='320'><rect width='240' height='320' fill='#e5e7eb'/><rect x='60' y='90' width='120' height='90' fill='none' stroke='#9ca3af' stroke-width='6'/><path d='M70 165 L100 135 L125 155 L150 130 L170 165 Z' fill='#9ca3af'/><text x='120' y='200' text-anchor='middle' font-family='sans-serif' font-size='16' font-weight='bold' fill='#6b7280'>NoImage</text></svg>";
-    decode_bytes_to_render_image(svg.as_bytes())
+    rasterize_svg(svg)
+}
+
+/// SVG 文字列を `RenderImage` に rasterize する（GPUI は BGRA を期待する）。
+/// **`image` クレートは SVG を復号できない**ため、表紙のプレースホルダはこちらを通す
+/// （以前は `decode_bytes_to_render_image` に SVG を渡していて常に `None` になっていた）。
+pub(crate) fn rasterize_svg(svg: &str) -> Option<Arc<RenderImage>> {
+    let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).ok()?;
+    let size = tree.size().to_int_size();
+    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height())?;
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let mut data = pixmap.data().to_vec();
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let rgba = image::RgbaImage::from_raw(size.width(), size.height(), data)?;
+    Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])))
 }
 
 pub(crate) fn placeholder_cover(title: &str, circle: &str) -> Option<Arc<RenderImage>> {
@@ -7199,7 +7215,7 @@ pub(crate) fn placeholder_cover(title: &str, circle: &str) -> Option<Arc<RenderI
             .replace('<', "&lt;")
             .replace('>', "&gt;"),
     );
-    decode_bytes_to_render_image(svg.as_bytes())
+    rasterize_svg(&svg)
 }
 
 /// Web の `CircularProgress` と同じ円形リング（SVG）を RGBA に rasterize する。
@@ -7792,6 +7808,25 @@ mod tests {
     }
 
     /// サイトを指定して本棚アイテムを seed する（`seed_shelf_item` は技術書典固定のため）。
+    /// 表紙のプレースホルダ（SVG）が実際に画像になること。
+    /// 以前は SVG を `image` クレートで復号しようとして常に None になり、
+    /// 表紙の無い本が空枠で表示されていた。
+    #[test]
+    fn placeholder_covers_are_rasterized() {
+        let image = placeholder_cover("テスト本", "サークル").expect("プレースホルダが None");
+        let size = image.size(0);
+        assert_eq!(
+            (size.width.0, size.height.0),
+            (240, 320),
+            "プレースホルダの寸法が違う"
+        );
+        let no_image = no_image_cover().expect("NoImage が None");
+        assert_eq!(
+            (no_image.size(0).width.0, no_image.size(0).height.0),
+            (240, 320)
+        );
+    }
+
     fn seed_shelf_item_for_site(
         cx: &mut TestAppContext,
         site_id: &str,

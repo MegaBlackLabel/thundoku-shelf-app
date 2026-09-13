@@ -88,18 +88,23 @@ impl TbfLoginView {
     fn start_url_check(&mut self, cx: &mut Context<Self>) {
         self.check_generation += 1;
         let generation = self.check_generation;
-        let handle = cx.entity();
+        // 強参照を持つと、ログイン画面を閉じてもビュー（と WebView）が解放されない。
+        // 弱参照にし、ビューが drop されたら update が Err を返すのでタスクを終了する。
+        let handle = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                let done = handle.update(cx, |this, cx| {
+                let Ok(done) = handle.update(cx, |this, cx| {
                     if this.check_generation != generation {
                         return true; // 新しい監視が始まっている
                     }
                     this.check_login(cx)
-                });
+                }) else {
+                    // Err = ビューが drop された（監視する相手がいない）
+                    break;
+                };
                 if done {
                     break;
                 }
@@ -240,5 +245,47 @@ impl Render for TbfLoginView {
                     })
                     .child(Icon::new(IconName::Close).size(px(18.0))),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::TestAppContext;
+
+    /// テスト用のウィンドウルート（描くものは無い）。
+    struct TestRoot;
+
+    impl Render for TestRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// ログイン画面を閉じて強参照を全て drop したらビューが解放されること。
+    /// 修正前は URL 監視タスクが `Entity` を持ち続け、WebView ごと残っていた。
+    #[gpui_kit::test]
+    async fn view_is_released_when_its_handles_are_dropped(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        // テストウィンドウには native handle が無いので WebView は作られない。
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(480.0),
+                height: gpui_kit::px(640.0),
+            },
+            |_, _| TestRoot,
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let weak = visual.update(|window, cx| {
+            let view = cx.new(|cx| TbfLoginView::new(window, cx));
+            let weak = view.downgrade();
+            drop(view); // モーダルを閉じた状態（強参照なし）
+            weak
+        });
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "TbfLoginView が解放されていない（URL 監視タスクのリーク）"
+        );
     }
 }

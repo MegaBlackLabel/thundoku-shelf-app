@@ -1,7 +1,7 @@
 //! チェックリストビュー: イベント一覧 → チェック項目、同期、試し読み、
 //! お気に入り取り込み。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::sync::Arc;
 
@@ -24,6 +24,10 @@ use thundoku_core::tbf;
 use crate::app_state::AppState;
 use crate::icons::AppIcon;
 use image::GenericImageView as _;
+
+/// デコード済みサムネイルの保持上限（1 ページ = 50 件 + 余裕を持たせた値）。
+/// これを超えたら古い順に追い出してメモリに残さない。
+const MAX_THUMB_CACHE: usize = 64;
 
 /// 並び替えフィールド（Web の SortField 相当）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,8 +53,15 @@ pub struct ChecklistView {
     page: usize,
     /// 一覧の「これより以前のイベントを表示」で表示済みの件数
     visible_older_count: usize,
-    /// デコード済みサムネイルのキャッシュ（render で毎回デコードしない）
+    /// デコード済みサムネイルのキャッシュ（render で毎回デコードしない）。
+    /// 保持数は MAX_THUMB_CACHE まで（超過分は古い順に追い出す）
     thumbnail_images: HashMap<String, Arc<RenderImage>>,
+    /// thumbnail_images の挿入順（先頭が最古）。上限超過時の追い出しに使う
+    thumbnail_order: VecDeque<String>,
+    /// 追い出し済みサムネイルの GPU テクスチャ解放待ち（`release_evicted_thumbs` が
+    /// 描画時に drop_image する）。キャッシュ操作は window を持たない
+    /// バックグラウンドタスクから呼ばれるため、いったんここに預けてから解放する
+    evicted_thumb_images: Vec<Arc<RenderImage>>,
     /// 取得中のサムネイル（重複ダウンロード防止）
     thumbnail_fetching: HashSet<String>,
     /// ダウンロード失敗したサムネイル（reload 連鎖の無限ループ防止。
@@ -73,6 +84,8 @@ impl ChecklistView {
             page: 0,
             visible_older_count: 0,
             thumbnail_images: HashMap::new(),
+            thumbnail_order: VecDeque::new(),
+            evicted_thumb_images: Vec::new(),
             thumbnail_fetching: HashSet::new(),
             fetch_failed: HashSet::new(),
         };
@@ -102,11 +115,9 @@ impl ChecklistView {
         cx.notify();
     }
 
-    /// DB に保存済みの thumbnail_data（base64）をバックグラウンドで
-    /// 縮小デコードしてキャッシュする（render で毎回デコードしない）。
-    /// デコード対象（thumbnail_data あり・未キャッシュ）を現在表示中の
-    /// ページ（50 件）に限定して返す。全件を一括デコードしない。
-    fn decode_pending(&self) -> Vec<(String, String)> {
+    /// 現在の並び替え・ページ設定で表示中の項目（Web の PAGE_SIZE = 50 件）。
+    /// サムネイルのデコード対象と、追い出しから守る範囲を揃えるために使う。
+    fn page_items(&self) -> Vec<CheckedItem> {
         let mut sorted = self.items.clone();
         sorted.sort_by(|a, b| {
             let ordering = match self.sort_field {
@@ -122,10 +133,16 @@ impl ChecklistView {
         });
         const PAGE_SIZE: usize = 50;
         let start = self.page * PAGE_SIZE;
-        sorted
+        sorted.into_iter().skip(start).take(PAGE_SIZE).collect()
+    }
+
+    /// DB に保存済みの thumbnail_data（base64）をバックグラウンドで
+    /// 縮小デコードしてキャッシュする（render で毎回デコードしない）。
+    /// デコード対象（thumbnail_data あり・未キャッシュ）を現在表示中の
+    /// ページ（50 件）に限定して返す。全件を一括デコードしない。
+    fn decode_pending(&self) -> Vec<(String, String)> {
+        self.page_items()
             .into_iter()
-            .skip(start)
-            .take(PAGE_SIZE)
             .filter(|item| {
                 item.thumbnail_data.is_some()
                     && !self.thumbnail_images.contains_key(&item.id)
@@ -139,6 +156,64 @@ impl ChecklistView {
             })
             .take(20)
             .collect()
+    }
+
+    /// デコード済みサムネイルをキャッシュへ追加する（上限つき LRU）。
+    /// 上限を超えた分は古い順に追い出し、`evicted_thumb_images` に積む。
+    /// ここでは window を持たない（バックグラウンドタスクから呼ばれる）ため、
+    /// GPU テクスチャの解放は `release_evicted_thumbs` が描画時に行う。
+    fn cache_thumb(&mut self, key: String, image: Arc<RenderImage>) {
+        if let Some(previous) = self.thumbnail_images.insert(key.clone(), image) {
+            // 同じキーの再挿入（取得とデコードの競合）は古い画像を解放待ちにして、
+            // 挿入位置を最新へ移す
+            self.evicted_thumb_images.push(previous);
+            if let Some(index) = self.thumbnail_order.iter().position(|k| k == &key) {
+                self.thumbnail_order.remove(index);
+            }
+        }
+        self.thumbnail_order.push_back(key);
+        self.trim_thumb_cache();
+    }
+
+    /// キャッシュの上限を超えたサムネイルを古い順に追い出す。
+    /// 現在表示中のページの項目は、追い出すと次のデコードまで表紙が消えるため残す。
+    fn trim_thumb_cache(&mut self) {
+        if self.thumbnail_images.len() <= MAX_THUMB_CACHE {
+            return;
+        }
+        let visible: Vec<String> = self.page_items().into_iter().map(|item| item.id).collect();
+        let mut index = 0;
+        while self.thumbnail_images.len() > MAX_THUMB_CACHE && index < self.thumbnail_order.len() {
+            if visible.contains(&self.thumbnail_order[index]) {
+                // 表示中の行は飛ばして、次に古いものを追い出す
+                index += 1;
+                continue;
+            }
+            let key = self.thumbnail_order.remove(index).expect("index < len");
+            self.evict_thumb(&key);
+        }
+        // 表示中だけで上限を超えた場合は、古い順に落として上限を守る
+        while self.thumbnail_images.len() > MAX_THUMB_CACHE {
+            let Some(key) = self.thumbnail_order.pop_front() else {
+                break;
+            };
+            self.evict_thumb(&key);
+        }
+    }
+
+    /// キャッシュから外し、GPU テクスチャ解放待ちに積む。
+    fn evict_thumb(&mut self, key: &str) {
+        if let Some(image) = self.thumbnail_images.remove(key) {
+            self.evicted_thumb_images.push(image);
+        }
+    }
+
+    /// 追い出し済みサムネイルの GPU テクスチャを解放する（render から呼ぶ）。
+    fn release_evicted_thumbs(&mut self, window: &mut Window) {
+        for image in std::mem::take(&mut self.evicted_thumb_images) {
+            // GPU 側のテクスチャも解放する（atlas は明示的に消すまで残る）
+            let _ = window.drop_image(image);
+        }
     }
 
     fn decode_cached_thumbnails(&mut self, cx: &mut Context<Self>) {
@@ -179,8 +254,8 @@ impl ChecklistView {
             let count = images.len();
             handle.update(cx, |this, cx| {
                 for (id, image) in images {
-                    this.thumbnail_images.insert(id.clone(), image);
                     this.thumbnail_fetching.remove(&id);
+                    this.cache_thumb(id, image);
                 }
                 // デコード失敗も記録して毎回の再試行を防ぐ（連鎖の停止）
                 for id in failed {
@@ -199,6 +274,8 @@ impl ChecklistView {
 
     /// サムネイルが未取得の項目について、thumbnail_url から画像を
     /// ダウンロードして thumbnail_data（base64）に保存する。
+    /// メモリ上に持つのは保存用の縮小 JPEG のみで、表示用のデコードは
+    /// 描画中のページに限り `decode_cached_thumbnails` が行う。
     fn fetch_missing_thumbnails(&mut self, cx: &mut Context<Self>) {
         // 取得済み/取得中の項目はスキップし、1 度の実行では 20 件まで
         let pending: Vec<(String, String)> = self
@@ -227,9 +304,10 @@ impl ChecklistView {
                 .timeout_connect(std::time::Duration::from_secs(15))
                 .timeout_read(std::time::Duration::from_secs(30))
                 .build();
-            // ダウンロード → 縮小デコード → base64 保存 + RenderImage キャッシュ
+            // ダウンロード → 縮小 JPEG にして DB へ保存する。
+            // 表示用のデコードは描画中のページだけ `decode_cached_thumbnails` が行う
+            // （全件分の RenderImage をメモリに作らない）
             let mut stored: Vec<(String, String)> = Vec::new();
-            let mut images: Vec<(String, Arc<RenderImage>)> = Vec::new();
             let mut failed: Vec<String> = Vec::new();
             for (id, url) in pending {
                 let ok = (|| {
@@ -238,11 +316,9 @@ impl ChecklistView {
                     resp.into_reader()
                         .read_to_end(&mut body)
                         .map_err(|e| e.to_string())?;
-                    let image = decode_thumbnail(&body).ok_or("not an image")?;
                     // 永続化は縮小 JPEG のみ（元画像は保存しない）
                     let jpeg_b64 = thumbnail_jpeg_base64(&body).ok_or("not an image")?;
                     stored.push((id.clone(), jpeg_b64));
-                    images.push((id.clone(), image));
                     Ok::<(), String>(())
                 })();
                 if ok.is_err() {
@@ -252,27 +328,12 @@ impl ChecklistView {
             for (id, data) in &stored {
                 let _ = db::checklist::update_thumbnail_data(&db, id, data);
             }
-            (images, failed, stored)
+            (failed, stored)
         });
         cx.spawn(async move |_window, cx| {
-            let (images, failed, stored) = task.await;
+            let (failed, stored) = task.await;
             handle.update(cx, |this, cx| {
-                for (id, image) in images {
-                    this.thumbnail_images.insert(id.clone(), image);
-                    this.thumbnail_fetching.remove(&id);
-                }
-                // 保存済みデータをメモリ上の items にも反映して、
-                // 次の reload まで再取得対象にならないようにする
-                for (id, data) in stored {
-                    if let Some(item) = this.items.iter_mut().find(|item| item.id == *id) {
-                        item.thumbnail_data = Some(data);
-                    }
-                }
-                // 失敗した項目は記録して再試行しない（無限連鎖の防止）
-                for id in failed {
-                    this.thumbnail_fetching.remove(&id);
-                    this.fetch_failed.insert(id);
-                }
+                this.apply_fetched_thumbnails(cx, stored, failed);
                 // 残りは直接続行（reload() は全体再ロードを伴い連鎖を生むので
                 // 呼ばない。pending が空なら即 return して終了する）
                 this.fetch_missing_thumbnails(cx);
@@ -280,6 +341,32 @@ impl ChecklistView {
             });
         })
         .detach();
+    }
+
+    /// 取得結果（保存済み base64 / 失敗した項目 ID）を items へ反映し、
+    /// 描画中のページのサムネイルだけをデコードし直す。
+    /// 非表示ページ分の RenderImage は作らない（メモリに残さない）。
+    fn apply_fetched_thumbnails(
+        &mut self,
+        cx: &mut Context<Self>,
+        stored: Vec<(String, String)>,
+        failed: Vec<String>,
+    ) {
+        // 保存済みデータをメモリ上の items にも反映して、
+        // 次の reload まで再取得対象にならないようにする
+        for (id, data) in stored {
+            self.thumbnail_fetching.remove(&id);
+            if let Some(item) = self.items.iter_mut().find(|item| item.id == *id) {
+                item.thumbnail_data = Some(data);
+            }
+        }
+        // 失敗した項目は記録して再試行しない（無限連鎖の防止）
+        for id in failed {
+            self.thumbnail_fetching.remove(&id);
+            self.fetch_failed.insert(id);
+        }
+        // 表示中のページのサムネイルをデコードしてキャッシュする
+        self.decode_cached_thumbnails(cx);
     }
 
     fn select_event(&mut self, cx: &mut Context<Self>, slug: &str) {
@@ -516,6 +603,8 @@ fn decode_size(bytes: &[u8]) -> Option<(i64, i64)> {
 /// 試し読み画像を同じウィンドウのリーダーで開く（workspace が処理）。
 impl Render for ChecklistView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 追い出し済みサムネイルの GPU テクスチャを解放する（window を持つここで行う）
+        self.release_evicted_thumbs(window);
         // Web と同じ 2 画面構成: 選択中イベントがなければ一覧、あれば詳細
         if self.selected_slug.is_none() {
             self.render_event_list(window, cx).into_any_element()
@@ -1555,30 +1644,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_pending_limits_to_current_page() {
-        // 60 件の項目を直接構築（非同期タスクなしで決定的に検証する）
-        let items: Vec<CheckedItem> = (0..60)
-            .map(|i| CheckedItem {
-                id: format!("item-{i:02}"),
-                event_id: "tbf20".into(),
-                circle_name: format!("C{i:02}"),
-                space_number: "あ-01".into(),
-                memo: String::new(),
-                is_checked: 0,
-                sort_order: i as i64,
-                tbf_circle_id: None,
-                product_id: Some("p1".into()),
-                product_title: "本".into(),
-                thumbnail_url: None,
-                thumbnail_data: Some("eA==".into()),
-                price: Some(1000),
-                is_purchased: 0,
-                sample_fetch_attempted_at: None,
-                created_at: "2026-08-21 00:00:00".into(),
-            })
-            .collect();
-        let view = ChecklistView {
+    /// テスト用の項目（id と並び順だけ指定）。
+    fn test_item(id: &str, sort_order: i64) -> CheckedItem {
+        CheckedItem {
+            id: id.into(),
+            event_id: "tbf20".into(),
+            circle_name: "サークルA".into(),
+            space_number: "あ-01".into(),
+            memo: String::new(),
+            is_checked: 0,
+            sort_order,
+            tbf_circle_id: None,
+            product_id: Some("p1".into()),
+            product_title: "本".into(),
+            thumbnail_url: None,
+            thumbnail_data: Some("eA==".into()),
+            price: Some(1000),
+            is_purchased: 0,
+            sample_fetch_attempted_at: None,
+            created_at: "2026-08-21 00:00:00".into(),
+        }
+    }
+
+    /// テスト用のビュー（非同期タスクを伴わず決定的に検証する）。
+    fn view_with_items(items: Vec<CheckedItem>) -> ChecklistView {
+        ChecklistView {
             events: Vec::new(),
             selected_slug: Some("tbf20".into()),
             items,
@@ -1591,9 +1681,27 @@ mod tests {
             page: 0,
             visible_older_count: 0,
             thumbnail_images: HashMap::new(),
+            thumbnail_order: VecDeque::new(),
+            evicted_thumb_images: Vec::new(),
             thumbnail_fetching: HashSet::new(),
             fetch_failed: HashSet::new(),
-        };
+        }
+    }
+
+    /// テスト用の 1x1 RenderImage（デコード不要で軽い）。
+    fn dummy_render_image() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new([image::Frame::new(
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255])),
+        )]))
+    }
+
+    #[test]
+    fn decode_pending_limits_to_current_page() {
+        // 60 件の項目を直接構築（非同期タスクなしで決定的に検証する）
+        let items: Vec<CheckedItem> = (0..60)
+            .map(|i| test_item(&format!("item-{i:02}"), i as i64))
+            .collect();
+        let view = view_with_items(items);
         // ページ 0 では先頭 50 件が対象（1 度の実行は 20 件まで）
         let pending = view.decode_pending();
         assert_eq!(pending.len(), 20, "page 0: at most 20 per batch");
@@ -1606,6 +1714,122 @@ mod tests {
         page1.fetch_failed.insert("item-59".into());
         let pending = page1.decode_pending();
         assert_eq!(pending.len(), 9, "failed item must be skipped");
+    }
+
+    #[test]
+    fn cache_thumb_keeps_cache_within_limit() {
+        let mut view = view_with_items(Vec::new());
+        // 上限を超えてキャッシュしても、保持数と挿入順は上限で止まる
+        for i in 0..(MAX_THUMB_CACHE + 10) {
+            view.cache_thumb(format!("item-{i:02}"), dummy_render_image());
+        }
+        assert_eq!(
+            view.thumbnail_images.len(),
+            MAX_THUMB_CACHE,
+            "保持数が上限を超えている"
+        );
+        assert_eq!(
+            view.thumbnail_order.len(),
+            MAX_THUMB_CACHE,
+            "挿入順の管理数が上限を超えている"
+        );
+        // 最古の 10 件は追い出され、GPU テクスチャ解放待ちに積まれる
+        for i in 0..10 {
+            assert!(
+                !view.thumbnail_images.contains_key(&format!("item-{i:02}")),
+                "最古のサムネイルが残っている"
+            );
+        }
+        assert!(
+            view.thumbnail_images
+                .contains_key(&format!("item-{:02}", MAX_THUMB_CACHE + 9)),
+            "最新のサムネイルが追い出されている"
+        );
+        assert_eq!(
+            view.evicted_thumb_images.len(),
+            10,
+            "追い出した画像が解放待ちに積まれていない"
+        );
+    }
+
+    #[test]
+    fn cache_thumb_keeps_thumbnails_of_visible_page() {
+        // 表示中のページ（先頭 50 件）のサムネイルは、他ページのサムネイルを
+        // 上限以上に足しても追い出されない（表示中に表紙が消えない）
+        let mut view = view_with_items(
+            (0..50)
+                .map(|i| test_item(&format!("item-{i:02}"), i as i64))
+                .collect(),
+        );
+        for i in 0..50 {
+            view.cache_thumb(format!("item-{i:02}"), dummy_render_image());
+        }
+        for i in 0..MAX_THUMB_CACHE {
+            view.cache_thumb(format!("other-{i:02}"), dummy_render_image());
+        }
+        assert!(
+            view.thumbnail_images.len() <= MAX_THUMB_CACHE,
+            "保持数が上限を超えている"
+        );
+        for i in 0..50 {
+            assert!(
+                view.thumbnail_images.contains_key(&format!("item-{i:02}")),
+                "表示中のサムネイルが追い出された"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn fetched_thumbnails_are_decoded_only_for_current_page(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 1x1 の透明 PNG（base64）。取得済みサムネイルとして渡す
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let view = cx.new(ChecklistView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                // 60 件（ページ 0 = 先頭 50 件、ページ 1 = 残り 10 件）
+                this.items = (0..60)
+                    .map(|i| test_item(&format!("item-{i:02}"), i as i64))
+                    .collect();
+                // ページ 0 とページ 1 の項目の取得結果をまとめて反映する
+                this.apply_fetched_thumbnails(
+                    cx,
+                    vec![
+                        ("item-01".into(), png_b64.into()),
+                        ("item-59".into(), png_b64.into()),
+                    ],
+                    vec!["item-02".into()],
+                );
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |this, _| {
+            // 取得結果は items に反映され、取得中フラグも解除される
+            let item = this.items.iter().find(|item| item.id == "item-01").unwrap();
+            assert!(
+                item.thumbnail_data.is_some(),
+                "取得データが反映されていない"
+            );
+            assert!(
+                !this.thumbnail_fetching.contains("item-01"),
+                "取得中フラグが残っている"
+            );
+            // 失敗した項目は再取得しない
+            assert!(
+                this.fetch_failed.contains("item-02"),
+                "失敗が記録されていない"
+            );
+            // 描画中のページ（ページ 0）だけデコードされる
+            assert!(
+                this.thumbnail_images.contains_key("item-01"),
+                "表示中のサムネイルがデコードされていない"
+            );
+            assert!(
+                !this.thumbnail_images.contains_key("item-59"),
+                "非表示ページのサムネイルまでデコードしている"
+            );
+        });
     }
 
     #[gpui_kit::test]

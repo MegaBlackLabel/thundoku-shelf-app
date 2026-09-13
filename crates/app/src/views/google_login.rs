@@ -104,7 +104,9 @@ impl GoogleLoginView {
         google: Arc<parking_lot::Mutex<Option<thundoku_core::google::GoogleClient>>>,
         cx: &mut Context<Self>,
     ) {
-        let handle = cx.entity();
+        // 弱参照にする: 監視タスクはアプリ寿命で動き続けるため、強参照を持つと
+        // ログイン画面を閉じてもビュー（と WebView）が解放されない。
+        let handle = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let result = cx.background_executor().spawn({
                 let google = google.clone();
@@ -119,7 +121,8 @@ impl GoogleLoginView {
                 }
             });
             let result = result.await;
-            handle.update(cx, |this, cx| {
+            // ビューが閉じられていたら（弱参照が切れていたら）何もしない
+            let _ = handle.update(cx, |this, cx| {
                 this.cancel = None;
                 // wry の WebView は GPUI のレイヤーとは別にウィンドウに重なっているため、
                 // 完了時（成功・失敗・キャンセル）に必ず隠す
