@@ -816,8 +816,8 @@ pub struct BookshelfView {
     auto_download_running: usize,
     /// 本棚グリッドの仮想化リスト状態
     list_state: gpui_kit::ListState,
-    /// リスト表示のスクロール追跡（選択行のスクロール連動用）
-    scroll_handle: gpui_kit::ScrollHandle,
+    /// リスト表示の行の仮想化リスト状態（可視行のみ構築。選択行のスクロール連動用）
+    list_rows_state: gpui_kit::ListState,
     /// リスト表示の行ごとの関連書籍カルーセル状態（`reload` で作る）。
     /// render 中に作ると毎描画で実体が増えるため、view 側で保持して使い回す。
     carousel_states: HashMap<String, Entity<CarouselState>>,
@@ -1090,7 +1090,12 @@ impl BookshelfView {
                 gpui_kit::px(100.0),
             )
             .measure_all(),
-            scroll_handle: gpui_kit::ScrollHandle::new(),
+            list_rows_state: gpui_kit::ListState::new(
+                0,
+                gpui_kit::ListAlignment::Top,
+                gpui_kit::px(LIST_ROW_OVERDRAW),
+            )
+            .measure_all(),
             carousel_states: HashMap::new(),
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
@@ -1114,8 +1119,8 @@ impl BookshelfView {
     /// Reload bookshelf items + local books; resolve covers (local pack ->
     /// cached file -> placeholder), then scheduled remote fetch for the rest.
     /// サイトで本棚を絞り込む（None = すべての本、Some("techbookfest") = 技術書典）。
-    /// shelf_cards は既に構築済みで、表示は visible_shelf_cards がフィルタする
-    /// ため reload（DB 再読込 + カバー再ロード）は行わない（即時反映・軽量）。
+    /// shelf_cards は既に構築済みで、表示は filtered（仮想化リストが見る）が
+    /// フィルタするため reload（DB 再読込 + カバー再ロード）は行わない（即時反映・軽量）。
     pub fn set_site_filter(&mut self, cx: &mut Context<Self>, site: Option<&str>) {
         // 展開中・同期中に切り替えると busy 表示や処理がバッティングするため無視する
         if self.fetching_covers || self.sync_busy > 0 {
@@ -1232,7 +1237,7 @@ impl BookshelfView {
             self.selected_index = Some(next as usize);
             // 選択行が見えるようにスクロールを連動させる
             if self.view_mode == ViewMode::List {
-                self.scroll_handle.scroll_to_item(next as usize);
+                self.list_rows_state.scroll_to_reveal_item(next as usize);
             } else {
                 let row = (next as usize) / cols;
                 self.list_state.scroll_to_reveal_item(row);
@@ -1913,6 +1918,10 @@ impl BookshelfView {
     }
 
     /// Shelf cards visible under the current filters（表示順 = ソート順）。
+    ///
+    /// 描画は `filtered`（同じ順序のインデックス。仮想化リストが使う）を見るため、
+    /// 表示中の並びをテストから確かめる用途で使う。
+    #[cfg(test)]
     fn visible_shelf_cards(&self, cx: &App) -> Vec<&ShelfCard> {
         let mut cards: Vec<&ShelfCard> = self
             .shelf_cards
@@ -2175,8 +2184,8 @@ impl BookshelfView {
             .into_any_element()
     }
 
-    /// 1 枚のカードが現在のフィルタ条件に一致するか（visible_shelf_cards と
-    /// List 仮想化用の filtered キャッシュで共通の判定ロジック）。
+    /// 1 枚のカードが現在のフィルタ条件に一致するか（`filtered` と、テスト用の
+    /// `visible_shelf_cards` で共通の判定ロジック）。
     fn matches_filter(&self, cx: &App, card: &ShelfCard) -> bool {
         let shelf = &card.shelf;
         // 非表示にした本は本棚に出さない
@@ -5360,14 +5369,19 @@ impl BookshelfView {
     }
 
     /// リスト表示の 1 行（Web の table 行相当: サムネイル + タイトル + イベント + 進捗 + タグ）。
+    ///
+    /// 仮想化リスト（`gpui_kit::list`）の行クロージャから呼ぶため `cx` は `&App`、
+    /// エンティティは呼び出し側（クロージャが capture している）から受け取る。
     fn render_list_row(
         &self,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &App,
+        handle: &Entity<Self>,
         card: &ShelfCard,
         selected: bool,
         tag_order: &TagOrder,
     ) -> impl IntoElement {
+        let handle = handle.clone();
         let shelf = &card.shelf;
         let title = shelf.title.clone();
         // サークル名（技術書典: organization / BOOTH: shop）
@@ -5396,7 +5410,6 @@ impl BookshelfView {
                 None => format!("{current}ページ閲覧中"),
             })
         });
-        let handle = cx.entity();
         let open_id = database_id.clone();
         let delete_id = local.map(|e| e.book.id.clone());
         let _ = window;
@@ -5455,7 +5468,11 @@ impl BookshelfView {
             .debug_selector(move || row_selector.clone())
             .flex()
             .flex_row()
-            // スクロール領域（flex_col）内で行が圧縮されないようにする
+            // 仮想化リストは行を max-content 幅で測るため、幅を明示しないと
+            // タグ列（行幅の 20%）が内容なりに広がり、タグが折り返さず行が伸びない
+            // （以前の flex_col スクロール領域では親が幅を埋めていた）。
+            .w_full()
+            // 仮想化リストの行として、行が圧縮されないようにする
             .flex_shrink_0()
             .gap_3()
             .p_2()
@@ -5806,8 +5823,7 @@ impl Render for BookshelfView {
         let is_booth = self.site_filter.as_deref() == Some("booth");
         // イベントフィルタは技術書典の本棚の概念なので、それ以外のサイトでは出さない
         let is_techbookfest = self.site_filter.as_deref() == Some("techbookfest");
-        let visible: Vec<&ShelfCard> = self.visible_shelf_cards(cx);
-        let visible_count = visible.len();
+        let visible_count = self.filtered.len();
         let view_mode = self.view_mode;
         let tag_fetch_enabled = self.tag_fetch_enabled;
         let available_events = self.available_events.clone();
@@ -6524,27 +6540,51 @@ impl Render for BookshelfView {
                                 )
                                 .into_any_element()
                         }
-                          ViewMode::List => div()
-                              .id("bookshelf-list")
-                              .debug_selector(|| "bookshelf-list".into())
-                              .flex()
-                              .flex_col()
-                              // 高さを親（bookshelf-grid = flex_1 + min_h_0）に合わせて束縛する。
-                              // 指定しないと内容高さまで伸び、overflow_y_scroll が効かずスクロールできない。
-                              .h_full()
-                              .min_h_0()
-                              .rounded_lg()
-                              .border_1()
-                              .border_color(cx.theme().border)
-                              .overflow_hidden()
-                              .overflow_y_scroll()
-                              .track_scroll(&self.scroll_handle)
-                              .children(visible.iter().enumerate().map(|(idx, entry)| {
-                                let selected = self.selected_index == Some(idx);
-                                self.render_list_row(window, cx, entry, selected, &tag_order)
-                                    .into_any_element()
-                            }))
-                            .into_any_element(),
+                        ViewMode::List => {
+                            // 仮想化: カード表示と同じく行単位の List で可視行だけを構築する。
+                            // 全行を組むと 1 行ごとの表紙・タグ計測・カルーセルで
+                            // スクロールが引っかかる。
+                            if self.list_rows_state.item_count() != visible_count {
+                                self.list_rows_state.reset(visible_count);
+                            }
+                            let list_state = self.list_rows_state.clone();
+                            let handle = handle.clone();
+                            let tag_order = tag_order.clone();
+                            div()
+                                .id("bookshelf-list")
+                                .debug_selector(|| "bookshelf-list".into())
+                                // 高さを親（bookshelf-grid = flex_1 + min_h_0）に合わせて束縛する。
+                                // 指定しないと内容高さまで伸び、リストがスクロールできない。
+                                .h_full()
+                                .min_h_0()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .overflow_hidden()
+                                .child(
+                                    gpui_kit::list(list_state, move |ix, window, cx| {
+                                        // 借用を閉じるため、行に必要なものは view から読む
+                                        // （可視行のみなので全行構築より桁違いに軽い）
+                                        let view = handle.read(cx);
+                                        let Some(&card_idx) = view.filtered.get(ix) else {
+                                            return div().into_any_element();
+                                        };
+                                        let selected = view.selected_index == Some(ix);
+                                        view.render_list_row(
+                                            window,
+                                            cx,
+                                            &handle,
+                                            &view.shelf_cards[card_idx],
+                                            selected,
+                                            &tag_order,
+                                        )
+                                        .into_any_element()
+                                    })
+                                    .h_full()
+                                    .w_full(),
+                                )
+                                .into_any_element()
+                        }
                     }),
             )
             // 取り込み確認モーダル（§6.3: 曖昧な構造のときだけ）。
@@ -6802,6 +6842,10 @@ const LIST_RELATED_LIMIT: usize = 5;
 const LIST_RELATED_PER_VIEW: f32 = 2.0;
 /// カルーセルの前へ / 次へバーの幅（アイコン程度。高さは列＝サムネイルいっぱい）。
 const LIST_CAROUSEL_BAR_W: f32 = 26.0;
+/// リスト表示の仮想化で、可視領域の上下に余分に構築する高さ。行の高さ（表紙 + 余白で
+/// 最低 `LIST_COVER_MIN_H + 16`）より大きめにして、わずかなスクロールで行が組み直されない
+/// ようにする（カード表示の overdraw = 100px に対し、行は背が高いので広く取る）。
+const LIST_ROW_OVERDRAW: f32 = 300.0;
 
 /// 同一サークル / 同一作者の関連書籍のインデックスを、**サークル一致 → 作者一致**の順で
 /// 最大 `limit` 件返す（自分自身は含めない。空のキーは一致とみなさない）。
@@ -8852,6 +8896,105 @@ mod tests {
         assert!(
             list.size.height > gpui_kit::px(200.0),
             "スクロール領域が潰れている: {list:?}"
+        );
+    }
+
+    /// リスト表示は可視行だけを構築する（カード表示と同じ仮想化）。
+    /// 全行を毎フレーム構築すると、行ごとのタグ計測・表紙・カルーセルで
+    /// スクロールが引っかかる。
+    #[gpui_kit::test]
+    async fn list_view_builds_only_visible_rows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 600px の窓に収まりきらない件数（1 行 ≒ 150px）を用意する
+        for i in 0..30 {
+            seed_shelf_item(
+                cx,
+                &format!("db-{i}"),
+                &format!("本{i:02}"),
+                "サークルA",
+                None,
+            );
+        }
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+
+        assert!(
+            rendered(&mut *visual, "book-list-db-0"),
+            "先頭の行が描かれていない"
+        );
+        assert!(
+            !rendered(&mut *visual, "book-list-db-29"),
+            "画面外の行まで構築されている（リスト表示が仮想化されていない）"
+        );
+    }
+
+    /// リスト表示でもキーボード選択の移動にスクロールが追従する（選択行が見える位置に来る）。
+    #[gpui_kit::test]
+    async fn list_view_scrolls_to_follow_the_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        for i in 0..30 {
+            seed_shelf_item(
+                cx,
+                &format!("db-{i}"),
+                &format!("本{i:02}"),
+                "サークルA",
+                None,
+            );
+        }
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.view_mode = ViewMode::List;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+        assert!(
+            !rendered(&mut *visual, "book-list-db-25"),
+            "25 番目の行が最初から画面内にある（追従の検証にならない）"
+        );
+
+        // 25 回下へ → 25 番目の本が選択され、見える位置までスクロールする
+        for _ in 0..25 {
+            visual.simulate_event(gpui_kit::KeyDownEvent {
+                keystroke: gpui_kit::Keystroke::parse("down").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+        }
+        assert_eq!(
+            view.read_with(cx, |this, _| this.selected_index),
+            Some(25),
+            "下キーで選択が移動していない"
+        );
+        draw_frames(&mut *visual);
+        assert!(
+            rendered(&mut *visual, "book-list-db-25"),
+            "選択行までスクロールしていない"
         );
     }
 

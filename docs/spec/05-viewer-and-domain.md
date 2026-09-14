@@ -569,8 +569,8 @@ pub enum ReadFilter { All, Unread, Reading, Read, Favorite }   // crates/app/src
 
 適用箇所は 2 系統あり、どちらも同じ `matches_filter` を通る:
 
-- `visible_shelf_cards(cx)`: フィルタ → `sort_by(compare_cards)`（`crates/app/src/views/bookshelf.rs:1904-1911`）。**リスト表示**はこちらを使う（`crates/app/src/views/bookshelf.rs:5753-5755`）。
-- `rebuild_filtered(cx)`: List 仮想化用のインデックスキャッシュ `filtered`（`filtered_dirty` で再構築）。**カード（グリッド）表示**はこちらを使う（`crates/app/src/views/bookshelf.rs:1941-1948`、`crates/app/src/views/bookshelf.rs:6374-6398`）。
+- `visible_shelf_cards(cx)`: フィルタ → `sort_by(compare_cards)`（`crates/app/src/views/bookshelf.rs:1920-1933`）。**テスト専用**（`#[cfg(test)]`）。描画は Card / List とも `filtered`（同じ順序のインデックス）を使う（`crates/app/src/views/bookshelf.rs:6536-6581`）。
+- `rebuild_filtered(cx)`: 仮想化リスト用のインデックスキャッシュ `filtered`（`filtered_dirty` で再構築）。**Card / List とも**こちらを使う（`crates/app/src/views/bookshelf.rs:1941-1948`、`crates/app/src/views/bookshelf.rs:6417-6440`、`crates/app/src/views/bookshelf.rs:6536-6581`）。
 
 フィルタは **SQL の `WHERE` ではなく Rust 側**（`books::list(db)` / `bookshelf::list_all(db)` で全件取ってから判定）。所有者スコープ（`owned_book_ids`）だけは `entries` 構築時に適用される（`crates/app/src/views/bookshelf.rs:1341-1346`、`crates/app/src/views/bookshelf.rs:598-603`）。
 
