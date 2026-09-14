@@ -677,12 +677,39 @@ impl SettingsView {
 
     pub fn logout_github(&mut self, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
-        // keyring のトークン削除とクライアント / プロフィール / ログイン状態の破棄は
-        // AppState 側にまとめてある。GitHub は本棚の絞り込みに関係しないので再取得は不要。
-        crate::app_state::clear_github_token(cx);
-        log::info!("logout_github: token cleared ({:?})", t.elapsed());
-        self.show_toast("GitHub からログアウトしました", cx);
-        cx.notify();
+        // keyring の削除は OS の応答待ち（許可ダイアログ等）で止まり得るので背景で行う。
+        // 削除に成功したときだけログイン状態を落とす（失敗時に「ログアウト済み」と見せると、
+        // 次回起動で勝手にログインし直って見える）。GitHub は本棚の絞り込みに関係しないので
+        // 再取得は不要。
+        let handle = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::app_state::delete_github_token_secret() })
+                .await;
+            let _ = handle.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        crate::app_state::clear_github_session(cx);
+                        log::info!("logout_github: token cleared ({:?})", t.elapsed());
+                        this.show_toast("GitHub からログアウトしました", cx);
+                    }
+                    Err(message) => {
+                        log::error!("logout_github: {message}");
+                        // サイドバーのアカウント欄から呼ばれると設定画面は表示されていないので、
+                        // 画面内の赤字だけでは見えない。トーストでも出す。
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            crate::app_state::ToastKind::Error,
+                            message.clone(),
+                        );
+                        this.error = Some(message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn logout_booth(&mut self, cx: &mut Context<Self>) {

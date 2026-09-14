@@ -21,7 +21,10 @@ use gpui_kit::{
 };
 use thundoku_core::github::{DEFAULT_SCOPE, DeviceCode, DeviceFlowPoll, GithubError};
 
-use crate::app_state::{AppState, default_github_client_id, save_github_token};
+use crate::app_state::{
+    AppState, ToastKind, default_github_client_id, set_github_session, set_toast_kind,
+    store_github_token_secret,
+};
 
 /// ログイン成功（トークン保存とプロフィール取得まで完了）。
 ///
@@ -52,6 +55,8 @@ pub struct GithubLoginView {
     phase: Phase,
     /// ポーリングを止めるためのフラグ（✕ で立てる）。
     cancel: Option<Arc<AtomicBool>>,
+    /// 既定ブラウザを開けなかった（URL を手で開いてもらう必要がある）。
+    browser_failed: bool,
 }
 
 impl GithubLoginView {
@@ -59,6 +64,7 @@ impl GithubLoginView {
         let mut this = Self {
             phase: Phase::Requesting,
             cancel: None,
+            browser_failed: false,
         };
         this.start(cx);
         this
@@ -112,8 +118,16 @@ impl GithubLoginView {
                 }
             };
 
-            // 2) コードを見せてブラウザを開く。
-            if thundoku_core::google::open_browser(&code.verification_uri).is_err() {
+            // 待っている間に ✕ で閉じられていたら、ブラウザを開かずに終わる
+            // （閉じたのに勝手にブラウザが開くのを防ぐ）。
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // 2) コードを見せてブラウザを開く。開けない環境（リモート/コンテナ等）でも
+            //    進められるように、失敗は画面にも出す（URL は画面に出してある）。
+            let opened = thundoku_core::google::open_browser(&code.verification_uri).is_ok();
+            if !opened {
                 log::warn!(
                     "github login: ブラウザを開けませんでした: {}",
                     code.verification_uri
@@ -124,6 +138,7 @@ impl GithubLoginView {
                 this.phase = Phase::Waiting {
                     code: waiting_code.clone(),
                 };
+                this.browser_failed = !opened;
                 cx.notify();
             });
 
@@ -157,24 +172,46 @@ impl GithubLoginView {
                         interval = next.max(interval + 5);
                     }
                     Some(Ok(DeviceFlowPoll::Authorized(token))) => {
-                        // 4) トークンを保存し、表示名のためにユーザーを引く。
-                        let user = executor.spawn({
-                            let github = github.clone();
-                            async move {
-                                let mut guard = github.lock();
-                                guard.as_mut().and_then(|client| client.current_user().ok())
+                        // 4) トークンを保存する。keyring への書き込みは OS の応答待ちで
+                        //    止まり得るので背景で実行し、成功したらメモリ上の状態を更新する
+                        //    （状態を先に立てると `current_user` が未認証で 401 になる）。
+                        let save = executor
+                            .spawn({
+                                let token = token.clone();
+                                async move { store_github_token_secret(&token) }
+                            })
+                            .await;
+                        let _ = handle.update(cx, |_, cx| {
+                            // 保存に失敗したらログイン状態は立てない。モーダルは閉じるので、
+                            // 理由はトーストで出す（画面内の赤字は閉じると見えない）。
+                            match save.err() {
+                                Some(message) => {
+                                    *AppState::global(cx).github_login_error.lock() =
+                                        Some(message.clone());
+                                    set_toast_kind(cx, ToastKind::Error, message);
+                                }
+                                None => set_github_session(cx, &token),
                             }
                         });
-                        let user = user.await;
+                        // 5) 表示名のためにユーザーを引く（保存できた＝認証済みの状態で）。
+                        let user = executor
+                            .spawn({
+                                let github = github.clone();
+                                async move {
+                                    let mut guard = github.lock();
+                                    guard.as_mut().and_then(|client| client.current_user().ok())
+                                }
+                            })
+                            .await;
                         let _ = handle.update(cx, |_, cx| {
-                            let state = AppState::global(cx);
-                            save_github_token(cx, &token);
                             if let Some(user) = user {
-                                *state.github_profile.lock() = Some(user);
+                                *AppState::global(cx).github_profile.lock() = Some(user);
                             }
                             // cx.emit は RefCell 再入でパニックしうるため、グローバル状態を
                             // 直接更新して Workspace の監視タスクに閉じさせる（Google と同じ）。
-                            state.github_login_done.store(true, Ordering::SeqCst);
+                            AppState::global(cx)
+                                .github_login_done
+                                .store(true, Ordering::SeqCst);
                         });
                         return;
                     }
@@ -230,6 +267,16 @@ impl GithubLoginView {
     }
 }
 
+impl Drop for GithubLoginView {
+    /// 画面が破棄されたらポーリングを止める。`close()` を通らない破棄（親が
+    /// `auth_dialog` を落とす等）でも GitHub へ問い合わせ続けないため。
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// 失敗を画面とグローバル状態の両方に反映する。
 fn finish_with_error(
     handle: &gpui_kit::WeakEntity<GithubLoginView>,
@@ -243,7 +290,9 @@ fn finish_with_error(
         {
             let state = AppState::global(cx);
             *state.github_login_error.lock() = Some(message);
-            state.github_login_done.store(true, Ordering::SeqCst);
+            // `github_login_done` は立てない。立てると Workspace の監視タスクが
+            // モーダルを閉じてしまい、失敗の理由と「やり直す」が読めなくなる。
+            // 閉じるのは利用者（✕）に任せる。
         }
         cx.notify();
     });
@@ -314,14 +363,72 @@ impl Render for GithubLoginView {
                                             .label("ブラウザで開く")
                                             .on_click({
                                                 let url = verification_uri.clone();
-                                                move |_, _window, _cx| {
-                                                    let _ =
-                                                        thundoku_core::google::open_browser(&url);
+                                                let handle = cx.weak_entity();
+                                                move |_, _window, cx| {
+                                                    let opened =
+                                                        thundoku_core::google::open_browser(&url)
+                                                            .is_ok();
+                                                    if !opened {
+                                                        log::warn!(
+                                                            "github login: ブラウザを開けませんでした: {url}"
+                                                        );
+                                                    }
+                                                    if let Some(handle) = handle.upgrade() {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.browser_failed = !opened;
+                                                            cx.notify();
+                                                        });
+                                                    }
                                                 }
                                             }),
                                     ),
                             ),
                     )
+                    // ブラウザが開けない環境でも進められるように URL を出す
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("ブラウザが開かないときは、この URL を開いてください。"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().text_xs().child(verification_uri.clone()))
+                                    .child(
+                                        Button::new("github-login-copy-url")
+                                            .cursor_pointer()
+                                            .outline()
+                                            .label("URL をコピー")
+                                            .on_click({
+                                                let url = verification_uri.clone();
+                                                move |_, _window, cx| {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(url.clone()),
+                                                    );
+                                                }
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(if self.browser_failed {
+                        div()
+                            .debug_selector(|| "github-login-browser-error".into())
+                            .text_xs()
+                            .text_color(gpui_kit::rgb(0xdc2626))
+                            .child("ブラウザを開けませんでした。上の URL を手で開いてください。")
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
                     .child(
                         div().text_xs().text_color(muted).child(
                             "入力が終わると自動でログインします（この画面は閉じられます）。",
@@ -430,12 +537,10 @@ impl Render for GithubLoginView {
                             ),
                     )
                     .child(body)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("レポート機能で使うアクセストークンだけを保存します。"),
-                    ),
+                    .child(div().text_xs().text_color(muted).child(
+                        "レポートの送信に使うアクセストークンを keyring に保存します\
+                                 （要求する権限: public_repo = 公開リポジトリへの書き込み）。",
+                    )),
             )
     }
 }

@@ -1,7 +1,9 @@
 //! レポート画面: GitHub の Issue テンプレートを下書きにして、投稿先リポジトリへ
 //! Issue を送る。
 //!
-//! 投稿先は設定 `report.target_repo`（既定 [`DEFAULT_TARGET_REPO`]）で切り替えられる。
+//! 投稿先はこのアプリのリポジトリ（[`TARGET_REPO`]）に固定する。Issue の宛先を
+//! 利用者が差し替えられるのは、誘導された利用者に別のリポジトリへ文面（と
+//! スクリーンショット）を送らせる余地になるため。
 //! テンプレートは Contents API から取得し、[`compose_body`] で本文の下書きに展開する。
 //! 画像は user-attachments へ上げて本文の末尾に `![file](url)` を足す（失敗しても
 //! 本文だけで投稿できる）。
@@ -19,28 +21,33 @@ use gpui_kit::component::attachment::{
     Attachment, AttachmentContent, AttachmentDescription, AttachmentStatus, AttachmentTitle,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
+    AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement, ReadGlobal as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px,
+    Styled as _, Window, div, px,
 };
 use parking_lot::Mutex;
-use thundoku_core::db;
 use thundoku_core::github::{
     GithubClient, GithubError, IssueTemplate, TemplateField, TemplateFieldKind,
 };
 
-use crate::app_state::{AppState, ToastKind, set_toast_kind};
+use crate::app_state::{
+    AppState, ToastKind, clear_github_session, delete_github_token_secret, set_toast_kind,
+};
 
-/// 投稿先の既定リポジトリ（設定 `report.target_repo` が無いとき）。
-pub(crate) const DEFAULT_TARGET_REPO: &str = "MegaBlackLabel/thundoku-shelf-app";
-
-/// 投稿先リポジトリの設定キー。
-const TARGET_REPO_KEY: &str = "report.target_repo";
+/// 投稿先リポジトリの owner（**固定**）。
+const TARGET_REPO_OWNER: &str = "MegaBlackLabel";
+/// 投稿先リポジトリの名前（**固定**）。
+const TARGET_REPO_NAME: &str = "thundoku-shelf-app";
+/// 画面に出す投稿先の表示。
+///
+/// 投稿先を設定で切り替えられるようにすると、誘導された利用者が別のリポジトリへ
+/// 文面（スクリーンショット込み）を送ってしまうため、ここは固定にする。
+pub(crate) const TARGET_REPO: &str = "MegaBlackLabel/thundoku-shelf-app";
 
 /// 未ログインのときに出す案内（送信も添付もできない）。
 const LOGIN_REQUIRED: &str = "GitHub にログインするとレポートを送れます";
@@ -51,10 +58,50 @@ const BODY_HEIGHT: f32 = 280.0;
 /// 添付できる画像の拡張子（`rfd` のフィルタと MIME 判定で同じ並びを使う）。
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
+/// 添付できる画像の上限サイズ。GitHub 側の上限（10MB）に合わせて手前で弾く。
+/// 大きいファイルを選んだまま無言でアップロードを始めないための確認でもある。
+const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 本文に貼る alt テキストを作る。
+///
+/// ファイル名はローカル FS 由来の任意文字列で、`]` `)` などが入ると Markdown の
+/// リンク構造を壊し、外部 URL を本文に紛れ込ませられる（テンプレート文面を
+/// そのまま流し込むのと同じ理由で、そのままは使わない）。
+fn markdown_alt(file_name: &str) -> String {
+    let cleaned: String = file_name
+        .chars()
+        .filter(|c| !matches!(c, '[' | ']' | '(' | ')' | '\\' | '\n' | '\r'))
+        .take(80)
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "画像".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// 説明文を引用（blockquote）にして本文の下書きに載せる。
+fn quote(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 選択したテンプレートの各項目を Markdown の下書きに展開する。
 ///
 /// - `markdown` の項目は `value`（説明文）をそのまま 1 節として出す
 /// - それ以外は `## {label}` の見出し + `placeholder`（無ければ `value`）
+/// - `description` は見出しの下に引用として出す。issue form では入力欄の補足として
+///   表示される文で、「秘密情報を確認してから貼る」のような注意書きがここに書かれる。
+///   アプリのフォームは field 単位の入力欄を作らないので、本文に載せて見えるようにする
 /// - 節は空行 1 つで区切る（末尾に余分な空行は残さない）
 /// - label も value も placeholder も無い項目はスキップする
 pub(crate) fn compose_body(fields: &[TemplateField]) -> String {
@@ -71,15 +118,27 @@ pub(crate) fn compose_body(fields: &[TemplateField]) -> String {
             .or(field.value.as_deref())
             .map(str::trim)
             .filter(|text| !text.is_empty());
+        let description = field
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(quote);
         let section = match field.kind {
             // 説明文は見出しを持たないので、本文だけをそのまま出す。
             TemplateFieldKind::Markdown => text.map(str::to_string),
             _ => match (label, text) {
-                (Some(label), Some(text)) => Some(format!("## {label}\n{text}")),
+                (Some(label), Some(text)) => Some(match description {
+                    Some(description) => format!("## {label}\n{description}\n{text}"),
+                    None => format!("## {label}\n{text}"),
+                }),
                 // 見出しが無い項目は本文だけを出す（`## ` だけの行を作らない）。
                 (None, Some(text)) => Some(text.to_string()),
                 // 本文が空でも見出しは出す（利用者がそこへ書く）。
-                (Some(label), None) => Some(format!("## {label}")),
+                (Some(label), None) => Some(match description {
+                    Some(description) => format!("## {label}\n{description}"),
+                    None => format!("## {label}"),
+                }),
                 (None, None) => None,
             },
         };
@@ -117,35 +176,22 @@ pub(crate) fn error_message(error: &GithubError) -> String {
         GithubError::AssetUploadDenied => {
             "画像を添付できませんでした（本文のみで投稿できます）".to_string()
         }
+        // 投稿先は固定なので、404 は「アプリが古い（リポジトリが移動/改名された）」か
+        // 「リポジトリが削除された」ことを意味する。設定を直しても解決しない。
         GithubError::NotFound(repo) => format!(
-            "{repo} が見つかりません（投稿先の設定を確認してください。private リポジトリには投稿できません）"
+            "{repo} が見つかりません。アプリを最新版に更新してください（リポジトリが移動・改名・削除された可能性があります）"
         ),
+        GithubError::RateLimited { retry_after } => match retry_after {
+            Some(seconds) => format!(
+                "GitHub の回数制限に当たりました。約 {seconds} 秒待ってからもう一度お試しください"
+            ),
+            None => "GitHub の回数制限に当たりました。しばらく待ってからもう一度お試しください"
+                .to_string(),
+        },
         GithubError::InvalidResponse(detail) => {
             format!("GitHub から予期しない応答が返りました: {detail}")
         }
     }
-}
-
-/// `owner/repo` を分解する（`https://github.com/owner/repo` 形式や末尾の `.git` も許容）。
-///
-/// 形式が違えば `None`。そのまま API の URL に埋めると別のリポジトリを叩きかねない。
-fn split_repo(value: &str) -> Option<(&str, &str)> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix("https://github.com/")
-        .or_else(|| value.strip_prefix("http://github.com/"))
-        .or_else(|| value.strip_prefix("github.com/"))
-        .unwrap_or(value);
-    let value = value
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .trim_end_matches('/');
-    let (owner, repo) = value.split_once('/')?;
-    let shaped = !owner.is_empty() && !repo.is_empty() && !repo.contains('/');
-    if !shaped || value.contains(char::is_whitespace) {
-        return None;
-    }
-    Some((owner, repo))
 }
 
 /// 拡張子から画像の MIME を決める（`IMAGE_EXTENSIONS` 以外は PNG として送る）。
@@ -166,6 +212,8 @@ enum AttachmentOutcome {
     Cancelled,
     /// アップロードできた（ファイル名と本文に貼る URL）。
     Uploaded { file_name: String, url: String },
+    /// アップロード前に分かった問題（サイズ超過など）。GitHub 側の失敗と区別する。
+    Rejected(String),
     /// 失敗（理由は種別ごとに文言化する）。
     Failed(GithubError),
 }
@@ -194,13 +242,21 @@ fn pick_and_upload(
             "ファイル名が取得できない".to_string(),
         ));
     };
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return AttachmentOutcome::Failed(GithubError::Network(format!(
-                "{file_name}: {error}"
-            )));
+    let bytes = match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > MAX_IMAGE_BYTES => {
+            return AttachmentOutcome::Rejected(format!(
+                "{file_name} は大きすぎます（上限 {}MB）",
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
         }
+        _ => match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return AttachmentOutcome::Failed(GithubError::Network(format!(
+                    "{file_name}: {error}"
+                )));
+            }
+        },
     };
     let mut guard = github.lock();
     let Some(client) = guard.as_mut() else {
@@ -237,12 +293,21 @@ enum PendingBody {
     Clear,
 }
 
+/// 送信した時点の下書き（成功時に「まだ同じ内容か」を見るために持つ）。
+///
+/// 送信の待ち時間に利用者が次を書き始めていることがあるので、無条件にクリアすると
+/// 書いた内容が消える。同じ内容のときだけ消す。
+struct SubmitSnapshot {
+    title: String,
+    body: String,
+}
+
+/// 送信時と同じ下書きか（同じときだけクリアしてよい）。
+fn draft_unchanged(snapshot: &SubmitSnapshot, title: &str, body: &str) -> bool {
+    snapshot.title == title && snapshot.body == body
+}
+
 pub struct ReportView {
-    /// 投稿先リポジトリ（`owner/repo`。設定 `report.target_repo` と同期）。
-    repo: String,
-    /// 投稿先の編集入力（render で遅延生成）。
-    repo_input: Option<Entity<InputState>>,
-    repo_subscription: Option<Subscription>,
     /// タイトル入力（render で遅延生成）。
     title_input: Option<Entity<InputState>>,
     /// 本文入力（複数行。render で遅延生成）。
@@ -259,6 +324,8 @@ pub struct ReportView {
     templates_error: Option<String>,
     /// 送信中（二重実行防止）。
     busy: bool,
+    /// 送信した時点の下書き（成功時にクリアしてよいかの判定に使う）。
+    snapshot: Option<SubmitSnapshot>,
     /// 画像の添付中（二重実行防止）。
     attaching: bool,
     /// 直近の画像添付の状態（チップ表示）。
@@ -270,12 +337,8 @@ pub struct ReportView {
 }
 
 impl ReportView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
-            repo: Self::read_setting(cx, TARGET_REPO_KEY)
-                .unwrap_or_else(|| DEFAULT_TARGET_REPO.to_string()),
-            repo_input: None,
-            repo_subscription: None,
             title_input: None,
             body_input: None,
             templates: Vec::new(),
@@ -284,6 +347,7 @@ impl ReportView {
             templates_fetched: false,
             templates_error: None,
             busy: false,
+            snapshot: None,
             attaching: false,
             attachment: None,
             pending_body: None,
@@ -291,40 +355,8 @@ impl ReportView {
         }
     }
 
-    fn read_setting(cx: &App, key: &str) -> Option<String> {
-        let state = AppState::global(cx);
-        let db = &state.db_pool;
-        db::settings::get(db, key)
-            .ok()
-            .flatten()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    }
-
-    fn write_setting(cx: &mut Context<Self>, key: &str, value: &str) {
-        let state = AppState::global(cx);
-        let db = &state.db_pool;
-        let _ = db::settings::set(db, key, value);
-    }
-
     /// 入力欄を遅延生成する（`new` は `Window` を持てないため render で作る）。
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.repo_input.is_none() {
-            let state = cx.new(|cx| InputState::new(window, cx).placeholder(DEFAULT_TARGET_REPO));
-            state.update(cx, |state, cx| {
-                state.set_value(self.repo.clone(), window, cx);
-            });
-            let subscription = cx.subscribe(
-                &state,
-                |this: &mut Self, _: Entity<InputState>, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                        this.commit_repo(cx);
-                    }
-                },
-            );
-            self.repo_input = Some(state);
-            self.repo_subscription = Some(subscription);
-        }
         if self.title_input.is_none() {
             let state = cx.new(|cx| {
                 InputState::new(window, cx).placeholder("[Bug] 一覧のスクロールが引っかかる")
@@ -339,26 +371,6 @@ impl ReportView {
             });
             self.body_input = Some(state);
         }
-    }
-
-    /// 投稿先の入力（Enter / フォーカス外れ）を確定して設定へ保存する。
-    /// 変わったときはテンプレートも取り直す（次の render で取得する）。
-    fn commit_repo(&mut self, cx: &mut Context<Self>) {
-        let Some(input) = self.repo_input.as_ref() else {
-            return;
-        };
-        let value = input.read(cx).value().trim().to_string();
-        if value == self.repo {
-            return;
-        }
-        self.repo = value;
-        Self::write_setting(cx, TARGET_REPO_KEY, &self.repo);
-        self.templates.clear();
-        self.selected_template = None;
-        self.templates_error = None;
-        self.templates_fetched = false;
-        self.error = None;
-        cx.notify();
     }
 
     /// 画面を開き直したときにテンプレートを取り直す（ログイン直後でも拾えるように）。
@@ -379,12 +391,7 @@ impl ReportView {
         if !*AppState::global(cx).github_logged_in.lock() {
             return;
         }
-        let Some((owner, repo)) = split_repo(&self.repo) else {
-            self.templates_fetched = true;
-            self.templates_error = Some("投稿先は owner/repo の形式で入力してください".to_string());
-            return;
-        };
-        let (owner, repo) = (owner.to_string(), repo.to_string());
+        let (owner, repo) = (TARGET_REPO_OWNER.to_string(), TARGET_REPO_NAME.to_string());
         self.templates_loading = true;
         self.templates_fetched = true;
         let github = AppState::global(cx).github.clone();
@@ -411,6 +418,18 @@ impl ReportView {
                     // テンプレートが無くても自由入力で投稿できる（理由だけ出す）。
                     Err(error) => {
                         log::warn!("report: テンプレートを取得できませんでした: {error}");
+                        // 失効したトークンならログイン状態を解除して再ログインへ誘導する。
+                        if matches!(error, GithubError::Auth(_)) {
+                            // 失効したトークンは keyring からも消す。削除は OS の応答待ちで
+                            // 止まり得るので背景で行い、結果は待たない（メモリ上の状態は
+                            // すぐ落として再ログインできるようにする）。
+                            clear_github_session(cx);
+                            cx.background_executor()
+                                .spawn(async move {
+                                    let _ = delete_github_token_secret();
+                                })
+                                .detach();
+                        }
                         this.templates_error = Some(error_message(&error));
                     }
                 }
@@ -432,6 +451,9 @@ impl ReportView {
         };
         self.selected_template = Some(template.file_name.clone());
         self.error = None;
+        // 本文を下書きで置き換えるので、前に足した画像の Markdown は消える。
+        // チップだけ残すと「添付したのに本文に無い」状態になるため一緒に消す。
+        self.attachment = None;
         let title = template.title.clone().unwrap_or_default();
         let body = compose_body(&template.fields);
         if let Some(input) = self.title_input.clone() {
@@ -446,7 +468,8 @@ impl ReportView {
     /// 「画像を添付」: 選んだ画像を上げて、本文の末尾に `![file](url)` を足す。
     /// 失敗しても本文だけで投稿できる。
     fn attach_image(&mut self, cx: &mut Context<Self>) {
-        if self.attaching {
+        // 送信中に添付を始めると、本文へ足す処理と送信後のクリアが競合する。
+        if self.attaching || self.busy {
             return;
         }
         if !*AppState::global(cx).github_logged_in.lock() {
@@ -454,12 +477,7 @@ impl ReportView {
             cx.notify();
             return;
         }
-        let Some((owner, repo)) = split_repo(&self.repo) else {
-            self.error = Some("投稿先は owner/repo の形式で入力してください".to_string());
-            cx.notify();
-            return;
-        };
-        let (owner, repo) = (owner.to_string(), repo.to_string());
+        let (owner, repo) = (TARGET_REPO_OWNER.to_string(), TARGET_REPO_NAME.to_string());
         self.attaching = true;
         self.error = None;
         self.attachment = Some(AttachmentView {
@@ -481,16 +499,38 @@ impl ReportView {
                     // キャンセルは失敗ではない（チップも残さない）。
                     AttachmentOutcome::Cancelled => this.attachment = None,
                     AttachmentOutcome::Uploaded { file_name, url } => {
-                        this.pending_body =
-                            Some(PendingBody::Append(format!("![{file_name}]({url})")));
+                        // ファイル名はそのまま alt に使わない（Markdown を壊せる）。
+                        this.pending_body = Some(PendingBody::Append(format!(
+                            "![{}]({url})",
+                            markdown_alt(&file_name)
+                        )));
                         this.attachment = Some(AttachmentView {
                             status: AttachmentStatus::Complete,
                             title: format!("{file_name} を添付しました"),
                             description: String::new(),
                         });
                     }
+                    AttachmentOutcome::Rejected(reason) => {
+                        this.attachment = Some(AttachmentView {
+                            status: AttachmentStatus::Failed,
+                            title: reason,
+                            description: "本文のみで投稿できます".to_string(),
+                        });
+                    }
                     AttachmentOutcome::Failed(error) => {
                         log::warn!("report: 画像を添付できませんでした: {error}");
+                        // 失効したトークンならログイン状態を解除して再ログインへ誘導する。
+                        if matches!(error, GithubError::Auth(_)) {
+                            // 失効したトークンは keyring からも消す。削除は OS の応答待ちで
+                            // 止まり得るので背景で行い、結果は待たない（メモリ上の状態は
+                            // すぐ落として再ログインできるようにする）。
+                            clear_github_session(cx);
+                            cx.background_executor()
+                                .spawn(async move {
+                                    let _ = delete_github_token_secret();
+                                })
+                                .detach();
+                        }
                         // write 権限が無いだけの失敗は、それ以上の説明が無い。
                         let detail = match error {
                             GithubError::AssetUploadDenied => String::new(),
@@ -512,7 +552,8 @@ impl ReportView {
 
     /// 「Issue を作成」: 背景で `create_issue` を呼び、成功したら通知してフォームを空にする。
     fn submit(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
+        // 添付中に送ると、本文へ足す処理と送信後のクリアが競合して内容が入れ替わる。
+        if self.busy || self.attaching {
             return;
         }
         if !*AppState::global(cx).github_logged_in.lock() {
@@ -534,11 +575,12 @@ impl ReportView {
             .as_ref()
             .map(|input| input.read(cx).value().to_string())
             .unwrap_or_default();
-        let Some((owner, repo)) = split_repo(&self.repo) else {
-            self.error = Some("投稿先は owner/repo の形式で入力してください".to_string());
-            cx.notify();
-            return;
-        };
+        let (owner, repo) = (TARGET_REPO_OWNER.to_string(), TARGET_REPO_NAME.to_string());
+        // 成功時に「まだ同じ下書きか」を判定できるように控えておく。
+        self.snapshot = Some(SubmitSnapshot {
+            title: title.clone(),
+            body: body.clone(),
+        });
         // 選択中のテンプレートの labels を引き継ぐ（未選択ならラベル無し）。
         let labels = self
             .selected_template
@@ -572,9 +614,17 @@ impl ReportView {
                 match result {
                     Ok(issue) => {
                         this.error = None;
-                        this.attachment = None;
-                        this.selected_template = None;
-                        this.pending_body = Some(PendingBody::Clear);
+                        // 待っている間に利用者が次の下書きを書き始めていたら消さない。
+                        let (title, body) = this.current_draft(cx);
+                        let unchanged = this
+                            .snapshot
+                            .take()
+                            .is_some_and(|snapshot| draft_unchanged(&snapshot, &title, &body));
+                        if unchanged {
+                            this.attachment = None;
+                            this.selected_template = None;
+                            this.pending_body = Some(PendingBody::Clear);
+                        }
                         set_toast_kind(
                             cx,
                             ToastKind::Success,
@@ -583,6 +633,21 @@ impl ReportView {
                     }
                     Err(error) => {
                         log::error!("report: Issue を作成できませんでした: {error}");
+                        this.snapshot = None;
+                        // トークンが失効/取り消しされている場合は、ログイン状態を解除して
+                        // 再ログインできる状態に戻す（keyring からも消す）。そうしないと
+                        // 「予期しない応答」だけが出て復帰できない。
+                        if matches!(error, GithubError::Auth(_)) {
+                            // 失効したトークンは keyring からも消す。削除は OS の応答待ちで
+                            // 止まり得るので背景で行い、結果は待たない（メモリ上の状態は
+                            // すぐ落として再ログインできるようにする）。
+                            clear_github_session(cx);
+                            cx.background_executor()
+                                .spawn(async move {
+                                    let _ = delete_github_token_secret();
+                                })
+                                .detach();
+                        }
                         this.error = Some(error_message(&error));
                     }
                 }
@@ -590,6 +655,21 @@ impl ReportView {
             });
         })
         .detach();
+    }
+
+    /// いま入力欄に入っているタイトルと本文（成功時に「同じ下書きか」を見るため）。
+    fn current_draft(&self, cx: &gpui_kit::App) -> (String, String) {
+        let title = self
+            .title_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        let body = self
+            .body_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        (title, body)
     }
 
     /// 背景タスクから受け取った本文の更新を反映する（次の render で呼ぶ）。
@@ -747,14 +827,9 @@ impl Render for ReportView {
         let templates_loading = self.templates_loading;
         let attachment = self.attachment.clone();
         let selected = self.selected_template.clone();
-        let target = self.repo.clone();
         let border = cx.theme().border;
         let muted_fg = cx.theme().muted_foreground;
         let handle = cx.entity();
-        let repo_input = self
-            .repo_input
-            .clone()
-            .expect("投稿先の入力は ensure_inputs で作られる");
         let title_input = self
             .title_input
             .clone()
@@ -830,7 +905,7 @@ impl Render for ReportView {
                     .child(Self::card(
                         cx,
                         "投稿先",
-                        Some("Issue を作るリポジトリ（owner/repo）"),
+                        Some("レポートはこのアプリの Issue に送られます"),
                         Icon::new(IconName::Github)
                             .size(px(16.0))
                             .text_color(muted_fg),
@@ -842,12 +917,13 @@ impl Render for ReportView {
                             .child(
                                 div()
                                     .debug_selector(|| "report-target-repo".to_string())
-                                    .w_full()
-                                    .child(Input::new(&repo_input).w_full()),
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(TARGET_REPO),
                             )
                             .child(div().text_xs().text_color(muted_fg).child(
-                                "Enter かフォーカスを外すと保存します。\
-                                     https://github.com/owner/repo の形式も使えます。",
+                                "このリポジトリの Issue に投稿します（投稿先は変更できません）。\
+                                     送信には GitHub へのログインが必要です。",
                             )),
                     ))
                     // テンプレート
@@ -875,9 +951,30 @@ impl Render for ReportView {
                             .children(template_rows)
                             .child(if let Some(message) = templates_error {
                                 div()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(message)
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().text_xs().text_color(muted_fg).child(message))
+                                    .child(
+                                        Button::new("report-templates-retry")
+                                            .outline()
+                                            .cursor_pointer()
+                                            .label("再取得")
+                                            .on_click({
+                                                let handle = handle.clone();
+                                                move |_, _window, cx| {
+                                                    handle.update(cx, |this, cx| {
+                                                        // 1 度失敗すると取得済みフラグが
+                                                        // 立ったままになるので、ここで戻す。
+                                                        this.templates_fetched = false;
+                                                        this.templates_error = None;
+                                                        this.ensure_templates(cx);
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            }),
+                                    )
                                     .into_any_element()
                             } else {
                                 div().into_any_element()
@@ -931,7 +1028,7 @@ impl Render for ReportView {
                                         Button::new("report-attach")
                                             .outline()
                                             .cursor_pointer()
-                                            .disabled(attaching || !logged_in)
+                                            .disabled(attaching || busy || !logged_in)
                                             .label("画像を添付")
                                             .debug_selector(|| "report-attach".to_string())
                                             .on_click({
@@ -984,14 +1081,14 @@ impl Render for ReportView {
                                         div()
                                             .text_xs()
                                             .text_color(muted_fg)
-                                            .child(format!("{target} に Issue を作成します")),
+                                            .child(format!("{TARGET_REPO} に Issue を作成します")),
                                     )
                                     .child(
                                         Button::new("report-submit")
                                             .primary()
                                             .cursor_pointer()
                                             .loading(busy)
-                                            .disabled(busy || !logged_in)
+                                            .disabled(busy || attaching || !logged_in)
                                             .label("Issue を作成")
                                             .debug_selector(|| "report-submit".to_string())
                                             .on_click({
@@ -1063,6 +1160,66 @@ mod tests {
         );
     }
 
+    /// issue form の `description`（秘密情報の確認など）も下書きに含めること。
+    /// アプリは field 単位の入力欄を作らないので、本文に載せないと注意書きが届かない。
+    #[test]
+    fn compose_body_includes_the_field_description() {
+        let mut logs = field(
+            TemplateFieldKind::Textarea,
+            Some("ログ"),
+            None,
+            Some("<details>...</details>"),
+        );
+        logs.description =
+            Some("秘密情報が含まれていないか確認してから貼ってください。".to_string());
+
+        assert_eq!(
+            compose_body(&[logs]),
+            "## ログ\n\
+             > 秘密情報が含まれていないか確認してから貼ってください。\n\
+             <details>...</details>"
+        );
+    }
+
+    /// 本文が空でも、見出しと説明は出すこと（利用者がそこへ書く）。
+    #[test]
+    fn compose_body_keeps_the_description_without_a_placeholder() {
+        let mut version = field(TemplateFieldKind::Input, Some("バージョン"), None, None);
+        version.description = Some("設定画面の下部で確認できます。".to_string());
+
+        assert_eq!(
+            compose_body(&[version]),
+            "## バージョン\n> 設定画面の下部で確認できます。"
+        );
+    }
+
+    /// 送信の待ち時間に書き換えられていたら、成功時でも下書きを消さないこと。
+    #[test]
+    fn draft_unchanged_detects_newer_edits() {
+        let snapshot = SubmitSnapshot {
+            title: "[Bug] スクロール".to_string(),
+            body: "## 概要\n引っかかる".to_string(),
+        };
+
+        assert!(draft_unchanged(
+            &snapshot,
+            "[Bug] スクロール",
+            "## 概要\n引っかかる"
+        ));
+        // タイトルだけ書き換えた
+        assert!(!draft_unchanged(
+            &snapshot,
+            "[Bug] 別の件",
+            "## 概要\n引っかかる"
+        ));
+        // 本文だけ書き換えた（テンプレ選択で置き換わった場合など）
+        assert!(!draft_unchanged(
+            &snapshot,
+            "[Bug] スクロール",
+            "## 概要\n別の内容"
+        ));
+    }
+
     /// placeholder が無い項目は value を使い、末尾に余分な空行を残さないこと
     /// （YAML のブロック値は末尾に改行を持ち込む）。
     #[test]
@@ -1125,49 +1282,36 @@ mod tests {
         }
     }
 
-    /// 投稿先は `owner/repo` と GitHub の URL を受け付け、壊れた値は弾くこと。
-    #[test]
-    fn split_repo_accepts_urls_and_rejects_invalid_values() {
-        assert_eq!(
-            split_repo(" MegaBlackLabel/thundoku-shelf-app "),
-            Some(("MegaBlackLabel", "thundoku-shelf-app"))
-        );
-        assert_eq!(
-            split_repo("https://github.com/MegaBlackLabel/thundoku-shelf-app.git"),
-            Some(("MegaBlackLabel", "thundoku-shelf-app"))
-        );
-        assert_eq!(split_repo(""), None);
-        assert_eq!(split_repo("MegaBlackLabel"), None);
-        assert_eq!(split_repo("owner/repo/extra"), None);
-        assert_eq!(split_repo("owner/re po"), None);
-    }
-
-    /// 投稿先は設定 `report.target_repo` から復元され、既定はアプリのリポジトリ。
+    /// 投稿先はアプリのリポジトリに固定されている（設定で差し替える入力が無い）。
     #[gpui_kit::test]
-    async fn target_repo_comes_from_the_setting(cx: &mut TestAppContext) {
+    async fn report_screen_shows_the_fixed_target(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
-        let view = cx.new(ReportView::new);
-        assert_eq!(
-            view.read_with(cx, |this, _| this.repo.clone()),
-            DEFAULT_TARGET_REPO
-        );
-
+        // 旧バージョンが残した設定があっても、画面は固定の投稿先を出す
         cx.update(|cx| {
             let db = &AppState::global(cx).db_pool;
-            db::settings::set(db, TARGET_REPO_KEY, "someone/elsewhere").unwrap();
+            let _ = thundoku_core::db::settings::set(db, "report.target_repo", "someone/elsewhere");
         });
         let view = cx.new(ReportView::new);
-        assert_eq!(
-            view.read_with(cx, |this, _| this.repo.clone()),
-            "someone/elsewhere"
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1280.0),
+                height: gpui_kit::px(1100.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
 
-        // 他のテストと同じ data_dir を共有するため、既定へ戻しておく
-        cx.update(|cx| {
-            let db = &AppState::global(cx).db_pool;
-            let _ = db::settings::set(db, TARGET_REPO_KEY, DEFAULT_TARGET_REPO);
-        });
+        assert!(
+            visual.debug_bounds("report-target-repo").is_some(),
+            "投稿先の表示が出ていない"
+        );
     }
 
     /// 未ログインでは案内を出して送信しない（Issue を作りに行かない）。

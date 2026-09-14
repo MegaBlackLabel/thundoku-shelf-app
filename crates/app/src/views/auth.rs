@@ -65,8 +65,11 @@ pub struct AuthDialog {
     /// GitHub の Device Flow ログインモーダルを表示中か
     show_github_login: bool,
     github_login: Option<Entity<GithubLoginView>>,
-    /// GithubLoginView の完了イベント購読（保持して drop を防ぐ）
-    github_subscription: Option<gpui_kit::Subscription>,
+    /// GitHub ログインの購読（Done / Failed / Cancelled の 3 本）。
+    ///
+    /// 3 本とも保持すること。`Subscription` は Drop で解除されるので、束縛せずに
+    /// 捨てるとイベントが届かなくなる（✕ や完了でモーダルが閉じなくなる）。
+    github_subscriptions: Vec<gpui_kit::Subscription>,
     /// 技術書典の WebView ログインモーダルを表示中か
     show_tbf_login: bool,
     tbf_login: Option<Entity<TbfLoginView>>,
@@ -94,7 +97,7 @@ impl AuthDialog {
             google_subscription: None,
             show_github_login: false,
             github_login: None,
-            github_subscription: None,
+            github_subscriptions: Vec::new(),
             show_tbf_login: false,
             tbf_login: None,
             tbf_subscription: None,
@@ -310,31 +313,31 @@ impl AuthDialog {
                 // 成功: トークン保存・ログイン状態・完了フラグ（github_login_done）は
                 // view 側で更新済み。ここでは view を畳むだけにする（Workspace の監視
                 // タスクがモーダル全体を閉じる）。
-                let _done = cx.subscribe(
+                let done = cx.subscribe(
                     &github_login,
                     |this: &mut Self, _: Entity<GithubLoginView>, _: &GithubLoginDone, _| {
                         this.show_github_login = false;
                         this.github_login = None;
-                        this.github_subscription = None;
+                        this.github_subscriptions.clear();
                     },
                 );
                 // 失敗: client_id 未設定などの失敗は view 内で完結する（エラー表示も view が
                 // 出す）。new() 内の同期 emit は購読前に飛ぶため、ここには届かない想定。
                 // 届いた場合も view を残し、✕（Cancelled）で閉じてもらう。
-                let _failed = cx.subscribe(
+                let failed = cx.subscribe(
                     &github_login,
                     |_: &mut Self, _: Entity<GithubLoginView>, _: &GithubLoginFailed, _| {},
                 );
                 // キャンセル: view を破棄してログイン画面に戻る（次回は新規フロー）
-                let _cancelled = cx.subscribe(
+                let cancelled = cx.subscribe(
                     &github_login,
                     |this: &mut Self, _: Entity<GithubLoginView>, _: &GithubLoginCancelled, _| {
                         this.show_github_login = false;
                         this.github_login = None;
-                        this.github_subscription = None;
+                        this.github_subscriptions.clear();
                     },
                 );
-                this.github_subscription = Some(_done);
+                this.github_subscriptions = vec![done, failed, cancelled];
                 // Device Flow は new で開始済み。モーダルを表示状態にする
                 // （render 毎に呼ぶと再通知ループになるため、生成時に 1 回だけ呼ぶ）。
                 github_login.update(cx, |view, cx| view.show(cx));

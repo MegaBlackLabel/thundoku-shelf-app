@@ -396,34 +396,74 @@ pub fn default_github_client_id() -> String {
     DEFAULT_GITHUB_CLIENT_ID.to_string()
 }
 
-/// GitHub のトークンを keyring に保存し、クライアントとログイン状態を更新する。
-/// Device Flow の完了時に呼ぶ。
-pub fn save_github_token(cx: &App, token: &GithubToken) {
+/// keyring にトークンを書き込む（**ブロッキング**。UI スレッドでは呼ばないこと）。
+///
+/// OS の資格情報ストアは許可ダイアログ待ちなどで返らないことがあるため、呼び出し側は
+/// 背景タスクから実行し、完了後に [`set_github_session`] で状態を更新する。
+pub fn store_github_token_secret(token: &GithubToken) -> Result<(), String> {
+    let json = serde_json::to_string(token).map_err(|error| error.to_string())?;
+    SecretStore::new()
+        .save(thundoku_core::secrets::USER_GITHUB, &json)
+        .map_err(|error| {
+            log::error!("github token save failed: {error}");
+            "トークンを保存できませんでした（資格情報ストアを確認してください）".to_string()
+        })
+}
+
+/// keyring からトークンを削除する（**ブロッキング**。UI スレッドでは呼ばないこと）。
+pub fn delete_github_token_secret() -> Result<(), String> {
+    SecretStore::new()
+        .delete(thundoku_core::secrets::USER_GITHUB)
+        .map_err(|error| {
+            log::error!("github token delete failed: {error}");
+            "ログアウトできませんでした（資格情報を削除できませんでした）".to_string()
+        })
+}
+
+/// メモリ上の状態をログイン済みにする（keyring への保存が**成功した後**に呼ぶ）。
+pub fn set_github_session(cx: &App, token: &GithubToken) {
     let state = AppState::global(cx);
-    if let Ok(json) = serde_json::to_string(token) {
-        let _ = state
-            .secrets
-            .save(thundoku_core::secrets::USER_GITHUB, &json);
-    }
     if let Some(client) = state.github.lock().as_mut() {
         client.restore_token(token.clone());
     }
     *state.github_logged_in.lock() = true;
     *state.github_login_error.lock() = None;
-    log::info!("github token saved -> github_logged_in = true");
+    log::info!("github session: ログイン状態にした");
 }
 
-/// GitHub のトークンを破棄する（ログアウト。keyring からも削除）。
-pub fn clear_github_token(cx: &App) {
+/// keyring は触らず、メモリ上のログイン状態だけを落とす（削除の完了後に呼ぶ）。
+pub fn clear_github_session(cx: &App) {
     let state = AppState::global(cx);
-    let _ = state.secrets.delete(thundoku_core::secrets::USER_GITHUB);
     if let Some(client) = state.github.lock().as_mut() {
         client.clear_token();
     }
     *state.github_profile.lock() = None;
     *state.github_logged_in.lock() = false;
     *state.github_login_error.lock() = None;
-    log::info!("github token cleared -> github_logged_in = false");
+    log::info!("github session: 未ログイン状態にした");
+}
+
+/// GitHub のトークンを keyring に保存し、クライアントとログイン状態を更新する。
+///
+/// 同期版（テストと、同期文脈からの利用）。UI スレッドから呼ぶと keyring の応答待ちで
+/// 固まりうるので、画面からは [`store_github_token_secret`] を背景で実行すること。
+///
+/// 保存に失敗したら**ログイン状態を立てない**（keyring に何も無いのに「ログイン済み」と
+/// 見せると、次の起動で黙って未ログインに戻って理由が分からなくなる）。
+pub fn save_github_token(cx: &App, token: &GithubToken) -> Result<(), String> {
+    store_github_token_secret(token)?;
+    set_github_session(cx, token);
+    Ok(())
+}
+
+/// GitHub のトークンを破棄する（同期版。ログアウト画面からは背景実行を使う）。
+///
+/// 削除に失敗したら**ログイン状態を下げない**（トークンが残っているのに「ログアウト
+/// 済み」と見せると、次回起動で勝手にログインし直って見える）。
+pub fn clear_github_token(cx: &App) -> Result<(), String> {
+    delete_github_token_secret()?;
+    clear_github_session(cx);
+    Ok(())
 }
 
 /// アプリ全体の通知を出す（Workspace が gpui-kit の Notification に流す。既定 5 秒で自動消滅）。
@@ -654,7 +694,9 @@ mod tests {
         });
 
         // メモリバックエンドはプロセス内で共有されるため後始末する
-        cx.update(|cx| clear_github_token(cx));
+        cx.update(|cx| {
+            let _ = clear_github_token(cx);
+        });
     }
 
     /// ログアウトでトークンが消え、ログイン状態も下がる（keyring からも消える）。
@@ -663,13 +705,13 @@ mod tests {
         let _guard = GITHUB_SLOT.lock();
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
-        cx.update(|cx| save_github_token(cx, &token()));
+        cx.update(|cx| save_github_token(cx, &token()).expect("保存できる"));
         cx.update(|cx| {
             let state = AppState::global(cx);
             assert!(*state.github_logged_in.lock(), "ログイン状態になっていない");
         });
 
-        cx.update(|cx| clear_github_token(cx));
+        cx.update(|cx| clear_github_token(cx).expect("削除できる"));
 
         cx.update(|cx| {
             let state = AppState::global(cx);

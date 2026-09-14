@@ -2756,8 +2756,10 @@ mod tests {
         );
 
         // ログアウトすると導線も消える
+        // （keyring を触る clear_github_token は他のテストと競合するので、
+        //   ここではログイン状態だけを落とす）
         cx.update(|cx| {
-            crate::app_state::clear_github_token(cx);
+            *AppState::global(cx).github_logged_in.lock() = false;
             ws.update(cx, |_, cx| cx.notify());
         });
         draw(visual);
