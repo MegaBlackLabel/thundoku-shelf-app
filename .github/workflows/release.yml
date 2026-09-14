@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 成果物名にバージョン（タグ）を入れる。例: v0.2.1 -> 0.2.1
+      # 成果物名にバージョン（タグ）を入れる。例: タグ v1.2.3 -> 1.2.3
       - name: Compute version
         id: ver
         shell: bash
@@ -93,7 +93,7 @@ jobs:
           # _CodeSignature/CodeResources が無く、codesign --verify が失敗して Gatekeeper が
           # 「壊れているため開けません」と判定しうる。Team ID は無いので ad-hoc（-）で署名する
           codesign --force --sign - "$APP"
-          codesign --verify --verbose=2 "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
           # ditto でバンドル構造（権限・リソース）を保ったまま zip 化する
           ditto -c -k --keepParent "$APP" "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
 

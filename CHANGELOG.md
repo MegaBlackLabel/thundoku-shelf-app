@@ -20,7 +20,7 @@
   `Info.plist`（バンドル ID・表示名・最小 OS バージョン・バージョン）と
   アプリアイコン入りの `ThundokuShelf.app` に変更した。Finder からアプリとして
   扱え、Dock の表示も正しくなる（`ditto -c -k --keepParent` で権限を保って zip 化）
-- **成果物名にバージョンを付与**: `thundoku-shelf-0.2.1-aarch64-macos.zip` のように
+- **成果物名にバージョンを付与**: `thundoku-shelf-0.2.2-aarch64-macos.zip` のように
   バージョンを含める（複数バージョンを落としても区別できる）
 - **リリースバイナリを strip**: `[profile.release] strip = true` でシンボルを落とし
   配布サイズを削減
