@@ -675,6 +675,16 @@ impl SettingsView {
         cx.notify();
     }
 
+    pub fn logout_github(&mut self, cx: &mut Context<Self>) {
+        let t = std::time::Instant::now();
+        // keyring のトークン削除とクライアント / プロフィール / ログイン状態の破棄は
+        // AppState 側にまとめてある。GitHub は本棚の絞り込みに関係しないので再取得は不要。
+        crate::app_state::clear_github_token(cx);
+        log::info!("logout_github: token cleared ({:?})", t.elapsed());
+        self.show_toast("GitHub からログアウトしました", cx);
+        cx.notify();
+    }
+
     pub fn logout_booth(&mut self, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
         let server_ok = {
@@ -1281,7 +1291,7 @@ impl SettingsView {
                 ),
         )
     }
-    /// アカウント欄（Google / 技術書典 / BOOTH / FANZA / DLsite のログイン状態）。
+    /// アカウント欄（Google / GitHub / 技術書典 / BOOTH / FANZA / DLsite のログイン状態）。
     ///
     /// `render` のスタックフレームを抑えるため別メソッドに切り出している。
     #[allow(clippy::too_many_arguments)]
@@ -1290,6 +1300,8 @@ impl SettingsView {
         cx: &Context<Self>,
         google_profile: Option<thundoku_core::google::GoogleProfile>,
         google_logged_in: bool,
+        github_profile: Option<thundoku_core::github::GithubUser>,
+        github_logged_in: bool,
         tbf_logged_in: bool,
         booth_logged_in: bool,
         fanza_logged_in: bool,
@@ -1297,10 +1309,12 @@ impl SettingsView {
     ) -> gpui_kit::AnyElement {
         let handle = cx.weak_entity();
         let muted_fg = cx.theme().muted_foreground;
+        // client_id が埋め込まれていないビルドでは GitHub ログインを開始できない
+        let github_login_enabled = !crate::app_state::default_github_client_id().is_empty();
         self.settings_card(
             cx,
             "アカウント",
-            Some("技術書典・Google・BOOTH・FANZA・DLsite のログイン状態"),
+            Some("技術書典・Google・GitHub・BOOTH・FANZA・DLsite のログイン状態"),
             Icon::new(IconName::CircleUser)
                 .size(px(16.0))
                 .text_color(muted_fg),
@@ -1360,6 +1374,74 @@ impl SettingsView {
                                         if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
                                             ws.update(cx, |ws, cx| {
                                                 ws.open_auth(cx, AuthProvider::Google);
+                                            });
+                                        }
+                                    });
+                                })
+                                .into_any_element()
+                        }),
+                )
+                // GitHub 行（Device Flow。完了は Workspace の監視タスクが拾ってモーダルを閉じる）
+                .child(
+                    div()
+                        .debug_selector(|| "account-row-github".into())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("GitHub"))
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    if !github_login_enabled {
+                                        // 未設定のビルドでは Device Flow を開始できない。押せない
+                                        // 理由と直し方が見えないと「壊れている」と見える。
+                                        "client_id 未設定（ビルド時に THUNDOKU_GITHUB_CLIENT_ID）"
+                                            .to_string()
+                                    } else {
+                                        match &github_profile {
+                                            Some(profile) if !profile.login.is_empty() => {
+                                                format!("@{}", profile.login)
+                                            }
+                                            Some(_) => "ログイン済み".to_string(),
+                                            None if github_logged_in => "ログイン済み".to_string(),
+                                            None => "未ログイン".to_string(),
+                                        }
+                                    },
+                                )),
+                        )
+                        .child(if github_logged_in {
+                            Button::new("logout-github")
+                                .cursor_pointer()
+                                .label("ログアウト")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.logout_github(cx)).ok();
+                                    }
+                                })
+                                .into_any_element()
+                        } else {
+                            Button::new("login-github")
+                                .cursor_pointer()
+                                .label("ログイン")
+                                .cursor_pointer()
+                                .disabled(!github_login_enabled)
+                                .on_click(|_, _window, cx| {
+                                    // 認証モーダル（GitHub は Device Flow）を開く。SettingsView を
+                                    // 非表示にしてから開くのは Google と同じ理由（RefCell 競合回避）。
+                                    cx.defer(move |cx| {
+                                        let ws_weak = AppState::global(cx).workspace.lock().clone();
+                                        if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                                            ws.update(cx, |ws, cx| {
+                                                ws.open_auth(cx, AuthProvider::Github);
                                             });
                                         }
                                     });
@@ -1634,6 +1716,8 @@ impl Render for SettingsView {
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let google_profile = AppState::global(cx).google_profile.lock().clone();
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
+        let github_profile = AppState::global(cx).github_profile.lock().clone();
+        let github_logged_in = *AppState::global(cx).github_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
         let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
@@ -2119,6 +2203,8 @@ impl Render for SettingsView {
             cx,
             google_profile,
             google_logged_in,
+            github_profile,
+            github_logged_in,
             tbf_logged_in,
             booth_logged_in,
             fanza_logged_in,
@@ -2615,6 +2701,48 @@ mod tests {
                 "{site} の表紙更新ボタンがあること"
             );
         }
+    }
+
+    #[gpui_kit::test]
+    async fn account_lists_github_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(SettingsView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+        // アカウント欄に GitHub 行がある（未ログインでも常に出す）
+        assert!(
+            visual.debug_bounds("account-row-github").is_some(),
+            "アカウントに GitHub 行があること"
+        );
+        // ログイン中（プロフィールあり）でも同じ行が描ける（@login を出す分岐）
+        view.update(cx, |_, cx| {
+            let state = AppState::global(cx);
+            *state.github_logged_in.lock() = true;
+            *state.github_profile.lock() = Some(thundoku_core::github::GithubUser {
+                login: "octocat".to_string(),
+                name: Some("The Octocat".to_string()),
+            });
+            cx.notify();
+        });
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+        assert!(
+            visual.debug_bounds("account-row-github").is_some(),
+            "ログイン中も GitHub 行があること"
+        );
     }
 
     #[gpui_kit::test]

@@ -39,6 +39,8 @@ pub enum AppIcon {
     StickyNote,
     /// チェックリスト（ListChecksIcon）
     ListChecks,
+    /// レポート（MegaphoneIcon: 問題・要望を送る）
+    Megaphone,
     /// 同期（RefreshCw）
     RefreshCw,
     /// タイル表示（LayoutGrid）
@@ -87,6 +89,7 @@ impl IconNamed for AppIcon {
             Self::BookmarkFilled => "icons/bookmark-filled.svg".into(),
             Self::StickyNote => "icons/sticky-note.svg".into(),
             Self::ListChecks => "icons/list-checks.svg".into(),
+            Self::Megaphone => "icons/megaphone.svg".into(),
             Self::RefreshCw => "icons/refresh-cw.svg".into(),
             Self::LayoutGrid => "icons/layout-grid.svg".into(),
             Self::List => "icons/list.svg".into(),
@@ -135,6 +138,7 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
         "icons/sticky-note.svg" => Some(include_bytes!("../assets/icons/sticky-note.svg")),
         "icons/bookmark-filled.svg" => Some(include_bytes!("../assets/icons/bookmark-filled.svg")),
         "icons/list-checks.svg" => Some(include_bytes!("../assets/icons/list-checks.svg")),
+        "icons/megaphone.svg" => Some(include_bytes!("../assets/icons/megaphone.svg")),
         "icons/refresh-cw.svg" => Some(include_bytes!("../assets/icons/refresh-cw.svg")),
         "icons/layout-grid.svg" => Some(include_bytes!("../assets/icons/layout-grid.svg")),
         "icons/list.svg" => Some(include_bytes!("../assets/icons/list.svg")),
@@ -175,6 +179,7 @@ mod tests {
             AppIcon::BookmarkFilled,
             AppIcon::StickyNote,
             AppIcon::ListChecks,
+            AppIcon::Megaphone,
             AppIcon::RefreshCw,
             AppIcon::LayoutGrid,
             AppIcon::List,

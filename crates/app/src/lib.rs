@@ -33,6 +33,7 @@ mod icon_assets_tests {
             "icons/book-marked.svg",
             "icons/library-big.svg",
             "icons/list-checks.svg",
+            "icons/megaphone.svg",
             "icons/refresh-cw.svg",
             "icons/layout-grid.svg",
             "icons/list.svg",

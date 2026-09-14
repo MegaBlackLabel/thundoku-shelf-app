@@ -36,6 +36,7 @@ use crate::views::checklist::ChecklistView;
 use crate::views::history::HistoryView;
 use crate::views::notes::NotesView;
 use crate::views::reader::ReaderView;
+use crate::views::report::ReportView;
 use crate::views::settings::SettingsView;
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, progress};
@@ -48,6 +49,8 @@ pub enum NavTarget {
     History,
     Notes,
     Checklist,
+    /// GitHub Issue を作るレポート画面（GitHub ログイン時のみ導線を出す）。
+    Report,
     Settings,
     About,
 }
@@ -90,6 +93,8 @@ pub struct Workspace {
     pub notes: Entity<NotesView>,
     checklist: Entity<ChecklistView>,
     about: Entity<AboutView>,
+    /// レポート画面（GitHub Issue を作る）。
+    report: Entity<ReportView>,
     /// Account/ログインパネル。
     auth_panel_open: bool,
     /// ログインモーダルの表示（auth.rs のテストが参照する）。
@@ -122,6 +127,7 @@ impl Workspace {
         let notes = cx.new(NotesView::new);
         let checklist = cx.new(ChecklistView::new);
         let about = cx.new(AboutView::new);
+        let report = cx.new(ReportView::new);
 
         let mut this = Self {
             active: NavTarget::Bookshelf,
@@ -136,6 +142,7 @@ impl Workspace {
             notes,
             checklist,
             about,
+            report,
             auth_panel_open: false,
             show_auth: false,
             auth_dialog: None,
@@ -157,12 +164,14 @@ impl Workspace {
         this
     }
 
-    /// Google ログイン（成功・失敗）完了フラグを監視し、認証モーダルを閉じる。
+    /// Google / GitHub ログイン（成功・失敗）完了フラグを監視し、認証モーダルを閉じる。
     /// `AuthDialog` から `Workspace` を直接 update すると RefCell 再入問題で固まるため、
     /// AppState のフラグを追ってここで状態をリセットする。
+    /// GitHub（Device Flow）は view 側が完了時に `github_login_done` を立てる。
     fn start_login_done_watcher(&mut self, cx: &mut Context<Self>) {
         let handle = cx.weak_entity();
         let flag = AppState::global(cx).google_login_done.clone();
+        let github_flag = AppState::global(cx).github_login_done.clone();
         let logout_flag = AppState::global(cx).google_logout_done.clone();
         let auth_open = AppState::global(cx).auth_open_requested.clone();
         let auth_provider = AppState::global(cx).auth_open_provider.clone();
@@ -220,6 +229,21 @@ impl Workspace {
                     let _ = handle.update(cx, |this, cx| {
                         this.bookshelf.update(cx, |b, bx| b.reload(bx));
                     });
+                    cx.refresh();
+                }
+                // GitHub ログイン（Device Flow）の完了。Google と同じく認証モーダルを閉じて
+                // 設定画面へ戻す。GitHub は書店ではないので本棚の再フィルタは不要。
+                if github_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    github_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let _ = handle.update(cx, |this, _cx| {
+                        this.show_auth = false;
+                        this.auth_dialog = None;
+                        this.auth_loading = false;
+                        this.active = NavTarget::Settings;
+                        this.sidebar_open = true;
+                    });
+                    // cx.notify() は RefCell already borrowed を起こすため、
+                    // AsyncApp::refresh()（&self）で再描画を要求する。
                     cx.refresh();
                 }
             }
@@ -309,6 +333,7 @@ impl Workspace {
             NavTarget::History => AnyView::from(self.history.clone()),
             NavTarget::Notes => AnyView::from(self.notes.clone()),
             NavTarget::Checklist => AnyView::from(self.checklist.clone()),
+            NavTarget::Report => AnyView::from(self.report.clone()),
             NavTarget::Settings => AnyView::from(self.settings.clone()),
             NavTarget::About => AnyView::from(self.about.clone()),
         }
@@ -839,6 +864,9 @@ impl Workspace {
         let theme = cx.theme().clone();
         let handle = cx.entity();
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
+        let github_logged_in = *AppState::global(cx).github_logged_in.lock();
+        // client_id が埋め込まれていないビルドでは GitHub ログインを開始できない
+        let github_login_enabled = !crate::app_state::default_github_client_id().is_empty();
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
@@ -849,6 +877,12 @@ impl Workspace {
             .lock()
             .clone()
             .map(|p| p.email);
+        let github_login = AppState::global(cx)
+            .github_profile
+            .lock()
+            .clone()
+            .map(|p| p.login)
+            .filter(|login| !login.is_empty());
         let site_row = |name: &str,
                         logged_in: bool,
                         login_provider: Option<AuthProvider>,
@@ -861,6 +895,10 @@ impl Workspace {
             let handle = handle.clone();
             let name = name.to_string();
             let name_for_id = name.clone();
+            // GitHub は client_id 未設定のビルドだと開始できないので、ログインボタンを
+            // グレー表示にして押しても何も起きない見た目にする。
+            let login_enabled =
+                login_provider != Some(AuthProvider::Github) || github_login_enabled;
             div()
                 .id(format!("account-row-{name_for_id}"))
                 .flex()
@@ -887,6 +925,25 @@ impl Workspace {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(google_email.clone().unwrap()),
+                            )
+                        })
+                        // GitHub はログイン中、@login を 2 段目に表示
+                        .when(github_login.is_some() && name_for_id == "GitHub", |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("@{}", github_login.clone().unwrap())),
+                            )
+                        })
+                        // client_id 未設定のビルドでは押せない理由を出す（非活性の理由が
+                        // 見えないと「壊れている」と見える）。
+                        .when(!github_login_enabled && name_for_id == "GitHub", |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("client_id 未設定"),
                             )
                         }),
                 )
@@ -932,30 +989,40 @@ impl Workspace {
                     Box::new(
                         div()
                             .id(format!("account-login-{name}"))
-                            .on_click({
-                                let provider = login_provider;
-                                let handle = handle.clone();
-                                move |_, _window, cx| {
-                                    if let Some(provider) = provider {
-                                        cx.defer(move |cx| {
-                                            cx.dispatch_action(&crate::actions::OpenAuthProvider {
-                                                provider,
+                            .when(login_enabled, |this| {
+                                this.on_click({
+                                    let provider = login_provider;
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        if let Some(provider) = provider {
+                                            cx.defer(move |cx| {
+                                                cx.dispatch_action(
+                                                    &crate::actions::OpenAuthProvider { provider },
+                                                );
                                             });
-                                        });
-                                        handle.update(cx, |this, cx| {
-                                            this.auth_panel_open = false;
-                                            cx.notify();
-                                        });
+                                            handle.update(cx, |this, cx| {
+                                                this.auth_panel_open = false;
+                                                cx.notify();
+                                            });
+                                        }
                                     }
-                                }
+                                })
                             })
                             .rounded_md()
                             .px_2()
                             .py_1()
-                            .bg(theme.primary)
-                            .text_color(theme.primary_foreground)
+                            .bg(if login_enabled {
+                                theme.primary
+                            } else {
+                                theme.secondary
+                            })
+                            .text_color(if login_enabled {
+                                theme.primary_foreground
+                            } else {
+                                theme.muted_foreground
+                            })
                             .text_xs()
-                            .cursor_pointer()
+                            .when(login_enabled, |this| this.cursor_pointer())
                             .child("ログイン"),
                     )
                     .into_any_element()
@@ -980,6 +1047,12 @@ impl Workspace {
                 google_logged_in,
                 Some(AuthProvider::Google),
                 Some(crate::views::settings::SettingsView::logout_google),
+            ))
+            .child(site_row(
+                "GitHub",
+                github_logged_in,
+                Some(AuthProvider::Github),
+                Some(crate::views::settings::SettingsView::logout_github),
             ))
             .child(site_row(
                 "技術書典",
@@ -1625,6 +1698,25 @@ impl Workspace {
         let active = self.active;
         let unread_count = self.unread_count;
         let theme_mode_name = self.theme_mode(cx).unwrap_or_else(|| "system".to_string());
+        // レポート（GitHub にログインしているときだけ設定の上に出す）。
+        // ログインしていないと Issue を作れないため導線も出さない。
+        let github_logged_in = *AppState::global(cx).github_logged_in.lock();
+        let report_item = github_logged_in.then(|| {
+            self.bottom_item(
+                "sidebar-nav-report",
+                Icon::new(AppIcon::Megaphone)
+                    .size(px(24.0))
+                    .text_color(theme.muted_foreground)
+                    .into_any_element(),
+                "レポート",
+                open,
+                |this, cx| {
+                    this.switch_to(NavTarget::Report, cx);
+                },
+                handle.clone(),
+                cx,
+            )
+        });
         // バッジ色分け: 100 件以上=赤 / 10〜99 件=黄 / 1〜9 件=緑
         let badge_color = if unread_count >= 100 {
             gpui_kit::rgb(0xef4444)
@@ -1800,8 +1892,10 @@ impl Workspace {
                     .gap_1()
                     .mt_auto()
                     .pb(px(16.0))
+                    .when_some(report_item, |this, item| this.child(item))
                     .child(
                         self.bottom_item(
+                            "sidebar-nav-settings",
                             Icon::new(IconName::Settings)
                                 .size(px(24.0))
                                 .text_color(theme.muted_foreground)
@@ -1817,6 +1911,7 @@ impl Workspace {
                     )
                     .child(
                         self.bottom_item(
+                            "sidebar-nav-theme",
                             Icon::new(match theme_mode_name.as_str() {
                                 "dark" => AppIcon::Moon,
                                 "system" => AppIcon::Monitor,
@@ -1840,6 +1935,7 @@ impl Workspace {
                     )
                     .child(
                         self.bottom_item(
+                            "sidebar-nav-account",
                             Icon::new(AppIcon::CircleUserRound)
                                 .size(px(24.0))
                                 .text_color(theme.muted_foreground)
@@ -2013,9 +2109,14 @@ impl Workspace {
             })
     }
 
-    /// 下部のアイテム（設定 / テーマ / アカウント 共通）。
+    /// 下部のアイテム（レポート / 設定 / テーマ / アカウント 共通）。
+    ///
+    /// `id` は静的な文字列で渡す（`debug_selector` が `&'static str` を要求するため。
+    /// テストが行の位置を検証する）。
+    #[allow(clippy::too_many_arguments)]
     fn bottom_item(
         &self,
+        id: &'static str,
         icon: gpui_kit::AnyElement,
         label: &str,
         open: bool,
@@ -2026,7 +2127,8 @@ impl Workspace {
         let theme = cx.theme().clone();
         let label = label.to_string();
         div()
-            .id(format!("sidebar-nav-{label}"))
+            .id(id)
+            .debug_selector(move || id.into())
             .flex()
             .items_center()
             .gap_2()
@@ -2550,6 +2652,80 @@ mod tests {
         assert!(
             bookshelf.origin.y < history.origin.y && history.origin.y < checklist.origin.y,
             "並び順が 本棚 → 閲覧履歴 → チェックリスト になっていない"
+        );
+    }
+
+    /// サイドバーの「レポート」行は GitHub にログインしているときだけ出る
+    /// （ログインしていないと Issue を作れないため導線も出さない）。
+    #[gpui_kit::test]
+    async fn report_row_needs_github_login(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+
+        draw(visual);
+        assert!(
+            visual.debug_bounds("sidebar-nav-report").is_none(),
+            "未ログインなのにレポート行が出ている"
+        );
+
+        cx.update(|cx| {
+            *AppState::global(cx).github_logged_in.lock() = true;
+            ws.update(cx, |_, cx| cx.notify());
+        });
+        draw(visual);
+        let report = visual
+            .debug_bounds("sidebar-nav-report")
+            .expect("GitHub にログインしてもレポート行が出ていない");
+        let settings = visual
+            .debug_bounds("sidebar-nav-settings")
+            .expect("設定の行が出ていない");
+        // 「設定」の上に出る
+        assert!(
+            report.origin.y < settings.origin.y,
+            "レポート行が設定より上に無い: report_y={} settings_y={}",
+            report.origin.y.as_f32(),
+            settings.origin.y.as_f32()
+        );
+        // 他の行と同じ位置・同じ幅（アイコンと文字が縦に揃う）。行を余分な div で
+        // 包むと `w_full()` の基準がずれて幅が変わり、アイコン位置がずれる。
+        assert!(
+            (report.origin.x.as_f32() - settings.origin.x.as_f32()).abs() < 1.0
+                && (report.size.width.as_f32() - settings.size.width.as_f32()).abs() < 1.0,
+            "レポート行の位置・幅が他の行と揃っていない: report={:?} settings={:?}",
+            report.size,
+            settings.size
+        );
+
+        // ログアウトすると導線も消える
+        cx.update(|cx| {
+            crate::app_state::clear_github_token(cx);
+            ws.update(cx, |_, cx| cx.notify());
+        });
+        draw(visual);
+        assert!(
+            visual.debug_bounds("sidebar-nav-report").is_none(),
+            "ログアウトしてもレポート行が残っている"
         );
     }
 
