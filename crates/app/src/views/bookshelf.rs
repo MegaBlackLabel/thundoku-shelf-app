@@ -1506,9 +1506,14 @@ impl BookshelfView {
                 });
                 // カードの表紙は**サイトから取得した画像**（同期時のサムネイル）を優先する。
                 // 取得できていないときだけ pack の表紙（ローカル取り込み）へ落とす。
+                //
+                // ここで placeholder を入れてはいけない。`cover` が `None` であることが
+                // 「未取得＝fetch_remote_covers の取得対象」の印であり、埋めてしまうと
+                // 取得対象の判定（cover.is_none()）が成立せず実表紙が取りに行かれなくなる
+                // （プレースホルダのまま固定される）。プレースホルダは描画側で
+                // フォールバックしているので、ここでは None のまま返す。
                 let cover = load_cached_cover(&thumbnails_dir, shelf)
-                    .or_else(|| local.and_then(|entry| entry.cover.clone()))
-                    .or_else(|| placeholder_cover(&shelf.title, &shelf.circle_name));
+                    .or_else(|| local.and_then(|entry| entry.cover.clone()));
                 let tags = if shelf.site_id == "fanza" || shelf.site_id == "dlsite" {
                     // FANZA / DLsite: タグは shelf.tags_json を正とする（book_tags は重複本で
                     // 分かれるため）。保存/ジャンル取得で両方に書くが、表示は安定。
@@ -2182,7 +2187,14 @@ impl BookshelfView {
         // 画像取得完了（fetch_remote_covers → reload）まで表示しない。
         // ローカル本（ダウンロード済み）は pack から表紙を読むため常に表示する。
         // 最初から thumbnail_url の無い本は取得対象外なので表示する。
-        if card.local.is_none() && card.cover.is_none() && card.shelf.thumbnail_url.is_some() {
+        // 隠すのは「未取得（取得待ち）」のあいだだけ。取得に失敗したものは
+        // NoImage ダミー付きで表示する（失敗も隠すと、全件失敗時に本棚が
+        // 空に見えてしまう）。
+        if card.local.is_none()
+            && card.cover.is_none()
+            && !card.cover_fetch_failed
+            && card.shelf.thumbnail_url.is_some()
+        {
             return false;
         }
         if let Some(site) = &self.site_filter
@@ -7958,6 +7970,76 @@ mod tests {
             assert_eq!(
                 books::get(db, "book-1").unwrap().unwrap().author,
                 "YORIMIYA"
+            );
+        });
+    }
+
+    /// 表紙の取得に失敗した本は**隠さず** NoImage ダミー付きで表示する。
+    ///
+    /// 失敗も `matches_filter` で隠してしまうと、全件失敗時に本棚が空になる
+    /// （描画側の `no_image_cover()` 分岐に到達しない）。
+    #[gpui_kit::test]
+    async fn failed_cover_fetch_is_shown_with_no_image(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(
+            cx,
+            "cover-fix-failed-1",
+            "取得失敗の本",
+            "サークルA",
+            Some("https://example.invalid/cover.png"),
+        );
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, _cx| {
+                // 前提: 未取得カードであること。テスト用 data_dir はテスト間で共有され
+                // 残留キャッシュを拾うと cover が Some になり、この検証が空振りする
+                // （その場合はここで気付けるようにしておく）。
+                assert!(
+                    this.shelf_cards[0].cover.is_none(),
+                    "前提: 未取得カード（残留キャッシュがあると検証が無意味になる）"
+                );
+                this.shelf_cards[0].cover_fetch_failed = true;
+            });
+            let this = view.read(cx);
+            let card = this.shelf_cards[0].clone();
+            assert!(
+                this.matches_filter(cx, &card),
+                "取得に失敗した本は NoImage 付きで表示する（隠さない）"
+            );
+        });
+    }
+
+    /// 未取得のリモート本は `cover` を `None` のままにする（＝取得対象として残す）。
+    ///
+    /// `None` が「未取得」の印で、`fetch_remote_covers` はこの印を見て取得する。
+    /// reload で placeholder を入れてしまうと印が消え、実表紙が取りに行かれず
+    /// プレースホルダのまま固定される（表紙が表示されない不具合）。
+    #[gpui_kit::test]
+    async fn unfetched_remote_item_stays_pending_for_cover_fetch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 解決しない TLD を使い、実取得（ネットワーク）は走らせず対象判定だけを見る
+        // 他テストと共有の temp data_dir を使うため、fixture id は一意にする
+        // （既存のキャッシュファイルを拾うと cover が Some になり検証が空振りする）
+        seed_shelf_item(
+            cx,
+            "cover-fix-pending-1",
+            "未取得の本",
+            "サークルA",
+            Some("https://example.invalid/cover.png"),
+        );
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            let this = view.read(cx);
+            let card = &this.shelf_cards[0];
+            assert!(
+                card.cover.is_none(),
+                "未取得のリモート本は cover を None のままにする（取得対象の印を消さない）"
+            );
+            assert!(
+                !this.matches_filter(cx, card),
+                "未取得のリモート本は取得完了まで非表示"
             );
         });
     }
