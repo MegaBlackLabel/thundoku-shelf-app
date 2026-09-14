@@ -85,6 +85,19 @@ pub struct SettingsView {
     poll_interval_subscription: Option<Subscription>,
 }
 
+/// Google の再ログインが必要なときの案内（生の `invalid_grant` JSON は出さない）。
+const GOOGLE_AUTH_EXPIRED_NOTICE: &str = "Google のログインが無効になりました（トークンが失効または取り消されています）。\
+     もう一度ログインしてください";
+
+/// Google の認証が失効したことを示すメッセージか。
+///
+/// 同期のエラーは `String` に畳まれて渡ってくるため、core の `GoogleError` の文言で判定する
+/// （`RefreshTokenRevoked` / `NoRefreshToken` はどちらも再ログインが必要）。core 側の文言が
+/// 変わったらテストが落ちるようにしてある。
+fn is_google_auth_expired(message: &str) -> bool {
+    message.contains("re-authorize required")
+}
+
 impl SettingsView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let storage_bytes = {
@@ -802,6 +815,54 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Google の認証が失効していたとき（リフレッシュトークンの失効・取り消し）の後始末。
+    ///
+    /// 保存済みトークンを破棄し、再ログインの導線を自動で出す。画面に出す日本語の文言を返す
+    /// （失効していなければ `None`）。`invalid_grant` の生 JSON は画面に出さない。
+    fn handle_google_auth_expiry(
+        &mut self,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        // core の `RefreshTokenRevoked`（失効・取り消し）と `NoRefreshToken` は
+        // どちらも再ログインが必要。
+        if !is_google_auth_expired(message) {
+            return None;
+        }
+        log::warn!("google auth expired: {message}");
+        {
+            let state = AppState::global(cx);
+            if let Some(client) = state.google.lock().as_mut() {
+                client.logout();
+            }
+            *state.google_profile.lock() = None;
+            *state.google_logged_in.lock() = false;
+            state
+                .google_logout_done
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // 失効したトークンを keyring に残さない（削除は背景で、UI を固めない）
+            let store = state.secrets.clone();
+            cx.background_spawn(async move {
+                let _ = store.delete(secrets::USER_GOOGLE);
+            })
+            .detach();
+        }
+        // 再ログインの導線を自動で出す。
+        //
+        // `dispatch_action` で認証モーダルを開くと、WebView 作成時にウィンドウの RefCell を
+        // 再入してアプリが固まる（設定画面のログインボタンと同じ理由）。本棚に切り替えて
+        // から `Workspace::open_auth` を呼ぶ経路にする。
+        cx.defer(move |cx| {
+            let ws_weak = AppState::global(cx).workspace.lock().clone();
+            if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                ws.update(cx, |ws, cx| {
+                    ws.open_auth(cx, AuthProvider::Google);
+                });
+            }
+        });
+        Some(GOOGLE_AUTH_EXPIRED_NOTICE.to_string())
+    }
+
     /// Drive 同期（接続済み前提）。エンジンは `drive::sync::sync`。
     pub fn sync_drive_now(&mut self, cx: &mut Context<Self>) {
         self.busy = true;
@@ -912,14 +973,24 @@ impl SettingsView {
                     }
                     Err(message) => {
                         log::error!("sync_drive_now failed: {message}");
-                        this.error = Some(message.clone());
-                        if message.contains("identity required") {
-                            // 暗号化 pack の復号には Google ログインが必要
-                            cx.defer(move |cx| {
-                                cx.dispatch_action(&OpenAuthProvider {
-                                    provider: AuthProvider::Google,
-                                })
-                            });
+                        if let Some(notice) = this.handle_google_auth_expiry(&message, cx) {
+                            // トークン失効。生の応答ではなく日本語の案内を出す
+                            this.error = Some(notice);
+                        } else {
+                            this.error = Some(message.clone());
+                            if message.contains("identity required") {
+                                // 暗号化 pack の復号には Google ログインが必要。
+                                // 認証モーダルは `dispatch_action` ではなく `Workspace::open_auth`
+                                // 経由で開く（WebView 作成時の RefCell 再入で固まるのを避ける）。
+                                cx.defer(move |cx| {
+                                    let ws_weak = AppState::global(cx).workspace.lock().clone();
+                                    if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                                        ws.update(cx, |ws, cx| {
+                                            ws.open_auth(cx, AuthProvider::Google);
+                                        });
+                                    }
+                                });
+                            }
                         }
                     }
                 }
@@ -2638,6 +2709,36 @@ mod tests {
     use thundoku_core::db;
 
     use super::*;
+
+    /// Google のトークン失効（`invalid_grant`）を見逃さないこと。
+    ///
+    /// 同期のエラーは `String` に畳まれて渡ってくるため core の文言で判定している。
+    /// core 側の文言が変わったらこのテストが落ちる（＝気づける）ようにしておく。
+    #[test]
+    fn detects_google_token_expiry_from_core_messages() {
+        use thundoku_core::google::GoogleError;
+
+        assert!(is_google_auth_expired(
+            &GoogleError::RefreshTokenRevoked.to_string()
+        ));
+        assert!(is_google_auth_expired(
+            &GoogleError::NoRefreshToken.to_string()
+        ));
+        assert!(!is_google_auth_expired(
+            &GoogleError::NotAuthorized.to_string()
+        ));
+        assert!(!is_google_auth_expired("network error: timed out"));
+
+        // 案内は日本語で、生の応答（JSON）を含まない
+        assert!(
+            GOOGLE_AUTH_EXPIRED_NOTICE.contains("ログイン"),
+            "案内が日本語でない: {GOOGLE_AUTH_EXPIRED_NOTICE}"
+        );
+        assert!(
+            !GOOGLE_AUTH_EXPIRED_NOTICE.contains('{'),
+            "案内に生の応答が混ざっている: {GOOGLE_AUTH_EXPIRED_NOTICE}"
+        );
+    }
 
     #[gpui_kit::test]
     async fn viewer_mode_setting_persists(cx: &mut TestAppContext) {

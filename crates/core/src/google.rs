@@ -48,6 +48,12 @@ pub enum GoogleError {
     Network(String),
     #[error("refresh token unavailable: re-authorize required")]
     NoRefreshToken,
+    /// リフレッシュトークンが失効・取り消しされている（再ログインが必要）。
+    ///
+    /// Google 側で revoke された / 長期間未使用で失効した場合に返る（`invalid_grant`）。
+    /// 生の応答（JSON）を画面に出さず、再ログインへ誘導するための型。
+    #[error("refresh token expired or revoked: re-authorize required")]
+    RefreshTokenRevoked,
     #[error("not authorized")]
     NotAuthorized,
     #[error("authorization cancelled")]
@@ -369,6 +375,12 @@ pub struct GoogleClient {
     client_id: String,
     client_secret: Option<String>,
     tokens: Option<OAuthTokens>,
+    /// リフレッシュトークンが失効・取り消し済みと判明した。
+    ///
+    /// 一度分かれば再ログインまで何度試しても同じ結果になるので、**再試行しない**。
+    /// これが無いと、失効後に Drive 系の呼び出し（ファイルごとなど）が
+    /// リフレッシュを連打して UI を巻き込む（実測: 数秒で数十回リクエストしていた）。
+    refresh_revoked: bool,
 }
 
 impl GoogleClient {
@@ -386,6 +398,7 @@ impl GoogleClient {
             client_id: client_id.into(),
             client_secret,
             tokens: None,
+            refresh_revoked: false,
         }
     }
 
@@ -400,10 +413,13 @@ impl GoogleClient {
 
     pub fn restore_tokens(&mut self, tokens: OAuthTokens) {
         self.tokens = Some(tokens);
+        // 新しいセッションなので失効の記憶を戻す
+        self.refresh_revoked = false;
     }
 
     pub fn logout(&mut self) {
         self.tokens = None;
+        self.refresh_revoked = false;
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -518,6 +534,10 @@ impl GoogleClient {
     /// Refresh using the stored refresh token; keeps the old refresh token
     /// when the endpoint omits a new one.
     pub fn refresh_tokens(&mut self) -> Result<(), GoogleError> {
+        // 失効が判明済みなら、ネットワークに出ずに即返す（連打を防ぐ）
+        if self.refresh_revoked {
+            return Err(GoogleError::RefreshTokenRevoked);
+        }
         let refresh_token = self
             .tokens
             .as_ref()
@@ -533,10 +553,23 @@ impl GoogleClient {
         }
         let response = self.post_token_form(&form)?;
         if !(200..300).contains(&response.status) {
+            let body = String::from_utf8_lossy(&response.body);
+            log::error!(
+                "token refresh failed: status {}, body: {}",
+                response.status,
+                body.trim()
+            );
+            // `invalid_grant` はリフレッシュトークンが失効・取り消しされている状態。
+            // 生の応答を画面に出さず、呼び出し側が再ログインへ誘導できるようにする。
+            if body.contains("invalid_grant") {
+                // 再ログインまで何度試しても同じなので記憶する
+                self.refresh_revoked = true;
+                return Err(GoogleError::RefreshTokenRevoked);
+            }
             return Err(GoogleError::Token(format!(
                 "token endpoint status {}: {}",
                 response.status,
-                String::from_utf8_lossy(&response.body).trim()
+                body.trim()
             )));
         }
         let mut tokens = parse_token_response(&response.body)?;
@@ -697,6 +730,107 @@ mod tests {
         assert!(
             !body.contains("client_secret="),
             "client_secret must not be sent when unconfigured: {body}"
+        );
+    }
+
+    /// 失効が分かったあとは再試行しないこと。
+    ///
+    /// 実機で、失効後に Drive 系の呼び出しが**リフレッシュを連打**して（数秒で数十回）
+    /// アプリが固まる症状が出たため、一度失敗したら再ログインまでネットワークに出ない。
+    #[test]
+    fn revoked_token_is_not_retried() {
+        /// 呼ばれた回数を数えつつ、常に 400 `invalid_grant` を返す transport。
+        struct CountingTransport {
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Transport for CountingTransport {
+            fn send(&mut self, _req: RequestSpec) -> Result<ResponseSpec, TbfError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ResponseSpec {
+                    status: 400,
+                    headers: Vec::new(),
+                    body: br#"{"error":"invalid_grant","error_description":"expired"}"#.to_vec(),
+                })
+            }
+        }
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = GoogleClient::with_transport(
+            Box::new(CountingTransport {
+                calls: calls.clone(),
+            }),
+            "cid",
+            None,
+        );
+        client.restore_tokens(OAuthTokens {
+            access_token: "old".to_string(),
+            expires_at: 0,
+            refresh_token: Some("dead".to_string()),
+        });
+
+        for _ in 0..5 {
+            assert!(matches!(
+                client.refresh_tokens(),
+                Err(GoogleError::RefreshTokenRevoked)
+            ));
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "失効後はネットワークに出ない（連打しない）"
+        );
+
+        // 再ログイン（logout → 新しいトークン）なら、また試せる
+        client.logout();
+        client.restore_tokens(OAuthTokens {
+            access_token: "new".to_string(),
+            expires_at: 0,
+            refresh_token: Some("fresh".to_string()),
+        });
+        let _ = client.refresh_tokens();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "新しいセッションでは再試行する"
+        );
+    }
+
+    /// リフレッシュトークンが失効・取り消しされている場合（`invalid_grant`）は、
+    /// 生の JSON を画面に出さずに専用のエラーとして返すこと。
+    /// 呼び出し側が再ログインへ誘導できるようにするため。
+    #[test]
+    fn refresh_reports_a_revoked_token_as_a_typed_error() {
+        /// 常に 400 `invalid_grant` を返す transport。
+        struct RevokedTransport;
+        impl Transport for RevokedTransport {
+            fn send(&mut self, _req: RequestSpec) -> Result<ResponseSpec, TbfError> {
+                Ok(ResponseSpec {
+                    status: 400,
+                    headers: Vec::new(),
+                    body: br#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#
+                        .to_vec(),
+                })
+            }
+        }
+
+        let mut client = GoogleClient::with_transport(Box::new(RevokedTransport), "cid", None);
+        client.restore_tokens(OAuthTokens {
+            access_token: "old".to_string(),
+            expires_at: 0,
+            refresh_token: Some("dead".to_string()),
+        });
+
+        let error = client.refresh_tokens().expect_err("失効を検出する");
+
+        assert!(
+            matches!(error, GoogleError::RefreshTokenRevoked),
+            "失効は専用のエラーで返す: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            !message.contains("invalid_grant") && !message.contains('{'),
+            "生の応答を文言に出さない: {message}"
         );
     }
 }
