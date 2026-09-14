@@ -10,18 +10,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # arch だけだと macOS x86_64 と Windows x86_64 でファイル名/アーティファクト名が
+          # 衝突する（upload-artifact@v4 は同名で 409 になる）ため os_name も持たせる
           - os: macos-14
+            os_name: macos
             target: aarch64-apple-darwin
-            artifact: thundoku-shelf-aarch64-macos.zip
+            arch: aarch64
           - os: macos-14
+            os_name: macos
             target: x86_64-apple-darwin
-            artifact: thundoku-shelf-x86_64-macos.zip
+            arch: x86_64
           - os: windows-latest
+            os_name: windows
             target: x86_64-pc-windows-msvc
-            artifact: thundoku-shelf-x86_64-windows.zip
+            arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # 成果物名にバージョン（タグ）を入れる。例: v0.2.1 -> 0.2.1
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
@@ -35,27 +46,77 @@ jobs:
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }} -p thundoku-shelf
 
+      # macOS は生バイナリではなく .app バンドルを配布する。
+      # 生バイナリだと Info.plist もアイコンも無く、Finder からアプリとして扱えず、
+      # Gatekeeper の扱いも厳しくなる（ローカルの scripts/make-app-bundle.sh と同じ構成）。
       - name: Package (macOS)
         if: runner.os == 'macOS'
-        working-directory: target/${{ matrix.target }}/release
-        run: zip -r "$GITHUB_WORKSPACE/${{ matrix.artifact }}" thundoku-shelf
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="target/${{ matrix.target }}/release/ThundokuShelf.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/thundoku-shelf" "$APP/Contents/MacOS/thundoku-shelf"
+          cp crates/app/assets/app-icon/icon.icns "$APP/Contents/Resources/icon.icns"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>Thundoku Shelf</string>
+            <key>CFBundleDisplayName</key>
+            <string>Thundoku Shelf</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.megablacklabel.thundoku-shelf</string>
+            <key>CFBundleExecutable</key>
+            <string>thundoku-shelf</string>
+            <key>CFBundleIconFile</key>
+            <string>icon</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ steps.ver.outputs.v }}</string>
+            <key>CFBundleVersion</key>
+            <string>${{ steps.ver.outputs.v }}</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>13.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          # ditto でバンドル構造（権限・リソース）を保ったまま zip 化する
+          ditto -c -k --keepParent "$APP" "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # PDFium (Apache-2.0) は動的ロードなので、exe と同じフォルダに同梱する。
-          # pdfium-render の pdfium_7881 バインディングに対応するバージョンを使う。
-          curl -fL -o pdfium.zip `
-            https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-win-x64.tgz
-          tar -xzf pdfium.zip
+          # PDFium (Apache-2.0) は実行時ロードなので、exe と同じフォルダに同梱する。
+          # pdfium-render の pdfium_7881 バインディングに対応するバージョンを使い、
+          # 供給網対策として SHA256 を検証してから展開する。
+          $url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-win-x64.tgz"
+          $sha = "73cc0de638ac2095e7445bf56a38200a5b7c7ca0e9f4ba144598f2457377ac08"
+          Invoke-WebRequest -Uri $url -OutFile pdfium.tgz
+          $actual = (Get-FileHash pdfium.tgz -Algorithm SHA256).Hash
+          if ($actual -ne $sha.ToUpper()) {
+            throw "pdfium のチェックサムが一致しません（expected=$sha actual=$actual）"
+          }
+          tar -xzf pdfium.tgz
           Copy-Item bin/pdfium.dll "target/${{ matrix.target }}/release/pdfium.dll"
-          Compress-Archive -Path @("target/${{ matrix.target }}/release/thundoku-shelf.exe", "target/${{ matrix.target }}/release/pdfium.dll") -DestinationPath "${{ matrix.artifact }}"
+          Compress-Archive -Path @(
+            "target/${{ matrix.target }}/release/thundoku-shelf.exe",
+            "target/${{ matrix.target }}/release/pdfium.dll"
+          ) -DestinationPath "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}
+          path: thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip
           if-no-files-found: error
 
   release:

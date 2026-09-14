@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/opfspack", "crates/core", "crates/app"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 authors = ["MegaBlackLabel"]
@@ -23,3 +23,5 @@ opt-level = 3
 [profile.release]
 # リリースビルドにデバッグ情報を含めない（ビルド高速化・バイナリ縮小）
 debug = false
+# シンボルを落として配布物を小さくする（63MB -> 大幅減）
+strip = true
