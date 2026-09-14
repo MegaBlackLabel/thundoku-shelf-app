@@ -5,9 +5,7 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-# 引数は release / --release のどちらでも受ける（usage は --release）。
 TARGET="${1:-debug}"
-TARGET="${TARGET#--}"
 if [ "$TARGET" = "release" ]; then
   BIN="target/release/thundoku-shelf"
   PROFILE="release"
