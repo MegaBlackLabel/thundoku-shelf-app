@@ -24,13 +24,32 @@ pub const DEFAULT_SCOPE: &str = "public_repo";
 /// GitHub は `User-Agent` の無いリクエストを 403 で拒否する。
 pub const USER_AGENT: &str = concat!("thundoku-shelf/", env!("CARGO_PKG_VERSION"));
 
+/// 取り込むテンプレート 1 ファイルの上限。issue form は数 KB で足りる。
+/// 外部から来るデータなので、大きすぎるものは読まない（メモリ枯渇を防ぐ）。
+const MAX_TEMPLATE_BYTES: usize = 256 * 1024;
+
+/// 取り込むテンプレートの最大件数（転送量の上限）。
+const MAX_TEMPLATE_FILES: usize = 20;
+
 /// keyring に保存するアクセストークン。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GithubToken {
     pub access_token: String,
     pub token_type: String,
     /// 空白区切りのスコープ（レスポンスの `scope` をそのまま保持）。
     pub scope: String,
+}
+
+impl std::fmt::Debug for GithubToken {
+    /// `access_token` は出さない。`{:?}` を 1 回書いただけでトークンがログに載る
+    /// 事故を防ぐ（フィールドを増やしたときも同様に隠すこと）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GithubToken")
+            .field("access_token", &"***")
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl GithubToken {
@@ -144,6 +163,9 @@ pub enum GithubError {
     /// 画像アップロードは対象リポジトリへの write 権限が要る（無いと 404）。
     #[error("no write access to the repository: images cannot be attached")]
     AssetUploadDenied,
+    /// 回数制限に当たった（`Retry-After` 秒待って再試行する）。
+    #[error("rate limited (retry after {retry_after:?}s)")]
+    RateLimited { retry_after: Option<u64> },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("invalid response: {0}")]
@@ -185,13 +207,42 @@ fn json_value(response: &ResponseSpec) -> Result<serde_json::Value, GithubError>
     })
 }
 
-/// GitHub のエラーレスポンスから `message` を取り出す。
+/// エラー時の本文は JSON とは限らない（プロキシや攻撃的な中間装置が HTML を返す）。
+/// status で分岐する前に parse で落ちないよう、読めなければ `Null` として扱う。
+fn json_or_null(response: &ResponseSpec) -> serde_json::Value {
+    serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null)
+}
+
+/// GitHub のエラーレスポンスから理由を取り出す。
+///
+/// 通常の API は `message`、OAuth（device flow）は `error` / `error_description` を返す。
 fn error_message(value: &serde_json::Value) -> String {
-    value
-        .get("message")
-        .and_then(|message| message.as_str())
+    ["message", "error_description", "error"]
+        .iter()
+        .find_map(|key| value.get(key).and_then(|node| node.as_str()))
         .unwrap_or("unknown error")
         .to_string()
+}
+
+/// `Retry-After` ヘッダ（秒）。回数制限の待ち時間を利用者に見せるために使う。
+fn retry_after(response: &ResponseSpec) -> Option<u64> {
+    response
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+}
+
+/// 回数制限（429、または `Retry-After` 付きの 403）なら対応するエラーを返す。
+///
+/// GitHub は二次レート制限を 403 で返すことがあり、`Retry-After` が付く。
+fn rate_limited(response: &ResponseSpec) -> Option<GithubError> {
+    let retry = retry_after(response);
+    if response.status == 429 || (response.status == 403 && retry.is_some()) {
+        Some(GithubError::RateLimited { retry_after: retry })
+    } else {
+        None
+    }
 }
 
 fn yaml_field<'a>(node: &'a yaml_rust2::Yaml, key: &str) -> Option<&'a yaml_rust2::Yaml> {
@@ -221,6 +272,16 @@ fn yaml_list(node: &yaml_rust2::Yaml) -> Vec<String> {
 /// issue form（`.github/ISSUE_TEMPLATE/*.yml`）を解析する。
 /// `name` を持たないものはテンプレートではないので `None` を返す。
 fn parse_issue_form(file_name: &str, text: &str) -> Result<Option<IssueTemplate>, GithubError> {
+    if text.len() > MAX_TEMPLATE_BYTES {
+        return Err(GithubError::InvalidResponse(format!(
+            "{file_name}: テンプレートが大きすぎます（{} バイト）",
+            text.len()
+        )));
+    }
+    // 注: yaml-rust2 はアンカー/エイリアスを上限なく展開するため、alias 爆弾で
+    // メモリを食い潰せる。いまの取得元はこのアプリのリポジトリ固定（＝自分たちが
+    // 書いた YAML）なので信用しているが、取得元を可変にするならノード数に予算を
+    // 設けるパーサへ替えること。
     let documents = yaml_rust2::YamlLoader::load_from_str(text)
         .map_err(|error| GithubError::InvalidResponse(format!("{file_name}: {error}")))?;
     let Some(document) = documents.first() else {
@@ -344,6 +405,13 @@ impl GithubClient {
             body: Some(form_body(&[("client_id", client_id), ("scope", scope)])),
             redirects: 0,
         })?;
+        if response.status != 200 {
+            return Err(GithubError::Auth(format!(
+                "status {}: {}",
+                response.status,
+                error_message(&json_or_null(&response))
+            )));
+        }
         let value = json_value(&response)?;
         let device_code = value
             .get("device_code")
@@ -396,6 +464,13 @@ impl GithubClient {
             ])),
             redirects: 0,
         })?;
+        if response.status != 200 {
+            return Err(GithubError::Auth(format!(
+                "status {}: {}",
+                response.status,
+                error_message(&json_or_null(&response))
+            )));
+        }
         let value = json_value(&response)?;
 
         if let Some(access_token) = value.get("access_token").and_then(|node| node.as_str()) {
@@ -441,6 +516,13 @@ impl GithubClient {
             body: None,
             redirects: 0,
         })?;
+        if response.status != 200 {
+            return Err(GithubError::Auth(format!(
+                "status {}: {}",
+                response.status,
+                error_message(&json_or_null(&response))
+            )));
+        }
         let value = json_value(&response)?;
         let login = value
             .get("login")
@@ -465,17 +547,24 @@ impl GithubClient {
             body: None,
             redirects: 0,
         })?;
-        let value = json_value(&response)?;
+        if let Some(error) = rate_limited(&response) {
+            return Err(error);
+        }
         if response.status != 200 {
             return match response.status {
                 404 => Err(GithubError::NotFound(format!("{owner}/{repo}"))),
-                403 => Err(GithubError::Forbidden(error_message(&value))),
+                403 => Err(GithubError::Forbidden(error_message(&json_or_null(
+                    &response,
+                )))),
+                // 失効したトークンは呼び出し側でログインをやり直させる。
+                401 => Err(GithubError::Auth(error_message(&json_or_null(&response)))),
                 status => Err(GithubError::InvalidResponse(format!(
                     "status {status}: {}",
-                    error_message(&value)
+                    error_message(&json_or_null(&response))
                 ))),
             };
         }
+        let value = json_value(&response)?;
         value
             .get("id")
             .and_then(|node| node.as_u64())
@@ -503,25 +592,37 @@ impl GithubClient {
             redirects: 0,
         })?;
 
-        let value = json_value(&response)?;
+        if let Some(error) = rate_limited(&response) {
+            return Err(error);
+        }
+
         match response.status {
-            201 => Ok(IssueRef {
-                number: value
-                    .get("number")
-                    .and_then(|node| node.as_u64())
-                    .unwrap_or(0),
-                html_url: value
-                    .get("html_url")
-                    .and_then(|node| node.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            }),
-            403 => Err(GithubError::Forbidden(error_message(&value))),
+            // 成功したときだけ JSON として読む（エラー本文は JSON とは限らない）。
+            201 => {
+                let value = json_value(&response)?;
+                Ok(IssueRef {
+                    number: value
+                        .get("number")
+                        .and_then(|node| node.as_u64())
+                        .unwrap_or(0),
+                    html_url: value
+                        .get("html_url")
+                        .and_then(|node| node.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+            }
+            403 => Err(GithubError::Forbidden(error_message(&json_or_null(
+                &response,
+            )))),
             404 => Err(GithubError::NotFound(format!("{owner}/{repo}"))),
             410 => Err(GithubError::IssuesDisabled(format!("{owner}/{repo}"))),
+            // 401 はトークンが失効/取り消しされている。呼び出し側がログインを
+            // やり直せるように `Auth` として返す（「予期しない応答」にしない）。
+            401 => Err(GithubError::Auth(error_message(&json_or_null(&response)))),
             status => Err(GithubError::InvalidResponse(format!(
                 "status {status}: {}",
-                error_message(&value)
+                error_message(&json_or_null(&response))
             ))),
         }
     }
@@ -555,19 +656,36 @@ impl GithubClient {
             redirects: 0,
         })?;
 
-        let value = json_value(&response)?;
+        if let Some(error) = rate_limited(&response) {
+            return Err(error);
+        }
+
         match response.status {
-            201 => Ok(value
-                .get("url")
-                .and_then(|node| node.as_str())
-                .unwrap_or_default()
-                .to_string()),
+            201 => {
+                let value = json_value(&response)?;
+                let url = value
+                    .get("url")
+                    .and_then(|node| node.as_str())
+                    .unwrap_or_default();
+                // この URL はそのまま Issue 本文へ貼る。期待する形でなければ貼らない
+                // （空文字を「添付できた」として扱わない）。
+                if !url.starts_with("https://github.com/user-attachments/assets/") {
+                    return Err(GithubError::InvalidResponse(format!(
+                        "画像の URL が不正です: {url}"
+                    )));
+                }
+                Ok(url.to_string())
+            }
             // write 権限が無い場合の 404 は「添付できない」として区別する。
             404 => Err(GithubError::AssetUploadDenied),
-            403 => Err(GithubError::Forbidden(error_message(&value))),
+            403 => Err(GithubError::Forbidden(error_message(&json_or_null(
+                &response,
+            )))),
+            // 失効したトークンは呼び出し側でログインをやり直させる。
+            401 => Err(GithubError::Auth(error_message(&json_or_null(&response)))),
             status => Err(GithubError::InvalidResponse(format!(
                 "status {status}: {}",
-                error_message(&value)
+                error_message(&json_or_null(&response))
             ))),
         }
     }
@@ -586,6 +704,24 @@ impl GithubClient {
             body: None,
             redirects: 0,
         })?;
+        // テンプレートを置いていないリポジトリは 404 になる。異常ではないので空で返す。
+        if response.status == 404 {
+            return Ok(Vec::new());
+        }
+        // 失効したトークンは呼び出し側でログインをやり直させる。
+        if response.status == 401 {
+            return Err(GithubError::Auth(error_message(&json_or_null(&response))));
+        }
+        if let Some(error) = rate_limited(&response) {
+            return Err(error);
+        }
+        if response.status != 200 {
+            return Err(GithubError::InvalidResponse(format!(
+                "status {}: {}",
+                response.status,
+                error_message(&json_or_null(&response))
+            )));
+        }
         let value = json_value(&response)?;
         let entries = value.as_array().ok_or_else(|| {
             GithubError::InvalidResponse(format!(
@@ -600,6 +736,7 @@ impl GithubClient {
             .filter(|entry| entry.get("type").and_then(|node| node.as_str()) == Some("file"))
             .filter_map(|entry| entry.get("name").and_then(|node| node.as_str()))
             .filter(|name| name.ends_with(".yml") && *name != "config.yml")
+            .take(MAX_TEMPLATE_FILES)
             .map(str::to_string)
             .collect();
 
@@ -615,6 +752,11 @@ impl GithubClient {
                 body: None,
                 redirects: 0,
             })?;
+            // 1 件読めなくても他は活かす（テンプレートは本文の下書き用の補助で、
+            // 1 ファイルの失敗で全部を失う理由が無い）。大きすぎる本文は読まない。
+            if response.status != 200 || response.body.len() > MAX_TEMPLATE_BYTES {
+                continue;
+            }
             let text = String::from_utf8_lossy(&response.body).to_string();
             if let Some(template) = parse_issue_form(&file_name, &text)? {
                 templates.push(template);
@@ -969,5 +1111,113 @@ body:
             header(&reqs[1], "accept").as_deref(),
             Some("application/vnd.github.raw+json")
         );
+    }
+
+    #[test]
+    fn list_issue_templates_returns_empty_when_the_repository_has_none() {
+        // テンプレートを置いていないリポジトリは Contents API が 404 を返す。異常ではない。
+        let (mut client, captured) = logged_in(vec![json(404, r#"{"message":"Not Found"}"#)]);
+
+        let templates = client.list_issue_templates("o", "r").expect("templates");
+
+        assert!(templates.is_empty());
+        assert_eq!(
+            captured.lock().len(),
+            1,
+            "テンプレートが無いならディレクトリ一覧で終わる"
+        );
+    }
+
+    #[test]
+    fn upload_asset_rejects_an_unexpected_url() {
+        // 応答の url はそのまま本文へ貼るので、期待する形でなければ成功にしない。
+        let (mut client, _) = logged_in(vec![json(
+            201,
+            r#"{"url":"https://evil.example/asset.png"}"#,
+        )]);
+
+        assert!(matches!(
+            client.upload_asset(1, "a.png", "image/png", b"x"),
+            Err(GithubError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn token_debug_does_not_print_the_access_token() {
+        let token = GithubToken {
+            access_token: "gho_supersecret".to_string(),
+            token_type: "bearer".to_string(),
+            scope: "public_repo".to_string(),
+        };
+
+        let printed = format!("{token:?}");
+
+        assert!(!printed.contains("gho_supersecret"), "{printed}");
+        assert!(printed.contains("public_repo"), "{printed}");
+    }
+
+    #[test]
+    fn rate_limit_reports_the_waiting_time() {
+        // 429 と、Retry-After 付きの 403（二次レート制限）を回数制限として扱う。
+        let mut throttled = json(429, r#"{"message":"API rate limit exceeded"}"#);
+        throttled
+            .headers
+            .push(("Retry-After".to_string(), "60".to_string()));
+        let mut secondary = json(
+            403,
+            r#"{"message":"You have exceeded a secondary rate limit"}"#,
+        );
+        secondary
+            .headers
+            .push(("Retry-After".to_string(), "30".to_string()));
+        let (mut client, _) = logged_in(vec![throttled, secondary]);
+
+        assert!(matches!(
+            client.create_issue("o", "r", "t", "b", &[]),
+            Err(GithubError::RateLimited {
+                retry_after: Some(60)
+            })
+        ));
+        assert!(matches!(
+            client.create_issue("o", "r", "t", "b", &[]),
+            Err(GithubError::RateLimited {
+                retry_after: Some(30)
+            })
+        ));
+    }
+
+    #[test]
+    fn expired_token_is_reported_as_an_auth_error() {
+        // 401（トークンの失効・取り消し）は「予期しない応答」ではなく認証エラーとして
+        // 返す。呼び出し側が再ログインへ誘導できるようにするため。
+        let (mut client, _) = logged_in(vec![
+            json(401, r#"{"message":"Bad credentials"}"#),
+            json(401, r#"{"message":"Bad credentials"}"#),
+            json(401, r#"{"message":"Bad credentials"}"#),
+        ]);
+
+        assert!(matches!(
+            client.create_issue("o", "r", "t", "b", &[]),
+            Err(GithubError::Auth(_))
+        ));
+        assert!(matches!(
+            client.repository_id("o", "r"),
+            Err(GithubError::Auth(_))
+        ));
+        assert!(matches!(
+            client.list_issue_templates("o", "r"),
+            Err(GithubError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn create_issue_keeps_the_status_when_the_error_body_is_not_json() {
+        // プロキシなどが HTML を返しても、status から種別を判定できること。
+        let (mut client, _) = logged_in(vec![raw(403, "<html>Forbidden</html>")]);
+
+        assert!(matches!(
+            client.create_issue("o", "r", "t", "b", &[]),
+            Err(GithubError::Forbidden(_))
+        ));
     }
 }
