@@ -89,6 +89,11 @@ jobs:
           </dict>
           </plist>
           PLIST
+          # .app として ad-hoc 署名し直す。実行ファイル単体の署名（リンカが付ける）だけだと
+          # _CodeSignature/CodeResources が無く、codesign --verify が失敗して Gatekeeper が
+          # 「壊れているため開けません」と判定しうる。Team ID は無いので ad-hoc（-）で署名する
+          codesign --force --sign - "$APP"
+          codesign --verify --verbose=2 "$APP"
           # ditto でバンドル構造（権限・リソース）を保ったまま zip 化する
           ditto -c -k --keepParent "$APP" "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
 
