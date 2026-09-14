@@ -10,14 +10,16 @@
 
 [Releases](https://github.com/MegaBlackLabel/thundoku-shelf-app/releases) からお使いの OS の zip をダウンロードして、展開して起動してください（インストーラーはありません）。
 
+ファイル名の `x.y.z` はバージョンです（例: `thundoku-shelf-0.2.1-aarch64-macos.zip`）。
+
 | OS | ファイル |
 |---|---|
-| Windows (x64) | `thundoku-shelf-x86_64-windows.zip` |
-| macOS (Apple Silicon) | `thundoku-shelf-aarch64-macos.zip` |
-| macOS (Intel) | `thundoku-shelf-x86_64-macos.zip` |
+| Windows (x64) | `thundoku-shelf-x.y.z-x86_64-windows.zip` |
+| macOS (Apple Silicon) | `thundoku-shelf-x.y.z-aarch64-macos.zip` |
+| macOS (Intel) | `thundoku-shelf-x.y.z-x86_64-macos.zip` |
 
 - **Windows**: 展開したフォルダに `pdfium.dll`（PDF 表示用）が入っています。**exe と同じフォルダに置いたまま**使ってください。初回起動時に SmartScreen の警告が出たら「詳細情報」→「実行」で進めます。
-- **macOS**: 現在、署名・公証を行っていません。初回は「開発元を検証できません」と表示されるので、**アプリを右クリック →「開く」**で起動してください（次回以降は通常どおり起動できます）。
+- **macOS**: zip を展開すると `ThundokuShelf.app` が出てきます（Applications に移すと Launchpad からも起動できます）。現在、署名・公証を行っていません。初回は「開発元を検証できません」と表示されるので、**アプリを右クリック →「開く」**で起動してください（次回以降は通常どおり起動できます）。
 
 ## 使い方
 
