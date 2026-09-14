@@ -264,6 +264,10 @@ impl AppState {
 
     /// Test-only initialization: in-memory DB, no keyring.
     pub fn init_test(cx: &mut App) {
+        // テストは BookshelfView::new → 所有者フィルタ → db_key() の経路で
+        // keychain に到達するため、メモリバックエンドにして触らないようにする
+        // （開発機の許可ダイアログ／CI でのアイテム作成を避ける）。
+        SecretStore::use_memory_backend();
         // sqlx のメモリ DB プール（1 接続固定で同一メモリを共有）＋マイグレーション適用
         let db_pool = thundoku_core::db::block_on(async {
             let options = sqlx::sqlite::SqliteConnectOptions::new()
