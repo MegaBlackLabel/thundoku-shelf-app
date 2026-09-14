@@ -6,6 +6,25 @@
 
 ### Added
 
+- **GitHub ログイン + レポート（Issue 投稿）**: サイドバーの「設定」の上に「レポート」を出し
+  （GitHub ログイン時のみ）、アプリからこのプロジェクトの Issue を立てられるようにした
+  - 認証は **OAuth Device Flow**（RFC 8628）。デスクトップアプリにクライアントシークレットを
+    置けない（GitHub が禁じている）ため `client_id` だけで完結する方式を採用。
+    `DEFAULT_GITHUB_CLIENT_ID`（`THUNDOKU_GITHUB_CLIENT_ID` で上書き可）のみ埋め込み、
+    **secret は一切保持しない**
+  - トークンは keyring（`USER_GITHUB`）に保存して起動時に復元する。**OAuth App 側で
+    Device Flow の有効化が必要**（未設定だと `device_flow_disabled`）
+  - レポート画面: テンプレート（`.github/ISSUE_TEMPLATE/*.yml` を Contents API で取得）を
+    選ぶとタイトルと本文が埋まり、タイトル・本文（複数行）を編集して画像を添付し、送信で
+    Issue を作成する。投稿先は設定 `report.target_repo`
+    （既定 `MegaBlackLabel/thundoku-shelf-app`、`owner/repo` と URL 形式を受け付ける）
+  - 画像は `uploads.github.com/user-attachments/assets`（`gh` CLI と同じ内部 API）で上げて
+    本文に `![](url)` を挿入する。**write 権限が無いリポジトリでは画像なしで投稿できる**
+    （`data:` URI は GitHub のサニタイザで除去されるため使えない）
+  - スコープは `public_repo` のみ。**private リポジトリには投稿できない**（エラー文言に明記）
+  - 実測（本番 GitHub に対して実装コードで通した）: Device Flow → `GET /user` →
+    `repository_id` → 画像アップロード（201）→ Issue 作成（201、本文の画像は署名付き
+    `private-user-images` に書き換わって表示される）
 - 本棚リスト表示を行の 4 列レイアウトに改修:
   - **表紙と情報列を固定サイズ**（表紙 162x108 / 情報列 320px）にし、行の高さが内容で
     変わってもテキスト開始 X が全行で揃うようにした（旧: 表紙が行の高さに追従して

@@ -453,6 +453,43 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
   削除は両方向とも伝播しない
 - 暗号化 pack は Google の `sub` で復号（未ログインならログイン誘導）
 
+### GitHub / レポート（Issue 投稿）
+
+アプリから GitHub の Issue を立てる導線。**GitHub にログインしているときだけ**サイドバーの
+「設定」の上に「レポート」が出る。
+
+- **認証**: OAuth **Device Flow**（RFC 8628）。デスクトップアプリにクライアントシークレットを
+  置けない（GitHub はクライアントサイドのコードに secret を置くことを禁じている）ため、
+  `client_id` だけで完結するこの方式だけを使う
+  - 埋め込むのは `DEFAULT_GITHUB_CLIENT_ID` のみ（ビルド時に `THUNDOKU_GITHUB_CLIENT_ID` で
+    上書きできる）。**secret は一切持たない**
+  - 流れ: `POST https://github.com/login/device/code` でコード取得 → 画面にコードを出して
+    既定ブラウザで `https://github.com/login/device` を開く → `POST /login/oauth/access_token`
+    を `interval` 秒間隔でポーリング（`slow_down` は +5 秒、`expired_token` はやり直し）
+  - トークンは keyring（`USER_GITHUB`）に保存し、起動時に復元する。**OAuth App 側で
+    Device Flow を有効化**しておく必要がある（未設定だと `device_flow_disabled` で失敗する）
+- **スコープは `public_repo`**: 公開リポジトリへの Issue 作成と画像添付に必要な最小限。
+  **private リポジトリには投稿できない**（`public_repo` では private リポジトリが見えず、
+  投稿先に指定すると「見つかりません」になる）
+- **テンプレート**: `.github/ISSUE_TEMPLATE/*.yml`（issue form）を Contents API で取得し、
+  `name` / `title` / `labels` / `body[]`（label / placeholder / required）を解釈して
+  レポート画面のフォームに流し込む（`config.yml` は除外）
+  - GitHub 側に「テンプレートを適用して投稿する」API は無い（GraphQL `issueTemplate` は
+    ラベル / 担当者のみで本文は埋まらない。実測では `.yml` は `NOT_FOUND`）ため、本文は
+    クライアント側で組み立てる（`compose_body`）
+- **画像添付**: `POST https://uploads.github.com/user-attachments/assets`（`gh` CLI が使う
+  内部 API）で `https://github.com/user-attachments/assets/<uuid>` を得て、本文に
+  `![file](url)` を挿入する。**対象リポジトリへの write 権限が必要**（無いと 404）
+  - 失敗しても投稿は続けられる（「画像を添付できませんでした（本文のみで投稿できます）」）
+  - `data:` URI は GitHub の Markdown サニタイザで `src` ごと除去されるため使えない（実測）
+- **投稿先**: 設定 `report.target_repo`（既定 `MegaBlackLabel/thundoku-shelf-app`）。
+  `owner/repo` と `https://github.com/owner/repo` の両形式を受け付ける
+- **送信**: UI スレッドでは HTTP を叩かない（背景タスク + `cx.spawn`）。成功で Issue の URL を
+  通知に出す。失敗は種別ごとの日本語（権限 / Issue 無効 / 見つからない / 画像不可 / 通信 /
+  認証）を画面に赤字で表示する
+- **制約**: レート制限（認証済み 5,000 req/hour、コンテンツ生成の二次制限）に当たると 403 / 429。
+  Issue 作成が `COLLABORATORS_ONLY` に制限されたリポジトリでは第三者が作成できない
+
 ### Zenn タグ
 
 - 起動時に 1 回、プロセス内キャッシュで取得（タイムアウト付き）

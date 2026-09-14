@@ -1,0 +1,83 @@
+name: 不具合報告
+description: アプリが期待どおりに動かないときはこちら
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        報告ありがとうございます。書く前に [既存の Issue を検索](https://github.com/MegaBlackLabel/thundoku-shelf-app/issues?q=is%3Aissue) して、同じ内容が無いか確認してください。
+
+        アプリの「レポート」画面から送ると、この下書きが入力済みの状態で開きます。
+  - type: textarea
+    id: summary
+    attributes:
+      label: 概要
+      description: 何が起きましたか？ スクリーンショットがあると分かりやすいです。
+      placeholder: 本棚のリスト表示でスクロールが引っかかる
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順
+      description: 同じ問題をもう一度起こす手順を書いてください（分かる範囲で構いません）。
+      placeholder: |
+        1. 本棚を開く
+        2. 表示をリストに切り替える
+        3. スクロールする
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 現在の動作と、期待する動作
+      placeholder: |
+        現在: スクロールが途中で引っかかる
+        期待: カード表示と同じように滑らかに動く
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: アプリのバージョン
+      description: 設定画面の下部、または起動時のログで確認できます。
+      placeholder: 0.0.2
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - その他
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: ログ（任意）
+      description: |
+        起動時のログやエラーが出ていれば貼ってください。
+        ⚠️ **API キー・トークン・Cookie などの秘密情報が含まれていないか確認してから**貼ってください。
+      value: |
+        <details><summary>ログ</summary>
+
+        ```
+        （ここに貼る）
+        ```
+
+        </details>
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: 補足（スクリーンショットなど）
+      description: 画像はここにドラッグ&ドロップできます。
+    validations:
+      required: false
