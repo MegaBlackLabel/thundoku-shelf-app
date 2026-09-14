@@ -712,6 +712,24 @@ impl Workspace {
         cx.notify();
     }
 
+    /// メニューの「終了」から終了する（`QuitApp` アクションのハンドラ）。
+    ///
+    /// ウィンドウを閉じる場合と同じアップロード確認を出す。ただし起動時の Drive
+    /// 復元確認（`show_restore_prompt`）が表示中のときは、ローカル（旧/空）で
+    /// Drive を上書きしないよう確認を出さずに終了する（確認ダイアログ自体が
+    /// `show_restore_prompt` 中は描画されないため、ここで分岐しないと「終了を
+    /// 押しても何も起きない」になる）。
+    pub fn quit_from_menu(&mut self, cx: &mut Context<Self>) {
+        if self.restore_prompt_active() {
+            AppState::global(cx)
+                .exit_checked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            cx.quit();
+            return;
+        }
+        self.request_exit_upload_check(cx);
+    }
+
     /// 指定プロバイダの認証モーダルを開く。`dispatch_action` を使わず直接 state を
     /// 更新する（RefCell 再入で固まるのを回避）。設定画面のログインボタンから呼ばれる。
     pub fn open_auth(
@@ -1105,6 +1123,7 @@ impl Workspace {
         reg!(crate::actions::ToggleSidebar, |this, cx| this
             .toggle_sidebar(cx));
         reg!(crate::actions::ToggleTheme, |this, cx| this.cycle_theme(cx));
+        reg!(crate::actions::QuitApp, |this, cx| this.quit_from_menu(cx));
         reg!(crate::actions::ShowBookshelf, |this, cx| {
             this.switch_to(NavTarget::Bookshelf, cx);
             this.sidebar_open = true;
@@ -2447,6 +2466,25 @@ mod tests {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         cx.new(Workspace::new)
+    }
+
+    /// メニューの「終了」（`QuitApp`）で終了確認（アップロードの確認）が出ること。
+    ///
+    /// アクションが未登録だと何も起きず、macOS のメニューから終了できない。
+    #[gpui_kit::test]
+    async fn quit_app_action_opens_exit_prompt(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        assert!(
+            !ws.read_with(cx, |w, _| w.exit_upload_prompt),
+            "初期状態では確認ダイアログは出ていない"
+        );
+        cx.update(|cx| {
+            cx.dispatch_action(&crate::actions::QuitApp);
+        });
+        assert!(
+            ws.read_with(cx, |w, _| w.exit_upload_prompt),
+            "終了でアップロード確認が表示されること"
+        );
     }
 
     #[gpui_kit::test]
