@@ -482,8 +482,9 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
   `![file](url)` を挿入する。**対象リポジトリへの write 権限が必要**（無いと 404）
   - 失敗しても投稿は続けられる（「画像を添付できませんでした（本文のみで投稿できます）」）
   - `data:` URI は GitHub の Markdown サニタイザで `src` ごと除去されるため使えない（実測）
-- **投稿先**: 設定 `report.target_repo`（既定 `MegaBlackLabel/thundoku-shelf-app`）。
-  `owner/repo` と `https://github.com/owner/repo` の両形式を受け付ける
+- **投稿先**: `MegaBlackLabel/thundoku-shelf-app` に**固定**（画面に「このリポジトリの Issue に
+  投稿します（変更できません）」と表示する）。宛先を利用者が差し替えられると、誘導された
+  利用者に別のリポジトリへ文面とスクリーンショットを送らせる余地になるため
 - **送信**: UI スレッドでは HTTP を叩かない（背景タスク + `cx.spawn`）。成功で Issue の URL を
   通知に出す。失敗は種別ごとの日本語（権限 / Issue 無効 / 見つからない / 画像不可 / 通信 /
   認証）を画面に赤字で表示する

@@ -1,56 +1,74 @@
-# Thundoku Shelf Desktop
+# Thundoku Shelf
 
-技術書典・BOOTH で購入した本の管理・閲覧のためのデスクトップアプリ。
-Rust + [GPUI](https://github.com/zed-industries/zed)（+ gpui-component）で実装。
-詳細な機能説明・注意点は [docs](docs/) を参照。
+技術書典・BOOTH・FANZA同人・DLsite で購入した同人誌を、デスクトップで管理・閲覧するアプリです。
 
-## 機能
+> **これはアルファ版です。** 開発中で、予告なく仕様が変わったり、データの互換性が壊れたりすることがあります。大切なデータは Google Drive へのバックアップを併用してください。
 
-- **本棚** — カードグリッド（仮想化）・リスト表示、サイト/タグ/イベント/読了/
-  お気に入りフィルタ、検索、キーボード選択（`hjkl` / 矢印 / `Enter`）
-- **リーダー** — 単一 / 見開き / スクロールの 3 モード、ズーム（ダブルクリックで
-  2 倍 -> 6 倍 -> 解除）、慣性付きパン、読書進捗・閲覧履歴の記録、
-  libwebp による高速デコード（詳細: [docs/features.md](docs/features.md)）
-- **チェックリスト** — イベント・サークル管理、試し読み
-- **同期** — 技術書典（直接ログイン）、Google Drive（.opfspack 双方向同期）、
-  Zenn タグ
-- **認証** — 技術書典サイト直接ログイン、Google OAuth（PKCE + ループバック）、
-  トークンは macOS キーチェーン（keyring）に保存
+> **対象は購入済み・DRM の無い（非DRM）同人誌のみ**です。購入していないコンテンツや、DRM で保護されたコンテンツは取り込めません。
 
-## ビルド / 実行
+## ダウンロードとインストール
 
-依存: [mise](https://mise.jdx.dev/)、Rust 1.97+
+[Releases](https://github.com/MegaBlackLabel/thundoku-shelf-app/releases) からお使いの OS の zip をダウンロードして、展開して起動してください（インストーラーはありません）。
 
-```sh
-mise install          # 依存ツールチェーン
-mise run build        # ビルド
-mise run run          # アプリ起動
-mise run test         # 全テスト
-mise run lint         # clippy
-```
+| OS | ファイル |
+|---|---|
+| Windows (x64) | `thundoku-shelf-x86_64-windows.zip` |
+| macOS (Apple Silicon) | `thundoku-shelf-aarch64-macos.zip` |
+| macOS (Intel) | `thundoku-shelf-x86_64-macos.zip` |
 
-### Windows の PDF レンダリング（pdfium.dll）
+- **Windows**: 展開したフォルダに `pdfium.dll`（PDF 表示用）が入っています。**exe と同じフォルダに置いたまま**使ってください。初回起動時に SmartScreen の警告が出たら「詳細情報」→「実行」で進めます。
+- **macOS**: 現在、署名・公証を行っていません。初回は「開発元を検証できません」と表示されるので、**アプリを右クリック →「開く」**で起動してください（次回以降は通常どおり起動できます）。
 
-Windows では PDF のレンダリングに PDFium（Apache-2.0）を使います。`pdfium.dll` を
-動的ロードするため、実行時は exe と同じフォルダ（またはカレントディレクトリ）に
-`pdfium.dll` を配置してください（PDF を取り込むときのみ必要）。
+## 使い方
 
-```sh
-# pdfium.dll（pdfium_7881 に対応する chromium/7881）を取得して配置
-curl -fL -o pdfium.zip \
-  https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-win-x64.tgz
-tar -xzf pdfium.zip && cp bin/pdfium.dll .
-```
+1. 起動すると本棚が開きます（初回は空です）
+2. **サイドバー下部のアカウント**から、購入元のストアにログインします
+3. 本棚の**同期**ボタンで購入本を取り込みます（表紙や書籍ファイルのダウンロードが始まります）
+4. 本をクリックするとビューアーで開きます。右クリックメニューからお気に入り・タグ・付箋などを操作できます
 
-## ドキュメント
+## 主な機能
 
-- [docs/features.md](docs/features.md) — 実装機能と注意点（ビューアー周り含む）
-- [docs/database.md](docs/database.md) — DB スキーマ構成
+- **本棚** — カード / リスト表示の切り替え、ストア・タグ・イベント・読書状態（未読 / 読書中 / 読了）・お気に入りでの絞り込み、検索、並び替え（購入日 / 発売日 / タイトル / 最終閲覧日 / 閲覧回数 / 閲覧時間 / サイズ）、キーボード操作（矢印 / `hjkl` / `Enter`）
+- **ビューアー** — 単一ページ / 見開き / スクロールの 3 モード。ダブルクリックでズーム（2x → 6x → 解除）、ドラッグで移動
+- **付箋** — ページ単位のメモ。付箋画面から一覧して、そのページで開き直せます
+- **閲覧履歴・読書統計** — いつ・何回・どれだけ読んだかを記録します
+- **チェックリスト** — 技術書典のイベント・サークルの確認（技術書典専用）
+- **ダウンロード管理** — 未取得の本だけを取り込み、進捗を表示
+- **ストアからの取り込み** — 技術書典 / BOOTH / FANZA同人 / DLsite に対応（ストアごとにログインして同期）
+- **自動タグ生成** — 取り込んだ本の情報からタグを生成（技術書典専用）
+- **Google Drive バックアップ** — Google でログインすると、本棚の DB と画像を Google Drive にバックアップ・同期できます（複数端末での共有も可）
+- **レポート（GitHub Issue）** — GitHub でログインすると、サイドバーの「設定」の上に「レポート」が出ます。不具合や要望をテンプレート付きの画面からそのまま Issue として送信できます（画像の添付もできます）
 
-## データ
+## データの保存場所
 
-データは `~/Library/Application Support/thundoku-shelf/` に保存されます
-（SQLite + .opfspack + 表紙キャッシュ）。
+購入履歴・書籍ファイル・表紙などは、すべて**お使いの PC の中**に保存されます。
+
+| OS | 場所 |
+|---|---|
+| Windows | `%APPDATA%\thundoku-shelf\` |
+| macOS | `~/Library/Application Support/thundoku-shelf/` |
+
+- アプリが外部と通信するのは、**各ストアへのログイン・同期**（技術書典 / BOOTH / FANZA同人 / DLsite）、**Google Drive へのバックアップ**、**GitHub へのレポート送信**のときです（ほかに、タグ生成のために Zenn のタグ一覧を参照します）。アクセス解析・広告・利用状況の送信はありません
+- 保存先は設定画面から変更できます（バックアップの対象にもなります）
+
+## 困ったときは
+
+- **不具合・要望の報告**: アプリの「レポート」機能（GitHub ログインが必要）から送るか、[Issues](https://github.com/MegaBlackLabel/thundoku-shelf-app/issues/new/choose) へどうぞ。Issue テンプレートを用意しています
+- **バージョンの確認**: 「このアプリについて」画面の下部に出ています
+- **機能の詳細と既知の制約**: [docs/features.md](docs/features.md)
+
+## 既知の制約
+
+- **アルファ版です**。仕様変更やデータの非互換が起こりえます（バックアップの併用を推奨）
+- 対象は購入済み・非DRM の同人誌のみです（DRM 付きのコンテンツは取り込めません）
+- Google ログインはバックアップ用です。**書籍を読むのにログインは不要**です
+- 「レポート」の画像添付は、投稿先リポジトリへの書き込み権限が必要です。権限が無い場合は本文のみで送信できます
+- レポートの投稿先はこのアプリのリポジトリ（`MegaBlackLabel/thundoku-shelf-app`）に固定です
+- macOS 版は署名・公証を行っていません（起動方法は「ダウンロードとインストール」を参照）
+
+## 開発者向け
+
+実装の詳細・設計メモ・DB スキーマは [docs/](docs/) にあります。ビルドやテストはリポジトリの `.mise.toml` のタスク（`mise run build` / `mise run test` / `mise run lint`）を使ってください。
 
 ## ライセンス
 

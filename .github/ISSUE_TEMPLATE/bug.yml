@@ -41,8 +41,8 @@ body:
     id: version
     attributes:
       label: アプリのバージョン
-      description: 設定画面の下部、または起動時のログで確認できます。
-      placeholder: 0.0.2
+      description: 「このアプリについて」画面の下部、または起動時のログで確認できます。
+      placeholder: 0.2.0
     validations:
       required: true
   - type: dropdown

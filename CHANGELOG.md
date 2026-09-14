@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-15
+
 ### Added
 
 - **GitHub ログイン + レポート（Issue 投稿）**: サイドバーの「設定」の上に「レポート」を出し
@@ -16,8 +18,9 @@
     Device Flow の有効化が必要**（未設定だと `device_flow_disabled`）
   - レポート画面: テンプレート（`.github/ISSUE_TEMPLATE/*.yml` を Contents API で取得）を
     選ぶとタイトルと本文が埋まり、タイトル・本文（複数行）を編集して画像を添付し、送信で
-    Issue を作成する。投稿先は設定 `report.target_repo`
-    （既定 `MegaBlackLabel/thundoku-shelf-app`、`owner/repo` と URL 形式を受け付ける）
+    Issue を作成する。**投稿先はこのアプリのリポジトリ（`MegaBlackLabel/thundoku-shelf-app`）
+    に固定**する（宛先を利用者が差し替えられると、誘導された利用者に別のリポジトリへ文面と
+    スクリーンショットを送らせる余地になるため）
   - 画像は `uploads.github.com/user-attachments/assets`（`gh` CLI と同じ内部 API）で上げて
     本文に `![](url)` を挿入する。**write 権限が無いリポジトリでは画像なしで投稿できる**
     （`data:` URI は GitHub のサニタイザで除去されるため使えない）
@@ -25,6 +28,9 @@
   - 実測（本番 GitHub に対して実装コードで通した）: Device Flow → `GET /user` →
     `repository_id` → 画像アップロード（201）→ Issue 作成（201、本文の画像は署名付き
     `private-user-images` に書き換わって表示される）
+  - 画像は 1 件 10MB まで。alt に使うファイル名は Markdown を壊さないようサニタイズする
+  - トークンの失効（401）はログインをやり直せる状態に戻し、回数制限（429 / `Retry-After` 付き
+    403）は待ち時間を画面に出す。keyring の読み書きは背景で行い、OS の応答待ちで UI を固めない
 - 本棚リスト表示を行の 4 列レイアウトに改修:
   - **表紙と情報列を固定サイズ**（表紙 162x108 / 情報列 320px）にし、行の高さが内容で
     変わってもテキスト開始 X が全行で揃うようにした（旧: 表紙が行の高さに追従して
@@ -181,6 +187,15 @@
   1 行でも多く本を表示するため）
 
 ### Fixed
+- **Google のトークンが失効したときの復帰**: リフレッシュトークンが取り消し・失効している
+  （`invalid_grant`）と、Drive 同期が `token endpoint status 400: {"error":"invalid_grant"…}` の
+  ような**生の応答をそのまま画面に出して**、以降も同じ失敗を繰り返していた。失効を型
+  （`GoogleError::RefreshTokenRevoked`）として扱い、画面には日本語の案内
+  （「Google のログインが無効になりました…もう一度ログインしてください」）を出し、保存済みの
+  失効トークン（メモリ + keyring）を破棄して Google ログインの導線を自動で開くようにした。
+  なお、この導線は認証モーダルを `Workspace::open_auth` 経由で開く（`dispatch_action` は
+  WebView 作成時にウィンドウの RefCell を再入して**アプリが固まる**ため。既存の
+  「identity required」の導線も同じ経路に直した）
 - 仕様書の作成中に見つかった不整合を修正: **並び替えの永続化**（`bookshelf.sort_field` /
   `bookshelf.sort_ascending` に保存し起動時に復元）/ **タグ絞り込みが未ダウンロード本に効かない**
   （本棚アイテムの `tags_json` も対象に）/ **見開きの滞在時間が 2 倍に計上**（左右へ均等配分）/
@@ -211,7 +226,7 @@
   WebView ごと残っていたのを `WeakEntity` 化
 - 履歴テストが**実行時刻（ローカル深夜）で落ちる**問題を、日付に依存しない形に修正
 
-## [0.1.0] - 2026-08-27
+## [0.0.1] - 2026-08-27
 
 ### Added
 

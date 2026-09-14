@@ -3,6 +3,7 @@
 //! Web 版の記載（ブラウザアプリ・OPFS・PWA インストール・Cookie セッション）
 //! はネイティブアプリの実態に合わせて修正してある。
 
+use gpui_kit::InteractiveElement as _;
 use gpui_kit::Styled as _;
 use gpui_kit::StyledImage as _;
 use gpui_kit::component::ActiveTheme as _;
@@ -186,6 +187,18 @@ impl Render for AboutView {
                                             .child(
                                                 "ネットで購入した同人誌を管理・閲覧するためのデスクトップアプリ",
                                             ),
+                                    )
+                                    // 不具合報告でバージョンを書いてもらうため、ここに出す
+                                    // （`.github/ISSUE_TEMPLATE/bug.yml` が案内している）。
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "about-version".into())
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child(concat!(
+                                                "バージョン ",
+                                                env!("CARGO_PKG_VERSION")
+                                            )),
                                     ),
                             ),
                     )
@@ -620,6 +633,7 @@ impl Render for AboutView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::AppContext as _;
 
     fn description(title: &str) -> &'static str {
         FEATURES
@@ -718,6 +732,36 @@ mod tests {
         assert!(
             LOGIN_SECTION_TITLE.contains("ストア"),
             "ログイン手順の見出しが技術書典限定のまま: {LOGIN_SECTION_TITLE}"
+        );
+    }
+
+    /// バージョンを画面に出すこと。
+    ///
+    /// `.github/ISSUE_TEMPLATE/bug.yml` が「「このアプリについて」画面の下部で確認できます」と
+    /// 案内しているので、ここが消えると利用者がバージョンを書けなくなる。
+    #[gpui_kit::test]
+    async fn about_shows_the_version(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        let view = cx.new(AboutView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(1400.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        assert!(
+            visual.debug_bounds("about-version").is_some(),
+            "バージョン表示が出ていない（不具合報告のテンプレートが案内している）"
         );
     }
 }
