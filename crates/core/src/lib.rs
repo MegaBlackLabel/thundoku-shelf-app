@@ -4,6 +4,7 @@ pub mod db;
 pub mod dlsite;
 pub mod drive;
 pub mod fanza;
+pub mod github;
 pub mod google;
 pub mod import;
 pub mod owner;

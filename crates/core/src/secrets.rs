@@ -55,6 +55,8 @@ fn cache_remove(key: &str) {
 pub const SERVICE: &str = "com.megablacklabel.thundoku-shelf";
 pub const USER_TECHBOOKFEST: &str = "techbookfest";
 pub const USER_GOOGLE: &str = "google";
+/// GitHub（レポート機能のログイン）のアクセストークンの保存キー。
+pub const USER_GITHUB: &str = "github";
 /// BOOTH（booth.pm）のセッション Cookie の保存キー。
 pub const USER_BOOTH: &str = "booth";
 /// `books.owner_sub` 暗号化用のローカル鍵（keyring）。
