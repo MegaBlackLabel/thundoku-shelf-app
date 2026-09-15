@@ -19,9 +19,16 @@
 | macOS (Intel) | `thundoku-shelf-x.y.z-x86_64-macos.zip` |
 
 - **Windows**: 展開したフォルダに `pdfium.dll`（PDF 表示用）が入っています。**exe と同じフォルダに置いたまま**使ってください。初回起動時に SmartScreen の警告が出たら「詳細情報」→「実行」で進めます。
-- **macOS**: zip を展開すると `ThundokuShelf.app` が出てきます（Applications に移すと Launchpad からも起動できます）。署名・公証を行っていないため、初回は Gatekeeper に止められます。**macOS 15 (Sequoia) 以降は「右クリック → 開く」の抜け道が廃止された**ので、次のどちらかで起動してください。
+- **macOS**: zip を展開すると `ThundokuShelf.app` が出てきます（Applications に移すと Launchpad からも起動できます）。署名・公証を行っていないため、初回は Gatekeeper に止められます。**macOS 15 (Sequoia) 以降は、右クリック →「開く」が Gatekeeper の回避として機能しません**（メニューには出ますが効きません）。次のいずれかで起動してください。
   - アプリをダブルクリック → 警告が出たら「完了」→ **システム設定 →「プライバシーとセキュリティ」→「このまま開く」**（失敗から約 1 時間以内に表示されます）
-  - ターミナルで `xattr -dr com.apple.quarantine /Applications/ThundokuShelf.app`（`curl` などブラウザ以外で落とした zip はそもそも隔離されません）
+  - ターミナルで `xattr -dr com.apple.quarantine /Applications/ThundokuShelf.app`
+  - 最初から隔離させない場合は、ブラウザではなくターミナルで落とす（隔離属性が付かず Gatekeeper の判定自体が走りません。`x.y.z` と `arch` は実際の値に置き換え）
+
+    ```sh
+    curl -fL -o /tmp/t.zip https://github.com/MegaBlackLabel/thundoku-shelf-app/releases/download/vx.y.z/thundoku-shelf-x.y.z-arch-macos.zip
+    ditto -x -k /tmp/t.zip /Applications/
+    open /Applications/ThundokuShelf.app
+    ```
 
 ## 使い方
 
