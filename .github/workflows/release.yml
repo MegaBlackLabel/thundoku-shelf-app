@@ -94,8 +94,15 @@ jobs:
           # 「壊れているため開けません」と判定しうる。Team ID は無いので ad-hoc（-）で署名する
           codesign --force --sign - "$APP"
           codesign --verify --strict --verbose=2 "$APP"
+          # 初回起動は Gatekeeper に止められるので、起動方法を書いた txt も同梱する
+          STAGE="target/${{ matrix.target }}/release/dist"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/ThundokuShelf.app"
+          cp packaging/macos/はじめにお読みください.txt "$STAGE/"
           # ditto でバンドル構造（権限・リソース）を保ったまま zip 化する
-          ditto -c -k --keepParent "$APP" "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
+          # --keepParent は付けない = zip 直下に .app と txt が並ぶ
+          ditto -c -k "$STAGE" "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
