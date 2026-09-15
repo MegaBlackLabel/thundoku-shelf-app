@@ -22,12 +22,20 @@
 - **macOS**: zip を展開すると `ThundokuShelf.app` が出てきます（Applications に移すと Launchpad からも起動できます）。署名・公証を行っていないため、初回は Gatekeeper に止められます。**macOS 15 (Sequoia) 以降は、右クリック →「開く」が Gatekeeper の回避として機能しません**（メニューには出ますが効きません）。次のいずれかで起動してください。
   - アプリをダブルクリック → 警告が出たら「完了」→ **システム設定 →「プライバシーとセキュリティ」→「このまま開く」**（失敗から約 1 時間以内に表示されます）
   - ターミナルで `xattr -dr com.apple.quarantine /Applications/ThundokuShelf.app`
-  - 最初から隔離させない場合は、ブラウザではなくターミナルで落とす（隔離属性が付かず Gatekeeper の判定自体が走りません。`x.y.z` と `arch` は実際の値に置き換え）
+  - 最初から隔離させない場合は、ブラウザではなくターミナルで落とす（隔離属性が付かず Gatekeeper の判定自体が走りません。`x.y.z` と `arch` は実際の値に置き換え。`~/Applications` なら管理者権限は不要、`/Applications` でも構いません）
 
     ```sh
+    mkdir -p ~/Applications
     curl -fL -o /tmp/t.zip https://github.com/MegaBlackLabel/thundoku-shelf-app/releases/download/vx.y.z/thundoku-shelf-x.y.z-arch-macos.zip
-    ditto -x -k /tmp/t.zip /Applications/
-    open /Applications/ThundokuShelf.app
+    shasum -a 256 /tmp/t.zip   # 下のコマンドが出す digest と一致することを確認
+    ditto -x -k /tmp/t.zip ~/Applications/
+    open ~/Applications/ThundokuShelf.app
+    ```
+
+    整合性の確認（`vx.y.z` は実際のタグ）:
+
+    ```sh
+    curl -s https://api.github.com/repos/MegaBlackLabel/thundoku-shelf-app/releases/tags/vx.y.z | grep -o 'sha256:[0-9a-f]\{64\}'
     ```
 
 ## 使い方
