@@ -19,7 +19,9 @@
 | macOS (Intel) | `thundoku-shelf-x.y.z-x86_64-macos.zip` |
 
 - **Windows**: 展開したフォルダに `pdfium.dll`（PDF 表示用）が入っています。**exe と同じフォルダに置いたまま**使ってください。初回起動時に SmartScreen の警告が出たら「詳細情報」→「実行」で進めます。
-- **macOS**: zip を展開すると `ThundokuShelf.app` が出てきます（Applications に移すと Launchpad からも起動できます）。現在、署名・公証を行っていません。初回は「開発元を検証できません」と表示されるので、**アプリを右クリック →「開く」**で起動してください（次回以降は通常どおり起動できます）。それでも開けない場合は、展開したフォルダで `xattr -cr ThundokuShelf.app` を実行してから再度開いてください（ダウンロード時に付く隔離属性を外します）。
+- **macOS**: zip を展開すると `ThundokuShelf.app` が出てきます（Applications に移すと Launchpad からも起動できます）。署名・公証を行っていないため、初回は Gatekeeper に止められます。**macOS 15 (Sequoia) 以降は「右クリック → 開く」の抜け道が廃止された**ので、次のどちらかで起動してください。
+  - アプリをダブルクリック → 警告が出たら「完了」→ **システム設定 →「プライバシーとセキュリティ」→「このまま開く」**（失敗から約 1 時間以内に表示されます）
+  - ターミナルで `xattr -dr com.apple.quarantine /Applications/ThundokuShelf.app`（`curl` などブラウザ以外で落とした zip はそもそも隔離されません）
 
 ## 使い方
 
