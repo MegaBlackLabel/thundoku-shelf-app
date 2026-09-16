@@ -362,6 +362,13 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
     // 上げない。空の所有集合でエクスポートすると、Drive 上の既存バックアップを
     // 「本を含まない内容」で置き換えてしまい、復元手段を失うため。
     let can_backup_db = identity_sub.is_some() && owner_key.is_some();
+    if db_path.is_some() && !can_backup_db {
+        // 無言でスキップすると「アップロードしたつもり」のまま終了してしまう
+        // （次回起動で毎回復元確認が出る原因になる）。
+        log::warn!(
+            "drive sync: 所有者（Google ログイン / 暗号鍵）が不明なため DB バックアップをスキップ"
+        );
+    }
     if db_path.is_some() && can_backup_db {
         let json = crate::db::backup::export_json(pool, Some(&upload_ids))?;
         let bytes = json.into_bytes();

@@ -155,6 +155,24 @@ fn restore_github_token(secrets: &SecretStore) -> (GithubClient, bool) {
     (client, logged_in)
 }
 
+/// 保存済みの Google プロフィール（`sub` 等）を keyring から復元する（起動時に呼ぶ）。
+///
+/// プロフィールはネットワーク（`userinfo`）でしか取れないが、`sub` は所有者
+/// （`books.owner_sub`）の判定に使う。起動直後に sub が無いと、Drive バックアップの
+/// 所有者フィルタを組めず、終了時のアップロードが丸ごとスキップされ、起動のたびに
+/// 「復元しますか」が出る（Drive 側は所有者で絞られた古いバックアップのため）。
+fn restore_google_profile(secrets: &SecretStore) -> Option<thundoku_core::google::GoogleProfile> {
+    let profile = thundoku_core::google::saved_profile(secrets);
+    log::info!(
+        "google profile: 起動時復元 = {}",
+        match &profile {
+            Some(profile) => format!("あり（sub={}）", profile.sub),
+            None => "なし".to_string(),
+        }
+    );
+    profile
+}
+
 impl AppState {
     /// Initialize from the real data directory and the OS keyring.
     pub fn init(cx: &mut App) {
@@ -213,7 +231,10 @@ impl AppState {
                 {
                     client.restore_tokens(tokens);
                 }
-                None // profile is fetched on demand; presence is tracked in UI
+                // `sub` は所有者判定（本棚の絞り込み・Drive バックアップの所有者フィルタ）に
+                // 使うため、保存済みプロフィールを起動時に復元する。表示用の email 等が
+                // 古くても実害は無く、設定画面を開けば取得し直す。
+                restore_google_profile(&secrets)
             } else {
                 None
             };
@@ -351,6 +372,9 @@ impl AppState {
                 ))
             })),
             secrets,
+            // メモリバックエンドの keyring はプロセス内で共有されるため、テストでは
+            // 保存済みプロフィールを復元しない（復元すると所有者フィルタが全テストに
+            // 波及する）。復元経路は init_with_data_dir（本番）で検証する。
             google_profile: Arc::new(Mutex::new(None)),
             google_logged_in: Arc::new(Mutex::new(false)),
             google_login_error: Arc::new(Mutex::new(None)),
@@ -464,6 +488,49 @@ pub fn clear_github_token(cx: &App) -> Result<(), String> {
     delete_github_token_secret()?;
     clear_github_session(cx);
     Ok(())
+}
+
+/// Google プロフィール（`sub` 等）を keyring に保存する（**ブロッキング**）。
+///
+/// `sub` は所有者（`books.owner_sub`）の判定に使う。プロフィールは `userinfo` を
+/// 叩かないと取れないため、保存しておかないと次回起動で「誰の本か」が分からず、
+/// Drive バックアップのアップロードが丸ごとスキップされる。
+pub fn store_google_profile_secret(
+    profile: &thundoku_core::google::GoogleProfile,
+) -> Result<(), String> {
+    thundoku_core::google::save_profile(&SecretStore::new(), profile).map_err(|error| {
+        log::error!("google profile save failed: {error}");
+        "プロフィールを保存できませんでした（資格情報ストアを確認してください）".to_string()
+    })
+}
+
+/// メモリ上のプロフィールを更新する（keyring への保存が済んだ後に呼ぶ）。
+pub fn set_google_profile(cx: &App, profile: &thundoku_core::google::GoogleProfile) {
+    let state = AppState::global(cx);
+    *state.google_profile.lock() = Some(profile.clone());
+    *state.google_logged_in.lock() = true;
+    *state.google_login_error.lock() = None;
+    log::info!("google profile: 状態を更新（sub={}）", profile.sub);
+}
+
+/// Google プロフィールを keyring に保存し、メモリ上の状態を更新する（同期版）。
+///
+/// keyring の応答待ちで固まりうる（許可ダイアログ等）。保存に失敗してもメモリ上の
+/// 状態は更新する: ログイン自体は成功しており、保存できなかったのは「次回起動で
+/// 所有者を特定するための控え」だけなので、今のセッションを未ログイン扱いにはしない。
+pub fn save_google_profile(cx: &App, profile: &thundoku_core::google::GoogleProfile) {
+    if let Err(error) = store_google_profile_secret(profile) {
+        log::warn!("google profile: 保存に失敗（次回起動で sub を復元できない）: {error}");
+    }
+    set_google_profile(cx, profile);
+}
+
+/// Google からログアウトした状態にする（keyring の削除は呼び出し側で行う）。
+pub fn clear_google_profile(cx: &App) {
+    let state = AppState::global(cx);
+    *state.google_profile.lock() = None;
+    *state.google_logged_in.lock() = false;
+    log::info!("google profile: 状態をクリア");
 }
 
 /// アプリ全体の通知を出す（Workspace が gpui-kit の Notification に流す。既定 5 秒で自動消滅）。
@@ -654,6 +721,65 @@ mod tests {
             token_type: "bearer".to_string(),
             scope: "public_repo".to_string(),
         }
+    }
+
+    fn google_profile() -> thundoku_core::google::GoogleProfile {
+        thundoku_core::google::GoogleProfile {
+            sub: "sub-1".to_string(),
+            email: "user@example.com".to_string(),
+            name: "ユーザー".to_string(),
+            picture: None,
+        }
+    }
+
+    /// keyring に保存したプロフィール（sub）が起動時に復元されること。
+    ///
+    /// プロフィールは設定画面を開くまで取得されない（`userinfo` はネットワーク）ため、
+    /// 復元しないと起動直後の所有者判定（本棚の絞り込み・Drive バックアップの所有者
+    /// フィルタ）に sub が無い。Drive 側のバックアップは所有者で絞られているので、
+    /// 終了時のアップロードが丸ごとスキップされ、起動のたびに復元確認が出る。
+    #[gpui_kit::test]
+    async fn restores_google_profile_on_startup(cx: &mut gpui_kit::TestAppContext) {
+        // keyring には触らない（メモリバックエンドはプロセス内で共有されるが、
+        // プロフィールを読むのは本番の起動経路＝このテストだけ）
+        thundoku_core::secrets::SecretStore::use_memory_backend();
+        cx.update(gpui_kit::component::init);
+        let data_dir = std::env::temp_dir().join("thundoku-shelf-test/google-profile-startup");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        cx.update(|cx| AppState::init_with_data_dir(cx, data_dir.clone()));
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            thundoku_core::google::delete_saved_profile(&state.secrets);
+            assert!(
+                state.google_profile.lock().is_none(),
+                "保存前はプロフィールを持たない"
+            );
+            // プロフィール取得時（ログイン完了・設定画面を開いたとき）に保存される
+            thundoku_core::google::save_profile(&state.secrets, &google_profile())
+                .expect("保存できる");
+        });
+
+        // 次回起動相当（keyring から読み直す）
+        cx.update(|cx| AppState::init_with_data_dir(cx, data_dir.clone()));
+
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let restored = state
+                .google_profile
+                .lock()
+                .clone()
+                .expect("プロフィールが復元されていない");
+            assert_eq!(
+                restored.sub, "sub-1",
+                "所有者判定に使う sub が復元されていない"
+            );
+        });
+
+        // メモリバックエンドはプロセス内で共有されるため後始末する
+        cx.update(|cx| {
+            thundoku_core::google::delete_saved_profile(&AppState::global(cx).secrets);
+        });
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// keyring に保存済みの GitHub トークンが起動時に復元され、ログイン状態になる。

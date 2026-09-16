@@ -601,8 +601,13 @@ impl SettingsView {
             handle.update(cx, |this, cx| {
                 this.profile_fetching = false;
                 if let Some(profile) = profile {
-                    let state = AppState::global(cx);
-                    *state.google_profile.lock() = Some(profile);
+                    // keyring への保存はブロッキングなので背景で行う（UI を固めない）
+                    let to_store = profile.clone();
+                    cx.background_spawn(async move {
+                        let _ = crate::app_state::store_google_profile_secret(&to_store);
+                    })
+                    .detach();
+                    crate::app_state::set_google_profile(cx, &profile);
                     log::info!("google profile restored from stored tokens");
                 }
                 cx.notify();
@@ -669,16 +674,16 @@ impl SettingsView {
             if let Some(client) = state.google.lock().as_mut() {
                 client.logout();
                 log::info!("logout_google: client logout ({:?})", t.elapsed());
-                *state.google_profile.lock() = None;
-                *state.google_logged_in.lock() = false;
+                crate::app_state::clear_google_profile(cx);
                 // ログアウトで未ログインに戻るため、本棚を再フィルタするフラグを立てる。
                 AppState::global(cx)
                     .google_logout_done
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                // keyring の削除はバックグラウンドで行う
+                // keyring の削除はバックグラウンドで行う（プロフィールの控えも消す）
                 let store = state.secrets.clone();
                 cx.background_spawn(async move {
                     let _ = store.delete(secrets::USER_GOOGLE);
+                    thundoku_core::google::delete_saved_profile(&store);
                 })
                 .detach();
             }
@@ -835,15 +840,16 @@ impl SettingsView {
             if let Some(client) = state.google.lock().as_mut() {
                 client.logout();
             }
-            *state.google_profile.lock() = None;
-            *state.google_logged_in.lock() = false;
+            crate::app_state::clear_google_profile(cx);
             state
                 .google_logout_done
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            // 失効したトークンを keyring に残さない（削除は背景で、UI を固めない）
+            // 失効したトークンを keyring に残さない（削除は背景で、UI を固めない）。
+            // プロフィールの控えも消す（古い sub で所有者判定を続けない）。
             let store = state.secrets.clone();
             cx.background_spawn(async move {
                 let _ = store.delete(secrets::USER_GOOGLE);
+                thundoku_core::google::delete_saved_profile(&store);
             })
             .detach();
         }

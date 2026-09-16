@@ -158,6 +158,10 @@ impl Workspace {
         this.register_actions(cx);
         this.refresh_unread_count(cx);
         this.restore_theme_mode(cx);
+        // 保存済みプロフィールが無い場合（アップグレード直後）はここで取得しておく。
+        // 所有者（sub）が分からないと、終了時のバックアップがスキップされ、復元確認も
+        // 出せない（[`backup_owner_ids`] を参照）。
+        this.restore_google_profile(cx);
         this.check_startup_backup(cx);
         this.start_login_done_watcher(cx);
         this.start_checklist_poller(cx);
@@ -530,15 +534,6 @@ impl Workspace {
         let state = AppState::global(cx);
         let google = state.google.clone();
         let db = state.db_pool.clone();
-        // 復元確認の差分判定も所有者ベースに揃える（P3）。
-        let book_ids = {
-            let sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
-            let key = state.secrets.db_key().ok();
-            match (sub, key) {
-                (Some(sub), Some(key)) => db::books::owned_book_ids(&db, &key, Some(&sub)).ok(),
-                _ => None,
-            }
-        };
         let folder_id = {
             let current = db::settings::get(&db, "drive.sync.folder_id")
                 .ok()
@@ -554,6 +549,15 @@ impl Workspace {
             current
         };
         let Some(folder_id) = folder_id else {
+            return;
+        };
+        // 差分判定は所有者ベースで揃える。所有者（ログイン中の sub）が分からないときは
+        // 比較しない: Drive 側は所有者で絞られたバックアップなので、ローカル全件と
+        // 突き合わせると内容が同じでも必ず差分ありになり、起動のたびに復元確認が出る。
+        let Some(book_ids) = backup_owner_ids(state) else {
+            log::info!(
+                "startup backup check: 所有者（Google プロフィール）が未取得のため復元確認をスキップ"
+            );
             return;
         };
         let handle = cx.weak_entity();
@@ -573,7 +577,7 @@ impl Workspace {
                 &db,
                 &mut drive,
                 &folder_id,
-                book_ids.as_ref(),
+                Some(&book_ids),
             )
             .ok()?;
             if !has_diff {
@@ -700,7 +704,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 起動時の Drive バックアップ復元確認（show_restore_prompt）が表示中か。
+    /// 起動時の Drive 復元確認（`show_restore_prompt`）が表示中か。
     /// 終了判定（close ハンドラ）から参照するための公開アクセサ。
     pub fn restore_prompt_active(&self) -> bool {
         self.show_restore_prompt
@@ -838,7 +842,12 @@ impl Workspace {
             Ok(())
         });
         cx.spawn(async move |_window, cx| {
-            let _ = task.await;
+            // アップロードは best-effort（失敗しても終了する）が、無言で捨てない:
+            // 「アップロードしたつもり」のまま終了すると、次回起動で毎回復元確認が
+            // 出る原因を後から追えない。
+            if let Err(error) = task.await {
+                log::error!("exit upload failed: {error}");
+            }
             handle.update(cx, |this, cx| {
                 this.exit_uploading = false;
                 AppState::global(cx)
@@ -2402,6 +2411,17 @@ impl Workspace {
     }
 }
 
+/// 起動時の復元確認・終了時のアップロードで使う所有者集合（現在の Google アカウントの本）。
+///
+/// Drive 側の `thundoku-backup.json` は「アップロードした時点のアカウントに帰属する本」
+/// だけを含むため、比較・アップロードも同じ範囲で行う必要がある。プロフィール
+/// （`sub`）か暗号鍵が無ければ範囲を決められないので `None` を返す（＝所有者不明）。
+fn backup_owner_ids(state: &AppState) -> Option<std::collections::HashSet<String>> {
+    let sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone())?;
+    let key = state.secrets.db_key().ok()?;
+    db::books::owned_book_ids(&state.db_pool, &key, Some(&sub)).ok()
+}
+
 /// F11 用: 最大化⇔復元をトグルする。
 fn toggle_maximize(window: &mut Window) {
     if window.is_maximized() {
@@ -3138,5 +3158,100 @@ mod tests {
             cx.dispatch_action(&crate::actions::OpenAuth);
         });
         assert!(ws.read_with(cx, |w, _| w.show_auth));
+    }
+
+    fn google_profile(sub: &str) -> thundoku_core::google::GoogleProfile {
+        thundoku_core::google::GoogleProfile {
+            sub: sub.to_string(),
+            email: format!("{sub}@example.com"),
+            name: "ユーザー".to_string(),
+            picture: None,
+        }
+    }
+
+    fn test_book(id: &str) -> books::Book {
+        books::Book {
+            id: id.to_string(),
+            title: "t".to_string(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "t.pdf".to_string(),
+            file_size: 1,
+            opfs_path: format!("{id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: None,
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-09-16 00:00:00".to_string(),
+            updated_at: "2026-09-16 00:00:00".to_string(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        }
+    }
+
+    /// Google の sub が未取得のときは、復元の差分比較に使える集合が無いこと。
+    ///
+    /// 差分比較は「Drive のバックアップ（所有者で絞られている）」と「ローカルの同じ範囲」を
+    /// 突き合わせる必要がある。sub を持たないままローカル全件で比較すると範囲が食い違い、
+    /// 内容が同じでも毎回「差分あり」になって起動のたびに復元確認が出る。
+    #[gpui_kit::test]
+    async fn backup_owner_ids_are_unavailable_without_a_google_profile(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            assert!(
+                state.google_profile.lock().is_none(),
+                "前提: プロフィール未取得"
+            );
+            assert!(
+                backup_owner_ids(state).is_none(),
+                "所有者が分からないのに比較対象の集合を作っている"
+            );
+        });
+    }
+
+    /// ログイン中の sub に帰属する本だけを比較対象にすること
+    /// （他アカウントの本・未所属の本は Drive のバックアップに含まれない）。
+    #[gpui_kit::test]
+    async fn backup_owner_ids_only_include_the_current_account(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let key = state.secrets.db_key().expect("暗号鍵");
+            for (id, owner) in [
+                ("b-mine", Some("sub-1")),
+                ("b-other", Some("sub-2")),
+                ("b-local", None),
+            ] {
+                books::insert(&state.db_pool, &test_book(id)).unwrap();
+                books::set_owner_sub(
+                    &state.db_pool,
+                    id,
+                    owner.map(|sub| thundoku_core::owner::encrypt(&key, sub)),
+                )
+                .unwrap();
+            }
+            *state.google_profile.lock() = Some(google_profile("sub-1"));
+
+            assert_eq!(
+                backup_owner_ids(state),
+                Some(std::collections::HashSet::from(["b-mine".to_string()])),
+                "現在のアカウントに帰属する本だけを対象にする"
+            );
+        });
     }
 }

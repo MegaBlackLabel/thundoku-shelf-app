@@ -28,12 +28,51 @@ pub struct OAuthTokens {
     pub expires_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `sub` は所有者（`books.owner_sub`）の判定に使うため keyring に永続化する
+/// （[`save_profile`]）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GoogleProfile {
     pub sub: String,
     pub email: String,
     pub name: String,
     pub picture: Option<String>,
+}
+
+/// 取得済みプロフィールを keyring に保存する（**ブロッキング**。UI スレッドでは呼ばない）。
+///
+/// 起動直後はプロフィールをネットワーク取得しない（設定画面を開くまで `userinfo` を
+/// 叩かない）ため、`books.owner_sub` の判定に使う `sub` を次回起動でオフライン復元
+/// できるようにする。
+pub fn save_profile(
+    store: &crate::secrets::SecretStore,
+    profile: &GoogleProfile,
+) -> Result<(), crate::secrets::SecretError> {
+    let json = serde_json::to_string(profile)
+        .map_err(|error| crate::secrets::SecretError::Encoding(error.to_string()))?;
+    store.save(crate::secrets::USER_GOOGLE_PROFILE, &json)
+}
+
+/// 保存済みプロフィール。未保存・壊れている・項目が欠けている場合は `None`
+/// （復元できなくても起動は続ける）。
+pub fn saved_profile(store: &crate::secrets::SecretStore) -> Option<GoogleProfile> {
+    let json = store
+        .load(crate::secrets::USER_GOOGLE_PROFILE)
+        .ok()
+        .flatten()?;
+    match serde_json::from_str(&json) {
+        Ok(profile) => Some(profile),
+        Err(error) => {
+            log::warn!("google profile: 保存値を復元できないため無視します: {error}");
+            None
+        }
+    }
+}
+
+/// 保存済みプロフィールを削除する（ログアウト時）。
+pub fn delete_saved_profile(store: &crate::secrets::SecretStore) {
+    if let Err(error) = store.delete(crate::secrets::USER_GOOGLE_PROFILE) {
+        log::warn!("google profile: 保存値を削除できません: {error}");
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -675,6 +714,16 @@ mod tests {
     use super::*;
     use crate::tbf::{RequestSpec, ResponseSpec, Transport};
 
+    /// メモリバックエンド（`SecretStore`）はプロセス内で共有されるため、
+    /// `USER_GOOGLE_PROFILE` スロットを使うテストはこの Mutex で直列化する。
+    static PROFILE_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_profile_slot() -> std::sync::MutexGuard<'static, ()> {
+        PROFILE_SLOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct CaptureTransport {
         captured: std::sync::Arc<std::sync::Mutex<Option<RequestSpec>>>,
     }
@@ -832,5 +881,54 @@ mod tests {
             !message.contains("invalid_grant") && !message.contains('{'),
             "生の応答を文言に出さない: {message}"
         );
+    }
+
+    /// プロフィール（sub）は keyring に永続化され、keychain 無しの経路でも読み戻せること。
+    ///
+    /// 起動直後はプロフィールをネットワーク取得しない（設定画面を開くまで `userinfo` を
+    /// 叩かない）。所有者（`books.owner_sub`）の判定に使う sub を起動時から使えるように
+    /// するため、一度取得したプロフィールは保存しておく必要がある。
+    #[test]
+    fn saved_profile_round_trips_and_deletes() {
+        let _guard = lock_profile_slot();
+        crate::secrets::SecretStore::use_memory_backend();
+        let store = crate::secrets::SecretStore::new();
+        delete_saved_profile(&store);
+
+        let profile = GoogleProfile {
+            sub: "sub-1".to_string(),
+            email: "user@example.com".to_string(),
+            name: "ユーザー".to_string(),
+            picture: Some("https://example.com/p.png".to_string()),
+        };
+        save_profile(&store, &profile).expect("保存できる");
+
+        assert_eq!(
+            saved_profile(&store),
+            Some(profile),
+            "保存したプロフィールが読み戻せること"
+        );
+
+        delete_saved_profile(&store);
+        assert_eq!(saved_profile(&store), None, "削除後は読み戻せないこと");
+    }
+
+    /// 壊れた保存値（JSON でない・項目欠け）は `None` に落とす（起動を止めない）。
+    #[test]
+    fn saved_profile_ignores_broken_value() {
+        let _guard = lock_profile_slot();
+        crate::secrets::SecretStore::use_memory_backend();
+        let store = crate::secrets::SecretStore::new();
+        store
+            .save(crate::secrets::USER_GOOGLE_PROFILE, "{not json")
+            .unwrap();
+
+        assert_eq!(saved_profile(&store), None);
+
+        store
+            .save(crate::secrets::USER_GOOGLE_PROFILE, r#"{"sub":"only-sub"}"#)
+            .unwrap();
+        assert_eq!(saved_profile(&store), None, "項目が欠けた値も無視する");
+        delete_saved_profile(&store);
     }
 }

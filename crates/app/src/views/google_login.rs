@@ -148,9 +148,8 @@ impl GoogleLoginView {
                         // cx.emit は AsyncApp::update の RefCell 再入でパニックするため、
                         // AppState のグローバル状態を直接更新する。
                         // （Workspace の監視タスクが google_login_done を検知して show_auth を閉じる）
-                        *state.google_profile.lock() = Some(profile.clone());
-                        *state.google_logged_in.lock() = true;
-                        *state.google_login_error.lock() = None;
+                        // プロフィール（sub）は keyring に保存する（次回起動の所有者判定用）。
+                        crate::app_state::save_google_profile(cx, &profile);
                         state
                             .google_login_done
                             .store(true, std::sync::atomic::Ordering::SeqCst);

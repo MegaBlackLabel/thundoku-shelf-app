@@ -261,10 +261,8 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<GoogleLoginView>, event: &GoogleLoginDone, cx| {
                         let profile = event.0.clone();
                         this.google_profile = Some(profile.clone());
-                        let state = AppState::global(cx);
-                        *state.google_profile.lock() = Some(profile);
-                        *state.google_logged_in.lock() = true;
-                        *state.google_login_error.lock() = None;
+                        // プロフィール（sub）は keyring に保存する（次回起動の所有者判定用）
+                        crate::app_state::save_google_profile(cx, &profile);
                         // WebView は完了処理で隠される。次回は新しい認可フローを開始する
                         this.google_login = None;
                         this.google_subscription = None;

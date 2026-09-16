@@ -55,6 +55,11 @@ fn cache_remove(key: &str) {
 pub const SERVICE: &str = "com.megablacklabel.thundoku-shelf";
 pub const USER_TECHBOOKFEST: &str = "techbookfest";
 pub const USER_GOOGLE: &str = "google";
+/// 取得済み Google プロフィール（`sub` 等）の保存キー。
+///
+/// `sub` は `books.owner_sub` の判定（バックアップの所有者フィルタ・本棚の絞り込み）に
+/// 使うため、起動直後にネットワーク取得できない場合でも復元できるよう残す。
+pub const USER_GOOGLE_PROFILE: &str = "google-profile";
 /// GitHub（レポート機能のログイン）のアクセストークンの保存キー。
 pub const USER_GITHUB: &str = "github";
 /// BOOTH（booth.pm）のセッション Cookie の保存キー。
