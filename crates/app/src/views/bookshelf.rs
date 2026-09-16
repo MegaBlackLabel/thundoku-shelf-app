@@ -617,6 +617,48 @@ pub(crate) fn owned_book_ids(state: &AppState) -> std::collections::HashSet<Stri
     }
 }
 
+/// リストのスクロール位置を「先頭からの割合（0.0..=1.0）」で表す。
+///
+/// 件数が変わっても同じ位置を指せるように、アイテム番号ではなく割合で持つ
+/// （行の高さが揃っている本棚では、割合 = 見た目の位置になる）。
+fn list_scroll_fraction(state: &gpui_kit::ListState) -> f32 {
+    let count = state.item_count();
+    if count <= 1 {
+        return 0.0;
+    }
+    let top = state.logical_scroll_top();
+    (top.item_ix as f32 / (count - 1) as f32).clamp(0.0, 1.0)
+}
+
+/// リストの件数を差し替えつつ、スクロール位置を保つ（`target` があればその位置へ戻す）。
+///
+/// 件数の差し替えには `ListState::reset` が要るが、これはスクロールのアンカーを捨てる
+/// （＝先頭に戻る）。絞り込みの適用・解除のたびに位置が失われるため、差し替えの直前に
+/// 位置を控え、差し替え後に同じ割合の位置を指し直す。
+///
+/// - `target`: 戻す位置（絞り込みの解除時に、適用前の位置を渡す）
+/// - 件数が変わらないときは位置に触らない（スクロール中の位置を描画のたびに
+///   アイテム境界へ寄せてしまわないため）
+fn set_list_count_keeping_scroll(state: &gpui_kit::ListState, count: usize, target: Option<f32>) {
+    let changed = state.item_count() != count;
+    if !changed && target.is_none() {
+        return;
+    }
+    // `reset` は件数（＝割合の基準）を変えるため、控えるのは差し替えの前
+    let fraction = target.unwrap_or_else(|| list_scroll_fraction(state));
+    if changed {
+        state.reset(count);
+    }
+    if count == 0 {
+        return;
+    }
+    let item_ix = ((count - 1) as f32 * fraction).round() as usize;
+    state.scroll_to(gpui_kit::ListOffset {
+        item_ix,
+        offset_in_item: gpui_kit::px(0.0),
+    });
+}
+
 /// タグチップのラベル（タグ名 / 「+n」）の幅を GPUI のテキスト計測で実測する。
 /// チップは `.text_xs()`（= rem の 0.75 倍）なので、フォントサイズは rem から求める。
 /// 計測結果は GPUI 側でフレーム単位にキャッシュされる（同じ文字列は次フレームで再利用）。
@@ -799,6 +841,11 @@ pub struct BookshelfView {
     filtered: Vec<usize>,
     /// フィルタ条件が変わったら true（render で filtered を再計算）
     filtered_dirty: bool,
+    /// 絞り込みを適用する前のスクロール位置（リスト全体に対する割合 0.0..=1.0）。
+    /// 解除したときに元の位置へ戻すため覚える（[`Self::filter_scroll_target`]）。
+    scroll_before_filter: Option<f32>,
+    /// 直前の描画で絞り込み中だったか（適用・解除の切り替えの検出用）。
+    was_filtering: bool,
     /// 並び替えの項目（既定: 購入日の新しい順 = 従来の並び）
     sort_field: SortField,
     /// 昇順か（既定は降順 = 新しい順 / 多い順）
@@ -1077,6 +1124,8 @@ impl BookshelfView {
             auto_download_started: false,
             filtered: Vec::new(),
             filtered_dirty: true,
+            scroll_before_filter: None,
+            was_filtering: false,
             sort_field: sort.0,
             sort_ascending: sort.1,
             last_search: String::new(),
@@ -3546,6 +3595,35 @@ impl BookshelfView {
             || self.read_filter != ReadFilter::All
     }
 
+    /// いま表示している仮想化リスト（表示モードで変わる）。
+    fn active_list(&self) -> &gpui_kit::ListState {
+        if self.view_mode == ViewMode::List {
+            &self.list_rows_state
+        } else {
+            &self.list_state
+        }
+    }
+
+    /// 絞り込みの適用・解除を検出し、リストに設定し直すスクロール位置（割合）を返す。
+    ///
+    /// - 適用した瞬間: いまの位置を控える（解除で戻すため）。表示は動かさない。
+    /// - 解除した瞬間: 控えておいた位置を返す（呼び出し側がそこへ戻す）。
+    /// - 切り替えていない場合: `None`（件数が変わったときだけ同じ割合を保つ）。
+    fn filter_scroll_target(&mut self, cx: &App) -> Option<f32> {
+        let filtering = self.is_filtering(cx);
+        let target = if filtering == self.was_filtering {
+            None
+        } else if filtering {
+            let fraction = list_scroll_fraction(self.active_list());
+            self.scroll_before_filter = Some(fraction);
+            None
+        } else {
+            self.scroll_before_filter.take()
+        };
+        self.was_filtering = filtering;
+        target
+    }
+
     /// 全項目ボタンのラベル。絞り込み中は「絞込中 ✕」（クリック / ESC で解除）。
     fn filter_all_label(&self, cx: &App) -> &'static str {
         if self.is_filtering(cx) {
@@ -5812,6 +5890,8 @@ impl Render for BookshelfView {
         if self.filtered_dirty {
             self.rebuild_filtered(cx);
         }
+        // 絞り込みの適用・解除でスクロール位置を失わないようにする（下のリスト構築で使う）
+        let scroll_target = self.filter_scroll_target(cx);
         if !self.auto_download_started {
             self.auto_download_started = true;
             self.auto_download_favorites(cx);
@@ -6444,9 +6524,11 @@ impl Render for BookshelfView {
                             // 仮想化: 行単位の List（可視行のみ描画）でスクロールを軽くする。
                             // 各行は同じカード幅・gap の横並び（行内左寄せは justify_start）。
                             let rows = self.filtered.len().div_ceil(columns);
-                            if self.list_state.item_count() != rows {
-                                self.list_state.reset(rows);
-                            }
+                            set_list_count_keeping_scroll(
+                                &self.list_state,
+                                rows,
+                                scroll_target,
+                            );
                             let handle = cx.entity();
                             let list_state = self.list_state.clone();
                             let theme = cx.theme().clone();
@@ -6544,9 +6626,11 @@ impl Render for BookshelfView {
                             // 仮想化: カード表示と同じく行単位の List で可視行だけを構築する。
                             // 全行を組むと 1 行ごとの表紙・タグ計測・カルーセルで
                             // スクロールが引っかかる。
-                            if self.list_rows_state.item_count() != visible_count {
-                                self.list_rows_state.reset(visible_count);
-                            }
+                            set_list_count_keeping_scroll(
+                                &self.list_rows_state,
+                                visible_count,
+                                scroll_target,
+                            );
                             let list_state = self.list_rows_state.clone();
                             let handle = handle.clone();
                             let tag_order = tag_order.clone();
@@ -12702,5 +12786,174 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(visible, vec!["db-2".to_string()]);
+    }
+
+    /// 絞り込みを適用して解除すると、スクロール位置が絞り込む前の位置に戻ること。
+    ///
+    /// リストの件数が変わると gpui の `ListState::reset` が必要になるが、これは
+    /// スクロールのアンカーを捨てる（＝先頭に戻る）。そのまま呼ぶと、絞り込みを
+    /// 解除したときに元の位置を失う。
+    #[gpui_kit::test]
+    async fn clearing_filters_keeps_the_scroll_position(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 60 冊（1280px = 5 列 → 12 行）。react = 12 冊 / rust = 50 冊に付ける
+        for i in 0..60 {
+            seed_book(cx, &format!("b{i}"), &format!("本{i}"), "サークルA");
+        }
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            for i in 0..12 {
+                db::tags::set_for_book(
+                    db,
+                    &format!("b{i}"),
+                    &[("react", "manual"), ("rust", "manual")],
+                )
+                .unwrap();
+            }
+            for i in 12..50 {
+                db::tags::set_for_book(db, &format!("b{i}"), &[("rust", "manual")]).unwrap();
+            }
+        });
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1280.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+
+        assert_eq!(
+            view.read_with(cx, |this, _| this.filtered.len()),
+            60,
+            "前提: 絞り込みなしで 60 冊表示されている"
+        );
+        let count = |cx: &mut TestAppContext| {
+            view.read_with(cx, |this: &BookshelfView, _| {
+                this.list_state.logical_scroll_top().item_ix
+            })
+        };
+
+        // 5 行目までスクロールする（12 行中）
+        view.update(cx, |this, _| {
+            this.list_state.scroll_to(gpui_kit::ListOffset {
+                item_ix: 4,
+                offset_in_item: gpui_kit::px(0.0),
+            });
+        });
+        draw_frames(&mut *visual);
+        assert_eq!(count(cx), 4, "前提: スクロールできている");
+
+        // 絞り込む（rust = 50 冊 = 10 行）→ 先頭に戻さない
+        view.update(cx, |this, cx| this.toggle_tag(cx, "rust"));
+        draw_frames(&mut *visual);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.filtered.len()),
+            50,
+            "前提: rust の 50 冊に絞り込めている"
+        );
+        assert!(
+            count(cx) > 0,
+            "絞り込むたびに先頭へ戻ってはいけない（実際: {}）",
+            count(cx)
+        );
+
+        // タグを外して解除 → 絞り込む前の位置（5 行目）に戻る
+        view.update(cx, |this, cx| this.toggle_tag(cx, "rust"));
+        draw_frames(&mut *visual);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.filtered.len()),
+            60,
+            "前提: タグを外すと 60 冊に戻る"
+        );
+        assert_eq!(count(cx), 4, "絞り込みを解除したら元の位置へ戻ること");
+
+        // 短い絞り込み（react = 12 冊 = 3 行）でも同じこと
+        view.update(cx, |this, cx| this.toggle_tag(cx, "react"));
+        draw_frames(&mut *visual);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.filtered.len()),
+            12,
+            "前提: react の 12 冊に絞り込めている"
+        );
+
+        // 解除（全項目ボタン）→ 絞り込む前の位置に戻る
+        let clear = visual
+            .debug_bounds("filter-all-btn")
+            .expect("全項目ボタンが描画されている");
+        visual.simulate_click(clear.center(), gpui_kit::Modifiers::default());
+        draw_frames(&mut *visual);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.filtered.len()),
+            60,
+            "前提: 解除で 60 冊に戻っている"
+        );
+        assert_eq!(
+            count(cx),
+            4,
+            "絞り込みを解除したら元のスクロール位置へ戻ること"
+        );
+    }
+
+    /// リスト表示でも同じ（絞り込みの解除でスクロール位置が元に戻ること）。
+    /// 表示モードごとに仮想化リストの状態が別なので、それぞれ検証する。
+    #[gpui_kit::test]
+    async fn clearing_filters_keeps_the_scroll_position_in_list_mode(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // リスト表示は 1 冊 = 1 行
+        for i in 0..40 {
+            seed_book(cx, &format!("b{i}"), &format!("本{i}"), "サークルA");
+        }
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            for i in 0..10 {
+                db::tags::set_for_book(db, &format!("b{i}"), &[("react", "manual")]).unwrap();
+            }
+        });
+        let view = cx.new(BookshelfView::new);
+        view.update(cx, |this, _| this.view_mode = ViewMode::List);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1280.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+
+        let row = |cx: &mut TestAppContext| {
+            view.read_with(cx, |this: &BookshelfView, _| {
+                this.list_rows_state.logical_scroll_top().item_ix
+            })
+        };
+
+        // 5 冊目までスクロールする
+        view.update(cx, |this, _| {
+            this.list_rows_state.scroll_to(gpui_kit::ListOffset {
+                item_ix: 4,
+                offset_in_item: gpui_kit::px(0.0),
+            });
+        });
+        draw_frames(&mut *visual);
+        assert_eq!(row(cx), 4, "前提: スクロールできている");
+
+        // 絞り込む（10 冊）→ 先頭に戻さない
+        view.update(cx, |this, cx| this.toggle_tag(cx, "react"));
+        draw_frames(&mut *visual);
+        assert!(
+            row(cx) > 0,
+            "絞り込むたびに先頭へ戻ってはいけない（実際: {}）",
+            row(cx)
+        );
+
+        // 解除 → 絞り込む前の位置に戻る
+        view.update(cx, |this, cx| this.toggle_tag(cx, "react"));
+        draw_frames(&mut *visual);
+        assert_eq!(row(cx), 4, "リスト表示でも解除で元の位置へ戻ること");
     }
 }

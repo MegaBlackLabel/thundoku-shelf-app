@@ -2417,7 +2417,11 @@ impl Workspace {
 /// だけを含むため、比較・アップロードも同じ範囲で行う必要がある。プロフィール
 /// （`sub`）か暗号鍵が無ければ範囲を決められないので `None` を返す（＝所有者不明）。
 fn backup_owner_ids(state: &AppState) -> Option<std::collections::HashSet<String>> {
-    let sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone())?;
+    let sub = state
+        .google_profile
+        .lock()
+        .as_ref()
+        .map(|p| p.sub.clone())?;
     let key = state.secrets.db_key().ok()?;
     db::books::owned_book_ids(&state.db_pool, &key, Some(&sub)).ok()
 }
