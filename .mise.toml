@@ -15,3 +15,8 @@ run = "cargo fmt --all"
 
 [tasks.lint]
 run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+# 依存を変えたらライセンス一覧（crates/app/assets/third-party/licenses.json）を作り直す。
+# 作り忘れは `cargo test -p thundoku-shelf` が検出する。
+[tasks.licenses]
+run = "cargo run -p thundoku-shelf --example regen_licenses"

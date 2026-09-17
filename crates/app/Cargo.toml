@@ -47,3 +47,7 @@ windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "W
  [build-dependencies]
 # Windows exe のアイコン埋め込み（リリースビルド時のみ、build.rs から使用）
 winres = "0.1"
+
+[dev-dependencies]
+# ライセンス一覧の生成・突き合わせ（examples/regen_licenses.rs と licenses.rs のテスト）
+toml = "1"

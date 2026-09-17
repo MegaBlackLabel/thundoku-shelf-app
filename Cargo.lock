@@ -9129,6 +9129,7 @@ dependencies = [
  "sqlx",
  "thundoku-core",
  "tiny-skia",
+ "toml 1.1.4+spec-1.1.0",
  "ureq",
  "url",
  "usvg 0.44.0",

@@ -3,18 +3,24 @@
 //! Web 版の記載（ブラウザアプリ・OPFS・PWA インストール・Cookie セッション）
 //! はネイティブアプリの実態に合わせて修正してある。
 
+use std::collections::HashSet;
+
 use gpui_kit::InteractiveElement as _;
+use gpui_kit::StatefulInteractiveElement as _;
 use gpui_kit::Styled as _;
 use gpui_kit::StyledImage as _;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::Icon;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
-    Context, FontWeight, IntoElement, ParentElement, Render, SharedString, Window, div, px,
-    relative,
+    AnyElement, App, Context, Entity, FontWeight, IntoElement, ListAlignment, ListState,
+    ParentElement, Render, SharedString, Window, div, px, relative,
 };
 
 use crate::icons::AppIcon;
+use crate::views::licenses;
 
 /// 対象コンテンツの注意。**最も誤解されやすい点**なので説明画面の上部で強調して出す。
 const TARGET_NOTICE: &str = "本アプリが対象にするのは、購入済み・DRM の無い（非DRM）同人誌のみです。\
@@ -107,16 +113,89 @@ const FEATURES: [(&str, AppIcon, &str); 13] = [
     ),
 ];
 
-pub struct AboutView;
+/// ライセンスページの説明。
+const LICENSES_LEAD: &str = "このアプリが利用しているオープンソースソフトウェアの一覧です。\
+                             OS ごとに使うもの（Windows の PDFium、macOS の MuPDF など）も含みます。\
+                             各行をクリックするとライセンス全文が開きます。全文をクレートが\
+                             同梱していない場合は、配布元を確認してください。";
+
+/// ライセンス全文をクレートが同梱していないときの案内。
+const NO_LICENSE_TEXT: &str =
+    "ライセンス全文はクレートに同梱されていません（配布元を確認してください）";
+
+/// ライセンス一覧の行の高さの目安。
+/// 仮想化リストのスクロールバーを最初から正しい大きさで出すために使う（行の高さは
+/// レンダリング時に実測されて置き換わる）。
+const LICENSE_ROW_HINT: f32 = 60.0;
+
+/// ライセンス一覧で画面外に余分に描画しておく高さ。
+const LICENSE_LIST_OVERDRAW: f32 = 200.0;
+
+/// 案内画面が表示しているページ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AboutPage {
+    /// 案内（説明）。
+    About,
+    /// オープンソースライセンス。
+    Licenses,
+}
+
+pub struct AboutView {
+    page: AboutPage,
+    /// ライセンス一覧（1000 行を超えるので仮想化する）。
+    licenses_list: ListState,
+    /// ライセンス全文を開いている行。
+    licenses_expanded: HashSet<usize>,
+}
 
 impl AboutView {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self
+        Self {
+            page: AboutPage::About,
+            licenses_list: ListState::new(
+                licenses::CATALOG.entries.len(),
+                ListAlignment::Top,
+                px(LICENSE_LIST_OVERDRAW),
+            )
+            .with_uniform_item_height(px(LICENSE_ROW_HINT)),
+            licenses_expanded: HashSet::new(),
+        }
+    }
+
+    /// ライセンスページを開く（案内画面の一番下の「ライセンスについて」）。
+    fn open_licenses(&mut self, cx: &mut Context<Self>) {
+        self.page = AboutPage::Licenses;
+        cx.notify();
+    }
+
+    /// 案内画面に戻る（ライセンスページの先頭の「戻る」）。
+    fn close_licenses(&mut self, cx: &mut Context<Self>) {
+        self.page = AboutPage::About;
+        cx.notify();
+    }
+
+    /// 行のライセンス全文を開閉する。行の高さが変わるので仮想化リストに測り直させる。
+    fn toggle_license(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if !self.licenses_expanded.remove(&ix) {
+            self.licenses_expanded.insert(ix);
+        }
+        self.licenses_list.remeasure_items(ix..ix + 1);
+        cx.notify();
     }
 }
 
 impl Render for AboutView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.page {
+            AboutPage::About => self.render_about(window, cx).into_any_element(),
+            AboutPage::Licenses => self.render_licenses(window, cx).into_any_element(),
+        }
+    }
+}
+
+impl AboutView {
+    /// 案内（説明）ページ。
+    fn render_about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = window;
         let card_bg = cx.theme().muted;
         let card_border = cx.theme().border;
@@ -613,20 +692,311 @@ impl Render for AboutView {
                                     ),
                             ),
                     )
-                    // フッター
+                    // フッター（保存場所の注意 + ライセンス表示への導線）
                     .child(
                         div()
                             .border_t_1()
                             .border_color(card_border)
                             .pt_6()
-                            .text_sm()
-                            .text_color(muted_fg)
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap_3()
                             .child(
-                                "Thundoku Shelf — データはすべてお使いの PC のローカルフォルダに保存されます。",
+                                div()
+                                    .text_sm()
+                                    .text_color(muted_fg)
+                                    .child(
+                                        "Thundoku Shelf — データはすべてお使いの PC のローカルフォルダに保存されます。",
+                                    ),
+                            )
+                            .child(
+                                Button::new("licenses-link")
+                                    .debug_selector(|| "about-licenses-link".into())
+                                    .label("ライセンスについて")
+                                    .ghost()
+                                    .small()
+                                    .cursor_pointer()
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_licenses(cx)),
+                                    ),
                             ),
                     ),
             ),
             )
+    }
+
+    /// ライセンスページ（案内画面の一番下の「ライセンスについて」から開く）。
+    ///
+    /// 行数が 1000 を超えるため、先頭（戻るボタン・見出し）は固定して、一覧だけを
+    /// 可視行しか構築しない仮想化リストにする。
+    fn render_licenses(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let _ = window;
+        let border = cx.theme().border;
+        let muted_fg = cx.theme().muted_foreground;
+        let handle = cx.entity();
+        let list_state = self.licenses_list.clone();
+        let count = licenses::CATALOG.entries.len();
+
+        div()
+            .debug_selector(|| "licenses-page".into())
+            .size_full()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            // 先頭: 案内に戻る + 見出し（スクロールしても残る）
+            .child(
+                div()
+                    .w_full()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .mx_auto()
+                            .w(px(720.0))
+                            .px_4()
+                            .py_6()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap_3()
+                            .child(
+                                Button::new("licenses-back")
+                                    .debug_selector(|| "licenses-back".into())
+                                    .label("← 案内に戻る")
+                                    .ghost()
+                                    .small()
+                                    .cursor_pointer()
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.close_licenses(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("オープンソースライセンス"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted_fg)
+                                    .line_height(relative(1.7))
+                                    .child(LICENSES_LEAD),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "licenses-count".into())
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(format!("{count} 件")),
+                            ),
+                    ),
+            )
+            // 一覧（見出しと同じ幅の中央寄せカラムに揃える）
+            .child(
+                div().flex_1().min_h_0().w_full().child(
+                    div().mx_auto().w(px(720.0)).h_full().child(
+                        gpui_kit::list(list_state, move |ix, _window, cx| {
+                            let Some(entry) = licenses::CATALOG.entries.get(ix) else {
+                                return div().into_any_element();
+                            };
+                            let expanded = handle.read(cx).licenses_expanded.contains(&ix);
+                            Self::license_row(ix, entry, expanded, &handle, cx)
+                        })
+                        .h_full()
+                        .w_full(),
+                    ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// ライセンス一覧の 1 行。見出しをクリックするとライセンス全文を開閉する。
+    fn license_row(
+        ix: usize,
+        entry: &licenses::Entry,
+        expanded: bool,
+        handle: &Entity<Self>,
+        cx: &mut App,
+    ) -> AnyElement {
+        // `CATALOG` は static なので、全文は `&'static str` のまま要素に渡せる（コピーしない）
+        let catalog: &'static licenses::Catalog = &licenses::CATALOG;
+        let theme = cx.theme();
+        let border = theme.border;
+        let card_bg = theme.muted;
+        let muted_fg = theme.muted_foreground;
+        let primary = theme.primary;
+        let hover_bg = crate::views::hover_bg(theme);
+
+        // 行に出すチップ（種別・ライセンス表記）。`highlight` はライセンス表記用。
+        let chip = move |text: String, highlight: bool| {
+            let (bg, fg) = if highlight {
+                (primary.opacity(0.12), primary)
+            } else {
+                (card_bg, muted_fg)
+            };
+            div()
+                .flex_shrink_0()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(bg)
+                .text_xs()
+                .text_color(fg)
+                .child(text)
+        };
+
+        // 同梱アセットは「何に使っているか」、クレートは配布元を添える
+        let source = match (entry.note.as_str(), entry.repository.as_str()) {
+            ("", "") => String::new(),
+            (note, "") => note.to_string(),
+            ("", repository) => repository.to_string(),
+            (note, repository) => format!("{note}・{repository}"),
+        };
+
+        let header = div()
+            .id(("licenses-entry", ix))
+            .debug_selector(move || format!("licenses-entry-{ix}"))
+            .w_full()
+            .px_4()
+            .py_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_bg))
+            .on_click({
+                let handle = handle.clone();
+                move |_, _, cx| handle.update(cx, |this, cx| this.toggle_license(ix, cx))
+            })
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(px(16.0))
+                .text_color(muted_fg),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(entry.name.clone()),
+                            )
+                            .child(if entry.version.is_empty() {
+                                div().into_any_element()
+                            } else {
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(format!("v{}", entry.version))
+                                    .into_any_element()
+                            }),
+                    )
+                    .child(if source.is_empty() {
+                        div().into_any_element()
+                    } else {
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .truncate()
+                            .child(source)
+                            .into_any_element()
+                    }),
+            )
+            .children(
+                entry
+                    .kind
+                    .chip()
+                    .map(|label| chip(label.to_string(), false)),
+            )
+            .children((!entry.license.is_empty()).then(|| chip(entry.license.clone(), true)));
+
+        let mut body: Vec<AnyElement> = Vec::new();
+        if expanded {
+            if entry.texts.is_empty() {
+                body.push(
+                    div()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(NO_LICENSE_TEXT)
+                        .into_any_element(),
+                );
+            }
+            for (ti, (label, text_ix)) in entry.texts.iter().enumerate() {
+                body.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted_fg)
+                                .child(label.clone()),
+                        )
+                        .child(
+                            div()
+                                .id(("licenses-text", ix * 1000 + ti))
+                                .debug_selector(move || format!("licenses-text-{ix}-{ti}"))
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(border)
+                                .bg(card_bg)
+                                .p_3()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .line_height(relative(1.6))
+                                .child(catalog.text(*text_ix)),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if !entry.repository.is_empty() {
+                let url = entry.repository.clone();
+                body.push(
+                    div()
+                        .id(("licenses-repository", ix))
+                        .text_xs()
+                        .text_color(primary)
+                        .cursor_pointer()
+                        .underline()
+                        .on_click(move |_, _, cx: &mut App| cx.open_url(&url))
+                        .child(entry.repository.clone())
+                        .into_any_element(),
+                );
+            }
+        }
+
+        div()
+            .w_full()
+            .border_b_1()
+            .border_color(border)
+            .flex()
+            .flex_col()
+            .child(header)
+            .children(body)
+            .into_any_element()
     }
 }
 
@@ -752,16 +1122,105 @@ mod tests {
             |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );
         let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw(&mut *visual);
+
+        assert!(
+            visual.debug_bounds("about-version").is_some(),
+            "バージョン表示が出ていない（不具合報告のテンプレートが案内している）"
+        );
+    }
+
+    /// 案内画面を縦に長いウィンドウで開く。
+    ///
+    /// 「ライセンスについて」のリンクは画面の一番下にあるため、スクロールせずに
+    /// クリックできる高さが要る。
+    fn open_about(cx: &mut gpui_kit::TestAppContext) -> &mut gpui_kit::VisualTestContext {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        let view = cx.new(AboutView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(4000.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        gpui_kit::VisualTestContext::from_window(*window, cx).into_mut()
+    }
+
+    /// テスト用に数フレーム描画する（レイアウトが確定して `debug_bounds` が引けるようになる）。
+    fn draw(visual: &mut gpui_kit::VisualTestContext) {
         for _ in 0..4 {
             visual.update(|window, cx| {
                 let arena_clear = window.draw(cx);
                 arena_clear.clear(cx);
             });
         }
+    }
+
+    /// 案内画面の一番下の「ライセンスについて」をクリックしてライセンスページを開く。
+    fn click_licenses_link(visual: &mut gpui_kit::VisualTestContext) {
+        let link = visual
+            .debug_bounds("about-licenses-link")
+            .expect("案内画面の一番下に「ライセンスについて」のリンクが無い");
+        visual.simulate_click(link.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+    }
+
+    /// 案内画面の一番下のリンクからライセンスページを開き、「戻る」で案内画面に戻ること。
+    #[gpui_kit::test]
+    async fn licenses_link_opens_the_page_and_back_returns_to_about(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let visual = open_about(cx);
+        draw(visual);
+
+        click_licenses_link(visual);
+        assert!(
+            visual.debug_bounds("licenses-page").is_some(),
+            "ライセンスページが開いていない"
+        );
+        assert!(
+            visual.debug_bounds("about-licenses-link").is_none(),
+            "ライセンスページを開いても案内画面の内容が残っている"
+        );
+
+        let back = visual
+            .debug_bounds("licenses-back")
+            .expect("ライセンスページの先頭に「戻る」ボタンが無い");
+        visual.simulate_click(back.center(), gpui_kit::Modifiers::default());
+        draw(visual);
 
         assert!(
-            visual.debug_bounds("about-version").is_some(),
-            "バージョン表示が出ていない（不具合報告のテンプレートが案内している）"
+            visual.debug_bounds("about-licenses-link").is_some(),
+            "「戻る」で案内画面に戻っていない"
+        );
+        assert!(
+            visual.debug_bounds("licenses-page").is_none(),
+            "「戻る」を押してもライセンスページが残っている"
+        );
+    }
+
+    /// ライセンスページに 1 件目（アプリ本体）の行が出て、クリックで全文が開くこと。
+    #[gpui_kit::test]
+    async fn licenses_page_entries_expand_the_full_text(cx: &mut gpui_kit::TestAppContext) {
+        let visual = open_about(cx);
+        draw(visual);
+        click_licenses_link(visual);
+
+        let row = visual
+            .debug_bounds("licenses-entry-0")
+            .expect("ライセンスページに 1 件目の行が無い");
+        assert!(
+            visual.debug_bounds("licenses-text-0-0").is_none(),
+            "最初からライセンス全文が開いている"
+        );
+
+        visual.simulate_click(row.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert!(
+            visual.debug_bounds("licenses-text-0-0").is_some(),
+            "行をクリックしてもライセンス全文が開かない"
         );
     }
 }

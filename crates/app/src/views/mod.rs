@@ -8,6 +8,7 @@ pub mod fanza_login;
 pub mod github_login;
 pub mod google_login;
 pub mod history;
+pub mod licenses;
 pub mod notes;
 pub mod reader;
 pub mod report;
