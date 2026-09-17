@@ -84,6 +84,8 @@ pub struct AppState {
     pub toast_kind: Arc<Mutex<ToastKind>>,
     /// トーストの世代（新メッセージごとに増える。タイマー再起動用）
     pub toast_generation: Arc<Mutex<u64>>,
+    /// トーストを自動で消すか（終了時のアップロード中など、完了まで出したいときは false）
+    pub toast_autohide: Arc<Mutex<bool>>,
     /// トーストホストを持つ workspace（トースト表示時の notify 用）
     pub workspace: Arc<Mutex<Option<gpui_kit::WeakEntity<crate::workspace::Workspace>>>>,
     /// 本棚の再読込が必要（設定画面の非表示解除等）。render で確認して reload する
@@ -319,6 +321,7 @@ impl AppState {
             toast_message: Arc::new(Mutex::new(None)),
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
             toast_generation: Arc::new(Mutex::new(0)),
+            toast_autohide: Arc::new(Mutex::new(true)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
             exit_checked: Arc::new(AtomicBool::new(false)),
@@ -393,6 +396,7 @@ impl AppState {
             toast_message: Arc::new(Mutex::new(None)),
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
             toast_generation: Arc::new(Mutex::new(0)),
+            toast_autohide: Arc::new(Mutex::new(true)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
             exit_checked: Arc::new(AtomicBool::new(false)),
@@ -544,10 +548,24 @@ pub enum ToastKind {
     Error,
 }
 
-/// 種別つきでメッセージを積む（表示は `Workspace` が Notification に流す）。
+/// 種別つきでメッセージを積む（表示は `Workspace` が Notification に流す。既定 5 秒で消える）。
 pub fn set_toast_kind(cx: &mut App, kind: ToastKind, message: impl Into<String>) {
+    set_toast_kind_with(cx, kind, message, true);
+}
+
+/// 自動消滅するかどうかも指定して積む。
+///
+/// `autohide = false` は「終わるまで出しておきたい」とき（終了時のアップロード中など）に使う。
+/// 消えるのはアプリ終了のときだけになる。
+pub fn set_toast_kind_with(
+    cx: &mut App,
+    kind: ToastKind,
+    message: impl Into<String>,
+    autohide: bool,
+) {
     let state = AppState::global(cx);
     *state.toast_kind.lock() = kind;
+    *state.toast_autohide.lock() = autohide;
     set_toast(cx, message);
 }
 

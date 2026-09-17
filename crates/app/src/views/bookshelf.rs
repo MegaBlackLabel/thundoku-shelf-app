@@ -12,6 +12,7 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::radio::Radio;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tag::{Tag, TagVariant};
 use gpui_kit::component::theme::Colorize as _;
 use gpui_kit::component::tooltip::Tooltip;
@@ -36,6 +37,7 @@ use crate::actions::{
     DeleteBook, EditBookTags, HideBook, OpenAuth, OpenAuthProvider, OpenReader, SyncDrive,
 };
 use crate::app_state::{AppState, ToastKind};
+use crate::components::dialog::dialog_button;
 use crate::icons::AppIcon;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -886,26 +888,39 @@ struct ImportOutcome {
 ///
 /// ダウンロード済みの bytes は worker スレッドが保持したまま `reply` を待つ
 /// （モーダル側は要約だけを持つ）。
-struct PendingImport {
+pub(crate) struct PendingImport {
     /// 本のタイトル（見出しに出す）
-    title: String,
+    pub(crate) title: String,
     /// コンテンツごとの要約
-    choices: Vec<ImportChoice>,
+    pub(crate) choices: Vec<ImportChoice>,
     /// 選択中の添字（初期値は計画の既定表示）
-    selected: usize,
+    pub(crate) selected: usize,
     /// 選択（`None` = キャンセル）を返す先。worker が `recv` で待っている。
-    reply: std::sync::mpsc::Sender<Option<usize>>,
+    pub(crate) reply: std::sync::mpsc::Sender<Option<usize>>,
 }
 
 /// 確認モーダルに出す 1 コンテンツ分の要約。
 #[derive(Clone)]
-struct ImportChoice {
-    display_name: String,
+pub(crate) struct ImportChoice {
+    pub(crate) display_name: String,
     /// `画像` / `PDF` / `EPUB` / `音声` / `動画`
-    kind: String,
+    pub(crate) kind: String,
     /// `画像 48ファイル / PDF 1ファイル` のようなレンディションの要約
-    detail: String,
+    pub(crate) detail: String,
 }
+
+/// 取り込み確認モーダルの選択肢リストの高さの上限。
+///
+/// 選択肢は数が読めない（まとめ本では数十件になる）ため、高さを抑えてリストだけを
+/// スクロールさせ、フッターのボタンが画面外に出ないようにする。
+const IMPORT_CHOICES_MAX_H: f32 = 360.0;
+
+/// 他の本を取り込み中に開こうとしたときの案内。
+const DOWNLOADING_NOTICE: &str = "ダウンロード中です。終わってから開いてください";
+
+/// 選択肢 1 行の高さ（名前 + 種別・詳細の 2 行ぶん）。
+/// リストの高さを「行数 × これ」で決めるために使う（上限で打ち切る）。
+const IMPORT_CHOICE_ROW_H: f32 = 48.0;
 
 /// 確認モーダルを出すか（§6.3: 形式が複数 / コンテンツが複数 / 差分セット）。
 fn import_needs_confirmation(plan: &thundoku_core::import::ImportPlan) -> bool {
@@ -1258,14 +1273,10 @@ impl BookshelfView {
             return;
         };
         let card = self.shelf_cards[card_idx].clone();
-        if self.download_states.contains_key(&card.shelf.database_id) {
-            return;
-        }
-        if let Some(book_id) = card.local.as_ref().map(|e| e.book.id.clone()) {
-            self.open_book(cx, &book_id);
-        } else {
-            self.download_item(cx, card.shelf.clone());
-        }
+        // カードのクリックと同じ経路に寄せる（取り込み中の扱いを揃える）
+        let database_id = card.shelf.database_id.clone();
+        let book_id = card.local.as_ref().map(|e| e.book.id.clone());
+        self.open_or_download(cx, &database_id, book_id, &card.shelf, false);
     }
 
     /// 選択位置を移動（dx: 左右、dy: 上下 — 上下は列数分移動）
@@ -3281,8 +3292,7 @@ impl BookshelfView {
                 // 取り込み確認モーダルの依頼（§6.3）
                 if let Ok(request) = prompt_rx.try_recv() {
                     progress_handle.update(cx, |this, cx| {
-                        this.pending_import = Some(request);
-                        cx.notify();
+                        this.request_pending_import(request, cx);
                     });
                 }
                 if let Some((id, state)) = pending.take() {
@@ -3513,6 +3523,24 @@ impl BookshelfView {
         if let Some(pending) = self.pending_import.take() {
             let _ = pending.reply.send(Some(pending.selected));
         }
+        cx.notify();
+    }
+
+    /// 取り込み確認モーダルが出ているか（ビューアーを重ねない判断に使う）。
+    pub(crate) fn has_pending_import(&self) -> bool {
+        self.pending_import.is_some()
+    }
+
+    /// worker から取り込み確認の依頼が来たとき（モーダルを出す）。
+    ///
+    /// ビューアーが開いているとモーダルがその下に隠れて操作できないため、閉じる。
+    pub(crate) fn request_pending_import(
+        &mut self,
+        request: PendingImport,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_import = Some(request);
+        cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseReader));
         cx.notify();
     }
 
@@ -3944,14 +3972,24 @@ impl BookshelfView {
         cx.notify();
     }
 
-    /// 行 / 関連サムネイルのクリック。ローカル本なら開き、未ダウンロードなら取り込む。
-    /// ダウンロード中の本は無視する（二重ダウンロード防止。行クリックと同じ扱い）。
+    /// いずれかの本を取り込み中か（他の本を開かせない判断に使う）。
+    fn has_running_downloads(&self) -> bool {
+        !self.download_states.is_empty()
+    }
+
+    /// クリック / Enter からの起動。ローカル本なら開き、未ダウンロードなら取り込む。
+    /// ダウンロード中の本は無視する（二重ダウンロード防止）。
+    ///
+    /// `confirm_undownloaded`: 未ダウンロード本をいきなり取り込まず確認するか。
+    /// 行・関連サムネイルは `true`（誤操作で勝手に落とさない）、カードと Enter は `false`
+    /// （そのまま取り込む。以前からの挙動）。
     fn open_or_download(
         &mut self,
         cx: &mut Context<Self>,
         database_id: &str,
         book_id: Option<String>,
         item: &bookshelf::BookshelfItem,
+        confirm_undownloaded: bool,
     ) {
         if self.download_states.contains_key(database_id) {
             // 取り込み中にクリックされたら、終わったら開くようにしておく
@@ -3964,12 +4002,21 @@ impl BookshelfView {
             cx.notify();
             return;
         }
+        // 他の本を取り込み中はビューアーを開かない（取り込みと競合する）。
+        // 対象が未ダウンロードなら、そのまま取り込みの確認へ進む。
+        if book_id.is_some() && self.has_running_downloads() {
+            crate::app_state::set_toast_kind(cx, ToastKind::Info, DOWNLOADING_NOTICE);
+            cx.notify();
+            return;
+        }
         if let Some(book_id) = book_id {
             self.open_book(cx, &book_id);
-        } else {
+        } else if confirm_undownloaded {
             // 未ダウンロード本は勝手に取り込まず、確認してから
             self.pending_download_confirm = Some(item.clone());
             cx.notify();
+        } else {
+            self.download_item(cx, item.clone());
         }
     }
 
@@ -4374,15 +4421,15 @@ impl BookshelfView {
             let click_database_id = database_id.clone();
             move |_, _window, cx| {
                 handle.update(cx, |this, cx| {
-                    // ダウンロード/取込中は再クリックを無視（二重ダウンロード防止）
-                    if this.download_states.contains_key(&click_database_id) {
-                        return;
-                    }
-                    if let Some(book_id) = &open_book_id {
-                        this.open_book(cx, book_id);
-                    } else {
-                        this.download_item(cx, download_item.clone());
-                    }
+                    // 行クリックと同じ経路（取り込み中は開かない）。
+                    // 未ダウンロード本は確認せずそのまま取り込む。
+                    this.open_or_download(
+                        cx,
+                        &click_database_id,
+                        open_book_id.clone(),
+                        &download_item,
+                        false,
+                    );
                 });
             }
         });
@@ -4543,6 +4590,7 @@ impl BookshelfView {
 
         card_el.context_menu({
             let has_local = delete_id.is_some();
+            let menu_handle = handle.clone();
             let open_id_for_menu = delete_id.clone().unwrap_or_else(|| open_id.clone());
             let edit_id_for_menu = database_id.clone();
             let delete_id_for_menu = delete_id.clone();
@@ -4561,11 +4609,14 @@ impl BookshelfView {
                     }
                 }
                 if has_local {
-                    menu = menu.menu(
+                    // 取り込み中は開けない（クリックと同じ扱い。理由が分かるよう無効表示にする）
+                    let downloading = menu_handle.read(cx).has_running_downloads();
+                    menu = menu.menu_with_disabled(
                         "開く",
                         Box::new(OpenReader {
                             book_id: open_id_for_menu.clone().into(),
                         }),
+                        downloading,
                     );
                 }
                 menu = menu.menu(
@@ -5438,7 +5489,7 @@ impl BookshelfView {
                 let item = click_item.clone();
                 let database_id = click_database_id.clone();
                 handle.update(cx, |this, cx| {
-                    this.open_or_download(cx, &database_id, book_id, &item);
+                    this.open_or_download(cx, &database_id, book_id, &item, true);
                 });
             })
             // 画像は比率を保つ（切り抜きしない）。リストの表紙と同じ見た目にする
@@ -5573,6 +5624,7 @@ impl BookshelfView {
                         &click_database_id,
                         open_book_id.clone(),
                         &download_item,
+                        true,
                     );
                 });
             }
@@ -6677,21 +6729,48 @@ impl Render for BookshelfView {
                 if let Some((title, choices, selected)) = pending_import {
                     let handle = handle.clone();
                     let content_handle = handle.clone();
+                    // 面（背景色）と縁（`border`）はテーマの既定をそのまま使う
                     Dialog::new(cx)
                         .title(div().child("取り込み内容の確認"))
-                        .content(move |content, _window, cx| {
-                            let mut list = content.child(div().text_sm().child(format!(
+                        // バツは置かない（このモーダルは worker が回答を待っているので、
+                        // キャンセル / 取り込む のどちらかで必ず答える必要がある）
+                        .close_button(false)
+                        .content(move |content, window, cx| {
+                            let list = content.child(div().text_sm().child(format!(
                                 "「{title}」には複数のコンテンツが含まれています。既定で表示するものを選んでください。"
                             )));
+                            // 選択肢が多いときは、ここだけをスクロールさせて
+                            // フッターのボタンが画面外に出ないようにする。
+                            //
+                            // 高さは「行数 × 1 行の高さ」を上限で打ち切った値にし、
+                            // **外側の div に掛ける**（`overflow_y_scrollbar` は要素の
+                            // サイズ指定をスクロール領域側へ移すため、内側に `max_h` を
+                            // 残すと「中身＝ビューポート」と見なされてスクロール域が 0 になる）。
+                            // ウィンドウが低いときは、そちらの半分も上限にする
+                            // （フッターのボタンが画面外に出ないように）
+                            let max_height = IMPORT_CHOICES_MAX_H
+                                .min(f32::from(window.viewport_size().height) / 2.0);
+                            let list_height =
+                                (choices.len() as f32 * IMPORT_CHOICE_ROW_H).min(max_height);
+                            let mut items = div().id("import-choices-scroll")
+                                .debug_selector(|| "import-choices-content".into())
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                // 行が縮むと「中身＝高さ」になりスクロールできなくなる
+                                .overflow_y_scrollbar();
                             for (index, choice) in choices.iter().enumerate() {
                                 let handle = content_handle.clone();
                                 let is_selected = index == selected;
-                                list = list.child(
+                                items = items.child(
                                     div()
                                         .id(SharedString::from(format!("import-choice-{index}")))
                                         .debug_selector(move || {
                                             format!("import-choice-{index}")
                                         })
+                                        // 行の高さを固定して中身がビューポートに縮まないようにする
+                                        .min_h(px(IMPORT_CHOICE_ROW_H))
+                                        .flex_shrink_0()
                                         .flex()
                                         .flex_row()
                                         .items_center()
@@ -6749,7 +6828,13 @@ impl Render for BookshelfView {
                                         ),
                                 );
                             }
-                            list
+                            list.child(
+                                div()
+                                    .h(px(list_height))
+                                    .w_full()
+                                    .debug_selector(|| "import-choices".into())
+                                    .child(items),
+                            )
                         })
                         .footer(
                             div()
@@ -6757,10 +6842,8 @@ impl Render for BookshelfView {
                                 .flex_row()
                                 .gap_2()
                                 .child(
-                                    Button::new("import-confirm-cancel")
-                                        .cursor_pointer()
-                                        .label("キャンセル")
-                                        .cursor_pointer()
+                                    dialog_button("import-confirm-cancel", "キャンセル")
+                                        .debug_selector(|| "import-confirm-cancel".into())
                                         .on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
@@ -6772,6 +6855,7 @@ impl Render for BookshelfView {
                                 )
                                 .child(
                                     Button::new("import-confirm-ok")
+                                        .debug_selector(|| "import-confirm-ok".into())
                                         .cursor_pointer()
                                         .primary()
                                         .label("この内容で取り込む")
@@ -6812,9 +6896,7 @@ impl Render for BookshelfView {
                                     div()
                                         .debug_selector(|| "download-confirm-no".into())
                                         .child(
-                                            Button::new("download-confirm-no")
-                                                .cursor_pointer()
-                                                .label("いいえ")
+                                            dialog_button("download-confirm-no", "いいえ")
                                                 .on_click({
                                                     let handle = no_handle.clone();
                                                     move |_, _window, cx| {
@@ -8559,6 +8641,7 @@ mod tests {
                     .find(|card| card.shelf.database_id == "db-1")
                     .map(|card| card.shelf.clone())
                     .expect("db-1"),
+                true,
             );
         });
         let (kind, message) = cx.update(|cx| {
@@ -12955,5 +13038,324 @@ mod tests {
         view.update(cx, |this, cx| this.toggle_tag(cx, "react"));
         draw_frames(&mut *visual);
         assert_eq!(row(cx), 4, "リスト表示でも解除で元の位置へ戻ること");
+    }
+
+    /// 取り込み確認は、選択肢が多くてもフッターのボタンが画面内に残ること。
+    ///
+    /// 選択肢の数は読めない（まとめ本では数十件になる）ため、リストだけをスクロール
+    /// させて、ダイアログが画面からはみ出さないようにする。
+    #[gpui_kit::test]
+    async fn import_confirmation_with_many_choices_stays_within_the_window(
+        cx: &mut TestAppContext,
+    ) {
+        const WINDOW_H: f32 = 700.0;
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        let (reply, _answer) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_import = Some(PendingImport {
+                    title: "総集編".into(),
+                    choices: (0..40)
+                        .map(|i| ImportChoice {
+                            display_name: format!("コンテンツ {i}"),
+                            kind: "画像".into(),
+                            detail: "画像 48ファイル".into(),
+                        })
+                        .collect(),
+                    selected: 0,
+                    reply,
+                });
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(WINDOW_H),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+
+        // 選択肢のリストは上限の高さに収まっている（画面いっぱいに伸びない）
+        let list = visual
+            .debug_bounds("import-choices")
+            .expect("選択肢のリストが描画されていない");
+        assert!(
+            list.size.height <= gpui_kit::px(IMPORT_CHOICES_MAX_H + 1.0),
+            "リストが上限を超えている: {:?}",
+            list.size.height
+        );
+
+        // フッターのボタンが画面内に残っている（押せる）
+        for id in ["import-confirm-cancel", "import-confirm-ok"] {
+            let bounds = visual
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("{id} が描画されていない"));
+            assert!(
+                bounds.top() >= gpui_kit::px(0.0) && bounds.bottom() <= gpui_kit::px(WINDOW_H),
+                "{id} が画面外に出ている: {bounds:?}"
+            );
+        }
+    }
+
+    /// 取り込み確認の選択肢リストが、スクロールできる状態になっていること。
+    ///
+    /// リストの高さの上限を中身側に `max_h` で掛けると「中身＝ビューポート」と
+    /// 見なされ、スクロールの余地が無くなって後ろの選択肢に到達できない（＝選べない）。
+    /// 行が縦に縮んで同じ状態になるのも防ぐ。
+    #[gpui_kit::test]
+    async fn import_choices_have_room_to_scroll(cx: &mut TestAppContext) {
+        const WINDOW_H: f32 = 700.0;
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        let (reply, _answer) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_import = Some(PendingImport {
+                    title: "総集編".into(),
+                    choices: (1..=40)
+                        .map(|i| ImportChoice {
+                            display_name: format!("コンテンツ {i}"),
+                            kind: "画像".into(),
+                            detail: "画像 48ファイル".into(),
+                        })
+                        .collect(),
+                    selected: 0,
+                    reply,
+                });
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(WINDOW_H),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+
+        let viewport = visual
+            .debug_bounds("import-choices")
+            .expect("選択肢のリストが描画されていない");
+        assert!(
+            viewport.size.height <= gpui_kit::px(IMPORT_CHOICES_MAX_H + 1.0),
+            "リストの高さが上限を超えている: {:?}",
+            viewport.size.height
+        );
+
+        // 中身はビューポートより高い（＝スクロールする余地がある）
+        let content = visual
+            .debug_bounds("import-choices-content")
+            .expect("選択肢の中身が描画されていない");
+        assert!(
+            content.size.height > viewport.size.height,
+            "スクロールの余地が無い（中身 {:?} / 領域 {:?}）",
+            content.size.height,
+            viewport.size.height
+        );
+
+        // 行が縮んでいないこと（縮むと中身がビューポートに収まり、スクロールできなくなる）
+        let first = visual
+            .debug_bounds("import-choice-0")
+            .expect("1 件目の選択肢が描画されていない");
+        assert!(
+            first.size.height >= gpui_kit::px(IMPORT_CHOICE_ROW_H - 1.0),
+            "選択肢の行が縮んでいる: {:?}",
+            first.size.height
+        );
+    }
+
+    /// 他の本を取り込み中は、ダウンロード済みの本をクリックしてもビューアーを開かないこと。
+    ///
+    /// 開いてしまうと取り込みと競合する（ビューアーの読み込み・ページ画像の生成と、
+    /// 取り込みの書き込みが重なる）。
+    #[gpui_kit::test]
+    async fn another_download_blocks_opening_the_viewer(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "local-1", "ローカル本", "サークル");
+        seed_shelf_item(cx, "db-2", "取り込み中の本", "サークル", None);
+        let view = cx.new(BookshelfView::new);
+
+        // OpenReader が飛んだかどうかを記録する（Workspace のハンドラの代わり）
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cx.update({
+            let opened = opened.clone();
+            move |cx| {
+                App::on_action(cx, move |_: &OpenReader, _: &mut App| {
+                    opened.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
+
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(900.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // カードのクリック（セレクタは `&'static str` 固定なのでリテラルで引く）
+        fn click_local_card(visual: &mut gpui_kit::VisualTestContext) {
+            let card = visual
+                .debug_bounds("book-card-local-1")
+                .expect("ローカル本のカードが描画されていない");
+            visual.simulate_click(card.center(), gpui_kit::Modifiers::default());
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        }
+        // 対照: 取り込みが無ければ開く
+        click_local_card(visual);
+        assert!(
+            opened.load(std::sync::atomic::Ordering::SeqCst),
+            "前提: 通常はクリックでビューアーが開くこと"
+        );
+        opened.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // 別の本を取り込み中
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_states
+                    .insert("db-2".to_string(), DownloadState::Downloading(0.0));
+                cx.notify();
+            });
+        });
+        click_local_card(visual);
+        assert!(
+            !opened.load(std::sync::atomic::Ordering::SeqCst),
+            "取り込み中に別の本のビューアーが開いている"
+        );
+
+        // 理由を通知で伝える
+        let message = cx.update(|cx| AppState::global(cx).toast_message.lock().clone());
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("ダウンロード中")),
+            "取り込み中で開けないことを伝えていない: {message:?}"
+        );
+
+        // キーボードからの起動（Enter）も同じ
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.selected_index = this.filtered.iter().position(|&card_idx| {
+                    this.shelf_cards[card_idx].shelf.database_id == "local-1"
+                });
+                this.activate_selected(cx);
+            });
+        });
+        assert!(
+            !opened.load(std::sync::atomic::Ordering::SeqCst),
+            "取り込み中に Enter でビューアーが開いている"
+        );
+
+        // 取り込みが終われば開ける
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_states.clear();
+                cx.notify();
+            });
+        });
+        click_local_card(visual);
+        assert!(
+            opened.load(std::sync::atomic::Ordering::SeqCst),
+            "取り込みが終わったら開けること"
+        );
+    }
+
+    /// 未ダウンロードの本をカード / Enter で開こうとしたら、確認を出さずそのまま取り込むこと。
+    ///
+    /// クリック元で挙動が違う（行・関連サムネイルは確認してから取り込む）。
+    #[gpui_kit::test]
+    async fn clicking_an_undownloaded_card_starts_the_download_without_confirming(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-3", "未取得の本", "サークル", None);
+        let view = cx.new(BookshelfView::new);
+
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(900.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+
+        // カードのクリック → 確認なしで取り込みが始まる
+        let card = visual
+            .debug_bounds("book-card-db-3")
+            .expect("未取得の本のカードが描画されていない");
+        visual.simulate_click(card.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+
+        let (confirming, downloading) = cx.update(|cx| {
+            view.read_with(cx, |this, _| {
+                (
+                    this.pending_download_confirm.is_some(),
+                    this.download_states.contains_key("db-3"),
+                )
+            })
+        });
+        assert!(
+            !confirming,
+            "カードのクリックで確認ダイアログが出ている（そのまま取り込むこと）"
+        );
+        assert!(downloading, "カードのクリックで取り込みが始まっていない");
+
+        // Enter（activate_selected）も同じ
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_states.clear();
+                this.pending_download_confirm = None;
+                this.selected_index = this
+                    .filtered
+                    .iter()
+                    .position(|&card_idx| this.shelf_cards[card_idx].shelf.database_id == "db-3");
+                this.activate_selected(cx);
+            });
+        });
+        let (confirming, downloading) = cx.update(|cx| {
+            view.read_with(cx, |this, _| {
+                (
+                    this.pending_download_confirm.is_some(),
+                    this.download_states.contains_key("db-3"),
+                )
+            })
+        });
+        assert!(
+            !confirming,
+            "Enter で確認ダイアログが出ている（そのまま取り込むこと）"
+        );
+        assert!(downloading, "Enter で取り込みが始まっていない");
     }
 }

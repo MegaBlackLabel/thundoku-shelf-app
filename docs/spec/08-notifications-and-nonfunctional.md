@@ -159,8 +159,10 @@
 ### 5.8 終了時の同期（`exit_checked` / `exit_uploading`）
 
 - `AppState.exit_checked: AtomicBool`（終了確認を表示済みか、キャンセルで false に戻す）と `exit_uploading: AtomicBool`（「アップロードして終了」実行中。本棚のダウンロード・ビューアー起動をブロックするために共有）`crates/app/src/app_state.rs:64-71`。
-- ウィンドウを閉じる時は保存済みウィンドウ状態（`window.bounds`）を DB に保存し、未確認なら終了確認ダイアログを出して `true` を返さない `crates/app/src/main.rs:112-125`。
-- 「アップロードして終了」は `drive.sync.folder_id` が無ければ「Drive 同期が未設定です」、Google 未ログインなら「Google にログインしてください」で失敗し、成功時は `db_path` 付きで同期してから `cx.quit()` `crates/app/src/workspace.rs:750-806`。
+- ウィンドウを閉じる時は保存済みウィンドウ状態（`window.bounds`）を DB に保存し、閉じてよいかの判断は `Workspace::handle_window_close_request` に集約する: アップロード中は常に閉じない（`false`）、未確認なら終了確認ダイアログを出して `false`、確認済みなら `true` `crates/app/src/workspace.rs:737-760`。
+- アップロードを始めたら Info の通知（「バックアップをアップロード中です…」）を出す。確認ダイアログは押した時点で閉じるため、これが進行中の唯一の手がかりになる。通知の自動消滅は `AppState.toast_autohide` で切り替えられ、これだけは `false`（完了＝アプリ終了まで出し続ける。他は従来どおり 5 秒）`crates/app/src/workspace.rs:730-745,845-860`; `crates/app/src/app_state.rs:86-88,551-570`。
+- アップロード中はメニューの「終了」も無効化する（`app_menus(false)`。macOS のメニューバー。完了時に戻す）`crates/app/src/workspace.rs:62-80,845-860`。
+- 「アップロードして終了」は `drive.sync.folder_id` が無ければ「Drive 同期が未設定です」、Google 未ログインなら「Google にログインしてください」で失敗し、成功時は `db_path` 付きで同期してから `cx.quit()` `crates/app/src/workspace.rs:845-905`。
 
 ---
 

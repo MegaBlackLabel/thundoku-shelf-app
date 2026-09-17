@@ -106,7 +106,7 @@ fn main() {
             Theme::global_mut(cx).motion.spring_move =
                 gpui_kit::base::Spring::new(std::time::Duration::from_millis(120))
                     .with_damping(0.9);
-            cx.set_menus(app_menus());
+            cx.set_menus(app_menus(true));
             cx.activate(true);
 
             AppState::init(cx);
@@ -126,29 +126,14 @@ fn main() {
                     // キャンセル時（cancel_exit_upload）に false へ戻す。
                     window.on_window_should_close(cx, move |window, cx| {
                         thundoku_shelf::app_state::save_window_bounds(window, cx);
-                        let app = thundoku_shelf::app_state::AppState::global(cx);
-                        if app.exit_checked.load(std::sync::atomic::Ordering::SeqCst) {
-                            // 確認ダイアログを既に表示し、キャンセルされていない → そのまま閉じる
-                            true
-                        } else {
-                            app.exit_checked
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                            let ws_weak = app.workspace.lock().clone();
-                            if let Some(ws) = ws_weak.and_then(|ws_weak| ws_weak.upgrade()) {
-                                // 起動時の Drive 復元確認（show_restore_prompt）が表示中の
-                                // まま閉じようとしたら、アップロード確認は出さずにそのまま閉じる。
-                                // Drive 側のバックアップをローカル（旧/空）で上書きしないため。
-                                let restoring_pending =
-                                    ws.read_with(cx, |ws, _| ws.restore_prompt_active());
-                                if restoring_pending {
-                                    true
-                                } else {
-                                    ws.update(cx, |ws, cx| ws.request_exit_upload_check(cx));
-                                    false
-                                }
-                            } else {
-                                false
-                            }
+                        // 閉じてよいかの判断は Workspace 側（アップロード中は閉じない等）
+                        let workspace = thundoku_shelf::app_state::AppState::global(cx)
+                            .workspace
+                            .lock()
+                            .clone();
+                        match workspace.and_then(|weak| weak.upgrade()) {
+                            Some(ws) => ws.update(cx, |ws, cx| ws.handle_window_close_request(cx)),
+                            None => false,
                         }
                     });
                     let workspace = cx.new(Workspace::new);

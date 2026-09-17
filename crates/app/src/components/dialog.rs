@@ -10,6 +10,7 @@ use std::time::Duration;
 use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::animation::ease_out_cubic;
+use gpui_kit::component::button::Button;
 use gpui_kit::{
     App, BoxShadow, InteractiveElement as _, IntoElement, ParentElement, Styled as _, anchored,
     div, hsla, point, prelude::FluentBuilder as _, px,
@@ -30,6 +31,7 @@ pub fn fade_dialog(
         window,
         cx,
     );
+    // 膜（ダークは `crate::theme::apply_dark_surfaces` で濃くしている）
     let overlay = cx.theme().colors.overlay;
     let view_size = window.viewport_size();
     gpui_kit::deferred(
@@ -53,39 +55,34 @@ pub fn fade_dialog(
     )
 }
 
+/// ダイアログの副ボタン（キャンセル・保存せずに終了など）。
+///
+/// 既定の `Button` は塗りが面とほぼ同じ明るさなので、ダイアログの面の上では形が
+/// 分からなくなる。縁を付けて面から切り離す（縁の色はテーマの `input`）。
+pub fn dialog_button(id: impl Into<gpui_kit::ElementId>, label: &'static str) -> Button {
+    Button::new(id).border_1().cursor_pointer().label(label)
+}
+
 /// ダイアログ本体のサーフェス（タイトル・本文・フッターを載せる枠）。
 /// テーマに追従するため `cx` から背景色・文字色を取得する。
 ///
 /// 呼び出し側では `let mut surface = dialog_surface(cx);` と先に評価し、
 /// `fade_dialog` に渡す（`cx` の借用を分離するため）。
 pub fn dialog_surface(cx: &App) -> gpui_kit::Div {
-    // ダークモードでは黒い影が背景（暗い）に沈んで見えないため、
-    // Web のダークモード標準に合わせて白の薄い縁（ハイライト）で区別する。
-    let is_dark = cx.theme().mode.is_dark();
+    let theme = cx.theme();
     div()
         .flex()
         .flex_col()
         .gap_3()
         .p_5()
         .rounded_xl()
-        .bg(cx.theme().colors.popover)
-        .text_color(cx.theme().colors.popover_foreground)
+        // 面は背景色（ライト＝白 / ダーク＝neutral-950）。浮かせるのは縁と膜と影で行う。
+        // 面を明るくすると、その上のボタン（`button`）が沈んで読めなくなる。
+        .bg(theme.colors.background)
+        .text_color(theme.colors.popover_foreground)
         .border_1()
-        .border_color(if is_dark {
-            hsla(0., 0., 1., 0.18)
-        } else {
-            cx.theme().colors.border
-        })
+        .border_color(theme.colors.border)
         .shadow(vec![
-            // ダークモードでは黒影が背景に沈むため、白のハイライト縁を先頭に置く。
-            // `0 0 0 1px rgba(255,255,255,…)` 相当で、背景との境界を明るく縁取る。
-            BoxShadow {
-                color: hsla(0., 0., 1., 0.14),
-                offset: point(px(0.), px(0.)),
-                blur_radius: px(1.),
-                spread_radius: px(0.),
-                inset: false,
-            },
             // Web のモーダルで広く使われる shadow-2xl 相当の強いレイヤー影。
             // 背景（オーバーレイ）との区別を強化するため、大きめのオフセットと強い不透明度を使う。
             BoxShadow {

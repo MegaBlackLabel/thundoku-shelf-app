@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::components::dialog::{dialog_surface, fade_dialog};
+use crate::components::dialog::{dialog_button, dialog_surface, fade_dialog};
 use gpui_kit::StyledImage as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
@@ -2584,8 +2584,7 @@ impl Render for SettingsView {
                                     .justify_center()
                                     .gap_2()
                                     .child(
-                                        Button::new("delete-cancel").cursor_pointer()
-                                            .label("キャンセル").cursor_pointer().on_click({
+                                        dialog_button("delete-cancel", "キャンセル").cursor_pointer().on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
                                                 handle.update(cx, |this, cx| {
@@ -2628,8 +2627,7 @@ impl Render for SettingsView {
                                     .flex_row()
                                     .gap_2()
                                     .child(
-                                        Button::new("datadir-cancel").cursor_pointer()
-                                            .label("キャンセル").cursor_pointer().on_click({
+                                        dialog_button("datadir-cancel", "キャンセル").cursor_pointer().on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
                                                 handle.update(cx, |this, cx| {
@@ -2669,8 +2667,7 @@ impl Render for SettingsView {
                                     .justify_center()
                                     .gap_2()
                                     .child(
-                                        Button::new("clear-sync-cancel").cursor_pointer()
-                                            .label("キャンセル").cursor_pointer().on_click({
+                                        dialog_button("clear-sync-cancel", "キャンセル").cursor_pointer().on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
                                                 handle.update(cx, |this, cx| {

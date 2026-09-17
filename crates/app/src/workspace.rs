@@ -14,10 +14,11 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, prelude::FluentBuilder as _,
 };
 
-use crate::components::dialog::{dialog_surface, fade_dialog};
+use crate::components::dialog::{dialog_button, dialog_surface, fade_dialog};
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode, WindowExt as _};
 use gpui_kit::{
@@ -28,6 +29,7 @@ use gpui_kit::{
 use raw_window_handle::HasWindowHandle;
 
 use crate::app_state::AppState;
+use crate::app_state::ToastKind;
 use crate::icons::AppIcon;
 use crate::views::about::AboutView;
 use crate::views::auth::{AuthDialog, AuthProvider};
@@ -55,12 +57,21 @@ pub enum NavTarget {
     About,
 }
 
+/// 「アップロードして終了」の実行中に出す通知。
+///
+/// 確認ダイアログは押した時点で閉じるため、これが進行中の唯一の手がかりになる。
+const EXIT_UPLOAD_NOTICE: &str =
+    "バックアップをアップロード中です…（完了するとアプリが終了します）";
+
 /// アプリメニュー（macOS のメニューバー相当。gpui の set_menus に渡す）。
-pub fn app_menus() -> Vec<Menu> {
+///
+/// `quit_enabled` が false のときは「終了」を無効化する（終了時のアップロード中など、
+/// メニューから中断させたくないとき）。
+pub fn app_menus(quit_enabled: bool) -> Vec<Menu> {
     let app = Menu::new("App").items([
         MenuItem::action("Thundoku Shelf について", crate::actions::OpenAbout),
         MenuItem::separator(),
-        MenuItem::action("終了", crate::actions::QuitApp),
+        MenuItem::action("終了", crate::actions::QuitApp).disabled(!quit_enabled),
     ]);
     let view = Menu::new("表示").items([
         MenuItem::action("サイドバーを切り替え", crate::actions::ToggleSidebar),
@@ -157,6 +168,8 @@ impl Workspace {
         };
         this.register_actions(cx);
         this.refresh_unread_count(cx);
+        // 保存済みモードを適用する前に、ダークの面の階層を引き直しておく
+        crate::theme::apply_dark_surfaces(cx);
         this.restore_theme_mode(cx);
         // 保存済みプロフィールが無い場合（アップグレード直後）はここで取得しておく。
         // 所有者（sub）が分からないと、終了時のバックアップがスキップされ、復元確認も
@@ -650,8 +663,19 @@ impl Workspace {
         .detach();
     }
 
+    /// 取り込み確認モーダルが出ている間はビューアーを開かない。
+    ///
+    /// モーダルはビューアーの下（本棚）に描かれるため、ビューアーを重ねると
+    /// 選択肢が見えず操作できなくなる。
+    fn reader_blocked_by_import_confirm(&self, cx: &App) -> bool {
+        self.bookshelf.read(cx).has_pending_import()
+    }
+
     /// リーダーを開く（本棚・チェックリストからの委譲）。
     pub fn open_reader(&mut self, cx: &mut Context<Self>, book_id: String) {
+        if self.reader_blocked_by_import_confirm(cx) {
+            return;
+        }
         let reader = cx.new(|cx| ReaderView::for_book(cx, book_id));
         self.reader = Some(reader);
         cx.notify();
@@ -666,6 +690,9 @@ impl Workspace {
         content_id: String,
         side: Option<thundoku_core::db::notes::SpreadSide>,
     ) {
+        if self.reader_blocked_by_import_confirm(cx) {
+            return;
+        }
         let reader = cx.new(|cx| ReaderView::for_book_at(cx, book_id, page, content_id, side));
         self.reader = Some(reader);
         cx.notify();
@@ -673,6 +700,9 @@ impl Workspace {
 
     /// サンプルページ（チェックリストの試し読み）を開く。
     pub fn open_sample_reader(&mut self, cx: &mut Context<Self>, item_id: String) {
+        if self.reader_blocked_by_import_confirm(cx) {
+            return;
+        }
         let reader = cx.new(|cx| ReaderView::for_sample(cx, item_id));
         self.reader = Some(reader);
         cx.notify();
@@ -708,6 +738,33 @@ impl Workspace {
     /// 終了判定（close ハンドラ）から参照するための公開アクセサ。
     pub fn restore_prompt_active(&self) -> bool {
         self.show_restore_prompt
+    }
+
+    /// ウィンドウの「閉じる」要求を処理する（true = 閉じてよい）。
+    ///
+    /// 終了時のアップロード中は、進行中のアップロードを中断させないため閉じない
+    /// （閉じるボタンは無効にできないので、ここで要求を止める）。
+    pub fn handle_window_close_request(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.exit_uploading {
+            return false;
+        }
+        if AppState::global(cx)
+            .exit_checked
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // 確認ダイアログを既に表示し、キャンセルされていない → そのまま閉じる
+            return true;
+        }
+        AppState::global(cx)
+            .exit_checked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // 起動時の Drive 復元確認が出ている間は、そのまま閉じる（Drive 側のバックアップを
+        // ローカル（旧/空）で上書きしないため、アップロード確認は出さない）。
+        if self.restore_prompt_active() {
+            return true;
+        }
+        self.request_exit_upload_check(cx);
+        false
     }
 
     /// ウィンドウを閉じる時に、バックアップ対象に変更があるかを確認する。
@@ -798,6 +855,12 @@ impl Workspace {
     pub fn confirm_exit_upload(&mut self, cx: &mut Context<Self>) {
         self.exit_upload_prompt = false;
         self.exit_uploading = true;
+        // 確認ダイアログは閉じるので、進行中であることを通知で知らせる
+        // （見た目が何も変わらないと、終了したのか固まったのか分からない）。
+        // 完了（アプリ終了）まで消えない通知にする（長いアップロードでも見失わない）
+        crate::app_state::set_toast_kind_with(cx, ToastKind::Info, EXIT_UPLOAD_NOTICE, false);
+        // アップロード中はメニューの「終了」も無効にする（macOS。Windows では no-op）
+        cx.set_menus(app_menus(false));
         AppState::global(cx)
             .exit_uploading
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -853,6 +916,7 @@ impl Workspace {
                 AppState::global(cx)
                     .exit_uploading
                     .store(false, std::sync::atomic::Ordering::SeqCst);
+                cx.set_menus(app_menus(true));
                 cx.notify();
             });
             cx.update(|cx| cx.quit());
@@ -1252,12 +1316,13 @@ impl Render for Workspace {
 
         // メッセージは gpui-kit の Notification（右上のトースト）で出す。
         // 自前のバーは廃止した（自動で消える・種別ごとに色が付く・履歴が残る）。
-        let (toast, toast_kind, toast_generation) = {
+        let (toast, toast_kind, toast_generation, toast_autohide) = {
             let state = AppState::global(cx);
             (
                 state.toast_message.lock().clone(),
                 *state.toast_kind.lock(),
                 *state.toast_generation.lock(),
+                *state.toast_autohide.lock(),
             )
         };
         if self.toast_host_generation != toast_generation {
@@ -1268,7 +1333,13 @@ impl Render for Workspace {
                     crate::app_state::ToastKind::Success => NotificationType::Success,
                     crate::app_state::ToastKind::Error => NotificationType::Error,
                 };
-                window.push_notification((kind, message), cx);
+                window.push_notification(
+                    Notification::new()
+                        .with_type(kind)
+                        .message(message)
+                        .autohide(toast_autohide),
+                    cx,
+                );
             }
             // 表示は Notification が持つので、こちらの状態はすぐ消す（世代は残して再表示を防ぐ）
             crate::app_state::clear_toast(cx);
@@ -1470,9 +1541,7 @@ impl Render for Workspace {
                                 .flex_row()
                                 .gap_2()
                                 .child(
-                                    Button::new("restore-cancel")
-                                        .cursor_pointer()
-                                        .label("キャンセル")
+                                    dialog_button("restore-cancel", "キャンセル")
                                         .on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
@@ -1520,9 +1589,7 @@ impl Render for Workspace {
                                 .flex_row()
                                 .gap_2()
                                 .child(
-                                    Button::new("drive-cancel")
-                                        .cursor_pointer()
-                                        .label("キャンセル")
+                                    dialog_button("drive-cancel", "キャンセル")
                                         .on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
@@ -1579,9 +1646,7 @@ impl Render for Workspace {
                             .justify_center()
                             .gap_2()
                             .child(
-                                Button::new("exit-upload-cancel")
-                                    .cursor_pointer()
-                                    .label("キャンセル")
+                                dialog_button("exit-upload-cancel", "キャンセル")
                                     .disabled(uploading)
                                     .on_click({
                                         let handle = handle.clone();
@@ -1593,9 +1658,7 @@ impl Render for Workspace {
                                     }),
                             )
                             .child(
-                                Button::new("exit-upload-quit")
-                                    .cursor_pointer()
-                                    .label("保存せずにアプリ終了")
+                                dialog_button("exit-upload-quit", "保存せずにアプリ終了")
                                     .disabled(uploading)
                                     .on_click({
                                         let handle = handle.clone();
@@ -2492,6 +2555,31 @@ mod tests {
         cx.new(Workspace::new)
     }
 
+    /// 数フレーム描画する（通知の反映まで見る）。
+    fn draw_frames(visual: &mut gpui_kit::VisualTestContext) {
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+    }
+
+    /// いま表示されている Notification の件数。
+    fn notification_count(visual: &mut gpui_kit::VisualTestContext) -> usize {
+        visual.update(|window, cx| {
+            window
+                .root::<gpui_kit::component::Root>()
+                .expect("root")
+                .expect("root view")
+                .read(cx)
+                .notification
+                .read(cx)
+                .notifications()
+                .len()
+        })
+    }
+
     /// メニューの「終了」（`QuitApp`）で終了確認（アップロードの確認）が出ること。
     ///
     /// アクションが未登録だと何も起きず、macOS のメニューから終了できない。
@@ -2580,34 +2668,13 @@ mod tests {
             |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
         );
         let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
-        let draw = |visual: &mut gpui_kit::VisualTestContext| {
-            for _ in 0..4 {
-                visual.update(|window, cx| {
-                    let arena_clear = window.draw(cx);
-                    arena_clear.clear(cx);
-                });
-            }
-        };
-        let notification_count = |visual: &mut gpui_kit::VisualTestContext| {
-            visual.update(|window, cx| {
-                window
-                    .root::<gpui_kit::component::Root>()
-                    .expect("root")
-                    .expect("root view")
-                    .read(cx)
-                    .notification
-                    .read(cx)
-                    .notifications()
-                    .len()
-            })
-        };
-        draw(visual);
+        draw_frames(visual);
         assert_eq!(notification_count(visual), 0, "最初から通知が出ている");
 
         cx.update(|cx| {
             crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Success, "テスト通知")
         });
-        draw(visual);
+        draw_frames(visual);
         assert_eq!(
             notification_count(visual),
             1,
@@ -2615,7 +2682,7 @@ mod tests {
         );
 
         // 追加で描画しても同じメッセージが重複して積まれない（世代で 1 回だけ）
-        draw(visual);
+        draw_frames(visual);
         assert_eq!(
             notification_count(visual),
             1,
@@ -2626,7 +2693,7 @@ mod tests {
         cx.update(|cx| {
             crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Error, "失敗しました")
         });
-        draw(visual);
+        draw_frames(visual);
         assert_eq!(notification_count(visual), 2, "2 件目の通知が出ていない");
     }
 
@@ -3257,5 +3324,242 @@ mod tests {
                 "現在のアカウントに帰属する本だけを対象にする"
             );
         });
+    }
+
+    /// アップロード中は、閉じるボタンでウィンドウを閉じられないこと。
+    ///
+    /// アップロードはアプリ内のバックグラウンドタスクなので、閉じてしまうと中断される
+    /// （バックアップが中途半端なまま終了する）。
+    #[gpui_kit::test]
+    async fn window_close_is_blocked_while_uploading(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+
+        // 1 回目の「閉じる」→ アップロード確認を出す（この時点では閉じない）
+        let allowed = cx.update(|cx| ws.update(cx, |w, cx| w.handle_window_close_request(cx)));
+        assert!(!allowed, "確認ダイアログを出すときは閉じない");
+        assert!(
+            ws.read_with(cx, |w, _| w.exit_upload_prompt),
+            "アップロード確認が出ていない"
+        );
+
+        // 「アップロードして終了」を押した後（アップロード中）
+        cx.update(|cx| {
+            ws.update(cx, |w, _cx| {
+                w.exit_upload_prompt = false;
+                w.exit_uploading = true;
+            });
+            AppState::global(cx)
+                .exit_checked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let allowed = cx.update(|cx| ws.update(cx, |w, cx| w.handle_window_close_request(cx)));
+        assert!(!allowed, "アップロード中は閉じられない");
+        assert!(
+            ws.read_with(cx, |w, _| w.exit_uploading),
+            "前提: アップロード中のままであること"
+        );
+
+        // アップロードが終われば閉じられる
+        cx.update(|cx| {
+            ws.update(cx, |w, _cx| w.exit_uploading = false);
+        });
+        let allowed = cx.update(|cx| ws.update(cx, |w, cx| w.handle_window_close_request(cx)));
+        assert!(allowed, "アップロードが終わったら閉じられる");
+    }
+
+    /// アップロード中はメニューの「終了」を無効にすること（macOS のメニューバー）。
+    #[test]
+    fn quit_menu_item_is_disabled_while_uploading() {
+        let find_quit = |menus: Vec<Menu>| {
+            menus
+                .into_iter()
+                .flat_map(|menu| menu.items)
+                .find(
+                    |item| matches!(item, MenuItem::Action { name, .. } if name.as_ref() == "終了"),
+                )
+                .expect("メニューに「終了」が無い")
+        };
+
+        assert!(
+            !find_quit(app_menus(true)).is_disabled(),
+            "通常は「終了」が有効であること"
+        );
+        assert!(
+            find_quit(app_menus(false)).is_disabled(),
+            "アップロード中は「終了」を無効にすること"
+        );
+    }
+
+    /// 取り込み確認モーダルが出ている間は、ビューアーを開かないこと。
+    ///
+    /// モーダルは本棚の層に描かれるため、ビューアーを重ねると選択肢が見えず操作できない。
+    #[gpui_kit::test]
+    async fn viewer_does_not_open_while_the_import_dialog_is_shown(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+
+        // 取り込み確認が出ている状態にする
+        cx.update(|cx| {
+            let bookshelf = ws.read_with(cx, |w, _| w.bookshelf.clone());
+            bookshelf.update(cx, |b, cx| {
+                let (reply, _answer) = std::sync::mpsc::channel();
+                b.request_pending_import(
+                    crate::views::bookshelf::PendingImport {
+                        title: "総集編".into(),
+                        choices: Vec::new(),
+                        selected: 0,
+                        reply,
+                    },
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            cx.dispatch_action(&crate::actions::OpenReader {
+                book_id: "b1".into(),
+            });
+        });
+        assert!(
+            ws.read_with(cx, |w, _| w.reader.is_none()),
+            "取り込み確認中はビューアーを開かないこと"
+        );
+    }
+
+    /// 取り込み確認モーダルが来たら、開いていたビューアーを閉じること。
+    ///
+    /// モーダルはビューアーの下の層に描かれるため、重なったままだと操作できない。
+    #[gpui_kit::test]
+    async fn import_dialog_closes_the_viewer(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            cx.dispatch_action(&crate::actions::OpenReader {
+                book_id: "b1".into(),
+            });
+        });
+        assert!(
+            ws.read_with(cx, |w, _| w.reader.is_some()),
+            "前提: ビューアーが開いている"
+        );
+
+        cx.update(|cx| {
+            let bookshelf = ws.read_with(cx, |w, _| w.bookshelf.clone());
+            bookshelf.update(cx, |b, cx| {
+                let (reply, _answer) = std::sync::mpsc::channel();
+                b.request_pending_import(
+                    crate::views::bookshelf::PendingImport {
+                        title: "総集編".into(),
+                        choices: Vec::new(),
+                        selected: 0,
+                        reply,
+                    },
+                    cx,
+                );
+            });
+        });
+
+        assert!(
+            ws.read_with(cx, |w, _| w.reader.is_none()),
+            "取り込み確認が出たらビューアーは閉じること"
+        );
+    }
+
+    /// 終了時のアップロードを始めたら、通知でアップロード中であることを知らせること。
+    ///
+    /// 「アップロードして終了」で確認ダイアログは閉じるため、通知が無いと
+    /// 画面には何も残らない（終了するのか固まったのか分からない）。
+    #[gpui_kit::test]
+    async fn exit_upload_shows_an_uploading_notification(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        assert_eq!(notification_count(visual), 0, "最初から通知が出ている");
+
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| w.confirm_exit_upload(cx));
+            // アップロードのタスク（テストでは即失敗して終了要求まで進む）が片付く前に、
+            // 同じ更新の中で通知が積まれたことを見る
+            let state = AppState::global(cx);
+            assert_eq!(
+                *state.toast_kind.lock(),
+                ToastKind::Info,
+                "アップロード中は進捗なので Info で出すこと"
+            );
+            let message = state
+                .toast_message
+                .lock()
+                .clone()
+                .expect("アップロード中の通知が出ていない");
+            assert!(
+                message.contains("アップロード中"),
+                "アップロード中であることが分かる文言になっていない: {message}"
+            );
+        });
+
+        // 通知として描画される
+        draw_frames(visual);
+        assert_eq!(
+            notification_count(visual),
+            1,
+            "アップロード中の通知が描画されていない"
+        );
+    }
+
+    /// アップロード中の通知は自動で消えないこと（他の通知は 5 秒で消える）。
+    ///
+    /// 長いアップロードでは途中で通知が消えて、また「終了したのか固まったのか」が
+    /// 分からなくなるため、完了（＝アプリ終了）まで出しておく。
+    #[gpui_kit::test]
+    async fn exit_upload_notification_stays_until_the_app_quits(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        // 時計を進めるために executor を先に取る（`visual` が cx を借りるため）
+        let clock = cx.background_executor.clone();
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        // 対照: 通常の通知は自動で消える
+        cx.update(|cx| {
+            crate::app_state::set_toast_kind(cx, ToastKind::Success, "テスト通知");
+        });
+        draw_frames(visual);
+        assert_eq!(notification_count(visual), 1, "通知が出ていない");
+        clock.advance_clock(std::time::Duration::from_secs(6));
+        draw_frames(visual);
+        assert_eq!(
+            notification_count(visual),
+            0,
+            "通常の通知が自動で消えていない（前提が崩れている）"
+        );
+
+        // アップロード中の通知は消えない
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| w.confirm_exit_upload(cx));
+        });
+        draw_frames(visual);
+        assert_eq!(
+            notification_count(visual),
+            1,
+            "アップロード中の通知が出ていない"
+        );
+        clock.advance_clock(std::time::Duration::from_secs(6));
+        draw_frames(visual);
+        assert_eq!(
+            notification_count(visual),
+            1,
+            "アップロード中の通知が自動で消えている（完了まで出しておくこと）"
+        );
     }
 }
