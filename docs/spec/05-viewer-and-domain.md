@@ -47,17 +47,18 @@
 
 - `ViewMode` = `Single` / `Spread` / `Scroll`（`crates/app/src/components/image_viewer/mod.rs:327-331`）。
 - パネル種別 `PanelView` = `Menu` / `PageList` / `Shortcuts` / `AutoplaySettings`（`crates/app/src/components/image_viewer/mod.rs:335-339`）。
-- サイト別設定キー `setting_key(base)` = `"{base}.{site}"`、`site_id` が無ければ `base`（`crates/app/src/components/image_viewer/mod.rs:450-455`）。
+- サイト別設定キー `setting_key(base)` = `"{base}.{site}"`、サイトが無ければ `base`（`crates/app/src/components/image_viewer/mod.rs:483-489`）。
+- ビューアは対象の本を `BookScope { id, site_id }` で持つ（試し読みなど本に紐づかない表示は `None`）（`crates/app/src/components/image_viewer/mod.rs:342-352`）。
 
 | 設定 | キー | 保存値 | 復元の優先順位 | 既定 | アンカー |
 |---|---|---|---|---|---|
-| 表示モード | `viewer.mode.{site}` → `viewer.mode` | `"spread"` / `"scroll"` / それ以外 = `"single"` | サイト別 → グローバル → サイト既定 | `site_id` が `fanza` / `dlsite` なら `Spread`、他は `Single` | `crates/app/src/components/image_viewer/mod.rs:468-494` |
-| 綴じ方向 | `viewer.page_turn.{site}` → `viewer.page_turn` | `"right-to-left"` = true / `"left-to-right"` = false | 同上 | `site_id` が `fanza` / `dlsite` なら true（右綴じ）、他は false（左綴じ。技術書典は左綴じ想定） | `crates/app/src/components/image_viewer/mod.rs:496-509` |
-| 自動再生間隔 | `viewer.autoplay_interval.{site}` → `viewer.autoplay_interval` | ミリ秒の文字列（`u64` parse 失敗時は既定） | 同上 | `AUTOPLAY_DEFAULT_MS` = 5000 ms | `crates/app/src/components/image_viewer/mod.rs:511-524` |
+| 表示モード | `viewer.mode.{site}` → `viewer.mode` | `"spread"` / `"scroll"` / それ以外 = `"single"` | サイト別 → グローバル → サイト既定 | `site_id` が `fanza` / `dlsite` なら `Spread`、他は `Single` | `crates/app/src/components/image_viewer/mod.rs:491-510` |
+| 綴じ方向 | `books.page_turn`（本ごと）→ `viewer.page_turn.{site}` → `viewer.page_turn` | `"right-to-left"` = 右綴じ / `"left-to-right"` = 左綴じ | **本ごと → サイト別 → グローバル → サイト既定** | `site_id` が `fanza` / `dlsite` なら右綴じ、他は左綴じ（技術書典は左綴じ想定） | `crates/app/src/components/image_viewer/mod.rs:465-480`, `:511-526` |
+| 自動再生間隔 | `viewer.autoplay_interval.{site}` → `viewer.autoplay_interval` | ミリ秒の文字列（`u64` parse 失敗時は既定） | 同上 | `AUTOPLAY_DEFAULT_MS` = 5000 ms | `crates/app/src/components/image_viewer/mod.rs:528-541` |
 
-- モード変更は `set_mode()` が `viewer.mode.{site}` に書き込む（`crates/app/src/components/image_viewer/mod.rs:1568-1580`）。
-- 綴じ方向は `set_binding()` が `viewer.page_turn.{site}` に書き込む（`crates/app/src/components/image_viewer/mod.rs:1549-1564`）。
-- 自動再生間隔は `set_autoplay_interval(ms)` が `ms.clamp(AUTOPLAY_MIN_MS, AUTOPLAY_MAX_MS)` したうえで **サイト別キーとグローバルキーの両方**に書き込む（後方互換）（`crates/app/src/components/image_viewer/mod.rs:1700-1717`）。
+- モード変更は `set_mode()` が `viewer.mode.{site}` に書き込む（`crates/app/src/components/image_viewer/mod.rs:1619-1631`）。
+- 綴じ方向は `set_binding()` が **その本の行**（`books.page_turn`）に書き込む。本ごとの指定はサイト別設定より優先され、サイト別設定（他の本の既定）は書き換えない。本に紐づかない表示では保存しない（`crates/app/src/components/image_viewer/mod.rs:1587-1604`、`crates/core/src/db/books.rs:465-493`）。
+- 自動再生間隔は `set_autoplay_interval(ms)` が `ms.clamp(AUTOPLAY_MIN_MS, AUTOPLAY_MAX_MS)` したうえで **サイト別キーとグローバルキーの両方**に書き込む（後方互換）（`crates/app/src/components/image_viewer/mod.rs:1751-1768`）。
 
 ### 1.3 ページ決定式（受入基準の核心）
 

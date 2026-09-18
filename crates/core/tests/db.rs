@@ -107,6 +107,81 @@ fn migrate_is_idempotent() {
     assert_eq!(count, 4);
 }
 
+// 本ごとの綴じ方向（books.page_turn）は後発の列。既存 DB（列が無い）でも
+// migrate が列を足し、既存の本の行を壊さないこと。
+#[test]
+fn legacy_books_get_the_page_turn_column() {
+    let pool = memory_db();
+    let stamp = "2026-01-01 00:00:00";
+    books::insert(
+        &pool,
+        &books::Book {
+            id: "b1".into(),
+            title: "既存の本".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "t.zip".into(),
+            file_size: 1,
+            opfs_path: "b1.opfspack".into(),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some("b1".into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: stamp.into(),
+            updated_at: stamp.into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+
+    // page_turn 列の無い状態に戻して「後発列を持たない既存 DB」を再現する
+    thundoku_core::db::block_on(async {
+        sqlx::query("ALTER TABLE books DROP COLUMN page_turn")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let has: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('books') WHERE name = 'page_turn'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(has, 0, "前提: page_turn 列が無い状態にできていない");
+    });
+
+    thundoku_core::db::migrate(&pool).unwrap();
+
+    assert_eq!(
+        books::get(&pool, "b1").unwrap().unwrap().title,
+        "既存の本",
+        "移行で既存の本が消えている"
+    );
+    assert_eq!(
+        books::page_turn(&pool, "b1").unwrap(),
+        None,
+        "移行後の既定は未設定（サイト別設定に従う）であること"
+    );
+    // 追加された列に保存できる
+    books::set_page_turn(&pool, "b1", Some(books::PageTurn::RightToLeft)).unwrap();
+    assert_eq!(
+        books::page_turn(&pool, "b1").unwrap(),
+        Some(books::PageTurn::RightToLeft)
+    );
+}
+
 #[test]
 fn settings_roundtrip() {
     let pool = memory_db();

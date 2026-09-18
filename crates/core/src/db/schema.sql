@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS books (
   is_hidden INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  owner_sub TEXT
+  owner_sub TEXT,
+  page_turn TEXT
 );
 
 CREATE INDEX IF NOT EXISTS books_site_id_idx ON books(site_id);

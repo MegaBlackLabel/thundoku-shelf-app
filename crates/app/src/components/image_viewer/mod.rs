@@ -26,6 +26,7 @@ use thundoku_core::db;
 
 use crate::actions::CloseReader;
 use crate::icons::AppIcon;
+use thundoku_core::db::books::PageTurn;
 use thundoku_core::db::documents::DocumentImage;
 
 /// 付箋アイコンの一辺（px）。ボタン、アイコン、単一表示の位置計算で共有する。
@@ -339,11 +340,24 @@ enum PanelView {
     AutoplaySettings,
 }
 
+/// ビューアが表示している本（設定の効く範囲を決める）。
+///
+/// サイト別の設定（`viewer.mode.{site}` / `viewer.page_turn.{site}`）はサイトで決まり、
+/// 綴じ方向だけは本ごとの指定（`books.page_turn`）が優先される。
+/// 試し読み（`Base64PageLoader`）のように本に紐づかない表示では `None`。
+#[derive(Debug, Clone)]
+pub struct BookScope {
+    pub id: String,
+    /// 取り込み元のサイト（techbookfest / booth / fanza / dlsite）。不明なら `None`。
+    pub site_id: Option<String>,
+}
+
 pub struct ImageViewer {
     pub loader: Arc<dyn PageLoader>,
     pub title: SharedString,
-    /// 本のサイト（techbookfest / booth）。サイト別ビューアー設定のキーに使う
-    site_id: Option<String>,
+    /// 表示している本（試し読みなど本に紐づかない表示では `None`）。
+    /// 設定キーのスコープ（サイト別）と、綴じ方向の本ごとの保存に使う
+    book: Option<BookScope>,
     current_page: usize,
     mode: ViewMode,
     images: Vec<Option<Arc<RenderImage>>>,
@@ -448,10 +462,27 @@ fn decoded_page_bytes(loader: &dyn PageLoader, index: usize) -> Option<usize> {
         .map(|(width, height)| width as usize * height as usize * 4)
 }
 
+/// この本の綴じ方向を決める。**本ごとの指定 > サイト（グローバル）設定 > サイト既定**。
+///
+/// サイト既定は FANZA / DLsite が右綴じ、それ以外は左綴じ（同人漫画は右綴じ、
+/// 技術書典の本は左綴じ前提）。
+fn resolve_page_turn(
+    book: Option<PageTurn>,
+    site_setting: Option<PageTurn>,
+    site_id: Option<&str>,
+) -> PageTurn {
+    let site_default = if matches!(site_id, Some("fanza") | Some("dlsite")) {
+        PageTurn::RightToLeft
+    } else {
+        PageTurn::LeftToRight
+    };
+    book.or(site_setting).unwrap_or(site_default)
+}
+
 impl ImageViewer {
-    /// サイト別設定キー（viewer.mode.{site}）。site_id がなければ従来キー。
+    /// サイト別設定キー（viewer.mode.{site}）。サイトが分からなければ従来キー。
     fn setting_key(&self, base: &str) -> String {
-        match &self.site_id {
+        match self.book.as_ref().and_then(|book| book.site_id.as_deref()) {
             Some(site) => format!("{base}.{site}"),
             None => base.to_string(),
         }
@@ -462,12 +493,13 @@ impl ImageViewer {
         loader: Arc<dyn PageLoader>,
         title: impl Into<SharedString>,
         initial_page: usize,
-        site_id: Option<String>,
+        book: Option<BookScope>,
     ) -> Self {
         let page_count = loader.page_count();
         let initial = initial_page.min(page_count.saturating_sub(1));
         // サイト別設定キー（viewer.mode.{site}）。サイト設定がなければ
         // 従来のグローバルキー（viewer.mode）にフォールバックする
+        let site_id = book.as_ref().and_then(|book| book.site_id.clone());
         let viewer_key = |base: &str| match &site_id {
             Some(site) => format!("{base}.{site}"),
             None => base.to_string(),
@@ -493,22 +525,21 @@ impl ImageViewer {
                 None => ViewMode::Single,
             }
         };
-        // ページめくり方向（設定ページの「ページめくり」から復元）
-        // デフォルトは左綴じ（技術書典の本は左綴じ想定）。
-        // 設定で明示的に right-to-left が選ばれている場合のみ右綴じ。
+        // ページめくり方向（本ごとの指定 → サイト別設定 → グローバル設定 → サイト既定）。
+        // 本ごとの指定（books.page_turn）はビューアの綴じ切替で保存される。
+        // サイト既定は左綴じ（技術書典の本は左綴じ想定）、FANZA / DLsite は右綴じ。
         let page_turn_right_to_left = {
             let state = crate::app_state::AppState::global(cx);
             let db = &state.db_pool;
-            let direction = db::settings::get(db, &viewer_key("viewer.page_turn"))
+            let book_page_turn = book
+                .as_ref()
+                .and_then(|book| db::books::page_turn(db, &book.id).ok().flatten());
+            let site_page_turn = db::settings::get(db, &viewer_key("viewer.page_turn"))
                 .ok()
                 .flatten()
-                .or_else(|| db::settings::get(db, "viewer.page_turn").ok().flatten());
-            match direction.as_deref() {
-                Some("right-to-left") => true,
-                Some("left-to-right") => false,
-                // 未設定のときのデフォルト: FANZA / DLsite は右綴じ。
-                _ => site_id.as_deref() == Some("fanza") || site_id.as_deref() == Some("dlsite"),
-            }
+                .or_else(|| db::settings::get(db, "viewer.page_turn").ok().flatten())
+                .and_then(|value| PageTurn::parse(&value));
+            resolve_page_turn(book_page_turn, site_page_turn, site_id.as_deref()).is_right_to_left()
         };
         // 自動再生の間隔（サイト別キー → グローバル → デフォルト）
         let saved_autoplay_interval = {
@@ -528,7 +559,7 @@ impl ImageViewer {
         let mut viewer = Self {
             loader,
             title: title.into(),
-            site_id,
+            book,
             current_page: initial,
             mode: saved_mode,
             page_turn_right_to_left,
@@ -1553,22 +1584,20 @@ impl ImageViewer {
     // -- modes --------------------------------------------------------------
 
     /// 見開きの綴じ方向（右綴じ = 右→左、左綴じ = 左→右）を切り替える。
-    /// 設定にも永続化する（Web の setReaderBindingDirection 相当）。
+    ///
+    /// **この本だけ**に効く（`books.page_turn` に保存し、サイト別の既定より優先する）。
+    /// サイト別の既定を変えたいときは設定画面の「サイト別 Viewer 設定」を使う。
+    /// 本に紐づかない表示（試し読み）では保存せず、その場限りにする。
     pub fn set_binding(&mut self, cx: &mut Context<Self>, right_to_left: bool) {
         self.page_turn_right_to_left = right_to_left;
-        {
+        if let Some(book) = self.book.as_ref() {
             let state = crate::app_state::AppState::global(cx);
-            let db = &state.db_pool;
-            let key = self.setting_key("viewer.page_turn");
-            let _ = db::settings::set(
-                db,
-                &key,
-                if right_to_left {
-                    "right-to-left"
-                } else {
-                    "left-to-right"
-                },
-            );
+            let page_turn = if right_to_left {
+                PageTurn::RightToLeft
+            } else {
+                PageTurn::LeftToRight
+            };
+            let _ = db::books::set_page_turn(&state.db_pool, &book.id, Some(page_turn));
         }
         cx.notify();
     }
@@ -3340,12 +3369,25 @@ mod tests {
     }
 
     fn viewer(cx: &mut TestAppContext, count: usize) -> Entity<ImageViewer> {
+        viewer_with_book(cx, count, None)
+    }
+
+    /// 本に紐づいたビューア（綴じ方向を本ごとに保存する経路の確認用）。
+    fn viewer_with_book(
+        cx: &mut TestAppContext,
+        count: usize,
+        book: Option<(&str, Option<&str>)>,
+    ) -> Entity<ImageViewer> {
         // 表示モードの永続化（app_settings）で AppState が必要。
         // 既に初期化済みなら再初期化しない（保存済み設定を消さない）。
         cx.update(|cx| {
             if cx.try_global::<crate::app_state::AppState>().is_none() {
                 crate::app_state::AppState::init_test(cx);
             }
+        });
+        let book = book.map(|(id, site_id)| BookScope {
+            id: id.to_string(),
+            site_id: site_id.map(|site| site.to_string()),
         });
         let png = make_png(100, 140);
         cx.new(|cx| {
@@ -3358,9 +3400,49 @@ mod tests {
                 }),
                 "テスト本",
                 0,
-                None,
+                book,
             )
         })
+    }
+
+    /// 本の行を作る（綴じ方向を保存するには books の行が要る）。
+    fn seed_book(cx: &mut TestAppContext, id: &str) {
+        cx.update(|cx| {
+            let db = &crate::app_state::AppState::global(cx).db_pool;
+            thundoku_core::db::books::insert(
+                db,
+                &thundoku_core::db::books::Book {
+                    id: id.into(),
+                    title: "テスト本".into(),
+                    author: String::new(),
+                    circle_name: String::new(),
+                    purchase_date: None,
+                    file_name: "t.pdf".into(),
+                    file_size: 1,
+                    opfs_path: format!("{id}.opfspack"),
+                    cover_thumbnail: None,
+                    tbf_product_id: None,
+                    site_id: Some("fanza".into()),
+                    tags_fetched: 1,
+                    pack_id: None,
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    created_at: "2026-01-01 00:00:00".into(),
+                    updated_at: "2026-01-01 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
+                },
+            )
+            .unwrap();
+        });
     }
 
     /// スクロールモードは全ページを持たず、**表示中ページの前後だけ**を予算内で保持する。
@@ -3654,39 +3736,126 @@ mod tests {
         );
     }
 
+    /// 綴じ方向の解決順: 本ごとの指定 > サイト（グローバル）設定 > サイト既定。
+    #[test]
+    fn page_turn_resolution_prefers_the_book_over_the_site() {
+        // 本ごとの指定が最優先（サイト設定も無視する）
+        assert_eq!(
+            resolve_page_turn(
+                Some(PageTurn::LeftToRight),
+                Some(PageTurn::RightToLeft),
+                Some("fanza")
+            ),
+            PageTurn::LeftToRight,
+            "本ごとの指定がサイト設定に負けている"
+        );
+        // 本ごとの指定が無ければサイト設定
+        assert_eq!(
+            resolve_page_turn(None, Some(PageTurn::RightToLeft), Some("techbookfest")),
+            PageTurn::RightToLeft,
+            "サイト設定が既定に負けている"
+        );
+        // どちらも無ければサイト既定（同人漫画の FANZA / DLsite は右綴じ、それ以外は左綴じ）
+        for site in ["fanza", "dlsite"] {
+            assert_eq!(
+                resolve_page_turn(None, None, Some(site)),
+                PageTurn::RightToLeft,
+                "{site} の既定が右綴じになっていない"
+            );
+        }
+        for site in [Some("techbookfest"), Some("booth"), None] {
+            assert_eq!(
+                resolve_page_turn(None, None, site),
+                PageTurn::LeftToRight,
+                "{site:?} の既定が左綴じになっていない"
+            );
+        }
+    }
+
+    /// ユーザーが変えた綴じ方向は**本ごと**に保存され、サイト別の既定より優先されること。
+    /// サイト別設定（他の本の既定）は書き換えない。
     #[gpui_kit::test]
-    async fn binding_switch_persists_and_flips_spread(cx: &mut TestAppContext) {
+    async fn binding_is_stored_per_book_over_the_site_default(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book(cx, "b1");
+        seed_book(cx, "b2");
+        // FANZA の既定（サイト別設定）は右綴じ
+        cx.update(|cx| {
+            let db = &crate::app_state::AppState::global(cx).db_pool;
+            thundoku_core::db::settings::set(db, "viewer.page_turn.fanza", "right-to-left")
+                .unwrap();
+        });
+
+        let first = viewer_with_book(cx, 5, Some(("b1", Some("fanza"))));
+        cx.update(|cx| first.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
+        assert_eq!(
+            first.read_with(cx, |v, _| v.spread_pages()),
+            vec![1, 0],
+            "サイト別の既定（右綴じ）で開いていない"
+        );
+
+        // ユーザーが左綴じに変更 → この本だけに保存される
+        cx.update(|cx| first.update(cx, |this, cx| this.set_binding(cx, false)));
+        cx.read(|cx| {
+            let db = &crate::app_state::AppState::global(cx).db_pool;
+            assert_eq!(
+                thundoku_core::db::books::page_turn(db, "b1").unwrap(),
+                Some(PageTurn::LeftToRight),
+                "本ごとに保存されていない"
+            );
+            assert_eq!(
+                thundoku_core::db::settings::get(db, "viewer.page_turn.fanza")
+                    .unwrap()
+                    .as_deref(),
+                Some("right-to-left"),
+                "サイト別設定を書き換えている"
+            );
+            assert_eq!(
+                thundoku_core::db::books::page_turn(db, "b2").unwrap(),
+                None,
+                "同じサイトの別の本に指定が入っている"
+            );
+        });
+
+        // 開き直すと本ごとの指定が優先される
+        let reopened = viewer_with_book(cx, 5, Some(("b1", Some("fanza"))));
+        cx.update(|cx| reopened.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
+        assert_eq!(
+            reopened.read_with(cx, |v, _| v.spread_pages()),
+            vec![0, 1],
+            "本ごとの指定が開き直しで復元されていない"
+        );
+
+        // 同じサイトの別の本はサイト別の既定のまま
+        let other = viewer_with_book(cx, 5, Some(("b2", Some("fanza"))));
+        cx.update(|cx| other.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
+        assert_eq!(
+            other.read_with(cx, |v, _| v.spread_pages()),
+            vec![1, 0],
+            "別の本がサイト別の既定を継承していない"
+        );
+    }
+
+    /// 本に紐づかない表示（試し読み）では綴じ方向を保存しない（その場限り）。
+    #[gpui_kit::test]
+    async fn binding_without_a_book_is_not_persisted(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
         let view = viewer(cx, 5);
-        cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
-        // デフォルトは左綴じ（技術書典の本は左綴じ想定）: 小さい番号が左
-        assert_eq!(
-            view.read_with(cx, |v, _| v.spread_pages()),
-            vec![0, 1],
-            "default binding must be left-to-right"
-        );
-        // 右綴じに切替 → 小さい番号が右（画像の配置が入れ替わる）
         cx.update(|cx| view.update(cx, |this, cx| this.set_binding(cx, true)));
-        assert_eq!(
-            view.read_with(cx, |v, _| v.spread_pages()),
-            vec![1, 0],
-            "right binding must place the smaller page number on the right"
+        assert!(
+            view.read_with(cx, |v, _| v.page_turn_right_to_left),
+            "その場で切り替わっていない"
         );
-        // 設定に永続化される
-        let stored = cx.read(|cx| {
+        cx.read(|cx| {
             let db = &crate::app_state::AppState::global(cx).db_pool;
-            thundoku_core::db::settings::get(db, "viewer.page_turn").unwrap()
+            assert_eq!(
+                thundoku_core::db::settings::get(db, "viewer.page_turn").unwrap(),
+                None,
+                "本に紐づかない表示からグローバル設定を書き換えている"
+            );
         });
-        assert_eq!(stored.as_deref(), Some("right-to-left"));
-        // 左綴じに戻す
-        cx.update(|cx| view.update(cx, |this, cx| this.set_binding(cx, false)));
-        assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![0, 1]);
-        let stored = cx.read(|cx| {
-            let db = &crate::app_state::AppState::global(cx).db_pool;
-            thundoku_core::db::settings::get(db, "viewer.page_turn").unwrap()
-        });
-        assert_eq!(stored.as_deref(), Some("left-to-right"));
     }
 
     #[gpui_kit::test]

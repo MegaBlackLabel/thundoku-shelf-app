@@ -231,8 +231,18 @@ impl ReaderView {
             progress.as_ref().map(|p| p.current_page).unwrap_or(0)
         );
 
-        let viewer =
-            cx.new(|cx| ImageViewer::new(cx, loader, title.clone(), initial_page, site_id));
+        let viewer = cx.new(|cx| {
+            ImageViewer::new(
+                cx,
+                loader,
+                title.clone(),
+                initial_page,
+                Some(crate::components::image_viewer::BookScope {
+                    id: book_id.clone(),
+                    site_id: site_id.clone(),
+                }),
+            )
+        });
         // ページ一覧で使うコンテンツ一覧を渡す（複数コンテンツ / レンディションの切替用）
         viewer.update(cx, |viewer, cx| {
             viewer.set_contents(
@@ -838,6 +848,39 @@ mod tests {
     use gpui_kit::TestAppContext;
     use thundoku_core::db::documents;
     use thundoku_core::db::page_views;
+
+    /// 本を開いて綴じ方向を変えると、**その本だけ**に保存されること。
+    ///
+    /// ビューアに本の id を渡し忘れると「その場限り」になり、無言で保存されなくなる。
+    #[gpui_kit::test]
+    async fn binding_in_the_reader_is_saved_for_that_book(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book_with_pages(cx, "b1", "本1", 10);
+        seed_book_with_pages(cx, "b2", "本2", 10);
+
+        let view = cx.new(|cx| ReaderView::for_book(cx, "b1".into()));
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let viewer = this.viewer.clone();
+                viewer.update(cx, |viewer, cx| viewer.set_binding(cx, true));
+            });
+        });
+
+        cx.read(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            assert_eq!(
+                db::books::page_turn(db, "b1").unwrap(),
+                Some(db::books::PageTurn::RightToLeft),
+                "開いている本に綴じ方向が保存されていない"
+            );
+            assert_eq!(
+                db::books::page_turn(db, "b2").unwrap(),
+                None,
+                "別の本に綴じ方向が入っている"
+            );
+        });
+    }
 
     /// 付箋から開くと、指定ページが**付けたときの見開き側**に来る（左右の調整込み）。
     #[gpui_kit::test]

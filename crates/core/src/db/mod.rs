@@ -268,6 +268,10 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 .await?;
             }
         }
+        // 本ごとの綴じ方向（プログラム的マイグレーション。NULL = サイト別設定
+        // `viewer.page_turn.{site}` に従う。既存の migration ファイルは checksum
+        // 管理されるため変更せず、PRAGMA で存在確認してから ALTER TABLE する）
+        ensure_column(&mut conn, "books", "page_turn", "page_turn TEXT").await?;
         // 閲覧履歴（プログラム的マイグレーション。既存の migration ファイルは
         // checksum 管理されるため変更せず、IF NOT EXISTS で冪等に適用する）
         sqlx::query(

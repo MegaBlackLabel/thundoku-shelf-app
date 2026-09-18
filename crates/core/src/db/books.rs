@@ -39,6 +39,40 @@ const COLUMNS: &str = "id, title, author, circle_name, purchase_date, file_name,
      is_favorite, is_hidden, created_at, updated_at, media_category, ai_type, is_drm, \
      release_date, description, theme, maker_id, page_count, age_rating, series_name";
 
+/// 本の綴じ方向（右綴じ = 右→左、左綴じ = 左→右）。
+///
+/// 既定はサイト単位の設定（`viewer.page_turn.{site}`）で決まり、`books.page_turn` に
+/// 入るのは**ビューアでユーザーが変えた本だけ**（`NULL` = サイトの設定に従う）。
+/// 保存文字列はサイト別設定と共有する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageTurn {
+    /// 右綴じ（右から左へ読む。日本の本・同人漫画）
+    RightToLeft,
+    /// 左綴じ（左から右へ読む。洋書・技術書典の本）
+    LeftToRight,
+}
+
+impl PageTurn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RightToLeft => "right-to-left",
+            Self::LeftToRight => "left-to-right",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "right-to-left" => Some(Self::RightToLeft),
+            "left-to-right" => Some(Self::LeftToRight),
+            _ => None,
+        }
+    }
+
+    pub fn is_right_to_left(self) -> bool {
+        matches!(self, Self::RightToLeft)
+    }
+}
+
 pub fn insert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query(&format!(
@@ -428,6 +462,38 @@ pub fn set_site_id(pool: &SqlitePool, id: &str, site_id: &str) -> Result<(), sql
     })
 }
 
+/// 本ごとの綴じ方向の指定（`None` = 未設定 = サイト別設定に従う）。
+///
+/// `Book` には載せない（`owner_sub` と同じく、本棚の一覧では使わないビューアー専用の列）。
+pub fn page_turn(pool: &SqlitePool, id: &str) -> Result<Option<PageTurn>, sqlx::Error> {
+    crate::db::block_on(async {
+        let raw: Option<Option<String>> =
+            sqlx::query_scalar("SELECT page_turn FROM books WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(raw.flatten().as_deref().and_then(PageTurn::parse))
+    })
+}
+
+/// 本ごとの綴じ方向を保存する（`None` で指定を消してサイト別設定に戻す）。
+pub fn set_page_turn(
+    pool: &SqlitePool,
+    id: &str,
+    page_turn: Option<PageTurn>,
+) -> Result<(), sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query(
+            "UPDATE books SET page_turn = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(page_turn.map(PageTurn::as_str))
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+}
+
 /// List favorite books (for the auto-download on startup).
 pub fn list_favorites(pool: &SqlitePool) -> Result<Vec<Book>, sqlx::Error> {
     crate::db::block_on(async {
@@ -437,4 +503,88 @@ pub fn list_favorites(pool: &SqlitePool) -> Result<Vec<Book>, sqlx::Error> {
         .fetch_all(pool)
         .await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed_book(pool: &SqlitePool, id: &str) {
+        insert(
+            pool,
+            &Book {
+                id: id.into(),
+                title: "t".into(),
+                author: String::new(),
+                circle_name: String::new(),
+                purchase_date: None,
+                file_name: "t.pdf".into(),
+                file_size: 1,
+                opfs_path: format!("{id}.opfspack"),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 1,
+                pack_id: None,
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: "2026-01-01 00:00:00".into(),
+                updated_at: "2026-01-01 00:00:00".into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// 本ごとの綴じ方向を上書きできる（未設定は `None` = サイト別設定に従う）。
+    #[test]
+    fn page_turn_override_round_trips_per_book() {
+        let pool = crate::db::test_pool();
+        seed_book(&pool, "b1");
+        seed_book(&pool, "b2");
+        assert_eq!(page_turn(&pool, "b1").unwrap(), None);
+        set_page_turn(&pool, "b1", Some(PageTurn::RightToLeft)).unwrap();
+        assert_eq!(page_turn(&pool, "b1").unwrap(), Some(PageTurn::RightToLeft));
+        // 同じサイトの別の本には影響しない
+        assert_eq!(page_turn(&pool, "b2").unwrap(), None);
+        // 指定を消せる（サイト別設定に戻る）
+        set_page_turn(&pool, "b1", None).unwrap();
+        assert_eq!(page_turn(&pool, "b1").unwrap(), None);
+    }
+
+    /// 保存文字列はビューアの切替・サイト別設定と共有する。
+    #[test]
+    fn page_turn_round_trips() {
+        for turn in [PageTurn::RightToLeft, PageTurn::LeftToRight] {
+            assert_eq!(PageTurn::parse(turn.as_str()), Some(turn));
+        }
+        assert_eq!(PageTurn::parse("up"), None);
+        assert!(PageTurn::RightToLeft.is_right_to_left());
+        assert!(!PageTurn::LeftToRight.is_right_to_left());
+    }
+
+    /// メタ更新（Drive 復元・再取り込みで使う upsert）で綴じ方向の指定が消えないこと。
+    #[test]
+    fn upsert_keeps_the_page_turn_override() {
+        let pool = crate::db::test_pool();
+        seed_book(&pool, "b1");
+        set_page_turn(&pool, "b1", Some(PageTurn::LeftToRight)).unwrap();
+        let mut book = get(&pool, "b1").unwrap().unwrap();
+        book.title = "更新後".into();
+        upsert(&pool, &book).unwrap();
+        assert_eq!(
+            page_turn(&pool, "b1").unwrap(),
+            Some(PageTurn::LeftToRight),
+            "メタ更新で本ごとの綴じ方向が消えている"
+        );
+    }
 }

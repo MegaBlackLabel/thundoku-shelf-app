@@ -49,7 +49,7 @@
 | `schema.sql` の位置づけ | スキーマの「正本」とされる参照用ファイル。**アプリのコードパスからは実行されない**（`include_str!` 等の参照なし。`grep -rn "schema.sql"` のヒットは `db/mod.rs:200` のコメントと `docs/database.md:4` のみ） | `crates/core/src/db/schema.sql` / `docs/database.md:3-7` |
 | シード行 | `sites` の `techbookfest` / `booth` は `0001_init.sql` と `schema.sql` の `INSERT OR IGNORE`。`fanza` / `dlsite` は `migrate()` が `INSERT OR IGNORE` で追加 | `crates/core/migrations/0001_init.sql:19-23`, `crates/core/src/db/schema.sql:19-23`, `crates/core/src/db/mod.rs:382-392` |
 
-### 1.2 `crates/core/src/db/schema.sql`（全文・281 行、verbatim）
+### 1.2 `crates/core/src/db/schema.sql`（全文・282 行、verbatim）
 
 テーブル定義位置: sites(:3) / app_settings(:25) / books(:32) / tbf_events(:55) / bookshelf_items(:76) / reading_progress(:108) / checked_items(:119) / book_contents(:138) / content_formats(:150) / imported_documents(:163) / document_images(:175) / page_views(:192) / document_text(:204) / token_analysis(:213) / book_tags(:226) / zenn_tag_metadata(:235) / favorite_tags(:243) / favorite_entities(:249) / book_first_events(:256) / product_sample_pages(:266)。
 
@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS books (
   is_hidden INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  owner_sub TEXT
+  owner_sub TEXT,
+  page_turn TEXT
 );
 
 CREATE INDEX IF NOT EXISTS books_site_id_idx ON books(site_id);
@@ -593,12 +594,14 @@ CREATE TABLE IF NOT EXISTS drive_sync_state (
 - `crates/core/src/db/mod.rs:233-250`: `books` に `owner_sub TEXT` を追加し、`books_site_tbf_product_id_unique` UNIQUE インデックスを**毎回** `DROP INDEX IF EXISTS`（複数アカウントで同一 source を owner ごとに持てるようにするため）。
 - `crates/core/src/db/mod.rs:382-392`: `sites` に `fanza`（`FANZA同人`, `https://www.dmm.co.jp/dc/doujin/`, display_order=2）と `dlsite`（`DLsite`, `https://www.dlsite.com/`, display_order=3）を `INSERT OR IGNORE`。
 - `crates/core/src/db/mod.rs:355-380`: 共有ソースメタ列を `bookshelf_items` と `books` の両方へ `ensure_column` で追加。列定義の一覧は次の 10 個（`ensure_column` に渡す `definition` 文字列そのまま）: `media_category TEXT` / `ai_type TEXT` / `is_drm INTEGER NOT NULL DEFAULT 0` / `release_date TEXT` / `description TEXT` / `theme TEXT` / `maker_id TEXT` / `page_count INTEGER` / `age_rating TEXT` / `series_name TEXT`。
+- `crates/core/src/db/mod.rs:271-274`: `books` に `page_turn TEXT` を `ensure_column` で追加（本ごとの綴じ方向。リリース前のためマイグレーションファイルは増やしていない）。既存 DB で列が足されることはテスト `legacy_books_get_the_page_turn_column` が固定する（`crates/core/tests/db.rs:112-183`）。
 
 ### 1.5 `schema.sql` と `0001_init.sql` の差分（再実装時に効く）
 
 | 対象 | `0001_init.sql` | `schema.sql`（= 最終形） | 差分を作る runtime DDL |
 |---|---|---|---|
 | `books` | `owner_sub` なし | `owner_sub TEXT` あり | `db/mod.rs:242` |
+| `books` | `page_turn` なし | `page_turn TEXT` あり（`NULL` = サイト別設定 `viewer.page_turn.{site}` に従う） | `db/mod.rs:274`（`ensure_column`） |
 | `books` の UNIQUE | `books_site_tbf_product_id_unique`（部分 UNIQUE インデックス）あり | なし | `db/mod.rs:250` の `DROP INDEX IF EXISTS` |
 | `bookshelf_items` | `author` / `hidden_at` / `poll_sync_enabled`(誤記注: `poll_sync_enabled` は `tbf_events`) なし、共有ソースメタ 10 列なし | あり | `db/mod.rs:209`（`hidden_at`）, `:226`（`author`）, `:355-380`（10 列） |
 | `tbf_events` | `poll_sync_enabled` なし | `poll_sync_enabled INTEGER NOT NULL DEFAULT 0` あり | `db/mod.rs:265` |
