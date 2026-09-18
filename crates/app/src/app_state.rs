@@ -86,6 +86,8 @@ pub struct AppState {
     pub toast_generation: Arc<Mutex<u64>>,
     /// トーストを自動で消すか（終了時のアップロード中など、完了まで出したいときは false）
     pub toast_autohide: Arc<Mutex<bool>>,
+    /// 進行中のトーストか（通知に Spinner を添えて「動いている」ことを示す）
+    pub toast_progress: Arc<Mutex<bool>>,
     /// トーストホストを持つ workspace（トースト表示時の notify 用）
     pub workspace: Arc<Mutex<Option<gpui_kit::WeakEntity<crate::workspace::Workspace>>>>,
     /// 本棚の再読込が必要（設定画面の非表示解除等）。render で確認して reload する
@@ -322,6 +324,7 @@ impl AppState {
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
             toast_generation: Arc::new(Mutex::new(0)),
             toast_autohide: Arc::new(Mutex::new(true)),
+            toast_progress: Arc::new(Mutex::new(false)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
             exit_checked: Arc::new(AtomicBool::new(false)),
@@ -397,6 +400,7 @@ impl AppState {
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
             toast_generation: Arc::new(Mutex::new(0)),
             toast_autohide: Arc::new(Mutex::new(true)),
+            toast_progress: Arc::new(Mutex::new(false)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
             exit_checked: Arc::new(AtomicBool::new(false)),
@@ -553,6 +557,26 @@ pub fn set_toast_kind(cx: &mut App, kind: ToastKind, message: impl Into<String>)
     set_toast_kind_with(cx, kind, message, true);
 }
 
+/// **進行中**のメッセージを積む（通知に Spinner が付き、同じ id で置き換わる）。
+///
+/// ダウンロードや取り込みのように「終わるまで動き続ける」処理で使う。同じ文言を
+/// 何度積んでも通知は増えず、1 つが更新される。既定では 5 秒で消えるので、
+/// 進行中は進捗が変わったときに積み直す（終われば自然に消える）。
+pub fn set_progress_notice(cx: &mut App, message: impl Into<String>) {
+    // `set_toast_kind_with` が進行中フラグを false に戻すので、あとから立てる
+    set_toast_kind_with(cx, ToastKind::Info, message, true);
+    *AppState::global(cx).toast_progress.lock() = true;
+}
+
+/// **進行中のまま消えない**メッセージを積む（終了時のアップロードなど）。
+///
+/// 完了するとアプリが終了する処理で使う。自動では消えないので、見失わない。
+pub fn set_sticky_progress_notice(cx: &mut App, message: impl Into<String>) {
+    // `set_toast_kind_with` が進行中フラグを false に戻すので、あとから立てる
+    set_toast_kind_with(cx, ToastKind::Info, message, false);
+    *AppState::global(cx).toast_progress.lock() = true;
+}
+
 /// 自動消滅するかどうかも指定して積む。
 ///
 /// `autohide = false` は「終わるまで出しておきたい」とき（終了時のアップロード中など）に使う。
@@ -566,6 +590,8 @@ pub fn set_toast_kind_with(
     let state = AppState::global(cx);
     *state.toast_kind.lock() = kind;
     *state.toast_autohide.lock() = autohide;
+    // 進行中フラグは既定 false。`set_progress_notice` 系が呼び出し後に立て直す
+    *state.toast_progress.lock() = false;
     set_toast(cx, message);
 }
 

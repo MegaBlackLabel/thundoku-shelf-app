@@ -787,11 +787,37 @@ impl DownloadState {
     }
 }
 
+/// 進行中のダウンロード/取り込みを通知に出す文言（進行中が無ければ `None`）。
+///
+/// **割合は入れない**。入れると刻みごとに文言が変わり、通知が置き換えのたびに
+/// 入場アニメをやり直すため「通知が連続して出てくる」ように見える（実測: 1 冊の
+/// 取り込みで 8 秒間に 28 回積まれていた）。細かい進み具合はカードのリングが
+/// 見せているので、通知は「何件・どの段階か」だけを伝える。
+fn download_notice_message(states: &HashMap<String, DownloadState>) -> Option<String> {
+    if states.is_empty() {
+        return None;
+    }
+    let count = states.len();
+    let processing = states
+        .values()
+        .any(|s| matches!(s, DownloadState::Processing(_)));
+    let verb = if processing {
+        "取り込み中です…"
+    } else {
+        "ダウンロード中です…"
+    };
+    Some(format!("{verb}（{count} 件）"))
+}
+
 pub struct BookshelfView {
     entries: Vec<BookEntry>,
     shelf_items: Vec<bookshelf::BookshelfItem>,
     shelf_cards: Vec<ShelfCard>,
     download_states: HashMap<String, DownloadState>,
+    /// 直近に通知へ出したダウンロード/取り込みの文言（変わったときだけ積む）
+    download_notice: Option<String>,
+    /// 直近に通知を積んだ時刻（置き換えの連打を防ぐ）
+    download_notice_at: Option<std::time::Instant>,
     favorite_tags: Vec<String>,
     /// お気に入りサークル（チップのハート。`favorite_entities`）
     favorite_circles: Vec<String>,
@@ -1109,6 +1135,8 @@ impl BookshelfView {
             shelf_items: Vec::new(),
             shelf_cards: Vec::new(),
             download_states: HashMap::new(),
+            download_notice: None,
+            download_notice_at: None,
             favorite_tags: Vec::new(),
             favorite_circles: Vec::new(),
             favorite_authors: Vec::new(),
@@ -2852,6 +2880,7 @@ impl BookshelfView {
         let database_id = item.database_id.clone();
         self.download_states
             .insert(database_id.clone(), DownloadState::Downloading(0.0));
+        self.notify_download_progress(cx);
         let handle = cx.entity();
         let state = Self::app_state(cx);
         let site_id = item.site_id.clone();
@@ -3306,6 +3335,7 @@ impl BookshelfView {
                         last_percent = Some(percent);
                         progress_handle.update(cx, |this, cx| {
                             this.download_states.insert(id, state);
+                            this.notify_download_progress(cx);
                             cx.notify();
                         });
                     }
@@ -3325,6 +3355,7 @@ impl BookshelfView {
             let complete_start = std::time::Instant::now();
             handle.update(cx, |this, cx| {
                 this.download_states.remove(&database_id);
+                this.notify_download_progress(cx);
                 let (toast, error) = download_messages(&result);
                 let succeeded = result.is_ok();
                 if let Some(message) = error {
@@ -3973,6 +4004,31 @@ impl BookshelfView {
     }
 
     /// いずれかの本を取り込み中か（他の本を開かせない判断に使う）。
+    /// 進行中のダウンロード/取り込みを通知に出す（文言が変わったときだけ）。
+    ///
+    /// カードのリングだけだと、一覧をスクロールしている間は何が動いているのか
+    /// 分からない。終われば文言が `None` になって積まなくなり、既定の 5 秒で消える。
+    fn notify_download_progress(&mut self, cx: &mut Context<Self>) {
+        let message = download_notice_message(&self.download_states);
+        if message == self.download_notice {
+            return;
+        }
+        // 置き換えのたびに入場アニメ（400ms）がやり直されるので、最短 10 秒あける。
+        // 進捗の刻みで積むと通知が流れ続けて見える（実測: 1 冊の取り込みで 8 秒間に
+        // 28 回）。件数と段階は 1 冊ごとに変わるので、一括同期でも 10 秒に 1 回で収まる。
+        let now = std::time::Instant::now();
+        if let Some(last) = self.download_notice_at
+            && now.duration_since(last) < std::time::Duration::from_secs(10)
+        {
+            return;
+        }
+        self.download_notice = message.clone();
+        self.download_notice_at = Some(now);
+        if let Some(message) = message {
+            crate::app_state::set_progress_notice(cx, message);
+        }
+    }
+
     fn has_running_downloads(&self) -> bool {
         !self.download_states.is_empty()
     }
@@ -8907,6 +8963,108 @@ mod tests {
         assert_eq!(choices[1].display_name, "別冊");
         assert_eq!(choices[1].kind, "PDF");
         assert_eq!(choices[1].detail, "PDF 1ファイル / 画像 3ファイル");
+    }
+
+    /// 進行中のダウンロード/取り込みの文言。
+    #[test]
+    fn download_notice_message_summarizes_active_items() {
+        let mut states = HashMap::new();
+        assert_eq!(
+            download_notice_message(&states),
+            None,
+            "進行中が無いのに文言が出ている"
+        );
+
+        states.insert("a".to_string(), DownloadState::Downloading(0.45));
+        let message = download_notice_message(&states).expect("ダウンロード中の文言が無い");
+        assert!(message.contains("ダウンロード中"), "{message}");
+        assert!(message.contains("1 件"), "{message}");
+        // 割合は入れない（刻みごとに文言が変わると通知が流れ続けて見える）
+        assert!(!message.contains('%'), "割合が入っている: {message}");
+
+        // 取り込み段階に入ると言葉が変わる（利用者から見て別の作業）
+        states.insert("a".to_string(), DownloadState::Processing(0.45));
+        let message = download_notice_message(&states).expect("取り込み中の文言が無い");
+        assert!(message.contains("取り込み中"), "{message}");
+
+        // 進み具合が変わっても文言は変わらない（通知を積み直さない）
+        states.insert("a".to_string(), DownloadState::Downloading(0.44));
+        let message = download_notice_message(&states).expect("文言が無い");
+        assert!(
+            !message.contains('%'),
+            "割合で文言が変わっている: {message}"
+        );
+
+        // 2 件なら件数が出る
+        states.insert("b".to_string(), DownloadState::Downloading(0.10));
+        let message = download_notice_message(&states).expect("文言が無い");
+        assert!(message.contains("2 件"), "{message}");
+    }
+
+    /// 進行中の通知は、文言が変わったときだけ積む。
+    ///
+    /// 16ms ごとの進捗で積み直すと、通知の置き換えが絶え間なく起きる。
+    #[gpui_kit::test]
+    async fn download_progress_notice_is_pushed_only_when_the_text_changes(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+
+        let generation =
+            |cx: &mut TestAppContext| cx.update(|cx| *AppState::global(cx).toast_generation.lock());
+
+        // 進行中が無いうちは何も積まない
+        cx.update(|cx| view.update(cx, |this, cx| this.notify_download_progress(cx)));
+        assert_eq!(generation(cx), 0, "進行中でないのに通知が積まれている");
+
+        // 開始すると積まれる
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_states
+                    .insert("db-1".to_string(), DownloadState::Downloading(0.0));
+                this.notify_download_progress(cx);
+            })
+        });
+        let started = generation(cx);
+        assert!(started > 0, "ダウンロード開始で通知が積まれていない");
+        let message = cx.update(|cx| AppState::global(cx).toast_message.lock().clone());
+        assert!(
+            message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ダウンロード中"),
+            "ダウンロード中の文言になっていない: {message:?}"
+        );
+
+        // 同じ文言のうちは積み直さない
+        cx.update(|cx| view.update(cx, |this, cx| this.notify_download_progress(cx)));
+        assert_eq!(generation(cx), started, "同じ文言で通知を積み直している");
+
+        // 10 秒以内の積み直しは見送る。通知は置き換えのたびに入場アニメ（400ms）を
+        // やり直すので、進捗や件数の刻みで積むと通知が流れ続けて見える。
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_states
+                    .insert("db-1".to_string(), DownloadState::Processing(0.5));
+                this.notify_download_progress(cx);
+            })
+        });
+        assert_eq!(generation(cx), started, "10 秒以内に積み直している");
+
+        // 間隔があいていれば（段階が変わっていれば）積み直す
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_notice_at =
+                    Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+                this.notify_download_progress(cx);
+            })
+        });
+        assert!(
+            generation(cx) > started,
+            "間隔があいても通知が更新されていない"
+        );
     }
 
     #[gpui_kit::test]

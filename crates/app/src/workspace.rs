@@ -16,6 +16,7 @@ use gpui_kit::{
 
 use crate::components::dialog::{dialog_button, dialog_surface, fade_dialog};
 use gpui_kit::component::Disableable as _;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::notification::Notification;
@@ -29,7 +30,6 @@ use gpui_kit::{
 use raw_window_handle::HasWindowHandle;
 
 use crate::app_state::AppState;
-use crate::app_state::ToastKind;
 use crate::icons::AppIcon;
 use crate::views::about::AboutView;
 use crate::views::auth::{AuthDialog, AuthProvider};
@@ -62,6 +62,12 @@ pub enum NavTarget {
 /// 確認ダイアログは押した時点で閉じるため、これが進行中の唯一の手がかりになる。
 const EXIT_UPLOAD_NOTICE: &str =
     "バックアップをアップロード中です…（完了するとアプリが終了します）";
+
+/// 進行中の通知の id（`Notification::id`）。
+///
+/// 同じ id の通知は**置き換わる**ので、進捗のたびに積み直しても増えない。
+/// 進行中でない通知は id を持たない（別々に積まれる）ままにする。
+struct ProgressNotice;
 
 /// アプリメニュー（macOS のメニューバー相当。gpui の set_menus に渡す）。
 ///
@@ -170,6 +176,7 @@ impl Workspace {
         this.refresh_unread_count(cx);
         // 保存済みモードを適用する前に、ダークの面の階層を引き直しておく
         crate::theme::apply_dark_surfaces(cx);
+        crate::theme::apply_light_surfaces(cx);
         this.restore_theme_mode(cx);
         // 保存済みプロフィールが無い場合（アップグレード直後）はここで取得しておく。
         // 所有者（sub）が分からないと、終了時のバックアップがスキップされ、復元確認も
@@ -858,7 +865,7 @@ impl Workspace {
         // 確認ダイアログは閉じるので、進行中であることを通知で知らせる
         // （見た目が何も変わらないと、終了したのか固まったのか分からない）。
         // 完了（アプリ終了）まで消えない通知にする（長いアップロードでも見失わない）
-        crate::app_state::set_toast_kind_with(cx, ToastKind::Info, EXIT_UPLOAD_NOTICE, false);
+        crate::app_state::set_sticky_progress_notice(cx, EXIT_UPLOAD_NOTICE);
         // アップロード中はメニューの「終了」も無効にする（macOS。Windows では no-op）
         cx.set_menus(app_menus(false));
         AppState::global(cx)
@@ -1316,13 +1323,14 @@ impl Render for Workspace {
 
         // メッセージは gpui-kit の Notification（右上のトースト）で出す。
         // 自前のバーは廃止した（自動で消える・種別ごとに色が付く・履歴が残る）。
-        let (toast, toast_kind, toast_generation, toast_autohide) = {
+        let (toast, toast_kind, toast_generation, toast_autohide, toast_progress) = {
             let state = AppState::global(cx);
             (
                 state.toast_message.lock().clone(),
                 *state.toast_kind.lock(),
                 *state.toast_generation.lock(),
                 *state.toast_autohide.lock(),
+                *state.toast_progress.lock(),
             )
         };
         if self.toast_host_generation != toast_generation {
@@ -1333,13 +1341,29 @@ impl Render for Workspace {
                     crate::app_state::ToastKind::Success => NotificationType::Success,
                     crate::app_state::ToastKind::Error => NotificationType::Error,
                 };
-                window.push_notification(
-                    Notification::new()
-                        .with_type(kind)
-                        .message(message)
-                        .autohide(toast_autohide),
-                    cx,
-                );
+                let mut notification = Notification::new()
+                    .with_type(kind)
+                    .message(message)
+                    .autohide(toast_autohide);
+                if toast_progress {
+                    // 進行中は Spinner を添える。面と文字だけだと「進んでいるのか
+                    // 固まっているのか」が分からないため。id を固定して、進捗で
+                    // 積み直しても通知が増えない（置き換わる）ようにする。
+                    notification = notification.id::<ProgressNotice>().content(|_, _, cx| {
+                        gpui_kit::div()
+                            .flex()
+                            .flex_row()
+                            .debug_selector(|| "notice-progress".into())
+                            .items_center()
+                            .child(
+                                gpui_kit::component::spinner::Spinner::new()
+                                    .small()
+                                    .color(cx.theme().muted_foreground),
+                            )
+                            .into_any_element()
+                    });
+                }
+                window.push_notification(notification, cx);
             }
             // 表示は Notification が持つので、こちらの状態はすぐ消す（世代は残して再表示を防ぐ）
             crate::app_state::clear_toast(cx);
@@ -2547,6 +2571,7 @@ fn window_restore(window: &mut Window) {
 mod tests {
     use super::*;
     use crate::app_state::AppState;
+    use crate::app_state::ToastKind;
     use gpui_kit::TestAppContext;
 
     fn setup(cx: &mut TestAppContext) -> gpui_kit::Entity<Workspace> {
@@ -2695,6 +2720,99 @@ mod tests {
         });
         draw_frames(visual);
         assert_eq!(notification_count(visual), 2, "2 件目の通知が出ていない");
+    }
+
+    /// 進行中の通知には Spinner が出る（終了時のアップロード・取り込み中）。
+    ///
+    /// 通知の面だけでは「進んでいるのか固まっているのか」が分からないので、
+    /// 実行中はスピナーを添える。普通の通知には出さない（常時スピナーだと
+    /// 何が進行中なのか分からなくなる）。
+    /// 終了時のアップロード中は「進行中・自動で消えない」通知にする。
+    ///
+    /// 完了するとアプリが終了するので、途中で消えると「止まった」ように見える。
+    /// また、実行中であることが分かるようスピナーを出す。
+    #[gpui_kit::test]
+    async fn exit_upload_notice_is_progress_and_sticky(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| crate::app_state::set_sticky_progress_notice(cx, EXIT_UPLOAD_NOTICE));
+
+        let (progress, autohide, message) = cx.update(|cx| {
+            let state = AppState::global(cx);
+            (
+                *state.toast_progress.lock(),
+                *state.toast_autohide.lock(),
+                state.toast_message.lock().clone(),
+            )
+        });
+        assert!(progress, "進行中になっていない（スピナーが出ない）");
+        assert!(!autohide, "自動で消える設定になっている");
+        assert_eq!(message.as_deref(), Some(EXIT_UPLOAD_NOTICE));
+    }
+
+    #[gpui_kit::test]
+    async fn progress_notice_shows_a_spinner(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        cx.update(|cx| {
+            crate::app_state::set_toast_kind(
+                cx,
+                crate::app_state::ToastKind::Info,
+                "ふつうのお知らせ",
+            )
+        });
+        draw_frames(visual);
+        assert_eq!(notification_count(visual), 1, "通知が出ていない");
+        assert!(
+            visual.debug_bounds("notice-progress").is_none(),
+            "進行中でない通知に Spinner が出ている"
+        );
+
+        cx.update(|cx| crate::app_state::set_progress_notice(cx, "アップロード中です…"));
+        draw_frames(visual);
+        assert!(
+            visual.debug_bounds("notice-progress").is_some(),
+            "進行中の通知に Spinner が出ていない"
+        );
+    }
+
+    /// 進行中の通知は積み上がらず、同じ 1 つが置き換わる。
+    ///
+    /// ダウンロードや取り込みは進捗のたびに積み直すので、置き換わらないと
+    /// 通知が増え続けて（上限 10 件で）他の通知を押し出してしまう。
+    #[gpui_kit::test]
+    async fn progress_notice_is_replaced_instead_of_stacked(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        cx.update(|cx| crate::app_state::set_progress_notice(cx, "取り込み中です…（10%）"));
+        draw_frames(visual);
+        assert_eq!(notification_count(visual), 1, "進行中の通知が出ていない");
+
+        cx.update(|cx| crate::app_state::set_progress_notice(cx, "取り込み中です…（40%）"));
+        draw_frames(visual);
+        assert_eq!(
+            notification_count(visual),
+            1,
+            "進捗の更新で通知が積み上がっている（置き換わっていない）"
+        );
     }
 
     #[gpui_kit::test]
