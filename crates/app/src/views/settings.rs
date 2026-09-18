@@ -70,7 +70,7 @@ pub struct SettingsView {
     dlsite_viewer_mode: String,
     /// DLsite サイトのページめくり方向
     dlsite_page_turn: String,
-    /// データベース情報: 未読/読書中/読了 の冊数
+    /// データベース情報: 未読/読んでいる途中/読了 の冊数
     status_counts: (usize, usize, usize),
     /// プロフィール再取得中フラグ（設定画面表示時のログイン状態チェック）
     #[cfg_attr(test, allow(dead_code))]
@@ -256,7 +256,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// 未読/読書中/読了 の冊数を集計（Web の getReadingStatusCounts 相当）。
+    /// 未読/読んでいる途中/読了 の冊数を集計（Web の getReadingStatusCounts 相当）。
     fn refresh_status_counts(&mut self, cx: &mut Context<Self>) {
         let state = AppState::global(cx);
         let db = &state.db_pool;
@@ -2251,7 +2251,7 @@ impl Render for SettingsView {
                                     .flex()
                                     .flex_row()
                                     .justify_between()
-                                    .child(div().text_color(muted_fg).child("読書中"))
+                                    .child(div().text_color(muted_fg).child("読んでいる途中"))
                                     .child(
                                         div()
                                             .font_weight(FontWeight::MEDIUM)

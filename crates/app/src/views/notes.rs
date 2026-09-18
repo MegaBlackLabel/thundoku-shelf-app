@@ -790,7 +790,7 @@ impl NotesView {
                                 .child(text),
                         )
                     })
-                    // 状態（読了 / 読書中 / 未読 + ♡）
+                    // 状態（読了 / 読んでいる途中 / 未読 + ♡）
                     .child(
                         div()
                             .debug_selector(move || state_selector.clone())
@@ -817,7 +817,7 @@ impl NotesView {
                                         |this| {
                                             this.bg(gpui_kit::rgb(0xe0f2fe))
                                                 .text_color(gpui_kit::rgb(0x0369a1))
-                                                .child("読書中")
+                                                .child("読んでいる途中")
                                         },
                                     )
                                     .when(

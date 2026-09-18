@@ -219,7 +219,7 @@ pub fn from_progress(progress: Option<&ReadingProgress>) -> Self {
 | 状態 | 判定式（優先順位どおり） | アンカー |
 |---|---|---|
 | `Read`（読了） | `finished_at.is_some()` **または** `is_finished()`（= `total_pages.is_some_and(|t| current_page >= t)`） | `crates/core/src/db/progress.rs:49`、`crates/core/src/db/progress.rs:21-26` |
-| `Reading`（読書中） | 上記以外で `current_page > 0`（1-indexed なので本を開いただけでは進捗行が作られず未読のまま） | `crates/core/src/db/progress.rs:50` |
+| `Reading`（表示は「読んでいる途中」） | 上記以外で `current_page > 0`（1-indexed なので本を開いただけでは進捗行が作られず未読のまま） | `crates/core/src/db/progress.rs:50` |
 | `Unread`（未読） | 進捗なし、または `current_page == 0` | `crates/core/src/db/progress.rs:51` |
 
 境界の固定（テスト）: `None` → Unread / `(0, Some(10), false)` → Unread / `(1, Some(10), false)` → Reading / `(9, Some(10), false)` → Reading（最終ページ 1 つ手前は読了ではない）/ `(10, Some(10), false)` → Read / `(1, Some(10), true)` → Read（`finished_at` 優先）/ `(3, None, false)` → Reading（`crates/core/src/db/progress.rs:151-194`）。
@@ -229,8 +229,8 @@ pub fn from_progress(progress: Option<&ReadingProgress>) -> Self {
 
 | 表示 | 内容 | アンカー |
 |---|---|---|
-| カードのバッジ | `card.local` が無ければ `unwrap_or(ReadingState::Unread)`。`Read` → 「読了」（背景 `rgb(0xd1fae5)` / 文字 `rgb(0x047857)`）、`Reading` → 「読書中」（背景 `rgb(0xe0f2fe)` / 文字 `rgb(0x0369a1)`）、`Unread` → 「未読」（背景 `rgb(0xfef3c7)` / 文字 `rgb(0xb45309)`）を表紙左上に重ねる | `crates/app/src/views/bookshelf.rs:4043-4059` |
-| リストのステータス | ローカル本のみ `Read` → `status_tag(database_id, "read", "既読", TagVariant::Success)` / `Reading` → `("reading", "読書中", TagVariant::Info)` / `Unread` → `("unread", "未読", TagVariant::Secondary)`。未ダウンロード本は「未読」ではなく `"not-downloaded"` のアイコンを出す | `crates/app/src/views/bookshelf.rs:4974`、`crates/app/src/views/bookshelf.rs:5017` |
+| カードのバッジ | `card.local` が無ければ `unwrap_or(ReadingState::Unread)`。`Read` → 「読了」（背景 `rgb(0xd1fae5)` / 文字 `rgb(0x047857)`）、`Reading` → 「読んでいる途中」（背景 `rgb(0xe0f2fe)` / 文字 `rgb(0x0369a1)`）、`Unread` → 「未読」（背景 `rgb(0xfef3c7)` / 文字 `rgb(0xb45309)`）を表紙左上に重ねる | `crates/app/src/views/bookshelf.rs:4043-4059` |
+| リストのステータス | ローカル本のみ `Read` → `status_tag(database_id, "read", "既読", TagVariant::Success)` / `Reading` → `("reading", "読んでいる途中", TagVariant::Info)` / `Unread` → `("unread", "未読", TagVariant::Secondary)`。未ダウンロード本は「未読」ではなく `"not-downloaded"` のアイコンを出す | `crates/app/src/views/bookshelf.rs:4974`、`crates/app/src/views/bookshelf.rs:5017` |
 | 表示とフィルタの差 | 未ダウンロード本はカード上「未読」バッジだが、`ReadFilter::Unread` は `card.local.map(|e| e.reading_state) == Some(Unread)` なので **未読フィルタに一致しない** | `crates/app/src/views/bookshelf.rs:3966`、`crates/app/src/views/bookshelf.rs:2195-2208` |
 
 使用者（判定が 1 か所であることの根拠）: 本棚カード（`crates/app/src/views/bookshelf.rs:1355`）、フィルタ（`crates/app/src/views/bookshelf.rs:2216-2228`）、設定の冊数集計（`crates/app/src/views/settings.rs:256-259`）、履歴画面（`crates/app/src/views/history.rs:265-267`）、付箋画面（`crates/app/src/views/notes.rs:167-169`）、サイドバー未読バッジ（`crates/app/src/workspace.rs:483-484`）。
@@ -715,7 +715,7 @@ FROM view_history GROUP BY book_id
 | 用途 | 式 | アンカー |
 |---|---|---|
 | カードのソート値 | `view_count: stats.map_or(0, |s| s.count)`、`view_seconds: stats.map_or(0, |s| s.total_seconds)`、`last_viewed_at: stats.and_then(|s| s.last_viewed_at.clone())`。`stats = local.and_then(|entry| view_stats.get(&entry.book.id))`（**ローカル本にしか紐付かない**。未取り込みのリモート本は 0 / None） | `crates/app/src/views/bookshelf.rs:1514-1519`、`crates/app/src/views/bookshelf.rs:1586-1595` |
-| 件数表示 | 画面上部の件数のみフィルタ連動: `visible_count = visible.len()` を `format!("{visible_count}件")` で表示。**未読 / 読書中 / 読了の冊数は本棚に出さない**（設定画面が集計する） | `crates/app/src/views/bookshelf.rs:5753-5754`、`crates/app/src/views/bookshelf.rs:5886`、`crates/app/src/views/settings.rs:250-262` |
+| 件数表示 | 画面上部の件数のみフィルタ連動: `visible_count = visible.len()` を `format!("{visible_count}件")` で表示。**未読 / 読んでいる途中 / 読了の冊数は本棚に出さない**（設定画面が集計する） | `crates/app/src/views/bookshelf.rs:5753-5754`、`crates/app/src/views/bookshelf.rs:5886`、`crates/app/src/views/settings.rs:250-262` |
 | 右クリックメニュー | `format!("閲覧回数: {count} 回")`（`db::view_history::view_count(db, book_id)` を都度クエリ、無効項目として表示） | `crates/app/src/views/bookshelf.rs:4411-4416`、`crates/app/src/views/bookshelf.rs:5668-5673` |
 | 履歴画面 | `view_history::list_daily(pool)`（1 日 1 本に集約。`duration_secs` / `sessions` は同じ 86400 秒換算・`num_seconds().max(0)`） | `crates/app/src/views/history.rs:222`、`crates/core/src/db/view_history.rs:142-198` |
 | 設定画面の冊数 | `ReadingState::from_progress` で `read / reading / unread` をカウント | `crates/app/src/views/settings.rs:250-262` |

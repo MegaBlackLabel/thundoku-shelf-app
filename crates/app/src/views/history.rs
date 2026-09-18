@@ -764,7 +764,7 @@ impl HistoryView {
                 }
                 None => div().w_full().h_full().bg(theme.muted).into_any_element(),
             })
-            // 左上: 未読 / 読書中 / 読了（本棚のカードと同じバッジ）
+            // 左上: 未読 / 読んでいる途中 / 読了（本棚のカードと同じバッジ）
             .child({
                 let mut badge = div()
                     .absolute()
@@ -782,11 +782,11 @@ impl HistoryView {
                         .bg(gpui_kit::rgb(0xd1fae5))
                         .text_color(gpui_kit::rgb(0x047857))
                         .child("読了"),
-                    // 読書中は青系（未読の黄 / 読了の緑と区別する）
+                    // 読んでいる途中は青系（未読の黄 / 読了の緑と区別する）
                     progress::ReadingState::Reading => badge
                         .bg(gpui_kit::rgb(0xe0f2fe))
                         .text_color(gpui_kit::rgb(0x0369a1))
-                        .child("読書中"),
+                        .child("読んでいる途中"),
                     progress::ReadingState::Unread => badge
                         .bg(gpui_kit::rgb(0xfef3c7))
                         .text_color(gpui_kit::rgb(0xb45309))
@@ -1299,7 +1299,7 @@ impl HistoryView {
                         |this| {
                             this.bg(gpui_kit::rgb(0xe0f2fe))
                                 .text_color(gpui_kit::rgb(0x0369a1))
-                                .child("読書中")
+                                .child("読んでいる途中")
                         },
                     )
                     .when(
@@ -1695,7 +1695,7 @@ mod tests {
         }
         for (selector, expected) in [
             ("history-state-unread-b1", "未読"),
-            ("history-state-reading-b2", "読書中"),
+            ("history-state-reading-b2", "読んでいる途中"),
             ("history-state-read-b3", "読了"),
         ] {
             assert!(

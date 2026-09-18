@@ -4292,12 +4292,12 @@ impl BookshelfView {
                         .text_color(gpui_kit::rgb(0x047857))
                         .text_xs()
                         .child("読了"),
-                    // 読書中は青系（未読の黄 / 読了の緑と区別する）
+                    // 読んでいる途中は青系（未読の黄 / 読了の緑と区別する）
                     progress::ReadingState::Reading => badge
                         .bg(gpui_kit::rgb(0xe0f2fe))
                         .text_color(gpui_kit::rgb(0x0369a1))
                         .text_xs()
-                        .child("読書中"),
+                        .child("読んでいる途中"),
                     progress::ReadingState::Unread => badge
                         .bg(gpui_kit::rgb(0xfef3c7))
                         .text_color(gpui_kit::rgb(0xb45309))
@@ -5208,12 +5208,13 @@ impl BookshelfView {
             .into_any_element()
     }
 
-    /// 状態（未読 / 読書中 / 既読 / ダウンロード済み / お気に入り）をタイトルの横に出す。
+    /// 状態（未読 / 読んでいる途中 / 既読 / ダウンロード済み / お気に入り）をタイトルの横に出す。
     ///
-    /// 文字タグは短い「未読 / 読書中 / 既読」だけにする（「ダウンロード済み」「お気に入り」は
-    /// 長くて変な折り返しになるためアイコン + tooltip で出す）。
+    /// 文字タグは「未読 / 読んでいる途中 / 既読」だけにする（「ダウンロード済み」
+    /// 「お気に入り」は長くて変な折り返しになるためアイコン + tooltip で出す）。
+    /// 「読んでいる途中」は他より長いが、状態の意味が伝わることを優先する。
     /// 配色は「注意が必要なものだけ色を付ける」方針:
-    /// 未読 = 落ち着いた灰色、**読書中 = 情報色（Info）**、既読 = 緑、未ダウンロード = 黄、
+    /// 未読 = 落ち着いた灰色、**読んでいる途中 = 情報色（Info）**、既読 = 緑、未ダウンロード = 黄、
     /// ダウンロード済み = 緑、お気に入り = ピンク（カードのハートと同じ色味）。
     fn render_status_tags(
         card: &ShelfCard,
@@ -5222,7 +5223,7 @@ impl BookshelfView {
     ) -> Vec<gpui_kit::AnyElement> {
         let database_id = card.shelf.database_id.as_str();
         let downloaded = card.local.is_some();
-        // 未読 / 読書中 / 既読（読了）の 3 状態（判定は `ReadingState` に集約）
+        // 未読 / 読んでいる途中 / 既読（読了）の 3 状態（判定は `ReadingState` に集約）
         let state = card
             .local
             .as_ref()
@@ -5238,7 +5239,7 @@ impl BookshelfView {
                     tags.push(status_tag(
                         database_id,
                         "reading",
-                        "読書中",
+                        "読んでいる途中",
                         TagVariant::Info,
                     ));
                 }
@@ -6201,8 +6202,9 @@ impl Render for BookshelfView {
                             )
                             .child(
                                 {
-                                    let mut button =
-                                        Button::new("filter-reading").cursor_pointer().label("読書中");
+                                    let mut button = Button::new("filter-reading")
+                                        .cursor_pointer()
+                                        .label("読んでいる途中");
                                     if read_filter == ReadFilter::Reading {
                                         button = button.primary();
                                     }
