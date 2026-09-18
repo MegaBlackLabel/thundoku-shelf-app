@@ -2,5 +2,7 @@
 .DS_Store
 # PDFium 動的ライブラリはリポジトリにコミットせず、CI/ビルド時に入手する
 pdfium.dll
+libpdfium.dylib
+libpdfium.so
 # ローカルでパッケージしたリリース成果物（zip）はコミットしない
 /thundoku-shelf-*-windows.zip

@@ -1411,18 +1411,6 @@ dependencies = [
 
 [[package]]
 name = "core-text"
-version = "20.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9d2790b5c08465d49f8dc05c8bcae9fea467855947db39b0f8145c091aaced5"
-dependencies = [
- "core-foundation 0.9.4",
- "core-graphics 0.23.2",
- "foreign-types",
- "libc",
-]
-
-[[package]]
-name = "core-text"
 version = "21.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a593227b66cbd4007b2a050dfdd9e1d1318311409c8d600dc82ba1b15ca9c130"
@@ -2441,31 +2429,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
-name = "font-kit"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c7e611d49285d4c4b2e1727b72cf05353558885cc5252f93707b845dfcaf3d3"
-dependencies = [
- "bitflags 2.13.1",
- "byteorder",
- "core-foundation 0.9.4",
- "core-graphics 0.23.2",
- "core-text 20.1.0",
- "dirs 6.0.0",
- "dwrote",
- "float-ord",
- "freetype-sys",
- "lazy_static",
- "libc",
- "log",
- "pathfinder_geometry",
- "pathfinder_simd",
- "walkdir",
- "winapi",
- "yeslogic-fontconfig-sys",
-]
-
-[[package]]
 name = "font-types"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3140,7 +3103,7 @@ source = "git+https://github.com/longbridge/gpui-kit?rev=84f57fdfcb4910623fb0bb7
 dependencies = [
  "anyhow",
  "chrono",
- "core-text 21.0.0",
+ "core-text",
  "enum-iterator",
  "gpui-base",
  "gpui-component-macros",
@@ -3416,7 +3379,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "core-graphics 0.24.0",
- "core-text 21.0.0",
+ "core-text",
  "ctor",
  "dispatch2",
  "foreign-types",
@@ -5338,33 +5301,6 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
-]
-
-[[package]]
-name = "mupdf"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "185fb74927a40c569b7152c01c73f4c0206059b8b3d37c7eb007cc3f63453b64"
-dependencies = [
- "bitflags 2.13.1",
- "font-kit",
- "mupdf-sys",
- "once_cell",
- "percent-encoding",
- "zerocopy",
-]
-
-[[package]]
-name = "mupdf-sys"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c20755e9694e43da4ce8ee2e0211d63883cccd68d314ea4d518c031efee7d8e"
-dependencies = [
- "bindgen",
- "cc",
- "pkg-config",
- "regex",
- "zerocopy",
 ]
 
 [[package]]
@@ -9083,7 +9019,6 @@ dependencies = [
  "lindera",
  "log",
  "md5 0.7.0",
- "mupdf",
  "opfspack",
  "parking_lot",
  "pdfium-render",
@@ -11651,7 +11586,7 @@ dependencies = [
  "byteorder",
  "core-foundation 0.10.1",
  "core-graphics 0.24.0",
- "core-text 21.0.0",
+ "core-text",
  "dirs 5.0.1",
  "dwrote",
  "float-ord",

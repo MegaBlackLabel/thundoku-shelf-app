@@ -104,15 +104,17 @@
 | 失敗時 | そのページを `warnings` に積んで**スキップ**（1 枚の破損で全体を失敗させない。決定 D6） | `import/mod.rs:1547-1554`, `:135-163` |
 | ページ番号 | レンディションごとに 1 始まりで振り直す（`page_rows.len() - start + 1`） | `import/mod.rs:1555-1556` |
 
-### 3.7 PDF レンダリング（2 実装）
+### 3.7 PDF レンダリング（PDFium）
 
 | 環境 | 実装 | 解像度 / 品質 | 並列 | アンカー |
 |---|---|---|---|---|
-| Windows | `pdfium-render` 0.9 + `pdfium.dll` を実行時ロード（exe と同じフォルダ → CWD の順に探索） | `set_target_width(1000)`、WebP 品質 **80**（高さ制限なし） | **直列**（`PDFIUM_LOCK: Mutex<()>` でプロセス全体を直列化。`thread_safe` feature はロックしないため自前で排他） | `pdf.rs:24-66`, `:68`, `:71-120` |
-| 非 Windows | `mupdf` 0.8（ソースビルド） | ページ幅を **1000 px** にスケール（`scale = 1000.0 / width`）、`Pixmap` を白でクリアしてから描画、WebP 品質 **80** | 8 スレッドにページ範囲を分割（`chunk_size = total.div_ceil(8)`）。スレッドごとに `Document::from_bytes` を 1 回だけ実行 | `pdf.rs:122-193`, `:196-236` |
-| テキスト抽出 | Windows: `page.text()` / 非 Windows: `to_text_page(PRESERVE_WHITESPACE \| PRESERVE_LIGATURES)`。取れない場合は空文字 | — | `pdf.rs:114`, `:230-234` |
-| 進捗 | `progress(finished / total)`（0.0〜1.0）。Windows 実装はページごと、非 Windows 実装は `AtomicUsize` で完了数を数えて通知 | — | `pdf.rs:116`, `:170-174` |
-| ページ 0 件 | `import_rendered_pdf_pages` が `ImportError::Pdf("no pages rendered")` | — | `import/mod.rs:1222-1224` |
+| 全プラットフォーム | `pdfium-render` 0.9（`pdfium_7881` / `image_latest` / `thread_safe`）を**実行時ロード**。探索順は ① `./`（テスト実行時の CWD） ② 実行ファイルと同じディレクトリ ③ macOS は `../Frameworks`（`.app` の `Contents/Frameworks`） | `set_target_width(1000)`、WebP 品質 **80**（高さ制限なし） | PDFium の呼び出し（初期化を含む）は **`PDFIUM_LOCK: Mutex<()>` で直列**（`thread_safe` feature はロックしないため自前で排他）。描画後の WebP エンコードは PDFium を触らないので **8 スレッドで並列**（`chunk_size = total.div_ceil(8)`） | `pdf.rs:80-95`, `:107`, `:122-131` |
+| テキスト抽出 | `page.text()` の文字列。取れない場合は空文字 | — | — | `pdf.rs:118` |
+| 進捗 | `progress(finished / total)`（0.0〜1.0）。**エンコードが終わったページ数**を `AtomicUsize` で数えてページごとに通知 | — | — | `pdf.rs:157-160` |
+| 失敗時 | 1 ページでも失敗したら `ImportError::Pdf`（失敗したページ番号はログに残す） | — | — | `pdf.rs:166-183` |
+| ページ 0 件 | `import_rendered_pdf_pages` が `ImportError::Pdf("no pages rendered")` | — | — | `import/mod.rs:1223` |
+
+以前は macOS / Linux が mupdf だったが、mupdf は **AGPL-3.0** で MIT 配布の本アプリと両立しないため依存から外し、全プラットフォーム PDFium に統一した（`crates/core/Cargo.toml:38-44`）。
 
 ### 3.8 DB 登録（`finish_import` の順序）
 
@@ -148,10 +150,10 @@
 
 | 事実 | 内容 | アンカー |
 |---|---|---|
-| 型 | `&mut (dyn FnMut(f32) + Send)`（非 Windows の PDF 実装のみ `+ Send`） | `import/mod.rs:1158-1164` |
-| 値域 | 0.0〜1.0（アプリは `(fraction * 100.0).round()` で % 表示） | `pdf.rs:116`, `crates/app/src/views/bookshelf.rs:2925-2934` |
-| 呼ばれる条件 | ZIP 経路では**既定表示コンテンツの PDF レンディションのみ**（他は副作用回避のため `None` を渡す）。画像・EPUB では呼ばれない | `import/mod.rs:1580-1586`, `:1402-1411` |
-| 単位 | PDF のページ単位（`(index + 1) / total`） | `pdf.rs:116`, `:170-174` |
+| 型 | `&mut (dyn FnMut(f32) + Send)`（WebP エンコードを 8 スレッドに流すため `+ Send` が必要） | `import/mod.rs:1163`, `pdf.rs:86` |
+| 値域 | 0.0〜1.0（アプリは `(fraction * 100.0).round()` で % 表示） | `pdf.rs:157-159`, `crates/app/src/views/bookshelf.rs:3080`, `:4377`, `:5613` |
+| 呼ばれる条件 | ZIP 経路では**既定表示コンテンツの PDF レンディションのみ**（他は副作用回避のため `None` を渡す）。画像・EPUB では呼ばれない | `import/mod.rs:1572-1577`, `:1402-1410` |
+| 単位 | PDF のページ単位（**エンコードが終わったページ数 / 全ページ**） | `pdf.rs:157-159` |
 
 ---
 
@@ -339,12 +341,11 @@
 
 | 名前 | 値 | 単位 | アンカー |
 |---|---|---|---|
-| PDF レンダリング目標幅（Windows / pdfium） | `set_target_width(1000)`（高さ制限なし） | px | `pdf.rs:104-110` |
-| PDF レンダリング目標幅（非 Windows / mupdf） | `1000.0 / width` 倍スケール | px | `pdf.rs:216-222` |
-| PDF ページ WebP 品質 | `80` | 0-100 | `pdf.rs:113`, `:227` |
-| mupdf 並列度 | `8`（`chunk_size = total.div_ceil(8)`） | スレッド | `pdf.rs:139-146` |
-| pdfium 排他 | プロセス全体で `Mutex` 1 本（直列化） | — | `pdf.rs:68-77` |
-| pdfium ライブラリ探索順 | ① `./`（crate ルート = テスト時 CWD） ② exe と同じディレクトリ | — | `pdf.rs:28-41` |
+| PDF レンダリング目標幅 | `set_target_width(1000)`（高さ制限なし） | px | `pdf.rs:104-107` |
+| PDF ページ WebP 品質 | `80` | 0-100 | `pdf.rs:147` |
+| PDFium の直列化 | プロセス全体で `Mutex` 1 本（初期化を含む。`thread_safe` feature はロックしないため自前で排他） | — | `pdf.rs:80`, `:91-95` |
+| PDFium の WebP エンコード並列度 | `8`（`chunk_size = total.div_ceil(8)`。PDFium を触らないので並列可） | スレッド | `pdf.rs:122-131` |
+| PDFium ライブラリ探索順 | ① `./`（テスト実行時の CWD = crate ルート） ② 実行ファイルと同じディレクトリ ③ macOS は実行ファイルの `../Frameworks`（`.app` の `Contents/Frameworks`） | — | `pdf.rs:37-55` |
 
 ### 5.3 DB（接続・バッチ）
 
@@ -404,7 +405,7 @@
 | `Io(std::io::Error)` | `io error: {0}` | ソース読み込み・pack 書き出し・ディレクトリ作成の失敗（`?` 伝播） | `import/mod.rs:36-37`, `:1171`, `:923-924` |
 | `Pack(opfspack::PackError)` | `pack error: {0}` | pack 構築・読み出しの失敗（`builder.build` / `PackReader::open` / `read_entry`） | `import/mod.rs:38-39`, `:922`, `:747`, `:1741` |
 | `Db(sqlx::Error)` | `database error: {0}` | すべての DB 書き込み・読み出し失敗（`books::*` / `documents::*` / `contents::*` / `tags::*` の `?`） | `import/mod.rs:40-41`, `:981`, `:1086`, `:1107` |
-| `Pdf(String)` | `pdf error: {0}` | `pdf.rs` の描画・読み込みエラーを文字列化（mupdf/pdfium の `load` / `render` / pixmap 寸法不正 / pdfium.dll のロード失敗 ほか）、および `import_rendered_pdf_pages` のページ 0 件 `"no pages rendered"` | `import/mod.rs:42-43`, `:1222-1224`, `pdf.rs:44-58`, `:85-113`, `:200-236` |
+| `Pdf(String)` | `pdf error: {0}` | `pdf.rs` の描画・読み込みエラーを文字列化（PDFium の `load` / `render` / RGB バッファ不正 / ライブラリのロード失敗 ほか）、および `import_rendered_pdf_pages` のページ 0 件 `"no pages rendered"` | `import/mod.rs:42-43`, `:1223`, `pdf.rs:57-79`, `:96-98`, `:110-116`, `:144-149`, `:166-183` |
 | `Image(String)` | `image error: {0}` | ① `image::load_from_memory` の失敗（壊れた画像。ページ単位では警告に落ちるが、単体画像取り込みやサムネ生成では致命） ② 主コンテンツのページ数 0 `"primary content has no pages: {display_name}"` ③ 改名時の `metadata.json` 再シリアライズ失敗を `Image(e.to_string())` として流用 | `import/mod.rs:44-45`, `:91`, `:109`, `:1668-1671`, `:775`, `:2072` |
 | `Zip(String)` | `zip error: {0}` | `zip` crate のオープン/エントリ取得/伸長失敗、および内部不整合 `"entry index out of range"`（`plan` の ordinal が `metas` の範囲外） | `import/mod.rs:46-47`, `:1419`, `:1450`, `:1479-1481` |
 | `EmptyArchive` | `empty archive` | ZIP のエントリが 0 件（`collect_metas_with_nested` の結果が空） | `import/mod.rs:48-49`, `:1422-1424` |
@@ -455,7 +456,7 @@
 | 7 | pack・エントリ単位のサイズ上限（1 pack 最大バイト数等） | `opfspack` に上限チェックが無い（上限は入れ子 ZIP の 512 MiB / 2000 件のみ）。仕様として「無制限」なのか未実装なのか不明 |
 | 8 | `books.cover_thumbnail` を埋める経路 | 取り込みは常に `None`（`import/mod.rs:933`）。Drive 取り込みも `None`（`drive/sync.rs:149`） |
 | 9 | `view_history.started_at` / `ended_at` をローカル時刻へ直す責務の所在（コメントは「表示側でローカルに直す」） | `db/view_history.rs:142-160` は `chrono::Local` で日付集計するが、どの層が正かは本担当範囲外（詳細は `local://spec-core.md` を参照） |
-| 10 | pdfium.dll の配布手順・バージョン整合（feature `pdfium_7881`） | 依存宣言のみで、配布物の生成手順は本担当範囲のファイルに無い |
+| 10 | PDFium ライブラリ（`pdfium.dll` / `libpdfium.dylib`）の配布手順・バージョン整合（feature `pdfium_7881`） | 依存宣言のみで、取得の手順は本担当範囲のファイルに無い（配布物は `.github/workflows/release.yml`、開発/テスト用は `scripts/fetch-pdfium.sh` = `mise run pdfium` が `crates/core/` へ取得する） |
 
 ## 8. 推測（根拠つき）
 

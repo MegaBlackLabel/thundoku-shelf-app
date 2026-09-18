@@ -131,12 +131,12 @@
 
 ### 5.6 スレッド安全性のための直列化
 
-- **PDFium はスレッドセーフでない**ため、Windows では PDFium を使う区間を `static PDFIUM_LOCK: std::sync::Mutex<()>` で直列化する `crates/core/src/import/pdf.rs:24-39`。
-  - 実測（Windows / pdfium-render 0.9.3）: テキスト入り 1 ページ PDF を 8 スレッドで同時レンダリングすると `STATUS_ACCESS_VIOLATION (0xc0000005)` でプロセスが落ちる。スレッドごとに `load_pdf_from_byte_slice` し直しても再現（ドキュメントを分けてもダメ）`crates/core/src/import/pdf.rs:29-34`。
-  - `pdfium-render` の `thread_safe` feature は `unsafe impl Send/Sync` を足すだけでロックしないため呼び出し側の責任 `crates/core/src/import/pdf.rs:29-34`。
-  - 1 冊の中の描画は元々逐次なので単冊の速度は変わらず、複数冊を並行取り込みするときだけ待ち合う `crates/core/src/import/pdf.rs:36-38`。
-  - pdfium のグローバル `BINDINGS` はプロセスに 1 つだけなので、`LazyLock` で一度だけ初期化して再利用する（2 回目の `Pdfium::new` は panic）`crates/core/src/import/pdf.rs:11-17`。
-  - 非 Windows は `mupdf` を使用（pdfium-render の prebuilt static lib が macOS でリンクできなかったため）`crates/core/src/import/pdf.rs:1-6`。
+- **PDFium はスレッドセーフでない**ため、PDFium を使う区間（初期化を含む）を `static PDFIUM_LOCK: std::sync::Mutex<()>` で直列化する（全プラットフォーム共通）`crates/core/src/import/pdf.rs:80`, `:91-95`。
+  - 実測（Windows / pdfium-render 0.9.3）: テキスト入り 1 ページ PDF を 8 スレッドで同時レンダリングすると `STATUS_ACCESS_VIOLATION (0xc0000005)` でプロセスが落ちる。スレッドごとに `load_pdf_from_byte_slice` し直しても再現（ドキュメントを分けてもダメ）`crates/core/src/import/pdf.rs:14-21`。
+  - `pdfium-render` の `thread_safe` feature は `unsafe impl Send/Sync` を足すだけでロックしないため呼び出し側の責任 `crates/core/src/import/pdf.rs:14-16`。
+  - 1 冊の中の描画は元々逐次なので単冊の速度は変わらず、複数冊を並行取り込みするときだけ待ち合う `crates/core/src/import/pdf.rs:20-21`。
+  - pdfium のグローバル `BINDINGS` はプロセスに 1 つだけなので、`LazyLock` で一度だけ初期化して再利用する（2 回目の `Pdfium::new` は panic）`crates/core/src/import/pdf.rs:57-79`。
+  - PDFium は**実行時ロード**（静的リンクしない）で、探索順は ① `./`（テスト実行時の CWD） ② 実行ファイルと同じディレクトリ ③ macOS は実行ファイルの `../Frameworks`（`.app` の `Contents/Frameworks`）。prebuilt の static ライブラリは macOS で `FPDF_FORMFILL` を欠きリンクできないため `crates/core/src/import/pdf.rs:8-12`, `:37-55`。
 - その他の直列化: `AppState` の各クライアントは `parking_lot::Mutex`（`tbf`, `google`, 各セッション、`google_profile` 等）`crates/app/src/app_state.rs:39-60`。Drive 同期・TBF 同期は同じ Mutex を通るため相互排他。
 - UI スレッドの再入回避: トースト通知・認証モーダル開閉は `cx.defer` / `AtomicBool` フラグ + 監視タスク経由（`cx.notify()` の RefCell 再入回避）`crates/app/src/app_state.rs:358-362`, `crates/app/src/workspace.rs:160-220`。
 
@@ -219,7 +219,6 @@
 - Google ログイン完了後に WebView を自動で閉じるかは未確認（実装は `webview.hide()` のみ）`crates/app/src/views/google_login.rs:104-107`。
 - Drive 同期の多重実行排他: `sync_drive_now` は UI の `busy` フラグでしかガードしておらず `crates/app/src/views/settings.rs:770`、バックグラウンドのポーラーや終了時同期と衝突した場合の挙動は不明。
 - `receive_callback` の 300 秒タイムアウト後に WebView 側の表示がどうなるか（エラー表示の有無）はコードから判断できない（`GoogleError::Auth` が `google_login_error` に入るのみ）。
-- Windows の PDFium 静的ライブラリの出所（ビルド成果物の取得方法）は `crates/core/src/import/pdf.rs` に記述が無く、リポジトリからは判断できない。
 - **[DLsite]** 購入履歴 1 ページあたりの実件数（コードに定数なし。`MAX_PAGES_PER_STORE` のコメントは「1 ページあたりの行数境界（実測は未確認）」だが実装は最大ページ数）。`crates/core/src/dlsite/client.rs:16-17`
 - **[DLsite]** `age_category` の実測値の全パターン（コメントは「2 以上（R18 想定）」で、2 以上を実測確認した記述はない）。`crates/core/src/dlsite/mod.rs:78-80`
 - **[DLsite]** `login.dlsite.com` 側に年齢確認・2 段階認証があるか（コードに分岐・文言が存在しないため判断不能）。`crates/app/src/views/dlsite_login.rs:106-154`

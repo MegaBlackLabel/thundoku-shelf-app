@@ -40,7 +40,7 @@
 | 問題（実測） | 原因 | 対策 |
 |---|---|---|
 | メモリが **6,000MB** まで増える | (1) `ImageViewer` の**強参照の自己循環**と、`ReaderView` を `App::on_action` のアプリ寿命リスナーが**強参照**していた→閉じても解放されず本ごとに累積 (2) スクロールモードで**全ページ**を保持（1 ページ平均 16MiB、192 ページで 5,631MiB） | (1) すべて `WeakEntity` 化（回帰テスト `viewer_is_dropped_when_no_strong_handle_remains` / `reader_is_dropped_when_closed`） (2) **384MiB のバイト予算**で表示中ページの前後だけ保持し、`Window::drop_image` で GPU からも解放 |
-| PDF の並列取り込みでプロセスが落ちる（`STATUS_ACCESS_VIOLATION`） | **PDFium はプロセスで 1 つのライブラリ状態を共有し、同時利用がスレッドセーフではない**（`pdfium-render` の `thread_safe` は `unsafe impl Send/Sync` を足すだけ） | PDFium を使う区間を `static Mutex` で**直列化**（`crates/core/src/import/pdf.rs`）。非 Windows の mupdf は `thread_local` コンテキストなので並列のまま |
+| PDF の並列取り込みでプロセスが落ちる（`STATUS_ACCESS_VIOLATION`） | **PDFium はプロセスで 1 つのライブラリ状態を共有し、同時利用がスレッドセーフではない**（`pdfium-render` の `thread_safe` は `unsafe impl Send/Sync` を足すだけ） | PDFium を使う区間（初期化を含む）を `static Mutex` で**直列化**（`crates/core/src/import/pdf.rs`）。描画後の WebP エンコードは PDFium を触らないので 8 スレッドで並列のまま |
 | 表紙のプレースホルダが**常に空枠** | SVG を `image` クレートで復号しようとして常に `None` | `usvg` + `resvg` + `tiny-skia` でラスタライズ（`rasterize_svg`）。BGRA 入れ替えが必要 |
 | 履歴の表紙が日ごとに再デコード | 同じ本が複数の日に出る | `reload` 内で `book_id` ごとに**1 回だけデコードして共有** |
 | 通知の自動消滅時間のコメントが「3 秒」 | 実装は gpui-kit の既定 **5 秒** | コメントを実装に合わせる（既知のドリフト） |

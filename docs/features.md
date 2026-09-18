@@ -37,8 +37,7 @@ Thundoku Shelf Desktop は、技術書典・BOOTH で購入した本の管理・
 
 | ライブラリ | 用途 |
 |---|---|
-| `mupdf`（非 Windows） | PDF のページレンダリング（`crates/core`）。デバッグビルドでも `opt-level = 3` で常に最適化 |
-| `pdfium-render`（Windows） | PDF のページレンダリング（`crates/core`）。Apache-2.0。`pdfium.dll` を動的ロードするため、配布時は exe と同じフォルダに `pdfium.dll` を同梱する（`chromium/7881` 相当） |
+| `pdfium-render` | PDF のページレンダリング（`crates/core`。**全プラットフォーム共通**）。**実行時ロード**なので配布時はライブラリを同梱する（macOS は `.app/Contents/Frameworks/libpdfium.dylib`、Windows は exe と同じフォルダに `pdfium.dll`。`chromium/7881` 相当）。PDFium 本体は BSD-3-Clause / Apache-2.0（mupdf は AGPL-3.0 で MIT 配布のアプリと両立しないため削除した） |
 | `image` | 画像の読み込み・縮小（PNG/JPEG/webp） |
 | `webp` / `libwebp-sys` | **webp のデコード（C 実装）**。ページ画像表示の高速化に必須（image クレートの webp デコーダーは 1000px で 1 秒超かかる） |
 | `zip` | ZIP の展開（画像 ZIP からの取り込み） |

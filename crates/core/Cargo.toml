@@ -35,16 +35,14 @@ webp = "0.3"
 lindera = { version = "0.44", features = ["ipadic"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 yaml-rust2 = "0.13"
-
-# mupdf は MSVC（msbuild）でソースビルドされるため、xwin クロスビルドでは使えない
-[target.'cfg(not(windows))'.dependencies]
-mupdf = "0.8"
-
-# Windows では PDFium（Apache-2.0）を使用。mupdf は AGPL のため MIT アプリと
-# 互換性がない。pdfium-render は実行時ロード（動的リンク）で、ビルド時に
-# ライブラリ不要。pdfium.dll は実行時に exe と同じ場所からロードする。
-[target.'cfg(windows)'.dependencies]
+# PDF レンダリングは PDFium（BSD-3-Clause / Apache-2.0）に統一した。mupdf は
+# AGPL-3.0 で、MIT で配布するこのアプリと両立しないため依存から外している。
+# PDFium は**実行時ロード**（静的リンクではない）ので、ビルド時にライブラリは
+# 要らない。dylib / dll は実行ファイルの隣（macOS の .app は
+# Contents/Frameworks）に置く。static を有効にしないこと — prebuilt の static は
+# macOS で FPDF_FORMFILL を欠きリンクできない。
 pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7881", "image_latest", "thread_safe"] }
+
 
 [dev-dependencies]
 parking_lot = "0.12"

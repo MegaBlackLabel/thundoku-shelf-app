@@ -1,11 +1,29 @@
-//! PDF rendering: mupdf (source-built) -> webp pages + text extraction.
-//! Isolated behind `render_pdf_pages` so the backend can be swapped without
-//! touching the import pipeline. (pdfium-render's prebuilt static library
-//! failed to link on macOS — missing FPDF_FORMFILL symbols — so the planned
-//! mupdf contingency is in use.)
+//! PDF rendering: PDFium（実行時ロードの dylib）-> webp pages + text extraction.
+//!
+//! 以前は macOS / Linux で mupdf をソースビルドして使っていた（Windows だけ
+//! PDFium）。mupdf は **AGPL-3.0** で、MIT で配布するアプリに同梱すると
+//! ライセンスが両立しないため、全プラットフォームで PDFium（BSD-3-Clause /
+//! Apache-2.0）に統一した。
+//!
+//! PDFium は**実行時**にライブラリをロードする。ビルド時にリンクしないのは、
+//! pdfium-binaries の prebuilt static ライブラリが macOS で `FPDF_FORMFILL` を
+//! 欠いていてリンクできないため（この経路ならその失敗を踏まない）。
+//! ライブラリの探索先はテスト実行（CWD）・実行ファイルの隣・macOS の
+//! `.app/Contents/Frameworks`。
+//!
+//! PDFium はプロセスで 1 つのライブラリ状態（フォントキャッシュ等）を共有し、
+//! **同時利用がスレッドセーフではない**。`pdfium-render` の `thread_safe` feature は
+//! `unsafe impl Send/Sync for Pdfium` を足すだけでロックはしない（呼び出し側の責任）。
+//! 実測: テキスト入りの PDF を複数スレッドで同時にレンダリングすると
+//! `STATUS_ACCESS_VIOLATION` (0xc0000005) でプロセスが落ちる。スレッドごとに
+//! `load_pdf_from_byte_slice` し直しても再現する（＝ドキュメントを分けてもダメ）。
+//! そのため PDFium を使う区間はこの Mutex で直列化する。1 冊の中の描画は元々
+//! 逐次なので、単冊の速度は変わらない（並行に複数冊を取り込むときだけ待ち合う）。
 
-#[cfg(not(windows))]
-use mupdf::{Colorspace, Device, Document, Matrix, Pixmap, TextPageFlags};
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use pdfium_render::prelude::*;
 
 use crate::import::ImportError;
 
@@ -16,63 +34,67 @@ pub struct PageImage {
     pub text: String,
 }
 
-/// Windows クロスビルド（xwin）では mupdf をビルドできないため PDF レンダリング不可。
-/// pdfium-render はグローバルな `BINDINGS` をプロセスで 1 つだけ持つため、
-/// `Pdfium::new` は一度しか呼べない。`LazyLock` で一度だけ初期化して再利用する
-/// （並列テスト・複数 PDF の取り込みで 2 回目に `Pdfium::new` すると panic する）。
-#[cfg(windows)]
-fn pdfium_instance() -> Result<&'static pdfium_render::prelude::Pdfium, ImportError> {
-    use pdfium_render::prelude::*;
+/// PDFium のライブラリを探す候補（プラットフォームごとのファイル名は
+/// `pdfium_platform_library_name_at_path` が解決する）。
+fn library_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        // テスト実行時（cargo test）は CWD が crate ルート。
+        Pdfium::pdfium_platform_library_name_at_path("./"),
+    ];
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        // アプリ実行時は実行ファイルの隣（Windows の配布レイアウト）。
+        candidates.push(Pdfium::pdfium_platform_library_name_at_path(dir));
+        // macOS の .app は Contents/Frameworks に置く。
+        candidates.push(Pdfium::pdfium_platform_library_name_at_path(
+            &dir.join("../Frameworks"),
+        ));
+    }
+    candidates
+}
+
+/// プロセスで 1 つだけ初期化して使い回す。
+///
+/// `pdfium-render` はグローバルな `BINDINGS` を 1 つしか持たず、`Pdfium::new` を
+/// 2 回呼ぶと panic する（並列テスト・複数 PDF の取り込みで踏む）。
+fn pdfium_instance() -> Result<&'static Pdfium, ImportError> {
     static PDFIUM: std::sync::LazyLock<Result<Pdfium, String>> = std::sync::LazyLock::new(|| {
-        // exe と同じディレクトリ、次いで CWD（./）から pdfium.dll を動的ロードする。
-        // 配布時は exe と同じフォルダに pdfium.dll を置く。ビルド時にはライブラリ不要
-        // （mupdf の AGPL と違い Apache-2.0 で MIT と互換）。
-        let candidates = [
-            // テスト実行時（cargo test）は CWD が crate ルート。
-            Pdfium::pdfium_platform_library_name_at_path("./"),
-            // アプリ実行時は exe と同じフォルダからロードする（配布レイアウト）。
-            Pdfium::pdfium_platform_library_name_at_path(
-                std::env::current_exe()
-                    .ok()
-                    .as_deref()
-                    .and_then(|p| p.parent())
-                    .unwrap_or_else(|| std::path::Path::new(".")),
-            ),
-        ];
+        let candidates = library_candidates();
         candidates
             .iter()
             .find_map(|candidate| Pdfium::bind_to_library(candidate).ok())
             .map(Pdfium::new)
             .ok_or_else(|| {
-                format!(
-                    "pdfium.dll をロードできませんでした（検索: {} / {}）",
-                    candidates[0].display(),
-                    candidates[1].display()
-                )
+                let list = candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                format!("PDFium のライブラリをロードできませんでした（検索: {list}）")
             })
     });
     PDFIUM.as_ref().map_err(|e| ImportError::Pdf(e.clone()))
 }
 
-/// PDFium はプロセスで 1 つのライブラリ状態（フォントキャッシュ等）を共有し、
-/// **同時利用がスレッドセーフではない**。`pdfium-render` の `thread_safe` feature は
-/// `unsafe impl Send/Sync for Pdfium` を足すだけでロックはしない（呼び出し側の責任）。
+/// PDFium のライブラリが実際に見つかっているか（テストの前提判定用）。
 ///
-/// 実測（Windows / pdfium-render 0.9.3）: テキスト入りの 1 ページ PDF を 8 スレッドで
-/// 同時にレンダリングすると `STATUS_ACCESS_VIOLATION` (0xc0000005) でプロセスが落ちる。
-/// スレッドごとに `load_pdf_from_byte_slice` し直しても再現する（＝ドキュメントを分けても
-/// ダメ）。そのため PDFium を使う区間はこの Mutex で直列化する。
-/// 1 冊の中の描画は元々このループが逐次なので、単冊の速度は変わらない（並行に複数冊を
-/// 取り込むときだけ待ち合う）。
-#[cfg(windows)]
-static PDFIUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// 見つからない環境（ライブラリをまだ取得していない開発機）では PDF を描画する
+/// テストをスキップするために使う。取得は `mise run pdfium`。
+pub fn pdfium_library_path() -> Option<PathBuf> {
+    library_candidates().into_iter().find(|path| path.exists())
+}
 
-#[cfg(windows)]
+static PDFIUM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Render every page of a PDF to webp (q80) at a target width of 1000px
+/// and extract the page text. `progress` receives 0..=1.
 pub fn render_pdf_pages(
     bytes: &[u8],
-    progress: &mut dyn FnMut(f32),
+    progress: &mut (dyn FnMut(f32) + Send),
 ) -> Result<Vec<PageImage>, ImportError> {
-    use pdfium_render::prelude::*;
+    log::info!("render_pdf_pages: 開始");
+    let render_start = std::time::Instant::now();
 
     // PDFium の同時利用は未定義動作なので、初期化も含めてここから直列化する。
     let _pdfium_guard = PDFIUM_LOCK
@@ -82,155 +104,108 @@ pub fn render_pdf_pages(
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(|e| ImportError::Pdf(e.to_string()))?;
-    let total = document.pages().len();
-    let total = total.max(0) as usize;
+    let total = document.pages().len().max(0) as usize;
     if total == 0 {
         return Ok(Vec::new());
     }
-    // mupdf と同じ解像度: ページ幅を 1000px に（アスペクト比維持）。
-    // pdfium のピクセルは既定で sRGB、webp q80 は mupdf 経路と同じ encode_webp を使う。
-    // mupdf と同じく高さ制限は設けない（縦長ページでも幅 1000px を維持し、
-    // アスペクト比に応じて高さが決まる。set_maximum_height を入れると
-    // 縦長ページで幅が縮み画質が下がるため）。
-    let render_config = PdfRenderConfig::new().set_target_width(1000);
-    let mut out = Vec::with_capacity(total);
-    for (index, page) in document.pages().iter().enumerate() {
-        let bitmap = page
-            .render_with_config(&render_config)
-            .map_err(|e| ImportError::Pdf(e.to_string()))?;
-        let image = bitmap
-            .as_image()
-            .map_err(|e| ImportError::Pdf(e.to_string()))?
-            .into_rgb8();
-        let (width, height) = image.dimensions();
-        let webp = crate::import::encode_webp(&image::DynamicImage::ImageRgb8(image), 80)?;
-        let text = page.text().map(|t| t.to_string()).unwrap_or_default();
-        out.push(PageImage {
-            data: webp,
-            width,
-            height,
-            text,
-        });
-        progress((index + 1) as f32 / total as f32);
-    }
-    Ok(out)
-}
 
-/// Render every page of a PDF to webp (q80) at a target width of 1000px
-/// and extract the page text. `progress` receives 0..=1.
-#[cfg(not(windows))]
-pub fn render_pdf_pages(
-    bytes: &[u8],
-    progress: &mut (dyn FnMut(f32) + Send),
-) -> Result<Vec<PageImage>, ImportError> {
-    log::info!("render_pdf_pages: 開始");
-    let render_start = std::time::Instant::now();
-    let document = Document::from_bytes(bytes, "application/pdf")
-        .map_err(|e| ImportError::Pdf(e.to_string()))?;
-    let count = document
-        .page_count()
-        .map_err(|e| ImportError::Pdf(e.to_string()))?;
-    let total = count.max(0) as usize;
-    if total == 0 {
-        return Ok(Vec::new());
-    }
-    // ページ範囲を 4 チャンクに分割し、各スレッドが 1 回だけ Document を
-    // パースして担当範囲をレンダリングする（ページごとにパースし直すと
-    // 200 ページ超の PDF でパースのオーバーヘッドが並列化を打ち消す）。
-    let results: std::sync::Mutex<Vec<Option<Result<PageImage, String>>>> =
-        std::sync::Mutex::new((0..total).map(|_| None).collect());
+    // ページ幅を 1000px に（アスペクト比維持）。高さの上限は設けない
+    // （縦長ページでも幅 1000px を維持する。`set_maximum_height` を入れると
+    // 縦長ページで幅が縮み画質が落ちる）。
+    let render_config = PdfRenderConfig::new().set_target_width(1000);
+    // 8 ページずつ「描画（直列）→ 並列エンコード」を回す。全ページの生 RGB を
+    // 溜めてから一括でエンコードすると 1 ページ約 4MB × ページ数になり、
+    // 200 ページ級の本で 1GB を超える（旧 mupdf 経路はページごとにエンコードして
+    // webp しか保持していなかった）。窓を切れば常駐は数ページ分で済む。
+    const WINDOW: usize = 8;
     let done = std::sync::atomic::AtomicUsize::new(0);
-    let progress = std::sync::Arc::new(std::sync::Mutex::new(progress));
-    let chunk_size = total.div_ceil(8);
-    std::thread::scope(|s| {
-        for chunk in 0..8 {
-            let start = chunk * chunk_size;
-            let end = ((chunk + 1) * chunk_size).min(total);
-            if start >= end {
-                continue;
-            }
-            let bytes = bytes.to_vec();
-            let results = &results;
-            let done = &done;
-            let progress = progress.clone();
-            s.spawn(move || {
-                let Ok(document) = Document::from_bytes(&bytes, "application/pdf") else {
-                    return;
-                };
-                for index in start..end {
-                    let result = render_page(&document, index as i32).map_err(|e| e.to_string());
-                    results.lock().unwrap()[index] = Some(result);
+    let progress = std::sync::Mutex::new(progress);
+    let mut rendered = Vec::with_capacity(total);
+    let mut first_error: Option<ImportError> = None;
+    // ページのハンドルは 1 つ作って使い回す。`document.pages().iter().skip(n)` を窓ごとに
+    // 作り直すと、手前のページを毎回ロードして捨てる（`PdfPagesIterator::next` が
+    // `PdfPages::get` を呼ぶため）。ページ数 n に対して約 n²/2W 回の無駄ロードになる。
+    let pages = document.pages();
+
+    for window_start in (0..total).step_by(WINDOW) {
+        let count = (window_start + WINDOW).min(total) - window_start;
+
+        // 1) 描画は PDFium の制約で直列。生の RGB はこの窓の中だけ保持する。
+        let mut raw: Vec<(u32, u32, Vec<u8>, String)> = Vec::with_capacity(count);
+        for index in window_start..window_start + count {
+            let page = pages
+                .get(index as _)
+                .map_err(|e| ImportError::Pdf(e.to_string()))?;
+            let bitmap = page
+                .render_with_config(&render_config)
+                .map_err(|e| ImportError::Pdf(e.to_string()))?;
+            let image = bitmap
+                .as_image()
+                .map_err(|e| ImportError::Pdf(e.to_string()))?
+                .into_rgb8();
+            let (width, height) = image.dimensions();
+            let text = page.text().map(|t| t.to_string()).unwrap_or_default();
+            raw.push((width, height, image.into_raw(), text));
+        }
+
+        // 2) WebP エンコードは PDFium を触らないので並列に流す（ここを直列にすると
+        //    8 並列だった mupdf 経路より体感で数倍遅くなる）。生バッファは
+        //    スレッドへ**所有権ごと**渡すので、追加のコピーは作らない。
+        let results: std::sync::Mutex<Vec<Option<Result<PageImage, String>>>> =
+            std::sync::Mutex::new((0..count).map(|_| None).collect());
+        std::thread::scope(|scope| {
+            for (offset, (width, height, pixels, text)) in raw.into_iter().enumerate() {
+                let results = &results;
+                let done = &done;
+                let progress = &progress;
+                scope.spawn(move || {
+                    let result = image::RgbImage::from_raw(width, height, pixels)
+                        .ok_or_else(|| "invalid rgb buffer".to_string())
+                        .and_then(|rgb| {
+                            crate::import::encode_webp(&image::DynamicImage::ImageRgb8(rgb), 80)
+                                .map_err(|e| e.to_string())
+                        })
+                        .map(|data| PageImage {
+                            data,
+                            width,
+                            height,
+                            text,
+                        });
+                    results.lock().unwrap()[offset] = Some(result);
                     let finished = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     if let Ok(mut callback) = progress.lock() {
                         callback(finished as f32 / total as f32);
                     }
+                });
+            }
+        });
+
+        for (offset, result) in results.into_inner().unwrap().into_iter().enumerate() {
+            match result.and_then(|r| r.ok()) {
+                Some(page) => rendered.push(page),
+                None => {
+                    let index = window_start + offset;
+                    log::error!("render_pdf_pages: ページ {index} のエンコードに失敗");
+                    if first_error.is_none() {
+                        first_error = Some(ImportError::Pdf(format!(
+                            "ページ {index} を画像に変換できませんでした"
+                        )));
+                    }
                 }
-            });
-        }
-    });
-    let mut first_error: Option<ImportError> = None;
-    let mut rendered = Vec::with_capacity(total);
-    for (index, result) in results.into_inner().unwrap().into_iter().enumerate() {
-        match result.unwrap_or_else(|| Err("page renderer did not produce a result".to_string())) {
-            Ok(page_image) => rendered.push(page_image),
-            Err(message) => {
-                if first_error.is_none() {
-                    first_error = Some(ImportError::Pdf(message));
-                }
-                log::error!("render_pdf_pages: ページ {index} のレンダリング失敗");
             }
         }
+        if first_error.is_some() {
+            break;
+        }
     }
+
     if let Some(error) = first_error {
         return Err(error);
     }
+
     log::info!(
         "render_pdf_pages: 完了（{total} ページ / {:?}）",
         render_start.elapsed()
     );
     Ok(rendered)
-}
-
-/// 1 ページをレンダリングする（並列ワーカー用 — Document は共有）。
-#[cfg(not(windows))]
-fn render_page(document: &Document, index: i32) -> Result<PageImage, ImportError> {
-    let page = document
-        .load_page(index)
-        .map_err(|e| ImportError::Pdf(e.to_string()))?;
-    let bounds = page.bounds().map_err(|e| ImportError::Pdf(e.to_string()))?;
-    let width = (bounds.x1 - bounds.x0).max(1.0);
-    let height = (bounds.y1 - bounds.y0).max(1.0);
-    let scale = 1000.0f32 / width;
-    let pixel_w = (width * scale).round().max(1.0) as i32;
-    let pixel_h = (height * scale).round().max(1.0) as i32;
-    let matrix = Matrix::new_scale(scale, scale);
-    // mupdf の Pixmap::new はピクセルを初期化しない（"will contain crap
-    // data"）。page.run はページの内容だけを描画するため、背景・余白部分に
-    // 前のページの残骸（未初期化メモリ）が残り、画像が重なって見える。
-    // 描画前に白でクリアしてこれを防ぐ。
-    let mut pixmap = Pixmap::new(&Colorspace::device_rgb(), 0, 0, pixel_w, pixel_h, false)
-        .map_err(|e| ImportError::Pdf(e.to_string()))?;
-    pixmap
-        .clear_with(255)
-        .map_err(|e| ImportError::Pdf(e.to_string()))?;
-    let device = Device::from_pixmap(&pixmap).map_err(|e| ImportError::Pdf(e.to_string()))?;
-    page.run(&device, &matrix)
-        .map_err(|e| ImportError::Pdf(e.to_string()))?;
-    let rgb = pixmap.samples().to_vec();
-    let rgb_image = image::RgbImage::from_raw(pixel_w as u32, pixel_h as u32, rgb)
-        .ok_or_else(|| ImportError::Pdf("invalid pixmap dimensions".into()))?;
-    let webp = crate::import::encode_webp(&image::DynamicImage::ImageRgb8(rgb_image), 80)?;
-
-    let text = page
-        .to_text_page(TextPageFlags::PRESERVE_WHITESPACE | TextPageFlags::PRESERVE_LIGATURES)
-        .and_then(|text_page| text_page.to_text())
-        .unwrap_or_default();
-
-    Ok(PageImage {
-        data: webp,
-        // レンダリング後の実サイズ（スケール前のポイント値ではなく）
-        width: pixel_w as u32,
-        height: pixel_h as u32,
-        text,
-    })
 }

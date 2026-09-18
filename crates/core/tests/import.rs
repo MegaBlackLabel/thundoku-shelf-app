@@ -116,6 +116,16 @@ fn solid_color_pdf(r: u8, g: u8, b: u8) -> Vec<u8> {
     solid_pdf_with_content(&content)
 }
 
+/// PDF を描画するテストの前提。PDFium のライブラリが無い環境ではスキップする
+/// （`mise run pdfium` で取得できる。CI は取得してからテストする）。
+fn pdfium_ready() -> bool {
+    if thundoku_core::import::pdf::pdfium_library_path().is_some() {
+        return true;
+    }
+    eprintln!("skip: PDFium のライブラリがありません（`mise run pdfium` で取得してください）");
+    false
+}
+
 fn center_rgb(pdf: &[u8]) -> (u8, u8, u8) {
     let pages = thundoku_core::import::pdf::render_pdf_pages(pdf, &mut no_progress).unwrap();
     assert_eq!(pages.len(), 1);
@@ -132,6 +142,9 @@ fn center_rgb(pdf: &[u8]) -> (u8, u8, u8) {
 /// 修正前はこの形で `STATUS_ACCESS_VIOLATION` によりプロセスが落ちていた。
 #[test]
 fn pdf_rendering_is_safe_from_multiple_threads() {
+    if !pdfium_ready() {
+        return;
+    }
     let bytes = text_pdf();
     let texts = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
@@ -165,6 +178,9 @@ fn pdf_rendering_is_safe_from_multiple_threads() {
 
 #[test]
 fn pdf_rendering_converts_cmyk_red_correctly() {
+    if !pdfium_ready() {
+        return;
+    }
     // 回帰: 技術書典の PDF は CMYK や ICC ベースの色を使うことが多い。
     // CMYK 赤 (C=0, M=1, Y=1, K=0) が RGB の赤 (255, 0, 0) に変換されること。
     let pdf = solid_pdf_with_content("1 0 0 1 0 0 cm\n0 1 1 0 k\n0 0 200 200 re\nf\n");
@@ -181,6 +197,9 @@ fn pdf_rendering_converts_cmyk_red_correctly() {
 
 #[test]
 fn pdf_rendering_preserves_mid_gray_gamma() {
+    if !pdfium_ready() {
+        return;
+    }
     // 回帰: mupdf がリニア RGB で出力すると中間グレーが暗くなり
     // 「色がおかしい」（赤が濁る等）ように見える。sRGB 128 が
     // ほぼ 128 で出力されること（±20 の許容）を検証する。
@@ -244,6 +263,9 @@ fn webp_encode_preserves_vivid_red() {
 
 #[test]
 fn pdf_rendering_preserves_red_color() {
+    if !pdfium_ready() {
+        return;
+    }
     // 回帰: 赤い矩形の PDF をレンダリングし、中心ピクセルの RGB が
     // 赤（R 優位・G/B ほぼゼロ）であることを検証する。
     let pdf = solid_color_pdf(255, 0, 0);
@@ -271,6 +293,9 @@ fn pdf_rendering_preserves_red_color() {
 
 #[test]
 fn pdf_pages_have_clean_white_backgrounds() {
+    if !pdfium_ready() {
+        return;
+    }
     // 回帰: mupdf の Pixmap::new はピクセルを初期化しないため、page.run が
     // ページ内容だけを描画すると背景・余白に前ページの残骸（未初期化メモリ）
     // が残り「画像が重なって見える」。描画前の白クリアを検証する。
@@ -304,6 +329,9 @@ fn pdf_pages_have_clean_white_backgrounds() {
 
 #[test]
 fn pdf_fixture_imports_pages_text_and_db_rows() {
+    if !pdfium_ready() {
+        return;
+    }
     let env = TestEnv::new("pdf");
     let mut progress_calls: Vec<f32> = Vec::new();
     let imported = import_file(
@@ -1135,6 +1163,9 @@ fn unsupported_extension_is_rejected() {
 
 #[test]
 fn pdf_import_binds_identity_when_provided() {
+    if !pdfium_ready() {
+        return;
+    }
     let env = TestEnv::new("pdf-identity");
     let pdf_bytes = std::fs::read(PDF_FIXTURE).unwrap();
     let book_id = uuid::Uuid::new_v4().to_string();

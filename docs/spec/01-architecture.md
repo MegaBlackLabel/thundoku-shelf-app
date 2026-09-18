@@ -9,12 +9,11 @@
 | パス | 役割 | 主な言語/依存 |
 |---|---|---|
 | `crates/opfspack` | 書籍ファイル形式 `.opfspack` の読み書き（自前形式） | Rust / aes-gcm, sha2 |
-| `crates/core` | DB・取り込み・各ストア同期・Google/Drive・タグ・暗号（UI 非依存） | Rust / sqlx, tokio, reqwest 相当は ureq, lindera, pdfium/mupdf |
+| `crates/core` | DB・取り込み・各ストア同期・Google/Drive・タグ・暗号（UI 非依存） | Rust / sqlx, tokio, reqwest 相当は ureq, lindera, pdfium-render |
 | `crates/app` | GPUI デスクトップ UI（画面・ビューアー・通知・アイコン） | Rust / gpui-kit, gpui-wry, image, resvg, usvg |
 
 - ワークスペース: `resolver = "3"`, `edition = "2024"`, version 0.0.1, license MIT（`Cargo.toml:1-13`）
-- リリースプロファイルは `debug = false`（`Cargo.toml:20-22`）
-- `mupdf-sys` は dev プロファイルでも `opt-level = 3`（デバッグビルドだと 1 ページ数秒かかるため。`Cargo.toml:15-17`）
+- リリースプロファイルは `debug = false`（`Cargo.toml:19-23`）
 
 ### 1.1 主要モジュール（アプリ層）
 
@@ -68,7 +67,7 @@
 | 非同期ランタイム | Tokio マルチスレッド、**worker_threads = 2**（`OnceLock` で 1 つだけ作る） | `crates/core/src/db/mod.rs` |
 | 同期処理のブロック | `crate::db::block_on(...)` で同期 API から非同期 SQLx を回す | `crates/core/src/db/mod.rs` |
 | 画像変換の並列度 | `min(コア数, 8)`、64 ページ単位のチャンク | `crates/core/src/import/mod.rs` |
-| PDF レンダリング | **Windows = pdfium（`static Mutex` で直列化）** / 非 Windows = mupdf（8 スレッド、スレッドごとに `thread_local` コンテキスト） | `crates/core/src/import/pdf.rs` |
+| PDF レンダリング（PDFium。全プラットフォーム共通） | ライブラリ呼び出し（初期化を含む）は **`static Mutex` でプロセス全体を直列化**（`thread_safe` feature はロックしないため自前で排他）。描画後の WebP エンコードは PDFium を触らないので **8 スレッドで並列** | `crates/core/src/import/pdf.rs` |
 | 重い処理の分離 | 取り込み・ダウンロードは専用スレッド/バックグラウンド実行し、UI スレッドでは待たない | `crates/app/src/views/bookshelf.rs` |
 
 **PDFium の直列化は必須**（理由は `docs/spec/07-decisions.md`）: PDFium はプロセスで 1 つのライブラリ状態（フォントキャッシュ等）を共有し、同時利用がスレッドセーフではない。実測でテキスト入り PDF を 8 スレッド同時描画すると `STATUS_ACCESS_VIOLATION` で落ちる。
@@ -98,8 +97,7 @@
 | `sqlx`（sqlite, runtime-tokio, migrate） | DB | |
 | `image` / `webp` / `libwebp-sys`（sse41） | WebP エンコード/デコード | `sse41` は xwin クロスビルド対策 |
 | `resvg` / `usvg` / `tiny-skia` | SVG（プレースホルダ表紙）のラスタライズ | `image` クレートは SVG を復号できないため |
-| `pdfium-render`（thread_safe, pdfium_7881） | Windows の PDF レンダリング | `thread_safe` は `unsafe impl Send/Sync` を足すだけで**ロックはしない**（自前で Mutex が必要） |
-| `mupdf`（非 Windows のみ） | PDF レンダリング | MSVC 前提のため xwin クロスビルドでは使えない |
+| `pdfium-render`（thread_safe, pdfium_7881） | PDF レンダリング（全プラットフォーム共通） | **実行時ロード**（ビルド時にライブラリは要らない。prebuilt の static は macOS で `FPDF_FORMFILL` を欠きリンクできない）。`thread_safe` は `unsafe impl Send/Sync` を足すだけで**ロックはしない**（自前で Mutex が必要）。以前の `mupdf` は AGPL-3.0 で MIT 配布と両立しないため削除した |
 | `lindera`（ipadic） | 日本語形態素解析（タグ自動生成） | |
 | `keyring`（apple-native / windows-native） | 認証情報の保存 | 値の長さ上限 2560 UTF-16 文字 → 長いセッションは DB 側へ |
 | `encoding_rs` / `zip` | Shift-JIS(CP932) のエントリ名デコード | `zip` は UTF-8 フラグ無しを CP437 と解釈するため自前デコード |
@@ -117,6 +115,7 @@
 | リリースビルド | `mise exec -- cargo build --release` → `target/release/thundoku-shelf.exe` |
 
 - 実行時ツールは **mise 管理**（`mise exec -- ...`）。システムの python/node は使わない
+- PDF を描画するテストには **PDFium の動的ライブラリ**が要る（`mise run pdfium` = `scripts/fetch-pdfium.sh` が `crates/core/` に `libpdfium.dylib` / `pdfium.dll` を取得する。無い場合はスキップされる）
 - リリース exe は**アプリ起動中は差し替えできない**（os error 5）。ビルド前にアプリを閉じる
 
 ## 7. 不明点

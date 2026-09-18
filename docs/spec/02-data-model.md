@@ -28,7 +28,7 @@
 | `db::*` 各ファイル | テーブル単位のリポジトリ（同期 API、`Result<_, sqlx::Error>`） | `crates/core/src/db/mod.rs:9-26`（`pub mod` 一覧） |
 | `import::mod` | 取り込みパイプライン本体（判定→計画→pack 生成→DB 登録） | `crates/core/src/import/mod.rs:1-21` |
 | `import::classify` | ZIP エントリ種別判定（名前のみ） | `crates/core/src/import/classify.rs:1-6` |
-| `import::pdf` | PDF → WebP ページ + テキスト抽出（Windows=pdfium、非 Windows=mupdf） | `crates/core/src/import/pdf.rs:1-8`, `:71`, `:122` |
+| `import::pdf` | PDF → WebP ページ + テキスト抽出（全プラットフォーム共通。PDFium を実行時ロード） | `crates/core/src/import/pdf.rs:1-21`, `:39`, `:84` |
 | `import::zip_names` | ZIP エントリ名/本文の CP932 デコード | `crates/core/src/import/zip_names.rs:1-14` |
 | `import::export_text` | `_export.txt`（`<<NPage>>` マーカー）パース | `crates/core/src/import/export_text.rs:1-5` |
 | `opfspack` | `.opfspack` バイナリ形式の reader/writer + 暗号（TS 実装とバイト互換） | `crates/opfspack/src/lib.rs:1-16` |

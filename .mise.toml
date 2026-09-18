@@ -20,3 +20,8 @@ run = "cargo clippy --workspace --all-targets -- -D warnings"
 # 作り忘れは `cargo test -p thundoku-shelf` が検出する。
 [tasks.licenses]
 run = "cargo run -p thundoku-shelf --example regen_licenses"
+
+# PDFium の動的ライブラリを crates/core/ に取得する（リポジトリにはコミットしない）。
+# PDF を描画するテストは、これが無いとスキップされる。
+[tasks.pdfium]
+run = "bash scripts/fetch-pdfium.sh"

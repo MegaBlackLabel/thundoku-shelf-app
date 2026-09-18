@@ -46,6 +46,33 @@ jobs:
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }} -p thundoku-shelf
 
+      # PDFium (BSD-3-Clause / Apache-2.0) は mupdf (AGPL-3.0) の代替として
+      # macOS でも使う。静的リンクはしない — 実行時に dylib をロードする方式なら
+      # prebuilt の static ライブラリが macOS で欠いている FPDF_FORMFILL を要求しない。
+      # 供給網対策として SHA256 を検証してから展開する。
+      - name: Fetch pdfium (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.arch }}" in
+            aarch64)
+              asset=pdfium-mac-arm64
+              sha=52e94ca5aa8847934330daf3f8150c190682c5ca93831468794f8b90d4392e40
+              ;;
+            x86_64)
+              asset=pdfium-mac-x64
+              sha=6dedf83990e0e3d6b7c93c9e7589c5a126b0ae14b7464d76120cff7a26afb18b
+              ;;
+            *)
+              echo "unknown arch: ${{ matrix.arch }}" >&2
+              exit 1
+              ;;
+          esac
+          curl -fsSL -o pdfium.tgz "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-${asset}.tgz"
+          echo "${sha}  pdfium.tgz" | shasum -a 256 -c -
+          tar -xzf pdfium.tgz lib/libpdfium.dylib
+
       # macOS は生バイナリではなく .app バンドルを配布する。
       # 生バイナリだと Info.plist もアイコンも無く、Finder からアプリとして扱えず、
       # Gatekeeper の扱いも厳しくなる（ローカルの scripts/make-app-bundle.sh と同じ構成）。
@@ -89,6 +116,12 @@ jobs:
           </dict>
           </plist>
           PLIST
+          # 実行時ロードする dylib をバンドルへ入れる（アプリは実行ファイルの
+          # 隣と ../Frameworks を探す）。署名より前に置くこと — 署名の seal は
+          # この時点で中身が確定している必要がある。
+          mkdir -p "$APP/Contents/Frameworks"
+          cp lib/libpdfium.dylib "$APP/Contents/Frameworks/libpdfium.dylib"
+          codesign --force --sign - "$APP/Contents/Frameworks/libpdfium.dylib"
           # .app として ad-hoc 署名し直す。実行ファイル単体の署名（リンカが付ける）だけだと
           # _CodeSignature/CodeResources が無く、codesign --verify が失敗して Gatekeeper が
           # 「壊れているため開けません」と判定しうる。Team ID は無いので ad-hoc（-）で署名する
