@@ -72,8 +72,9 @@ struct ProgressNotice;
 /// アプリメニュー（macOS のメニューバー相当。gpui の set_menus に渡す）。
 ///
 /// `quit_enabled` が false のときは「終了」を無効化する（終了時のアップロード中など、
-/// メニューから中断させたくないとき）。
-pub fn app_menus(quit_enabled: bool) -> Vec<Menu> {
+/// メニューから中断させたくないとき）。`checklist_enabled` が false のときは
+/// 「チェックリスト」を無効化する（技術書典に未ログインのとき）。
+pub fn app_menus(quit_enabled: bool, checklist_enabled: bool) -> Vec<Menu> {
     let app = Menu::new("App").items([
         MenuItem::action("Thundoku Shelf について", crate::actions::OpenAbout),
         MenuItem::separator(),
@@ -86,11 +87,27 @@ pub fn app_menus(quit_enabled: bool) -> Vec<Menu> {
         MenuItem::action("本棚", crate::actions::ShowBookshelf),
         MenuItem::action("閲覧履歴", crate::actions::ShowHistory),
         MenuItem::action("付箋", crate::actions::ShowNotes),
-        MenuItem::action("チェックリスト", crate::actions::ShowChecklist),
+        MenuItem::action("チェックリスト", crate::actions::ShowChecklist)
+            .disabled(!checklist_enabled),
         MenuItem::action("設定", crate::actions::ShowSettings),
         MenuItem::action("説明", crate::actions::ShowAbout),
     ]);
     vec![app, view]
+}
+
+/// アプリの現在の状態に合わせてアプリメニューを組み直す（macOS のメニューバー。
+/// Windows では no-op）。
+///
+/// 可否は `AppState` から読む（「終了」= 終了時のアップロード中でないこと、
+/// 「チェックリスト」= 技術書典にログイン済みであること）。判定を 1 箇所に集約する
+/// ため、状態を変えた側は `app_menus` ではなくこれを呼ぶ。
+pub fn sync_app_menus(cx: &App) {
+    let state = AppState::global(cx);
+    let quit_enabled = !state
+        .exit_uploading
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let checklist_enabled = *state.tbf_logged_in.lock();
+    cx.set_menus(app_menus(quit_enabled, checklist_enabled));
 }
 
 /// メインのワークスペースエンティティ。
@@ -189,6 +206,9 @@ impl Workspace {
     }
 
     /// Google / GitHub ログイン（成功・失敗）完了フラグを監視し、認証モーダルを閉じる。
+    /// 技術書典のログイン状態（`tbf_logged_in`）も同じループで見張り、変わったら
+    /// アプリメニューを組み直す（メニューはアプリ全体で 1 つなので、サイドバーの
+    /// ように描画のたびに読むことができない）。
     /// `AuthDialog` から `Workspace` を直接 update すると RefCell 再入問題で固まるため、
     /// AppState のフラグを追ってここで状態をリセットする。
     /// GitHub（Device Flow）は view 側が完了時に `github_login_done` を立てる。
@@ -200,6 +220,9 @@ impl Workspace {
         let auth_open = AppState::global(cx).auth_open_requested.clone();
         let auth_provider = AppState::global(cx).auth_open_provider.clone();
         let db = AppState::global(cx).db_pool.clone();
+        // 技術書典のログイン状態（メニューの「チェックリスト」の可否に効く）
+        let tbf_logged_in = AppState::global(cx).tbf_logged_in.clone();
+        let mut tbf_was_logged_in = *tbf_logged_in.lock();
         cx.spawn(async move |_window, cx| {
             loop {
                 cx.background_executor()
@@ -269,6 +292,14 @@ impl Workspace {
                     // cx.notify() は RefCell already borrowed を起こすため、
                     // AsyncApp::refresh()（&self）で再描画を要求する。
                     cx.refresh();
+                }
+                // 技術書典のログイン状態が変わったらアプリメニューを組み直す
+                // （「チェックリスト」の可否。ログイン / ログアウトのどちらの経路でも
+                //   ここを通るので、呼び出し側ごとに set_menus を書かなくてよい）。
+                let tbf_now = *tbf_logged_in.lock();
+                if tbf_now != tbf_was_logged_in {
+                    tbf_was_logged_in = tbf_now;
+                    let _ = handle.update(cx, |_this, cx| sync_app_menus(cx));
                 }
             }
         })
@@ -866,11 +897,11 @@ impl Workspace {
         // （見た目が何も変わらないと、終了したのか固まったのか分からない）。
         // 完了（アプリ終了）まで消えない通知にする（長いアップロードでも見失わない）
         crate::app_state::set_sticky_progress_notice(cx, EXIT_UPLOAD_NOTICE);
-        // アップロード中はメニューの「終了」も無効にする（macOS。Windows では no-op）
-        cx.set_menus(app_menus(false));
         AppState::global(cx)
             .exit_uploading
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // アップロード中はメニューの「終了」も無効にする（macOS。Windows では no-op）
+        sync_app_menus(cx);
         AppState::global(cx)
             .exit_checked
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -923,7 +954,7 @@ impl Workspace {
                 AppState::global(cx)
                     .exit_uploading
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                cx.set_menus(app_menus(true));
+                sync_app_menus(cx);
                 cx.notify();
             });
             cx.update(|cx| cx.quit());
@@ -1816,6 +1847,7 @@ impl Workspace {
         // レポート（GitHub にログインしているときだけ設定の上に出す）。
         // ログインしていないと Issue を作れないため導線も出さない。
         let github_logged_in = *AppState::global(cx).github_logged_in.lock();
+        let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let report_item = github_logged_in.then(|| {
             self.bottom_item(
                 "sidebar-nav-report",
@@ -1983,19 +2015,23 @@ impl Workspace {
                             cx,
                         ),
                     )
-                    .child(
-                        self.nav_row(
-                            NavTarget::Checklist,
-                            Icon::new(AppIcon::ListChecks)
-                                .size(px(24.0))
-                                .into_any_element(),
-                            "チェックリスト",
-                            open,
-                            active,
-                            handle.clone(),
-                            cx,
-                        ),
-                    ),
+                    // チェックリストは技術書典専用（同期も試し読みも技術書典の
+                    // セッションが要る）。未ログインでは導線を出さない。
+                    .when(tbf_logged_in, |this| {
+                        this.child(
+                            self.nav_row(
+                                NavTarget::Checklist,
+                                Icon::new(AppIcon::ListChecks)
+                                    .size(px(24.0))
+                                    .into_any_element(),
+                                "チェックリスト",
+                                open,
+                                active,
+                                handle.clone(),
+                                cx,
+                            ),
+                        )
+                    }),
             )
             // 下部: 設定 + テーマ + アカウント
             .child(
@@ -2580,6 +2616,15 @@ mod tests {
         cx.new(Workspace::new)
     }
 
+    /// メニューから名前で項目を引く（`app_menus` の可否を検証する）。
+    fn find_menu_item(menus: Vec<Menu>, name: &str) -> MenuItem {
+        menus
+            .into_iter()
+            .flat_map(|menu| menu.items)
+            .find(|item| matches!(item, MenuItem::Action { name: item_name, .. } if item_name.as_ref() == name))
+            .unwrap_or_else(|| panic!("メニューに「{name}」が無い"))
+    }
+
     /// 数フレーム描画する（通知の反映まで見る）。
     fn draw_frames(visual: &mut gpui_kit::VisualTestContext) {
         for _ in 0..4 {
@@ -2819,6 +2864,8 @@ mod tests {
     async fn sidebar_notes_row_opens_the_notes_screen(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
+            // チェックリスト行は技術書典ログイン時のみ出る（並び順の検証に必要）
+            *AppState::global(cx).tbf_logged_in.lock() = true;
             ws.update(cx, |w, cx| {
                 w.sidebar_open = true;
                 cx.notify();
@@ -2863,11 +2910,13 @@ mod tests {
         );
     }
 
-    /// サイドバーのナビ行は「本棚 → 閲覧履歴 → チェックリスト」の順に並ぶ。
+    /// サイドバーのナビ行は「本棚 → 閲覧履歴 → 付箋 → チェックリスト」の順に並ぶ。
     #[gpui_kit::test]
     async fn sidebar_history_row_sits_after_the_bookshelf(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
+            // チェックリスト行は技術書典ログイン時のみ出る（並び順の検証に必要）
+            *AppState::global(cx).tbf_logged_in.lock() = true;
             ws.update(cx, |w, cx| {
                 w.sidebar_open = true;
                 cx.notify();
@@ -2899,6 +2948,79 @@ mod tests {
         assert!(
             bookshelf.origin.y < history.origin.y && history.origin.y < checklist.origin.y,
             "並び順が 本棚 → 閲覧履歴 → チェックリスト になっていない"
+        );
+    }
+
+    /// サイドバーの「チェックリスト」行は技術書典にログインしているときだけ出る
+    /// （ログインしていないと同期も試し読みもできないため導線も出さない）。
+    #[gpui_kit::test]
+    async fn checklist_row_needs_techbookfest_login(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+
+        draw(visual);
+        assert!(
+            visual.debug_bounds("sidebar-nav-checklist").is_none(),
+            "技術書典に未ログインなのにチェックリスト行が出ている"
+        );
+
+        cx.update(|cx| {
+            *AppState::global(cx).tbf_logged_in.lock() = true;
+            ws.update(cx, |_, cx| cx.notify());
+        });
+        draw(visual);
+        let notes = visual
+            .debug_bounds("sidebar-nav-notes")
+            .expect("付箋の行が出ていない");
+        let checklist = visual
+            .debug_bounds("sidebar-nav-checklist")
+            .expect("技術書典にログインしてもチェックリスト行が出ていない");
+        // 「付箋」の下に出る（並び順は 本棚 → 閲覧履歴 → 付箋 → チェックリスト）
+        assert!(
+            notes.origin.y < checklist.origin.y,
+            "チェックリスト行が付箋より下に無い: notes_y={} checklist_y={}",
+            notes.origin.y.as_f32(),
+            checklist.origin.y.as_f32()
+        );
+        // 他のナビ行と同じ幅（アイコンと文字が縦に揃う）
+        assert!(
+            (checklist.size.width.as_f32() - notes.size.width.as_f32()).abs() < 1.0,
+            "チェックリスト行の幅が他の行と揃っていない: checklist={:?} notes={:?}",
+            checklist.size,
+            notes.size
+        );
+
+        // ログアウトすると導線も消える（keyring を触る logout_tbf は他テストと
+        // 競合するので、ここではログイン状態だけを落とす）
+        cx.update(|cx| {
+            *AppState::global(cx).tbf_logged_in.lock() = false;
+            ws.update(cx, |_, cx| cx.notify());
+        });
+        draw(visual);
+        assert!(
+            visual.debug_bounds("sidebar-nav-checklist").is_none(),
+            "ログアウトしてもチェックリスト行が残っている"
         );
     }
 
@@ -3488,23 +3610,27 @@ mod tests {
     /// アップロード中はメニューの「終了」を無効にすること（macOS のメニューバー）。
     #[test]
     fn quit_menu_item_is_disabled_while_uploading() {
-        let find_quit = |menus: Vec<Menu>| {
-            menus
-                .into_iter()
-                .flat_map(|menu| menu.items)
-                .find(
-                    |item| matches!(item, MenuItem::Action { name, .. } if name.as_ref() == "終了"),
-                )
-                .expect("メニューに「終了」が無い")
-        };
-
         assert!(
-            !find_quit(app_menus(true)).is_disabled(),
+            !find_menu_item(app_menus(true, true), "終了").is_disabled(),
             "通常は「終了」が有効であること"
         );
         assert!(
-            find_quit(app_menus(false)).is_disabled(),
+            find_menu_item(app_menus(false, true), "終了").is_disabled(),
             "アップロード中は「終了」を無効にすること"
+        );
+    }
+
+    /// 技術書典に未ログインなら、メニューの「チェックリスト」を無効にすること
+    /// （サイドバーの行を隠すのと同じ条件。ログインしていないと同期も試し読みもできない）。
+    #[test]
+    fn checklist_menu_item_needs_techbookfest_login() {
+        assert!(
+            !find_menu_item(app_menus(true, true), "チェックリスト").is_disabled(),
+            "ログイン済みなら「チェックリスト」が有効であること"
+        );
+        assert!(
+            find_menu_item(app_menus(true, false), "チェックリスト").is_disabled(),
+            "未ログインでは「チェックリスト」を無効にすること"
         );
     }
 

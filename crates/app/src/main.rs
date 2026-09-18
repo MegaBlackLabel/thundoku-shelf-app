@@ -9,7 +9,7 @@ use gpui_kit::*;
 use thundoku_core::single_instance::{InstanceError, InstanceGuard};
 use thundoku_shelf::app_state::AppState;
 use thundoku_shelf::icons::AppAssets;
-use thundoku_shelf::workspace::{Workspace, app_menus};
+use thundoku_shelf::workspace::Workspace;
 
 fn main() {
     // Windows で WebView（gpui-wry）を描画させるには DirectComposition を
@@ -106,10 +106,12 @@ fn main() {
             Theme::global_mut(cx).motion.spring_move =
                 gpui_kit::base::Spring::new(std::time::Duration::from_millis(120))
                     .with_damping(0.9);
-            cx.set_menus(app_menus(true));
             cx.activate(true);
 
             AppState::init(cx);
+            // 起動時の状態をメニューに反映する（技術書典にログイン済みなら
+            // 「チェックリスト」を有効にする）。
+            thundoku_shelf::workspace::sync_app_menus(cx);
 
             cx.spawn(async move |cx| {
                 // 前回のウィンドウ配置・サイズがあれば復元する（macOS / Linux / Windows 共通）
