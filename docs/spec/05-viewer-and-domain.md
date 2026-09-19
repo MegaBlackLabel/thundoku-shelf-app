@@ -5,11 +5,11 @@
 > 事実にはアンカー付き。断定できない事項は章末の「不明点 / 推測」に分離してある。
 > 情報源: crates/app/src/components/image_viewer/**, crates/app/src/views/{reader,bookshelf}.rs, crates/core/src/{db,tags}
 
-情報源（すべて読み取りのみ。行番号は 2026-09-14 時点のリポジトリ状態）:
+情報源（すべて読み取りのみ。行番号は 2026-09-20 時点のリポジトリ状態）:
 
-- `crates/app/src/components/image_viewer/mod.rs`（4,362 行）
-- `crates/app/src/views/reader.rs`（1,920 行）
-- `crates/app/src/views/bookshelf.rs`（12,370 行）
+- `crates/app/src/components/image_viewer/mod.rs`
+- `crates/app/src/views/reader.rs`
+- `crates/app/src/views/bookshelf.rs`
 - `crates/core/src/db/progress.rs` / `db/notes.rs` / `db/view_history.rs` / `db/page_views.rs` / `db/tags.rs`
 - `crates/core/src/tags.rs`
 - `crates/core/src/import/mod.rs`（タグ生成の呼び出し元）
@@ -54,6 +54,7 @@
 | 表示モード | `viewer.mode.{site}` → `viewer.mode` | `"spread"` / `"scroll"` / それ以外 = `"single"` | サイト別 → グローバル → サイト既定 | `site_id` が `fanza` / `dlsite` なら `Spread`、他は `Single` | `crates/app/src/components/image_viewer/mod.rs:491-510` |
 | 綴じ方向 | `books.page_turn`（本ごと）→ `viewer.page_turn.{site}` → `viewer.page_turn` | `"right-to-left"` = 右綴じ / `"left-to-right"` = 左綴じ | **本ごと → サイト別 → グローバル → サイト既定** | `site_id` が `fanza` / `dlsite` なら右綴じ、他は左綴じ（技術書典は左綴じ想定） | `crates/app/src/components/image_viewer/mod.rs:465-480`, `:511-526` |
 | 自動再生間隔 | `viewer.autoplay_interval.{site}` → `viewer.autoplay_interval` | ミリ秒の文字列（`u64` parse 失敗時は既定） | 同上 | `AUTOPLAY_DEFAULT_MS` = 5000 ms | `crates/app/src/components/image_viewer/mod.rs:528-541` |
+| ホイール方向 | `viewer.wheel_direction` | `"down-to-next"` = 下スクロールで次へ / `"up-to-next"` = 上スクロールで次へ（未知の値・未設定は既定に倒す） | サイト別キー無し（グローバルのみ） | `down-to-next` | `crates/app/src/views/settings.rs:103-105`、`crates/app/src/components/image_viewer/mod.rs:571-580` |
 
 - モード変更は `set_mode()` が `viewer.mode.{site}` に書き込む（`crates/app/src/components/image_viewer/mod.rs:1619-1631`）。
 - 綴じ方向は `set_binding()` が **その本の行**（`books.page_turn`）に書き込む。本ごとの指定はサイト別設定より優先され、サイト別設定（他の本の既定）は書き換えない。本に紐づかない表示では保存しない（`crates/app/src/components/image_viewer/mod.rs:1587-1604`、`crates/core/src/db/books.rs:465-493`）。
@@ -108,7 +109,7 @@
 
 | 操作 | 式 / 値 | アンカー |
 |---|---|---|
-| ホイールズーム | `delta = (Pixels(y) or Lines(y) * 20.0) * -0.001`、Ctrl 押下時のみ。`hovering_ui` 中とスクロールモードでは無効 | `crates/app/src/components/image_viewer/mod.rs:2708-2736` |
+| ホイールズーム / ページ送り | `delta = (Pixels(y) or Lines(y) * 20.0) * -0.001`、Ctrl 押下時のみ。`hovering_ui` 中とスクロールモードでは無効。**通常ホイール（Ctrl なし）は Single / Spread で 1 ノッチ（`WHEEL_TURN_LINES = 3.0` 行の累積）= 1 ページ送り**（方向は `viewer.wheel_direction`）、Scroll では不適用（ページ番号の更新のみで送りはしない） | `crates/app/src/components/image_viewer/mod.rs:2773-2872`、`crates/app/src/components/image_viewer/mod.rs:46` |
 | `adjust_zoom(delta)` | `zoomed = true`、`zoom_scale = (zoom_scale + delta).clamp(1.0, 8.0)`。`zoom_scale <= 1.0` なら `zoomed = false` + `pan_offset = (0,0)` | `crates/app/src/components/image_viewer/mod.rs:1720-1734` |
 | ダブルクリック（サイクル） | 未ズーム → `zoom_scale = 2.0` / `zoom_scale < 5.9` → `6.0` / それ以上 → 解除（`zoomed = false`, `zoom_scale = 1.5`, `pan_offset = (0,0)`, `pan_velocity = (0,0)`） | `crates/app/src/components/image_viewer/mod.rs:1739-1762` |
 | ダブルクリックのデバウンス | 直前の呼び出しから **250 ms 未満**なら無視 | `crates/app/src/components/image_viewer/mod.rs:1741-1745` |
@@ -273,12 +274,11 @@ ON CONFLICT(book_id, content_id) DO UPDATE SET
 |---|---|---|
 | `start(pool, book_id)` | `INSERT INTO view_history (id, book_id, started_at, ended_at) SELECT hex(randomblob(16)), ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP RETURNING ...`（**id = 16 バイト乱数の hex 32 文字**。`ended_at` は開始時刻で初期化） | `crates/core/src/db/view_history.rs:23-35` |
 | `end(pool, session_id)` | `UPDATE view_history SET ended_at = CURRENT_TIMESTAMP WHERE id = ?` | `crates/core/src/db/view_history.rs:37-45` |
-| `touch(pool, session_id)` | 同じ UPDATE（強制終了対策の heartbeat と説明されている） | `crates/core/src/db/view_history.rs:48-57` |
 | `view_count(pool, book_id)` | `SELECT COUNT(*) FROM view_history WHERE book_id = ?` | `crates/core/src/db/view_history.rs:59-67` |
 | `total_duration_secs(pool, book_id)` | 下記 `view_stats` と同じ `SUM(julianday(...) * 86400)` を 1 冊に絞って `CAST(... AS INTEGER)` | `crates/core/src/db/view_history.rs:110-124` |
 | `list_daily(pool)` | 全行を読み、`CURRENT_TIMESTAMP`（UTC）を `Local` に直して `(book_id, day)` で集約。`duration = (ended - started).num_seconds().max(0)`、`sessions += 1`、`last_started_at` は最大値。並びは `last_started_at` 降順 → `book_id` 昇順 | `crates/core/src/db/view_history.rs:142-198` |
 
-**重要（コード上の事実）**: `touch()` の呼び出し元はテストのみで、アプリ本体からの呼び出しは存在しない（`crates/core/src/db/view_history.rs:217`、`crates/core/src/db/view_history.rs:396` が唯一の呼び出し）。`docs/database.md:125` の「`touch` をページ操作のたびに実行」は現行コードと一致しない。
+**重要（コード上の事実）**: `view_history::touch` はアプリ本体から呼ばれていなかったため削除済み。`ended_at` を更新する直接の UPDATE はテスト専用ヘルパ（`crates/core/src/db/view_history.rs:195-199`）にのみ残る。
 
 リーダー側の呼び出し:
 
@@ -315,11 +315,11 @@ ON CONFLICT(book_id, content_id, page_number) DO UPDATE SET
 | タイミング | 内容 | アンカー |
 |---|---|---|
 | 本を開いた直後 | `spread_pages()` の各ページに `record_view`（見開きは左右 2 ページ） | `crates/app/src/views/reader.rs:286-300` |
-| 表示ページ集合が変わったとき | `record_page_view`: `current_pages == last_pages` なら何もしない（画像ロード等の notify を弾く）。変わったら **離れる前の集合**の各ページに `add_dwell(secs)`（`secs = now - last_page_at`、秒・小数）→ `last_pages` を更新 → **新しい集合**の各ページに `record_view` → `last_page_at = now` | `crates/app/src/views/reader.rs:617-653` |
-| リーダーを閉じるとき | `end_session`: 最後の集合に `add_dwell(started.elapsed().as_secs_f64())`（`secs > 0.0` のときのみ） | `crates/app/src/views/reader.rs:147-168` |
+| 表示ページ集合が変わったとき | `record_page_view`: `current_pages == last_pages` なら何もしない（画像ロード等の notify を弾く）。変わったら **離れる前の集合**の各ページに `add_dwell(secs / ページ数)`（`secs = now - last_page_at`、秒・小数。集合へ均等配分）→ `last_pages` を更新 → **新しい集合**の各ページに `record_view` → `last_page_at = now` | `crates/app/src/views/reader.rs:632-664` |
+| リーダーを閉じるとき | `end_session`: 最後の集合に `add_dwell(started.elapsed().as_secs_f64() / ページ数)`（`secs > 0.0` のときのみ。均等配分） | `crates/app/src/views/reader.rs:153-170` |
 | 試し読み | `book_id == None` のため `record_page_view` / `end_session` は何もしない | `crates/app/src/views/reader.rs:618-620` |
 
-**単位の注意（コード上の事実）**: 見開きでは**左右両ページに同じ滞在秒数が加算される**（`for page in &self.last_pages` で同一 `secs` を渡す）。合計すると実時間の 2 倍になる（`crates/app/src/views/reader.rs:630-644`）。
+**単位の注意（コード上の事実）**: 見開きは **表示中のページ集合へ均等配分**する（`share = secs / self.last_pages.len().max(1)` を各ページに渡すので、合計が実時間になる）（`crates/app/src/views/reader.rs:161-169`、`crates/app/src/views/reader.rs:649-657`）。
 
 ### 2.5 進捗の保存（リーダー）
 
@@ -438,6 +438,8 @@ sorted.sort_by(|a, b| {
 |---|---|---|
 | 集計の作り方 | `count_tag_usage(shelf_cards.iter().map(|c| c.tags.as_slice()))`。**同じカード内の重複タグは 1 冊として数える**（`HashSet` で重複排除）。追加 SQL は無し | `crates/app/src/views/bookshelf.rs:707-717`、`crates/app/src/views/bookshelf.rs:1615-1618` |
 | 集計の再計算タイミング | `reload` のたび（タグの追加・削除・取り込みで並びが変わる）。お気に入りの付け外しは `TagOrder` を作り直すだけで並び替わる（reload 不要） | `docs/features.md:139-145`、`crates/app/src/views/bookshelf.rs:5761-5766` |
+| `site_favorite_tags` | サイト絞り込み中に使う「お気に入りタグのうち、そのサイトに存在するもの」のキャッシュ。絞り込みなしのときは `favorite_tags` のコピー。サイトのタグ集合は本棚アイテム（`tags_json`）とローカル本（`book_tags`）の両方から作る。お気に入りタグの一覧（ポップオーバー）もこの並びで出す | `crates/app/src/views/bookshelf.rs:1051-1052`、`crates/app/src/views/bookshelf.rs:2357-2390` |
+| `site_favorite_tags` の再計算タイミング | 画面に入ったとき（`reload` 後の描画）とフィルタ変更時（`rebuild_filtered`）。以前は `render` の中で本 1 冊ずつ `book_tags` を読んでいたため、スクロールのたびにその冊数ぶんクエリが走っていた（実機で 1 ノッチあたり約 90 件） | `crates/app/src/views/bookshelf.rs:2347-2348`、`crates/app/src/views/bookshelf.rs:2356` |
 | `TagOrder::new` の生成箇所 | 本棚の描画（1 描画につき 1 個）、履歴画面、付箋画面 | `crates/app/src/views/bookshelf.rs:5761-5766`、`crates/app/src/views/history.rs:1417-1421`、`crates/app/src/views/notes.rs:1018-1021` |
 | 性能（コメント実測） | 集計 1000 冊 × 30 タグ（30,000 件）= 33.7 ms / 1 フレーム分（可視 25 冊 × 30 タグ）の並び替え = 1.06 ms（debug ビルド） | `crates/app/src/views/bookshelf.rs:9882-9905`、`docs/features.md:158-161` |
 
@@ -562,7 +564,7 @@ pub enum ReadFilter { All, Unread, Reading, Read, Favorite }   // crates/app/src
 | 3 | サイト | `site_filter` が `Some(site)` のとき `shelf.site_id != *site` なら除外（完全一致） | AND | `crates/app/src/views/bookshelf.rs:2148-2151` |
 | 4 | 検索 | `current_search` が `Some(q)` のとき `format!("{} {} {}", title, circle_name, author).to_lowercase().contains(&q.to_lowercase())` が false なら除外 | AND | `crates/app/src/views/bookshelf.rs:2153-2159` |
 | 5 | イベント | `selected_events` が非空のとき `any(|e| shelf.event_name.as_deref() == Some(e.as_str()))` が false なら除外（**完全一致・OR**） | カテゴリ内 OR / 他とは AND | `crates/app/src/views/bookshelf.rs:2161-2168` |
-| 6 | タグ | `selected_tags` が非空のとき `any(|t| card_tags.contains(t))` が false なら除外（**OR**）。`card_tags` は **`card.local.map(|e| e.tags)` のみ**（未ダウンロード本はタグ空 = 一致しない） | カテゴリ内 OR / 他とは AND | `crates/app/src/views/bookshelf.rs:2169-2182` |
+| 6 | タグ | `selected_tags` が非空のとき `any(|t| card_tags.contains(t))` が false なら除外（**OR**）。`card_tags` = `card.local.map(|e| e.tags)` に **`bookshelf_items.tags_json` も結合**（`bookshelf::tags_of(&card.shelf)`。未ダウンロード本もチップが出ているタグで一致する） | カテゴリ内 OR / 他とは AND | `crates/app/src/views/bookshelf.rs:2672-2691` |
 | 7 | サークル | `circle_filter == Some(c)` のとき `shelf.circle_name != *c` なら除外（完全一致・大小文字区別あり） | AND | `crates/app/src/views/bookshelf.rs:2183-2187` |
 | 8 | 作者 | `author_filter == Some(a)` のとき `shelf.author != *a` なら除外（完全一致） | AND | `crates/app/src/views/bookshelf.rs:2188-2192` |
 | 9 | 読書状態 / お気に入り | `ReadFilter::All` → 通す / `Unread` / `Reading` / `Read` → `card.local.map(|e| e.reading_state) == Some(該当状態)`（ローカル本のみ該当。リモート本は不一致）/ `Favorite` → `card.shelf.is_favorite == 1` | AND | `crates/app/src/views/bookshelf.rs:2195-2208` |
@@ -624,7 +626,7 @@ pub(crate) enum SortField {
 |---|---|---|
 | `sort_field` 既定 | `SortField::PurchaseDate` | `crates/app/src/views/bookshelf.rs:1073` |
 | `sort_ascending` 既定 | `false`（= 購入日の新しい順。従来の `causedAt DESC` と同じ） | `crates/app/src/views/bookshelf.rs:1074`、`crates/app/src/views/bookshelf.rs:257` |
-| 永続化 | **無し**（`db::settings` に保存しない。フィールドはメモリのみ） | `crates/app/src/views/bookshelf.rs:797-800`（保存コードが見当たらない） |
+| 永続化 | `bookshelf.sort_field`（slug 文字列）/ `bookshelf.sort_ascending`（`"1"` / `"0"`）に保存（`db::settings`）。起動時に `load_sort` で復元し、保存値が無ければ既定 | `crates/app/src/views/bookshelf.rs:2392-2394`、`crates/app/src/views/bookshelf.rs:2416-2444`、`crates/app/src/views/bookshelf.rs:1411-1413` |
 | `set_sort_field(field)` | 同じ項目なら**何もしない**（方向も変えない）。違う項目なら `sort_ascending = field.default_ascending()` にリセット | `crates/app/src/views/bookshelf.rs:1952-1960` |
 | `set_sort_direction(ascending)` | 方向だけ変更 | `crates/app/src/views/bookshelf.rs:1963-1967` |
 | `reset_sort()` | `PurchaseDate` + 降順に戻す（メニューの「既定に戻す」） | `crates/app/src/views/bookshelf.rs:1970-1975` |
@@ -682,7 +684,7 @@ year, month, day = parts[0..3].trim().parse::<u32>()?       # 解析できなけ
 - 並び替えは **Rust 側の `sort_by`**（`ORDER BY` は使わない）。ソート対象は `visible_shelf_cards`（フィルタ後）または `rebuild_filtered` のインデックス列（`crates/app/src/views/bookshelf.rs:1910`、`crates/app/src/views/bookshelf.rs:1945`）。
 - 日付の検証は**範囲チェック無し**: 月 `1..=12` / 日が暦上有効かの検証はせず、成立条件は「`['/', '-']` 分割が 3 要素以上」かつ「先頭 3 要素が `u32` に parse できる」ことのみ（`crates/app/src/views/bookshelf.rs:375-381`）。
 - `Text`（タイトル）には**値なしの概念が無い**（`Text(String)` であり `Option` ではない）。trim・全角半角・かな正規化はせず `to_lowercase()` のみ（`crates/app/src/views/bookshelf.rs:422-423`、`crates/app/src/views/bookshelf.rs:482`）。
-- カード / リストの切替は `toggle_view_mode()` が `ViewMode::Card ⇄ List` と `cx.notify()` をするだけ。**絞り込み・ソート状態は変更しない**（切替時の既定リセットは無い）（`crates/app/src/views/bookshelf.rs:3413-3420`）。
+- カード / リストの切替は `toggle_view_mode()` が `ViewMode::Card ⇄ List` を切り替え、`persist_view_mode()` で `bookshelf.view_mode`（`"card"` / `"list"`）に保存し（起動時に復元）、`cx.notify()` をする。**絞り込み・ソート状態は変更しない**（切替時の既定リセットは無い）（`crates/app/src/views/bookshelf.rs:4024-4032`、`crates/app/src/views/bookshelf.rs:2398-2414`）。
 - `docs/features.md:205-211` に対応する記述（日付の正規化・値なしは末尾・データが無い項目は非表示・同順位はタイトル昇順）がある。
 
 ---
@@ -726,22 +728,19 @@ FROM view_history GROUP BY book_id
 ## 不明点
 
 1. `reading_progress.scroll_position` の用途: 列とフィールドは存在するが、**書き込みは常に `0.0`**（`crates/app/src/views/reader.rs:686`）、読み出しも `for_book` / `switch_selection` のどこからも参照されない。スクロール位置の復元は `current_page` 経由でしか行われない（`crates/app/src/views/reader.rs:219-226`）。将来の用途は不明（`docs/database.md:110` は「スクロールモードの位置」と説明）。
-2. `view_history::touch` の位置づけ: 実装は存在するが、**アプリ本体からの呼び出しが無い**（呼び出しはテストのみ）。`docs/database.md:125` の記述と食い違う。ページ操作ごとの定期更新が意図的に外されたのか、未配線なのかはコードから判断できない。
-3. ビューアーの 30 ページ保持クリア（`crates/app/src/components/image_viewer/mod.rs:1316-1319`）は `Arc` を落とすだけで `window.drop_image` を呼ばない。GPU テクスチャが即座に解放されるかは GPUI 側の実装依存で、このリポジトリからは判断できない（サムネイルとスクロールの追い出しは `window.drop_image` を呼ぶ）。
-4. 並び替えの永続化: `sort_field` / `sort_ascending` を `db::settings` に保存するコードは見当たらない（フィールドは `crates/app/src/views/bookshelf.rs:797-800` のみ）。ウィンドウ再起動時の復元仕様は不明。サイトフィルタ（`bookshelf.site_filter`）と表示モード（`history.view_mode` 等）は保存される。
-5. 検索の「複数語 AND」検討の有無: 実装は単純な部分文字列一致のみ。仕様書・コメントに複数語対応の記述は無い（`docs/features.md:190` は「検索（タイトル・サークル名）」のみ）。
-6. タグ `all_tags` の並び: `book_tags` 側は `ORDER BY tag_name` だが、`shelf_items.tags_json` 由来タグは末尾に **追記のみ**（ソートされない）。フィルタ候補リストの最終的な並びが「厳密なソート」を意図しているかは不明（`crates/app/src/views/bookshelf.rs:1449-1457`）。
-7. `note_request` の `side` はアクションの `SharedString` を `SpreadSide::parse` した結果で、不正値は `None` になる（= 単一表示扱い）。不正値が実際に送られる経路があるかは不明（`crates/app/src/views/reader.rs:265-277`）。
-8. `page_views.total_seconds` は見開きで左右両ページに同じ秒数が加算される（合計が実時間の約 2 倍）。意図（「どちらのページも見ていた」）か実装上の重複かはコメントからは判断できない（`crates/app/src/views/reader.rs:630-644`、`crates/app/src/views/reader.rs:155-167`）。
-9. カード / リストのタグ折りたたみで「+n」の `n` は `ordered.len() - visible` だが、カードは `CARD_TAGS_COLLAPSED_MAX` による固定、リストは幅計算。両者が混在する画面（カード表示とリスト表示の切替）で展開状態 `expanded_tag_rows` が共用される（`crates/app/src/views/bookshelf.rs:4335-4342`、`crates/app/src/views/bookshelf.rs:5545-5551`）。切替時の展開状態のリセット有無は不明。
-10. タグの `confidence` 列（`book_tags.confidence: Option<f64>`）は読み出しのみで、書き込みは `set_for_book` の INSERT に含まれない（= 常に NULL）（`crates/core/src/db/tags.rs:6-13`、`crates/core/src/db/tags.rs:30-38`）。
+2. 並び替えの永続化: `sort_field` / `sort_ascending` は `bookshelf.sort_field` / `bookshelf.sort_ascending` に保存し、起動時に `load_sort` で復元する（`crates/app/src/views/bookshelf.rs:2392-2394`、`crates/app/src/views/bookshelf.rs:1411-1413`）。サイト切替時に使えない項目だった場合の補正（`crates/app/src/views/bookshelf.rs:2016-2020`）は保存しない（意図かは不明）。サイトフィルタ（`bookshelf.site_filter`）と表示モード（`bookshelf.view_mode`）も保存される。
+3. 検索の「複数語 AND」検討の有無: 実装は単純な部分文字列一致のみ。仕様書・コメントに複数語対応の記述は無い（`docs/features.md:190` は「検索（タイトル・サークル名）」のみ）。
+4. タグ `all_tags` の並び: `book_tags` 側は `ORDER BY tag_name` だが、`shelf_items.tags_json` 由来タグは末尾に **追記のみ**（ソートされない）。フィルタ候補リストの最終的な並びが「厳密なソート」を意図しているかは不明（`crates/app/src/views/bookshelf.rs:1449-1457`）。
+5. `note_request` の `side` はアクションの `SharedString` を `SpreadSide::parse` した結果で、不正値は `None` になる（= 単一表示扱い）。不正値が実際に送られる経路があるかは不明（`crates/app/src/views/reader.rs:265-277`）。
+6. カード / リストのタグ折りたたみで「+n」の `n` は `ordered.len() - visible` だが、カードは `CARD_TAGS_COLLAPSED_MAX` による固定、リストは幅計算。両者が混在する画面（カード表示とリスト表示の切替）で展開状態 `expanded_tag_rows` が共用される（`crates/app/src/views/bookshelf.rs:4335-4342`、`crates/app/src/views/bookshelf.rs:5545-5551`）。切替時の展開状態のリセット有無は不明。
+7. タグの `confidence` 列（`book_tags.confidence: Option<f64>`）は読み出しのみで、書き込みは `set_for_book` の INSERT に含まれない（= 常に NULL）（`crates/core/src/db/tags.rs:6-13`、`crates/core/src/db/tags.rs:30-38`）。
 
 ## 推測
 
-1. **推測**: `view_history::touch` は `view_stats` の `MAX(COALESCE(ended_at, started_at))` が「最後に読んでいた時刻」になるようにするための heartbeat で、現行では `end` が閉じるときに一度だけ走るため、強制終了時はセッション開始時刻のままになる（`crates/core/src/db/view_history.rs:23-35` の「ended_at は開始時刻で初期化」と `crates/app/src/views/reader.rs:146-151`）。
+1. **推測**: `view_history::touch`（削除済み）は `view_stats` の `MAX(COALESCE(ended_at, started_at))` が「最後に読んでいた時刻」になるようにするための heartbeat だったと考えられる。現行は `end` が閉じるときに一度だけ `ended_at` を更新するため、強制終了時はセッション開始時刻のままになる（`crates/core/src/db/view_history.rs:23-35` の「ended_at は開始時刻で初期化」と `crates/app/src/views/reader.rs:146-151`）。
 2. **推測**: スクロール位置の復元は「`current_page` 経由で `scroll_to_item`」で代替されている（`crates/app/src/components/image_viewer/mod.rs:593-596`）ため、`scroll_position` は未使用の残置カラムと考えられる（根拠: `scroll_position: 0.0` 固定の保存と、`ReaderView` 内に読み出しが無いこと）。
 3. **推測**: 見開きの左右ナビ帯がウィンドウ端（画像端ではない）なのは、見開きペアが中央寄せで幅が可変のため、固定のクリック領域を端に置いたほうが押しやすいからだと思われる（根拠: 単一表示だけ画像矩形に合わせている `crates/app/src/components/image_viewer/mod.rs:2578-2600` と、見開きの実装 `crates/app/src/components/image_viewer/mod.rs:2789-2849` の差）。
 4. **推測**: `docs/features.md:190` の検索対象の記述が古い（author を含む実装に対し「タイトル・サークル名」）のは、author 追加時（プレースホルダは「著者」に更新済み）に docs を更新し忘れたため（根拠: `crates/app/src/views/bookshelf.rs:2152-2156` のコメント「placeholder（タイトル・サークル・著者）に合わせて author も検索対象にする」）。
-5. **推測**: `card.tags`（表示）と `card.local.tags`（タグ絞り込み判定）が別経路なのは、FANZA / DLsite の `tags_json` スナップショットが「ローカル取り込み前でもカードにタグを出す」ための表示専用データであり、絞り込みは `book_tags` を正とする設計だから（根拠: `crates/app/src/views/bookshelf.rs:1505-1513` のコメントと `crates/app/src/views/bookshelf.rs:2168-2181`）。副作用として、未ダウンロードの FANZA / DLsite 本はタグチップが見えても（`tags_json` 由来）タグ絞り込みにヒットしない。
+5. **推測**: `card.tags`（表示）と絞り込み判定が別経路なのは、FANZA / DLsite の `tags_json` スナップショットが「ローカル取り込み前でもカードにタグを出す」ための表示用データであり、絞り込み側は `book_tags` に加えて `bookshelf_items.tags_json` も結合して判定するから（根拠: `crates/app/src/views/bookshelf.rs:1900-1908` のコメントと `crates/app/src/views/bookshelf.rs:2672-2691`）。未ダウンロードの FANZA / DLsite 本も、チップが出ているタグ（`tags_json` 由来）でタグ絞り込みにヒットする。
 
 ---

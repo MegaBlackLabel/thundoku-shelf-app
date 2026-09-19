@@ -16,7 +16,6 @@
   - `clear_toast(cx)` — メッセージのみクリア `crates/app/src/app_state.rs:366-369`。
 - ホスト（`Workspace::render`）`crates/app/src/workspace.rs:1152-1174`: `toast_generation` が前回と変わったときだけ 1 回 `window.push_notification((NotificationType, message), cx)` を呼び、その後 `clear_toast`。表示は `gpui_kit::component::Root::render_notification_layer(window, cx)` `crates/app/src/workspace.rs:1271-1274`。種別→`NotificationType` の対応は Info/Success/Error の 1:1 `crates/app/src/workspace.rs:1165-1169`。
 - 表示位置・消滅時間: gpui-kit の Notification（ウィンドウ右上、**既定 5 秒で自動消滅**、マウスを乗せるとカウントダウン停止）`docs/features.md:459-465`, `crates/app/src/workspace.rs:1271`。実装値は依存先 `gpui-kit` rev `84f57fdf…` のリポジトリ外ファイル `~/.cargo/git/checkouts/gpui-kit-ad7eb35d851fbd28/84f57fdf/crates/component/src/notification.rs:841`（`timeout = autohide.then_some(Duration::from_secs(5))`）、遷移 400 ms / 退出 200 ms / 進行間隔 50 ms（同ファイル `:23-27`）。
-- ※ コード内コメントの不一致: `crates/app/src/app_state.rs:349` と `crates/app/src/views/settings.rs:601` は「3 秒で消す」と書くが、実装（gpui-kit 既定）は 5 秒。→ 「不明点」参照。
 - 旧実装（本棚下部の自前メッセージバー、下部パディング 28px）は廃止済み `docs/features.md:478-482`。
 
 ### 4.2 送出元の一覧（種別・メッセージ・位置）
@@ -212,7 +211,6 @@
 
 ## 不明点
 
-- 通知の自動消滅時間: コード内コメントは「3 秒」`crates/app/src/app_state.rs:349`, `crates/app/src/views/settings.rs:601` だが、実際の実装（依存 `gpui-kit` rev `84f57fdf…` のリポジトリ外ファイル `~/.cargo/git/checkouts/gpui-kit-ad7eb35d851fbd28/84f57fdf/crates/component/src/notification.rs:841`）と `crates/app/src/workspace.rs:1271` / `docs/features.md:461-463` は「5 秒」。どちらが意図か（コメントの更新漏れか、将来 3 秒へ変更予定か）はコードから判断できない。
 - 本番 DB プールの最大接続数: `db::connect` は `SqlitePool::connect_with(options)` のみで pool options を指定しておらず、リポジトリ内に実効値の記述が無い `crates/core/src/db/mod.rs:50-58`。
 - `docs/account-switch.md:78` は Drive フォルダを `drive.sync.folder_id.{sub}`（アカウントごとに別フォルダ）と記載するが、実装は単一キー `drive.sync.folder_id` のみ `crates/app/src/views/settings.rs:787`, `crates/app/src/workspace.rs:518`。doc と実装のどちらが正か（実装未追随か文書が先行案か）は不明。
 - `drive.sync.enabled` を false にしたとき、どの自動同期（起動時の復元確認・チェックリスト連動・終了時アップロード）が止まるかの明記がコード・docs に無い `crates/app/src/views/settings.rs:754-766`。

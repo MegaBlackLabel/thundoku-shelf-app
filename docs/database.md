@@ -35,8 +35,10 @@ Drive 同期設定など）。
 | created_at / updated_at | TEXT |
 
 使用されるキー例: `viewer.mode` / `viewer.mode.{site}`、`viewer.page_turn`、
-`bookshelf.site_filter`、`tag.fetch.enabled`、`drive.sync.folder_id`、
-`drive.sync.enabled`、`api.last_sync_at`。
+`viewer.wheel_direction`（`down-to-next` / `up-to-next`）、`viewer.autoplay_interval.{site}`、
+`bookshelf.site_filter`、`bookshelf.view_mode`（`card` / `list`）、`bookshelf.sort_field` /
+`bookshelf.sort_ascending`、`tag.fetch.enabled`、`drive.sync.folder_id`、
+`drive.sync.enabled`、`api.last_sync_at`、`theme.mode`、`checklist.poll.interval_min`。
 
 ### books
 
@@ -57,6 +59,7 @@ Drive 同期設定など）。
 | pack_id | TEXT | .opfspack の ID（`packs/{pack_id}.opfspack`） |
 | is_favorite | INTEGER | お気に入り |
 | is_hidden | INTEGER | 非表示 |
+| page_turn | TEXT | 本ごとの綴じ方向（`right-to-left` / `left-to-right`。未設定はサイト別設定に従う） |
 | created_at / updated_at | TEXT | |
 
 ### tbf_events
@@ -119,10 +122,10 @@ Drive 同期設定など）。
 | id | TEXT PK | セッション ID（hex(randomblob(16))） |
 | book_id | TEXT FK→books (ON DELETE CASCADE) | 閲覧した本 |
 | started_at | TEXT | 開始時刻 |
-| ended_at | TEXT | 終了時刻（閲覧中は最後に操作した時刻に更新される heartbeat） |
+| ended_at | TEXT | 終了時刻。`start()` が開始時刻で初期化し、正常終了時に `end()` が現在時刻へ更新する（heartbeat API は無い） |
 
 - `view_history::start(book_id)` で開始（ended_at は開始時刻で初期化）
-- 表示中ページ集合が変わったときに前の集合の滞在時間を確定し、セッションの終了は `end(session_id)` で記録する（`touch` という関数は無い。強制終了時はセッションが `ended_at` 未設定のまま残る）
+- 表示中ページ集合が変わったときに前の集合の滞在時間を確定し、セッションの終了は `end(session_id)` で記録する（`touch` という関数は無い。強制終了時はセッションが `started_at` と同じ初期値のまま残る）
 - `view_history::end(session_id)` で終了時刻記録
 - `view_count(book_id)` / `total_duration_secs(book_id)` で集計
 
@@ -141,7 +144,7 @@ Drive 同期設定など）。
 | last_viewed_at | TEXT | 最終表示時刻 |
 
 - `page_views::record_view(book_id, content_id, page)` で表示回数を +1（単一表示は 1 ページ、見開きは左右両ページ）
-- `page_views::add_dwell(book_id, page, secs)` で滞在秒数を加算
+- `page_views::add_dwell(book_id, content_id, page, secs)` で滞在秒数を加算
 - `page_views::for_book(book_id)` でページ毎の記録を取得
 
 ### page_notes
@@ -301,6 +304,8 @@ Google Drive との同期状態（pack ごと）。
   `content_formats`、`document_images.content_id` / `format_id`: `migrate()` 内の
   `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN` で適用
   （新しいマイグレーションファイルは作らない方針）
+- `books.page_turn` は `ensure_column`（`books` / `page_turn` / `page_turn TEXT`）で
+  冪等に追加する（本ごとの綴じ方向。NULL はサイト別設定 `viewer.page_turn.{site}` に従う）
 - `content_formats.label` の旧値（`画像` / `PDF` / `EPUB`）は `migrate()` 内の
   データ移行（`contents::migrate_legacy_labels`）で実データに合わせて書き換える
   （画像 = 拡張子名、PDF/EPUB = 種別名）

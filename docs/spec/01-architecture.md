@@ -12,7 +12,7 @@
 | `crates/core` | DB・取り込み・各ストア同期・Google/Drive・タグ・暗号（UI 非依存） | Rust / sqlx, tokio, reqwest 相当は ureq, lindera, pdfium-render |
 | `crates/app` | GPUI デスクトップ UI（画面・ビューアー・通知・アイコン） | Rust / gpui-kit, gpui-wry, image, resvg, usvg |
 
-- ワークスペース: `resolver = "3"`, `edition = "2024"`, version 0.0.1, license MIT（`Cargo.toml:1-13`）
+- ワークスペース: `resolver = "3"`, `edition = "2024"`, version 0.2.3, license MIT（`Cargo.toml:1-9`）
 - リリースプロファイルは `debug = false`（`Cargo.toml:19-23`）
 
 ### 1.1 主要モジュール（アプリ層）

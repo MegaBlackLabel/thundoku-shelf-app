@@ -698,7 +698,7 @@ ON DELETE の注記（事実）: `books` の子のうち `imported_documents` / 
 | テーブル | キー | 生成規則（事実） | アンカー |
 |---|---|---|---|
 | `sites` | `id` | 固定文字列 `techbookfest` / `booth`（SQL シード）、`fanza` / `dlsite`（runtime DDL） | `schema.sql:19-23`, `db/mod.rs:382-392` |
-| `app_settings` | `key` | 呼び出し側が決める文字列（例 `owner_sub_model.initialized`, `drive.last_sync_at`, `drive.sync.enabled`, `drive.sync.folder_id`） | `db/settings.rs:7-40`, `db/mod.rs:449-455` |
+| `app_settings` | `key` | 呼び出し側が決める文字列（例 `owner_sub_model.initialized`, `drive.last_sync_at`, `drive.sync.enabled`, `drive.sync.folder_id`, `viewer.wheel_direction`（`down-to-next` / `up-to-next`）, `bookshelf.view_mode`（`card` / `list`）, `bookshelf.sort_field`（`purchase-date` / `release-date` / `last-viewed-at` / `view-count` / `view-seconds` / `file-size` / `title`）, `bookshelf.sort_ascending`（`1` / `0`）） | `db/settings.rs:7-40`, `db/mod.rs:449-455` |
 | `books` | `id` | `book_id_for()`: ① `reuse_book_id` があればそれ ② 無ければ `Identity.pack_id` ③ 無ければ `Uuid::new_v4()` | `import/mod.rs:166-174` |
 | `books` | `opfs_path` | `format!("{book_id}.opfspack")`（`UNIQUE`） | `import/mod.rs:937` |
 | `books` | `pack_id` | 取り込み時は `Some(book_id)` | `import/mod.rs:944` |
