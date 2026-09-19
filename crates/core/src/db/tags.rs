@@ -66,6 +66,27 @@ pub fn list_for_book(pool: &SqlitePool, book_id: &str) -> Result<Vec<BookTag>, s
     })
 }
 
+/// 全書籍のタグ名を `book_id` ごとにまとめて返す。
+///
+/// 画面の描画や読み込みで 1 冊ずつ `list_for_book` を呼ぶと N+1 になるため、
+/// タグ表（小さな表）を 1 クエリで全件取って Rust 側で束ねる。
+pub fn tag_names_by_book(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<String, Vec<String>>, sqlx::Error> {
+    crate::db::block_on(async {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT book_id, tag_name FROM book_tags ORDER BY book_id, tag_name")
+                .fetch_all(pool)
+                .await?;
+        let mut by_book: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (book_id, tag_name) in rows {
+            by_book.entry(book_id).or_default().push(tag_name);
+        }
+        Ok(by_book)
+    })
+}
+
 /// Distinct tag names across all books (for the tag filter).
 pub fn all_tags(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
     crate::db::block_on(async {

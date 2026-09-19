@@ -1047,6 +1047,9 @@ pub struct BookshelfView {
     /// 直近に通知を積んだ時刻（置き換えの連打を防ぐ）
     download_notice_at: Option<std::time::Instant>,
     favorite_tags: Vec<String>,
+    /// サイト絞り込み中に使う「そのサイトのタグ集合」のキャッシュ。
+    /// 絞り込みなしのときはお気に入りタグ。`rebuild_filtered` / `reload` で作り直す。
+    site_favorite_tags: Vec<String>,
     /// お気に入りサークル（チップのハート。`favorite_entities`）
     favorite_circles: Vec<String>,
     /// お気に入り作者（チップのハート。`favorite_entities`）
@@ -1417,6 +1420,7 @@ impl BookshelfView {
             download_notice: None,
             download_notice_at: None,
             favorite_tags: Vec::new(),
+            site_favorite_tags: Vec::new(),
             favorite_circles: Vec::new(),
             favorite_authors: Vec::new(),
             search_state: None,
@@ -1727,16 +1731,14 @@ impl BookshelfView {
             // ソート用の閲覧統計（回数 / 累計秒 / 最終閲覧）を 1 クエリでまとめて取る
             let view_stats = db::view_history::view_stats(db).unwrap_or_default();
             let mut entries = Vec::new();
+            // タグは 1 クエリでまとめて引く（本 1 冊ずつ引くと N+1 になる）
+            let tags_by_book = db::tags::tag_names_by_book(db).unwrap_or_default();
             for book in books::list(db)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|b| owned.contains(&b.id))
             {
-                let tags: Vec<String> = db::tags::list_for_book(db, &book.id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|tag| tag.tag_name)
-                    .collect();
+                let tags: Vec<String> = tags_by_book.get(&book.id).cloned().unwrap_or_default();
                 let progress = progress::get(db, &book.id).ok().flatten();
                 // 一度でも最終ページまで表示したら読了（finished_at が立つと戻っても維持）。
                 // upsert 時に最終ページ到達で finished_at がセットされる。
@@ -2342,6 +2344,49 @@ impl BookshelfView {
         indices.sort_by(|&a, &b| self.compare_cards(&self.shelf_cards[a], &self.shelf_cards[b]));
         self.filtered = indices;
         self.filtered_dirty = false;
+        // フィルタ状態が変わったのでサイト別タグのキャッシュも作り直す
+        self.refresh_site_favorite_tags(cx);
+    }
+
+    /// サイト絞り込み中に使う「お気に入りタグのうち、そのサイトに存在するもの」を作り直す。
+    ///
+    /// 以前はこれを `render` の中で本 1 冊ずつ `book_tags` を読んで作っていたため、
+    /// スクロールのたびにその冊数ぶんクエリが走っていた（実機で 1 ノッチあたり約 90 件。
+    /// リーダーの左パネルのスクロールが重かったのも、背後に残る本棚の描画が同じ経路を
+    /// 通っていたため）。フィルタ状態が変わったとき（`rebuild_filtered`）だけ更新する。
+    fn refresh_site_favorite_tags(&mut self, cx: &App) {
+        let Some(site) = self.effective_site_filter().map(str::to_string) else {
+            // 絞り込みなしのときはお気に入りタグをそのまま使う
+            self.site_favorite_tags = self.favorite_tags.clone();
+            return;
+        };
+        let state = Self::app_state(cx);
+        let db = &state.db_pool;
+        let mut site_tags = std::collections::HashSet::new();
+        // 本棚アイテム（同期で得た `tags_json`）のタグ
+        for item in bookshelf::list_all(db).ok().unwrap_or_default() {
+            if item.site_id == site {
+                for tag in bookshelf::tags_of(&item) {
+                    site_tags.insert(tag);
+                }
+            }
+        }
+        // ローカル本のタグは 1 クエリでまとめて引く
+        let tags_by_book = db::tags::tag_names_by_book(db).unwrap_or_default();
+        for book in books::list(db).ok().unwrap_or_default() {
+            if book.site_id.as_deref() == Some(site.as_str()) {
+                for tag in tags_by_book.get(&book.id).cloned().unwrap_or_default() {
+                    site_tags.insert(tag);
+                }
+            }
+        }
+        // そのサイトに無いお気に入りタグは出さない（元の挙動と同じ）
+        self.site_favorite_tags = self
+            .favorite_tags
+            .iter()
+            .filter(|tag| site_tags.contains(*tag))
+            .cloned()
+            .collect();
     }
 
     /// 並び替え設定の保存キー（表示モードと同じく DB の settings に置く）。
@@ -6512,10 +6557,13 @@ impl Render for BookshelfView {
         } else if self.selected_index.is_none_or(|i| i >= self.filtered.len()) {
             self.selected_index = Some(0);
         }
-        // 検索文字列の変更を検出してフィルタキャッシュを更新する
-        let search = self.current_search(cx);
-        if search.as_deref() != Some(self.last_search.as_str()) {
-            self.last_search = search.clone().unwrap_or_default();
+        // 検索文字列の変更を検出してフィルタキャッシュを更新する。
+        // `current_search` は空のとき `None` を返すので、`None` と空文字を同じ扱いにする
+        // （`None` と `Some("")` を比べると毎フレーム dirty になり、フィルタの作り直し
+        // ＝サイト別お気に入りタグの作り直しが描画のたびに走ってしまう）。
+        let search = self.current_search(cx).unwrap_or_default();
+        if search != self.last_search {
+            self.last_search = search;
             self.filtered_dirty = true;
         }
         if self.filtered_dirty {
@@ -6548,33 +6596,10 @@ impl Render for BookshelfView {
             self.tag_counts.clone(),
         );
         let favorite_tags = {
-            let favs = self.favorite_tags.clone();
-            let sorted = match self.effective_site_filter() {
-                // サイト選択中はそのサイトのタグでお気に入りタグフィルタを絞る
-                Some(site) => {
-                    let state = Self::app_state(cx);
-                    let db = &state.db_pool;
-                    let mut site_tags = std::collections::HashSet::new();
-                    for item in bookshelf::list_all(db).ok().unwrap_or_default() {
-                        if item.site_id == site {
-                            for t in bookshelf::tags_of(&item) {
-                                site_tags.insert(t);
-                            }
-                        }
-                    }
-                    for b in books::list(db).ok().unwrap_or_default() {
-                        if b.site_id.as_deref() == Some(site) {
-                            for t in db::tags::list_for_book(db, &b.id).unwrap_or_default() {
-                                site_tags.insert(t.tag_name);
-                            }
-                        }
-                    }
-                    favs.into_iter()
-                        .filter(|t| site_tags.contains(t))
-                        .collect::<Vec<_>>()
-                }
-                None => favs,
-            };
+            // サイト選択中はそのサイトのタグで絞る。`rebuild_filtered` でキャッシュ済み
+            // （以前はここで本 1 冊ずつ `book_tags` を引いていて、スクロールのたびに
+            // その冊数ぶんクエリが走っていた）。
+            let sorted = self.site_favorite_tags.clone();
             // 一覧もタグチップと同じ並び（集計数の多い順 → 名前順）にする
             tag_order.sorted(&sorted)
         };
@@ -9012,6 +9037,74 @@ mod tests {
         });
     }
 
+    /// サイト絞り込み中でも、描画のたびにサイト内のタグを DB から引き直さない。
+    ///
+    /// 以前は描画（お気に入りタグの絞り込み）の中で本 1 冊ずつ `book_tags` を読んでいたため、
+    /// スクロールのたびにその冊数ぶんクエリが走っていた（実機で 1 ノッチあたり約 90 件）。
+    /// リーダーの左パネルのスクロールが重かったのも、背後に残る本棚の描画が同じ経路を
+    /// 通っていたため。
+    #[gpui_kit::test]
+    async fn site_tags_are_cached_between_draws(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book_in_site(cx, "booth-1", "booth");
+        seed_book_in_site(cx, "booth-2", "booth");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::tags::set_for_book(db, "booth-1", &[("既存タグ", "manual")]).unwrap();
+            db::tags::set_for_book(db, "booth-2", &[("別のタグ", "manual")]).unwrap();
+            // お気に入りタグ: サイト内のものと、よそのサイトのもの
+            db::tags::set_favorite(db, "既存タグ", true).unwrap();
+            db::tags::set_favorite(db, "よそのタグ", true).unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        cx.update(|cx| view.update(cx, |this, cx| this.set_site_filter(cx, Some("booth"))));
+        draw_frames(visual);
+        let before = view.read_with(cx, |v, _| v.site_favorite_tags.clone());
+        assert!(
+            before.contains(&"既存タグ".to_string()),
+            "サイト内のお気に入りタグがキャッシュされていない: {before:?}"
+        );
+        assert!(
+            !before.contains(&"別のタグ".to_string())
+                && !before.contains(&"よそのタグ".to_string()),
+            "お気に入りでない/別サイトのタグが混ざっている: {before:?}"
+        );
+        // 裏でタグが変わる（同期やタグ取得で起きる）。サイト内から消える変化なので、
+        // 読み直せばキャッシュからも消える。
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::tags::set_for_book(db, "booth-1", &[]).unwrap();
+        });
+        draw_frames(visual);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.site_favorite_tags.clone()),
+            before,
+            "描画でサイト内タグを読み直している（スクロールのたびにクエリが走る原因）"
+        );
+        // 読み直せば反映される（描画から外したぶん、更新は明示的に行う）
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.reload(cx);
+                this.set_site_filter(cx, Some("booth"));
+            })
+        });
+        draw_frames(visual);
+        assert!(
+            view.read_with(cx, |v, _| v.site_favorite_tags.clone())
+                .is_empty(),
+            "読み直しでサイトから消えたタグが残っている"
+        );
+    }
+
     /// 進捗行は**無いときだけ**作る（再取得で読書位置を消さない）。
     #[gpui_kit::test]
     async fn seed_progress_if_absent_keeps_reading_position(cx: &mut TestAppContext) {
@@ -9073,6 +9166,46 @@ mod tests {
                     cover_thumbnail: None,
                     tbf_product_id: None,
                     site_id: None,
+                    tags_fetched: 1,
+                    pack_id: Some(id.into()),
+                    is_favorite: 0,
+                    is_hidden: 0,
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    /// サイト指定つきで本を seed する（サイト絞り込みの検証用）。
+    fn seed_book_in_site(cx: &mut TestAppContext, id: &str, site_id: &str) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            books::insert(
+                db,
+                &books::Book {
+                    id: id.into(),
+                    title: format!("本 {id}"),
+                    author: String::new(),
+                    circle_name: "サークル".into(),
+                    purchase_date: None,
+                    file_name: format!("{id}.pdf"),
+                    file_size: 10,
+                    opfs_path: format!("{id}.opfspack"),
+                    cover_thumbnail: None,
+                    tbf_product_id: None,
+                    site_id: Some(site_id.into()),
                     tags_fetched: 1,
                     pack_id: Some(id.into()),
                     is_favorite: 0,
