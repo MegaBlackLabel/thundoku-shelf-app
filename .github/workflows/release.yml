@@ -53,6 +53,11 @@ jobs:
       - name: Fetch pdfium (macOS)
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          # アセットは gh（API 経由）で落とす。リリースの CDN URL を直に叩くと、
+          # ランナーから 404 が返ることがある（v0.2.3 のリリースで macOS の 2 ジョブが失敗。
+          # Windows ジョブは同じタグの別アセットを取得できていた）。
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           case "${{ matrix.arch }}" in
@@ -69,7 +74,8 @@ jobs:
               exit 1
               ;;
           esac
-          curl -fsSL -o pdfium.tgz "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-${asset}.tgz"
+          gh release download "chromium/7881" --repo bblanchon/pdfium-binaries \
+            --pattern "pdfium-${asset}.tgz" --output pdfium.tgz
           echo "${sha}  pdfium.tgz" | shasum -a 256 -c -
           tar -xzf pdfium.tgz lib/libpdfium.dylib
 
@@ -140,13 +146,15 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # PDFium (Apache-2.0) は実行時ロードなので、exe と同じフォルダに同梱する。
           # pdfium-render の pdfium_7881 バインディングに対応するバージョンを使い、
           # 供給網対策として SHA256 を検証してから展開する。
-          $url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-win-x64.tgz"
+          # アセットは gh（API 経由）で落とす（CDN 直叩きの一時的な 404 を避ける）。
           $sha = "73cc0de638ac2095e7445bf56a38200a5b7c7ca0e9f4ba144598f2457377ac08"
-          Invoke-WebRequest -Uri $url -OutFile pdfium.tgz
+          gh release download "chromium/7881" --repo bblanchon/pdfium-binaries --pattern "pdfium-win-x64.tgz" --output pdfium.tgz
           $actual = (Get-FileHash pdfium.tgz -Algorithm SHA256).Hash
           if ($actual -ne $sha.ToUpper()) {
             throw "pdfium のチェックサムが一致しません（expected=$sha actual=$actual）"
