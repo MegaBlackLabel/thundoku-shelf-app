@@ -267,6 +267,14 @@
   測った半径と定数の一致を `about_logo_radius_matches_the_icon_frame` で固定している
   （描画結果の画素は、テスト用プラットフォームに `HeadlessRenderer` が無く
   `window.render_to_image()` が使えないため見られない = 実機のスクリーンショットで確認）。
+- **サイドバーのロゴ（白いタイル）がナビ行の下地より大きかった**: 閉じたサイドバーでロゴだけ
+  40×40、ナビ行のホバー / 選択で出る下地（`secondary` の角丸）が 36×36 だったため、白い
+  ブロックだけ一回り大きく浮いて見えていた（実測: 40×40 = 下地より 4px 大きい）。閉状態の
+  ロゴを **36×36** にして下地と揃えた（実測: 白タイル 36px / 下地 36px。角丸も同じ
+  `rounded_xl` なので形まで一致する）。開状態はアプリ名の隣に出るので 40×40 のまま。
+  あわせて、サイズを測っていない（自分で設定した `sidebar_open` を assert するだけの）
+  `sidebar_logo_stays_square_when_collapsed` / `sidebar_logo_stays_square_when_expanded` を
+  削除した（コメントの「常に 40×40」も実測していなかった）。
 
 ### Added
 

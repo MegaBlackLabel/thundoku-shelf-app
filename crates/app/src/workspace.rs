@@ -2204,8 +2204,11 @@ impl Workspace {
             .debug_selector(|| "sidebar-logo".into())
             .relative()
             .flex_shrink_0()
-            .w(px(40.0))
-            .h(px(40.0))
+            // 閉じたときはナビ行と同じ 36x36 に揃える（ホバー / 選択で出る下地と同じ大きさ。
+            // 40x40 だと下地より一回り大きく、白いブロックだけが浮いて見えていた）。
+            // 開いたときはアプリ名の隣に出るので少し大きい 40x40 のまま
+            .w(px(if open { 40.0 } else { 36.0 }))
+            .h(px(if open { 40.0 } else { 36.0 }))
             .rounded_xl()
             .bg(theme.primary)
             .flex()
@@ -3548,20 +3551,6 @@ mod tests {
         assert_eq!(count, 0, "no books in an empty DB");
     }
 
-    #[gpui_kit::test]
-    async fn sidebar_logo_stays_square_when_collapsed(cx: &mut TestAppContext) {
-        let ws = setup(cx);
-        cx.update(|cx| {
-            ws.update(cx, |w, cx| {
-                w.sidebar_open = false;
-                cx.notify();
-            });
-        });
-        // ロゴは常に 40x40（閉状態でも潰れない）
-        let logo_size = ws.read_with(cx, |w, _| (w.sidebar_open,));
-        assert!(!logo_size.0);
-    }
-
     /// 未読数は**本棚のときだけ**出す。サイドバーを開いたときの「未読数 N 件」と、
     /// 閉じたときのロゴのバッジの両方で同じ扱いにする（履歴 / 付箋 / 設定などの
     /// 画面では本棚の話ではないので出さない）。
@@ -3808,19 +3797,6 @@ mod tests {
                 <= wrap.origin.y + wrap.size.height + gpui_kit::px(1.0),
             "サブメニューの高さが足りず最終行が切れている: wrap={wrap:?} last={last:?}"
         );
-    }
-
-    #[gpui_kit::test]
-    async fn sidebar_logo_stays_square_when_expanded(cx: &mut TestAppContext) {
-        let ws = setup(cx);
-        cx.update(|cx| {
-            ws.update(cx, |w, cx| {
-                w.sidebar_open = true;
-                cx.notify();
-            });
-        });
-        let logo_size = ws.read_with(cx, |w, _| (w.sidebar_open,));
-        assert!(logo_size.0);
     }
 
     #[gpui_kit::test]
