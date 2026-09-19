@@ -172,11 +172,12 @@
    3. `packs_dir/{pack_id}.opfspack` が無ければスキップ。
    4. `sync_state` が無ければアップロード。あれば「Drive 側に同じ `drive_file_id` がまだ存在」**かつ**「ローカル mtime > last_synced_at」のときだけアップロード（削除は伝播させない）。
    5. `upload_multipart` 実行後、`sync_state::upsert(md5 = md5(local bytes), modified_time = None, last_synced_at = now)`。
-7. **DB バックアップ**（`db_path.is_some()` のとき）`crates/core/src/drive/sync.rs:362-390`:
+7. **DB バックアップ**（`db_path.is_some()` のとき）`crates/core/src/drive/sync.rs:372-411`:
    1. `db::backup::export_json(pool, Some(&upload_ids))` でテキストテーブルの JSON を生成。
    2. `md5(ローカル JSON)` と Drive の `thundoku-backup.json` の `md5Checksum` を比較。
    3. 不一致（または Drive にファイルが無い）→ 既存ファイルを `delete` してから `upload_multipart`。`outcome.database_backed_up = true`。
    4. 一致 → `drive.touch(file.id)` で `modifiedTime` だけ現在時刻に更新（バックアップの更新日時が古いままにならないように）。
+   5. どちらの場合も、いま書き出した JSON の**正規形 md5 を `app_settings['drive.backup.md5']` に保存**する（起動時チェックの基準値。アップロードした場合も md5 一致でスキップした場合も Drive 上の内容はこのエクスポートと一致するため）`crates/core/src/drive/sync.rs:406-410`。
 - 戻り値 `SyncOutcome` `crates/core/src/drive/sync.rs:22-38`: `downloaded` / `uploaded` / `skipped` / `conflicts`（pack_id の Vec）, `file_count`（Drive フォルダ内の全ファイル数）, `total_bytes`（Σ size、bytes）, `database_backed_up`, `database_restored`。
 - エラー型 `SyncError` `crates/core/src/drive/sync.rs:40-58`: `Drive` / `Io` / `Db` / `Pack` / `InvalidPack` / `IdentityRequired`。
 - **削除は双方向とも伝播しない**（モジュールコメント `crates/core/src/drive/sync.rs:1-13`、`docs/features.md:447-450`）。
@@ -192,12 +193,16 @@
 
 - 目的（モジュールコメント）: 画像 base64 を含む DB ファイル全体（200MB 級）を上げるのは重いため、主要テーブルのテキストのみ JSON 化する。`thumbnail_data` / `image_data` と環境依存設定（`drive.*` / `api.last_sync_at` 等）は含めない `crates/core/src/db/backup.rs:1-8`。
 - 対象テーブル（16 個、この順で処理。FK 参照元が先）: `books`, `bookshelf_items`, `checked_items`, `tbf_events`, `book_contents`, `content_formats`, `reading_progress`, `page_views`, `book_tags`, `favorite_tags`, `favorite_entities`, `imported_documents`, `document_images`, `book_first_events`, `zenn_tag_metadata`, `view_history` `crates/core/src/db/backup.rs:14-31`。
-- 除外カラム: `thumbnail_data`, `image_data` `crates/core/src/db/backup.rs:33`。
-- owner フィルタ（P3）: `book_ids` を渡すと `books` を絞り、関連テーブルも `book_id IN (...)` で連動して除外する `crates/core/src/db/backup.rs:40-56`, `:129-150`。
-- 復元 `import_json`: 各テーブルを PK 競合時 `DO UPDATE` の UPSERT でマージ（**Drive 側優先**）。`INSERT ... ON CONFLICT DO UPDATE` は DELETE を伴わないため FK の `ON DELETE CASCADE` を発火させない `crates/core/src/db/backup.rs:57-63`, `:226-230`。PK 定義は `books:[id]`, `bookshelf_items:[site_id,database_id]`, `checked_items:[id]`, `tbf_events:[id]`, `book_contents:[content_id]`, `content_formats:[format_id]`, `reading_progress:[book_id,content_id]`, `page_views:[book_id,content_id,page_number]`, `book_tags:[id]`, `favorite_tags:[tag_name]`, `favorite_entities:[entity_kind,entity_name]`, `imported_documents:[id]`, `document_images:[id]`, `book_first_events:[site_id,database_id]`, `zenn_tag_metadata:[tag_name]`, `view_history:[id]` `crates/core/src/db/backup.rs:82-100`。
-- Drive 上のファイル名: `const DB_BACKUP_NAME = "thundoku-backup.json"` `crates/core/src/drive/sync.rs:392`。
-- 復元 API: `check_drive_backup(drive, folder_id)` → `DriveBackupInfo{file_id, md5, size, modified_time}`（無ければ `None`）`crates/core/src/drive/sync.rs:394-415`; `restore_drive_backup(drive, folder_id, pool)` はダウンロードして `backup::import_json` `crates/core/src/drive/sync.rs:417-432`。
-- 差分判定 `backup_has_diff(pool, drive, folder_id, book_ids)`: Drive の JSON をダウンロードし、**Drive 側に存在するテーブル名だけ**に両者を正規化してから md5 比較（新テーブル追加で毎回復元確認が出るのを防ぐ）`crates/core/src/drive/sync.rs:434-487`。
+- 除外カラム: `thumbnail_data`, `image_data` `crates/core/src/db/backup.rs:38-39`。
+- owner フィルタ（P3）: `book_ids` を渡すと `books` を絞り、関連テーブルも `book_id IN (...)` で連動して除外する `crates/core/src/db/backup.rs:135-160`, `:248-277`。
+- 復元 `import_json`: 各テーブルを PK 競合時 `DO UPDATE` の UPSERT でマージ（**Drive 側優先**）。`INSERT ... ON CONFLICT DO UPDATE` は DELETE を伴わないため FK の `ON DELETE CASCADE` を発火させない `crates/core/src/db/backup.rs:163-190`, `:318-355`。PK 定義は `books:[id]`, `bookshelf_items:[site_id,database_id]`, `checked_items:[id]`, `tbf_events:[id]`, `book_contents:[content_id]`, `content_formats:[format_id]`, `reading_progress:[book_id,content_id]`, `page_views:[book_id,content_id,page_number]`, `book_tags:[id]`, `favorite_tags:[tag_name]`, `favorite_entities:[entity_kind,entity_name]`, `imported_documents:[id]`, `document_images:[id]`, `book_first_events:[site_id,database_id]`, `zenn_tag_metadata:[tag_name]`, `view_history:[id]` `crates/core/src/db/backup.rs:204-226`。
+- Drive 上のファイル名: `const DB_BACKUP_NAME = "thundoku-backup.json"` `crates/core/src/drive/sync.rs:417`。
+- 復元 API: `check_drive_backup(drive, folder_id)` → `DriveBackupInfo{file_id, md5, size, modified_time}`（無ければ `None`）`crates/core/src/drive/sync.rs:419-446`; `restore_drive_backup(drive, folder_id, pool)` はダウンロードして `backup::import_json` `crates/core/src/drive/sync.rs:448-470`。
+- 差分判定 `inspect_drive_backup(pool, drive, folder_id, book_ids, baseline_md5)` → `Option<BackupStatus{info, drive_changed, local_differs}>` `crates/core/src/drive/sync.rs:509-537`:
+  - 比較は両側を `backup::canonicalize_json` の正規形にしてから md5 で行う。正規形は「Drive 側に存在するテーブルだけに絞る」「揮発列（`books.updated_at` / `bookshelf_items.synced_at,updated_at` / `tbf_events.updated_at`）を落とす」「行を PK 順に並べる」`crates/core/src/db/backup.rs:41-129`。新テーブル追加・同期のたびに書き換わる時刻・行の物理順で毎回復元確認が出るのを防ぐ。
+  - `drive_changed` = Drive 側の正規形 md5 が基準値 `app_settings['drive.backup.md5']`（最後にアップロードした内容）と違う。基準値が無ければ判定不能として false。
+  - `should_offer_restore()` = `drive_changed && local_differs`。**ローカル側だけが進んだ場合は復元確認を出さない**（出すと新しいローカルを古いバックアップで上書きしてしまう）`crates/core/src/drive/sync.rs:476-496`。
+- `restore_drive_backup` は復元後に**同じ内容を基準値として保存**する（ローカルに Drive に無い行が残っていると差分は消えないため、更新しないと次回起動でまた復元を促し続ける）`crates/core/src/drive/sync.rs:466-468`。
 - 同期状態テーブル `drive_sync_state(pack_id PK, drive_file_id, md5, modified_time, last_synced_at)` の get/upsert/list/delete `crates/core/src/db/sync_state.rs:6-55`。
 
 ### 3.5 同期のトリガーと OFF 条件
@@ -208,9 +213,9 @@
 | Google ログイン直後 | `drive.last_sync_at` が未設定なら「Google Drive と同期しますか？」ダイアログ → 「同期する」で `drive.sync.enabled="true"` を保存し即同期 | `crates/app/src/workspace.rs:195-209`, `:1406-1451` |
 | チェックリストのポーリング | 変化があったときだけ `sync_drive_now` を呼ぶ（無変化ならノーコスト） | `crates/app/src/workspace.rs:294-296` |
 | ウィンドウ終了時 | バックアップ対象に変更があれば「アップロードして終了」を提示し、`db_path` 付きで同期してから終了 | `crates/app/src/workspace.rs:750-806`, `:1467-1472` |
-| 起動時 | ログイン済み かつ `drive.sync.enabled` が `"true"`/`"1"` かつ `drive.sync.folder_id` があり、`backup_has_diff` が真のときだけ復元確認ダイアログ | `crates/app/src/workspace.rs:502-576`, `:1359-1364` |
+| 起動時 | ログイン済み かつ `drive.sync.enabled` が `"true"`/`"1"` かつ `drive.sync.folder_id` があり、`inspect_drive_backup` が「Drive 側が最後のアップロードから動いた」と判定したときだけ復元確認ダイアログ（ローカル側だけが進んだ場合は出さない） | `crates/app/src/workspace.rs:582-673`, `:1359-1364` |
 | OFF スイッチ | 設定のトグルで `drive.sync.enabled` に `"true"`/`"false"` を保存（起動時読み込み時に `"true"` のみ有効） | `crates/app/src/views/settings.rs:754-766`, `:133` |
-| 同期情報のクリア | `drive_sync_state` を全 DELETE し、`drive.sync.enabled` / `drive.sync.folder_id` / `drive.last_sync_at` / `drive.file_count` / `drive.total_bytes` を削除（次回は全ファイルが再送/再取得対象） | `crates/core/src/drive/sync.rs:489-510`, `crates/app/src/views/settings.rs:2478-2509` |
+| 同期情報のクリア | `drive_sync_state` を全 DELETE し、`drive.sync.enabled` / `drive.sync.folder_id` / `drive.last_sync_at` / `drive.file_count` / `drive.total_bytes` / `drive.backup.md5` を削除（次回は全ファイルが再送/再取得対象） | `crates/core/src/drive/sync.rs:540-551`, `crates/app/src/views/settings.rs:2478-2509` |
 | 未ログイン | `sync_drive_now` は「Google にログインしてください」で失敗。同期エンジン側も `identity_sub=None` でアップロード対象ゼロ | `crates/app/src/views/settings.rs:792-795`, `crates/core/src/drive/sync.rs:216-222` |
 | 暗号化 pack を未ログインで受信 | `SyncError::IdentityRequired`（UI はログイン誘導） | `crates/core/src/drive/sync.rs:268-271`, `crates/app/src/views/settings.rs:860-866` |
 

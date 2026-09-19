@@ -580,7 +580,8 @@ impl Workspace {
     }
 
     /// 起動時: Google ログイン済みなら Drive の DB バックアップを確認し、
-    /// ローカルと異なれば復元確認を表示する。
+    /// 最後にアップロードした内容から Drive 側が動いていれば復元確認を表示する
+    /// （ローカル側だけが進んだ場合は何も出さない）。
     fn check_startup_backup(&mut self, cx: &mut Context<Self>) {
         let state = AppState::global(cx);
         let google = state.google.clone();
@@ -611,6 +612,11 @@ impl Workspace {
             );
             return;
         };
+        // 最後にアップロードしたバックアップの内容（基準値）。Drive 側がこれから
+        // 変わっていないなら、差分はローカル側だけのもの＝復元する必要はない。
+        let baseline = db::settings::get(&db, thundoku_core::drive::sync::BACKUP_BASELINE_KEY)
+            .ok()
+            .flatten();
         let handle = cx.weak_entity();
         let task = cx.background_executor().spawn(async move {
             // Google にログイン済みでなければ何もしない
@@ -623,20 +629,30 @@ impl Workspace {
                 Box::new(thundoku_core::tbf::UreqTransport::new()),
                 token,
             );
-            // ローカルと Drive のバックアップに差分があるときだけ復元候補にする
-            let has_diff = thundoku_core::drive::sync::backup_has_diff(
+            let status = thundoku_core::drive::sync::inspect_drive_backup(
                 &db,
                 &mut drive,
                 &folder_id,
                 Some(&book_ids),
+                baseline.as_deref(),
             )
-            .ok()?;
-            if !has_diff {
+            .ok()??;
+            // Drive 側が最後のアップロードから動いていないときは復元候補にしない。
+            // （ローカル側だけが進んでいる場合に「復元しますか」を出すと、新しい
+            // ローカルを古いバックアップで上書きしてしまう）
+            if !status.should_offer_restore() {
+                log::info!(
+                    "startup backup check: skip (drive_changed={}, local_differs={})",
+                    status.drive_changed,
+                    status.local_differs
+                );
                 return None;
             }
-            thundoku_core::drive::sync::check_drive_backup(&mut drive, &folder_id)
-                .ok()
-                .flatten()
+            log::info!(
+                "startup backup check: drive backup moved since the last upload (md5={:?})",
+                status.info.md5
+            );
+            Some(status.info)
         });
         cx.spawn(async move |_window, cx| {
             let info = task.await;

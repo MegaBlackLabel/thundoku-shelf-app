@@ -38,6 +38,96 @@ const TABLES: &[&str] = &[
 /// 画像・バイナリとして除外するカラム名。
 const EXCLUDED_COLUMNS: &[&str] = &["thumbnail_data", "image_data"];
 
+/// 比較のときに無視する揮発列（アプリ自身が同期のたびに書き換える時刻）。
+/// 内容が同じでも値が変わるため、そのまま比較すると毎回「差分あり」になる。
+const VOLATILE_COLUMNS: &[(&str, &[&str])] = &[
+    ("books", &["updated_at"]),
+    ("bookshelf_items", &["synced_at", "updated_at"]),
+    ("tbf_events", &["updated_at"]),
+];
+
+/// バックアップ JSON を比較用の正規形へ変換する。
+///
+/// - `keep_tables` が `Some` のとき、その名前のテーブルだけを残す（Drive 側に
+///   まだ無いテーブルを比較対象から外す）
+/// - 揮発列（[`VOLATILE_COLUMNS`]）を落とす
+/// - 行を PK 順に並べる（`SELECT` の物理順＝挿入順に依存しない）
+pub fn canonicalize_json(
+    value: &serde_json::Value,
+    keep_tables: Option<&[String]>,
+) -> serde_json::Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let mut out = Map::new();
+    for (table, rows) in object {
+        if let Some(keep) = keep_tables
+            && !keep.iter().any(|name| name == table)
+        {
+            continue;
+        }
+        let volatile: &[&str] = VOLATILE_COLUMNS
+            .iter()
+            .find(|(name, _)| name == table)
+            .map(|(_, columns)| *columns)
+            .unwrap_or_default();
+        let mut normalized: Vec<Value> = rows
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        let Some(row) = row.as_object() else {
+                            return row.clone();
+                        };
+                        let mut filtered = Map::new();
+                        for (column, cell) in row {
+                            if !volatile.contains(&column.as_str()) {
+                                filtered.insert(column.clone(), cell.clone());
+                            }
+                        }
+                        Value::Object(filtered)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        normalized.sort_by_key(|row| row_sort_key(table, row));
+        out.insert(table.clone(), Value::Array(normalized));
+    }
+    Value::Object(out)
+}
+
+/// 行の並べ替えキー（PK 列の値。PK が分からないテーブルは行そのもの）。
+fn row_sort_key(table: &str, row: &serde_json::Value) -> String {
+    match pk_columns(table) {
+        Some(pk) => {
+            let cells: Vec<Value> = pk
+                .iter()
+                .map(|column| row.get(*column).cloned().unwrap_or(Value::Null))
+                .collect();
+            Value::Array(cells).to_string()
+        }
+        None => row.to_string(),
+    }
+}
+
+/// 正規形の md5（比較と、最後にアップロードした内容の基準値に使う）。
+pub fn canonical_md5(value: &serde_json::Value, keep_tables: Option<&[String]>) -> String {
+    format!(
+        "{:x}",
+        md5::compute(canonicalize_json(value, keep_tables).to_string().as_bytes())
+    )
+}
+
+/// JSON 文字列の正規形 md5。
+pub fn canonical_md5_str(
+    json: &str,
+    keep_tables: Option<&[String]>,
+) -> Result<String, sqlx::Error> {
+    let value: Value =
+        serde_json::from_str(json).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    Ok(canonical_md5(&value, keep_tables))
+}
+
 /// 主要テーブルを JSON 文字列にエクスポートする。
 /// `book_ids` が `Some(ids)` のとき、所有者（本の id 集合）に連動して
 /// `books` とその下位テーブルだけをエクスポートする（P3）。`None` は全件。
@@ -185,7 +275,13 @@ async fn table_rows(
             _ => {}
         }
     }
-    let sql = format!("SELECT {col_list} FROM {table}{where_sql}");
+    // 行の並びを PK 順に固定する。物理順（挿入順・索引の選択）に依存すると、
+    // 内容が同じでも JSON の md5 が変わり、無変更なのに再アップロードになる。
+    let order_sql = match pk_columns(table) {
+        Some(pk) => format!(" ORDER BY {}", pk.join(", ")),
+        None => String::new(),
+    };
+    let sql = format!("SELECT {col_list} FROM {table}{where_sql}{order_sql}");
     let mut query = sqlx::query(&sql);
     if let Some(json) = &bind_json {
         query = query.bind(json);

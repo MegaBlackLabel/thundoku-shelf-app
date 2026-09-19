@@ -101,6 +101,13 @@
     出る（しかも古い Drive の内容でローカルを上書きできてしまう）。判定できないときは
     スキップする（`Workspace::backup_owner_ids`）。終了時のアップロードも owner 不明なら
     行わない（`sync()` の `can_backup_db`。無言でスキップせず警告ログを出す）。
+- **復元確認は「Drive 側が動いた」ときだけ**: 「ローカルと Drive が違う」だけでは方向が
+  分からず、ローカル側だけが進んだ場合（他端末を起動していない場合）にも出てしまう。
+  最後にアップロードした内容の正規形 md5 を `app_settings['drive.backup.md5']` に保存し、
+  Drive 側の md5 がそれと違うときだけ復元を提案する（`inspect_drive_backup` /
+  `BackupStatus::should_offer_restore`）。比較は揮発列（`tbf_events.updated_at` 等）を
+  落として PK 順に並べた正規形で行う（`db::backup::canonicalize_json`）。アップロード後と
+  復元後は基準値を更新する（更新しないと次回起動で同じ差分を再提示し続ける）。
 
 ## セキュリティ / リスク
 

@@ -454,6 +454,7 @@ pub fn clear_owner_model_if_first_run(
         "drive.last_sync_at",
         "drive.sync.enabled",
         "drive.sync.folder_id",
+        crate::drive::sync::BACKUP_BASELINE_KEY,
     ] {
         let _ = settings::delete(pool, key);
     }
