@@ -74,15 +74,27 @@ jobs:
               exit 1
               ;;
           esac
-          # アセットは gh の API でアセット ID を引いてから落とす。
-          # `gh release download --pattern` は、タグに `/` を含むリリースで macOS ランナーの
-          # gh だと "no assets match the file pattern" になる（Windows ランナーでは成功する）。
-          # パターン照合に依存しない経路にして、ランナー差をなくす。
-          asset_id=$(gh api "repos/bblanchon/pdfium-binaries/releases/tags/chromium%2F7881" \
-            --jq ".assets[] | select(.name == \"pdfium-${asset}.tgz\") | .id")
-          test -n "$asset_id"
-          gh api "repos/bblanchon/pdfium-binaries/releases/assets/${asset_id}" \
-            -H "Accept: application/octet-stream" > pdfium.tgz
+          url="https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-${asset}.tgz"
+          # 認証ヘッダ付きで取得する（未認証だと混雑時に 404 が返ることがある。
+          # v0.2.3 のリリースで macOS の 2 ジョブがこれで落ちた）。
+          # 失敗したら間を置いて再試行し、それでも駄目なら API 経由（アセット ID）に切り替える。
+          fetched=0
+          for attempt in 1 2 3; do
+            if curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -o pdfium.tgz "$url"; then
+              fetched=1
+              break
+            fi
+            echo "pdfium の取得に失敗（試行 ${attempt}）。待って再試行する"
+            sleep $((attempt * 15))
+          done
+          if [ "$fetched" -ne 1 ]; then
+            echo "curl では取得できないため API 経由に切り替える"
+            json=$(gh api "repos/bblanchon/pdfium-binaries/releases/tags/chromium%2F7881")
+            asset_id=$(printf '%s' "$json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(a['id'] for a in d['assets'] if a['name']=='pdfium-${asset}.tgz'))")
+            test -n "$asset_id"
+            gh api "repos/bblanchon/pdfium-binaries/releases/assets/${asset_id}" \
+              -H "Accept: application/octet-stream" > pdfium.tgz
+          fi
           echo "${sha}  pdfium.tgz" | shasum -a 256 -c -
           tar -xzf pdfium.tgz lib/libpdfium.dylib
 
