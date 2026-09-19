@@ -19,7 +19,7 @@ use gpui_kit::component::IconNamed;
 use gpui_kit::{AssetSource, Result, SharedString};
 
 /// Web 版で使われている lucide アイコンのうち、gpui-component に無いもの。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AppIcon {
     /// ロゴ（BookMarkedIcon）
     BookMarked,

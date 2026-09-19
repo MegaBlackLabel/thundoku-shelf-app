@@ -25,7 +25,7 @@ use gpui_kit::{
 };
 use gpui_kit::{
     App, Context, Entity, Hsla, IntoElement, KeyDownEvent, ParentElement, Render, RenderImage,
-    SharedString, Window, div, img, px, relative,
+    Rgba, SharedString, Window, div, img, px, relative,
 };
 use thundoku_core::booth::BoothClient;
 use thundoku_core::db;
@@ -242,6 +242,143 @@ impl ChipPalette {
             self.selected_bg.alpha(0.55),
         )
     }
+}
+
+/// 表紙に重ねる丸バッジの一辺。
+const COVER_BADGE_SIZE: f32 = 24.0;
+/// バッジの中に描くアイコンの一辺。文字グリフ（♥ ♡ ✓ ↓）は細くて潰れるのでアイコンを描く。
+const COVER_BADGE_ICON: f32 = 14.0;
+
+/// 表紙バッジの配色（塗り / アイコン / 輪郭）。
+///
+/// 表紙は任意の画像なので、**テーマではなく「どんな表紙の上でも読めるか」**で決める:
+/// - オフ（お気に入り未登録 / 未ダウンロード）: 60% 黒のスクリム + 白アイコン。
+///   最も明るい表紙（白）の上でも 5.7:1（旧実装の 25% スクリム + 白グリフは 1.6:1 で沈んでいた）。
+/// - オン（お気に入り / ダウンロード済み）: 不透明の色チップ + 白アイコン
+///   （rose-600 = 4.7:1 / emerald-700 = 5.5:1）。半透明の色は明るい表紙で飛ぶ。
+/// - 輪郭は 35% 白。黒い表紙でも丸の形が残る。
+///
+/// 下限は WCAG 2.2 SC 1.4.11（非テキスト 3:1）で、細いアイコンでも読めるよう
+/// 4.5:1 を目標にする（`cover_badge_icons_stay_readable_on_any_cover` で固定）。
+#[derive(Clone, Copy, PartialEq)]
+struct CoverBadgeColors {
+    /// 塗り（`fg` をこの上に載せる）。
+    bg: Rgba,
+    /// アイコン。
+    fg: Rgba,
+    /// 表紙から丸を切り出す輪郭。
+    border: Rgba,
+}
+
+impl CoverBadgeColors {
+    /// オフ: 半透明の黒スクリム + 白アイコン。
+    fn off() -> Self {
+        Self {
+            bg: gpui_kit::rgba(0x00000099),
+            fg: gpui_kit::rgba(0xffffffff),
+            border: gpui_kit::rgba(0xffffff59),
+        }
+    }
+
+    /// オン: 不透明の色チップ + 白アイコン。
+    fn on(fill: Rgba) -> Self {
+        Self {
+            bg: fill,
+            fg: gpui_kit::rgba(0xffffffff),
+            border: gpui_kit::rgba(0xffffff59),
+        }
+    }
+}
+
+/// 表紙バッジのアイコン（アプリ内 SVG と gpui-component 標準の 2 系統）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BadgeGlyph {
+    App(AppIcon),
+    Catalog(gpui_kit::assets::IconName),
+}
+
+impl BadgeGlyph {
+    fn element(self, color: Rgba) -> gpui_kit::AnyElement {
+        match self {
+            Self::App(icon) => div()
+                .text_color(color)
+                .child(Icon::new(icon).size(px(COVER_BADGE_ICON)))
+                .into_any_element(),
+            Self::Catalog(icon) => div()
+                .text_color(color)
+                .child(Icon::new(icon).size(px(COVER_BADGE_ICON)))
+                .into_any_element(),
+        }
+    }
+}
+
+/// 表紙に重ねるバッジ（お気に入り / ダウンロード）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CoverBadge {
+    Favorite { on: bool },
+    Downloaded { on: bool },
+}
+
+impl CoverBadge {
+    fn favorite(on: bool) -> Self {
+        Self::Favorite { on }
+    }
+
+    fn downloaded(on: bool) -> Self {
+        Self::Downloaded { on }
+    }
+
+    fn colors(self) -> CoverBadgeColors {
+        match self {
+            // お気に入り（登録済み）: rose-600。白アイコンで 4.7:1。
+            Self::Favorite { on: true } => CoverBadgeColors::on(gpui_kit::rgba(0xe11d48ff)),
+            // ダウンロード済み: emerald-700。白アイコンで 5.5:1。
+            Self::Downloaded { on: true } => CoverBadgeColors::on(gpui_kit::rgba(0x047857ff)),
+            Self::Favorite { on: false } | Self::Downloaded { on: false } => {
+                CoverBadgeColors::off()
+            }
+        }
+    }
+
+    /// アイコン。色だけに頼らないよう、状態で**形**も変える（WCAG 1.4.1）。
+    fn glyph(self) -> BadgeGlyph {
+        match self {
+            Self::Favorite { on: true } => BadgeGlyph::App(AppIcon::HeartFilled),
+            Self::Favorite { on: false } => BadgeGlyph::App(AppIcon::Heart),
+            Self::Downloaded { on: true } => BadgeGlyph::Catalog(gpui_kit::assets::IconName::Check),
+            Self::Downloaded { on: false } => BadgeGlyph::App(AppIcon::Download),
+        }
+    }
+
+    /// ホバーで出す説明。お気に入りはクリックで何が起きるかも書く。
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Favorite { on: true } => "お気に入り（クリックで解除）",
+            Self::Favorite { on: false } => "お気に入りにする",
+            Self::Downloaded { on: true } => "ダウンロード済み",
+            Self::Downloaded { on: false } => "未ダウンロード（カードをクリックで取り込み）",
+        }
+    }
+}
+
+/// 表紙に重ねる丸バッジ。位置（`.absolute()` など）とクリックは呼び出し側で付ける。
+fn cover_badge(badge: CoverBadge, id: String) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let colors = badge.colors();
+    let tooltip: SharedString = badge.tooltip().into();
+    div()
+        .id(SharedString::from(id.clone()))
+        .debug_selector(move || id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .w(px(COVER_BADGE_SIZE))
+        .h(px(COVER_BADGE_SIZE))
+        .bg(colors.bg)
+        .border_1()
+        .border_color(colors.border)
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .child(badge.glyph().element(colors.fg))
 }
 
 #[derive(Clone)]
@@ -4551,78 +4688,33 @@ impl BookshelfView {
             })
             // 右上: お気に入りハート（クリックでトグル）
             .child(
-                div()
-                    .id(SharedString::from(format!("fav-{database_id}")))
-                    .absolute()
-                    .right_1()
-                    .top_1()
-                    .cursor_pointer()
-                    .on_click({
-                        let handle = handle.clone();
-                        let card = card.clone();
-                        move |_, _window, cx| {
-                            cx.stop_propagation();
-                            handle.update(cx, |this, cx| this.toggle_favorite(cx, &card));
-                        }
-                    })
-                    .rounded_full()
-                    .w(px(24.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui_kit::rgba(0x00000040))
-                    .text_color(if is_favorite {
-                        gpui_kit::rgb(0xf43f5e)
-                    } else {
-                        gpui_kit::rgb(0xffffff)
-                    })
-                    .text_sm()
-                    .child(if is_favorite { "♥" } else { "♡" })
-                    .into_any_element(),
+                cover_badge(
+                    CoverBadge::favorite(is_favorite),
+                    format!("fav-{database_id}"),
+                )
+                .absolute()
+                .right_1()
+                .top_1()
+                .cursor_pointer()
+                .on_click({
+                    let handle = handle.clone();
+                    let card = card.clone();
+                    move |_, _window, cx| {
+                        cx.stop_propagation();
+                        handle.update(cx, |this, cx| this.toggle_favorite(cx, &card));
+                    }
+                }),
             )
-            // 右下: ダウンロード済み/未ダウンロードアイコン（Web の ArrowDownCircle 相当）
-            .child(if is_downloaded {
-                div()
-                    .absolute()
-                    .right_1()
-                    .bottom_1()
-                    .rounded_full()
-                    .w(px(24.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui_kit::rgba(0x05966933))
-                    .child(
-                        div()
-                            .text_color(gpui_kit::rgb(0x059669))
-                            .text_sm()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child("✓"),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .absolute()
-                    .right_1()
-                    .bottom_1()
-                    .rounded_full()
-                    .w(px(24.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui_kit::rgba(0x00000033))
-                    .child(
-                        div()
-                            .text_color(gpui_kit::white())
-                            .text_sm()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child("↓"),
-                    )
-                    .into_any_element()
-            });
+            // 右下: ダウンロード済み / 未ダウンロード（クリックはカードへ抜ける）
+            .child(
+                cover_badge(
+                    CoverBadge::downloaded(is_downloaded),
+                    format!("dl-{database_id}"),
+                )
+                .absolute()
+                .right_1()
+                .bottom_1(),
+            );
 
         // 中央: ダウンロード/取込中オーバーレイ（Web の CircularProgress 相当）
         if let Some(state) = download_state {
@@ -11600,6 +11692,110 @@ mod tests {
         assert!(dark.favorite_text.l > 0.6, "ダークの文字は明るい色");
         assert!(dark.favorite_heart.l > 0.6, "ダークのハートは明るい色");
         assert!(dark.selected_text.l > 0.6, "ダークの選択中文字も明るい色");
+    }
+
+    /// 半透明色 `top` を不透明色 `under` に重ねた色（sRGB 空間 = GPU のブレンドと同じ）。
+    fn blend_over(top: Rgba, under: Rgba) -> Rgba {
+        let mix = |t: f32, u: f32| top.a * t + (1.0 - top.a) * u;
+        Rgba {
+            r: mix(top.r, under.r),
+            g: mix(top.g, under.g),
+            b: mix(top.b, under.b),
+            a: 1.0,
+        }
+    }
+
+    /// WCAG の相対輝度。
+    fn relative_luminance(color: Rgba) -> f32 {
+        let channel = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+    }
+
+    /// WCAG のコントラスト比（1.0〜21.0）。
+    fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 表紙バッジ（お気に入り / ダウンロード）のアイコンは、**どんな表紙の上でも**
+    /// 読めること。表紙は白〜黒まで何でもあり得るので、両極端の上に合成したときの
+    /// コントラスト比を固定する。
+    ///
+    /// 下限は WCAG 2.2 SC 1.4.11（非テキスト 3:1）より厳しい 4.5:1。14px の細い
+    /// アイコンは 3:1 だと実測で薄く見える（旧実装は白表紙の上で 1.6〜3.0:1 だった）。
+    #[test]
+    fn cover_badge_icons_stay_readable_on_any_cover() {
+        for (label, badge) in [
+            ("お気に入り（登録済み）", CoverBadge::favorite(true)),
+            ("お気に入り（未登録）", CoverBadge::favorite(false)),
+            ("ダウンロード済み", CoverBadge::downloaded(true)),
+            ("未ダウンロード", CoverBadge::downloaded(false)),
+        ] {
+            let colors = badge.colors();
+            for (cover_label, cover) in [
+                ("白", gpui_kit::rgba(0xffffffff)),
+                ("黒", gpui_kit::rgba(0x000000ff)),
+            ] {
+                let chip = blend_over(colors.bg, cover);
+                let ratio = contrast_ratio(colors.fg, chip);
+                assert!(
+                    ratio >= 4.5,
+                    "{label} / {cover_label}表紙: アイコンが読めない（{ratio:.2}:1 < 4.5:1）"
+                );
+            }
+        }
+    }
+
+    /// 状態は色だけでなく**形（アイコン）**でも変わること（WCAG 1.4.1）。
+    /// お気に入り / ダウンロードとも、オン / オフで別のアイコンを描く。
+    #[test]
+    fn cover_badges_change_shape_not_only_color() {
+        for (label, on, off) in [
+            (
+                "お気に入り",
+                CoverBadge::favorite(true),
+                CoverBadge::favorite(false),
+            ),
+            (
+                "ダウンロード",
+                CoverBadge::downloaded(true),
+                CoverBadge::downloaded(false),
+            ),
+        ] {
+            assert_ne!(on.glyph(), off.glyph(), "{label}: 形が変わっていない");
+            assert_ne!(
+                on.colors().bg,
+                off.colors().bg,
+                "{label}: 塗りが変わっていない"
+            );
+        }
+    }
+
+    /// 表紙バッジはホバーで状態（と操作）を説明する。4 状態とも別々の文。
+    #[test]
+    fn cover_badge_tooltips_are_distinct() {
+        let badges = [
+            CoverBadge::favorite(true),
+            CoverBadge::favorite(false),
+            CoverBadge::downloaded(true),
+            CoverBadge::downloaded(false),
+        ];
+        for badge in badges {
+            let text = badge.tooltip();
+            assert!(!text.is_empty(), "{badge:?}: 説明が空");
+            assert_eq!(
+                badges.iter().filter(|b| b.tooltip() == text).count(),
+                1,
+                "{badge:?}: 説明が他の状態と同じ（{text}）"
+            );
+        }
     }
 
     /// 「絞込中」ボタンはタグ選択中と同じ青系（チップの選択色）を使い、
