@@ -115,9 +115,10 @@ const FEATURES: [(&str, AppIcon, &str); 13] = [
 
 /// ライセンスページの説明。
 const LICENSES_LEAD: &str = "このアプリが利用しているオープンソースソフトウェアの一覧です。\
-                             OS ごとに使うもの（Windows の PDFium、macOS の MuPDF など）も含みます。\
-                             各行をクリックするとライセンス全文が開きます。全文をクレートが\
-                             同梱していない場合は、配布元を確認してください。";
+                             Rust のクレートのほかに、同梱しているアセット（PDF 表示に使う \
+                             PDFium、アイコンの Lucide）も含みます。各行をクリックすると\
+                             ライセンス全文が開きます。全文をクレートが同梱していない場合は、\
+                             配布元を確認してください。";
 
 /// ライセンス全文をクレートが同梱していないときの案内。
 const NO_LICENSE_TEXT: &str =
@@ -1102,6 +1103,36 @@ mod tests {
         assert!(
             LOGIN_SECTION_TITLE.contains("ストア"),
             "ログイン手順の見出しが技術書典限定のまま: {LOGIN_SECTION_TITLE}"
+        );
+    }
+
+    /// ライセンスページの説明は、実際に同梱しているものだけを名指しすること。
+    ///
+    /// PDF 表示は全プラットフォーム PDFium に統一した（以前は macOS / Linux が MuPDF = AGPL-3.0
+    /// で、MIT 配布のアプリと両立しないため削除した）。使っていないライブラリを名指しすると、
+    /// 関係ないライセンスを案内することになる。
+    #[test]
+    fn licenses_lead_names_only_bundled_libraries() {
+        for name in ["PDFium", "Lucide"] {
+            assert!(
+                LICENSES_LEAD.contains(name),
+                "説明文に {name}（同梱しているもの）が無い: {LICENSES_LEAD}"
+            );
+            assert!(
+                licenses::CATALOG
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == name),
+                "ライセンス一覧に {name} が無いのに説明文が名指ししている"
+            );
+        }
+        assert!(
+            !LICENSES_LEAD.contains("MuPDF") && !LICENSES_LEAD.contains("mupdf"),
+            "削除した MuPDF を説明文が名指ししている: {LICENSES_LEAD}"
+        );
+        assert!(
+            !LICENSES_LEAD.contains("AGPL"),
+            "削除したライブラリのライセンス（AGPL）を説明文が挙げている: {LICENSES_LEAD}"
         );
     }
 

@@ -226,6 +226,14 @@
   全画面で続け、表示だけをゲートする（開 / 閉の両方で同じ判定を通す）。本棚・閲覧履歴・付箋・
   チェックリスト・設定・説明・レポート × 開 / 閉 の組み合わせを
   `unread_count_shows_only_on_the_bookshelf_screen` で固定した。
+- **ライセンス画面が削除済みの MuPDF を案内していた**: 説明文が「OS ごとに使うもの
+  （Windows の PDFium、macOS の MuPDF など）も含みます」のままだった。PDF 表示は
+  **全プラットフォーム PDFium に統一**して MuPDF（AGPL-3.0）は依存（`Cargo.toml` /
+  `Cargo.lock`）からもライセンス一覧からも消えているので、**同梱していないライブラリを
+  名指ししている**状態だった。Rust のクレートと同梱アセット（PDF 表示に使う PDFium、
+  アイコンの Lucide）を挙げる文面に直し、説明文が名指しするものはライセンス一覧に載っている
+  ものだけであること（+ 削除済みの名前を書かないこと）を
+  `licenses_lead_names_only_bundled_libraries` で固定した。
 
 ### Added
 
