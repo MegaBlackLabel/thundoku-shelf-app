@@ -11,6 +11,7 @@ use std::sync::Arc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::theme::Colorize as _;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -26,9 +27,9 @@ use crate::app_state::AppState;
 use crate::icons::AppIcon;
 use crate::views::bookshelf::{
     CARD_TAGS_COLLAPSED_MAX, CHIP_HEART_BUTTON, CHIP_HEART_ICON, CoverBadge, LIST_COVER_MIN_H,
-    LIST_COVER_W, LIST_INFO_W, LIST_TAGS_W_RATIO, SIDEBAR_W, TagOrder, ViewMode, cover_badge,
-    cover_fit_inside_frame, fit_cover_size, list_tags_visible_count, load_cached_cover,
-    load_cover_image, no_image_cover, owned_book_ids, placeholder_cover,
+    LIST_COVER_W, LIST_INFO_W, LIST_TAGS_W_RATIO, SIDEBAR_W, StatusIconPalette, TagOrder, ViewMode,
+    cover_badge, cover_fit_inside_frame, fit_cover_size, list_tags_visible_count,
+    load_cached_cover, load_cover_image, no_image_cover, owned_book_ids, placeholder_cover,
 };
 
 /// 期間フィルタ。
@@ -1326,6 +1327,8 @@ impl HistoryView {
     ) -> AnyElement {
         let database_id = item.book.id.clone();
         let is_favorite = item.book.is_favorite == 1;
+        // 行の背景の上なので、本棚の行の状態アイコンと同じ配色（テーマで変わる）
+        let (circle, heart) = row_heart_colors(theme, is_favorite);
         div()
             .id(SharedString::from(format!("history-heart-{database_id}")))
             .debug_selector({
@@ -1338,14 +1341,19 @@ impl HistoryView {
             .w(px(size))
             .h(px(size))
             .rounded_full()
-            .bg(theme.background)
-            .text_color(if is_favorite {
-                gpui_kit::rgb(0xf43f5e).into()
-            } else {
-                theme.muted_foreground
-            })
+            .bg(circle)
+            .text_color(heart)
             .cursor_pointer()
             .hover(|style| style.bg(theme.secondary))
+            .tooltip({
+                let text = if is_favorite {
+                    "お気に入り（クリックで解除）"
+                } else {
+                    "お気に入りにする"
+                }
+                .to_string();
+                move |window, cx| Tooltip::new(text.clone()).build(window, cx)
+            })
             .on_click({
                 let handle = handle.clone();
                 let book_id = database_id.clone();
@@ -1372,6 +1380,20 @@ fn card_badges(is_favorite: bool) -> (CoverBadge, CoverBadge) {
     (
         CoverBadge::favorite(is_favorite),
         CoverBadge::downloaded(true),
+    )
+}
+
+/// リスト行のお気に入りハートの配色（丸の地色, ハートの色）。
+///
+/// 表紙の上に乗るカードは [`cover_badge`] を使い、こちらは**行の背景の上**なので
+/// 本棚の行の状態アイコンと共通の [`StatusIconPalette`] から色を取る（テーマで変わる）。
+fn row_heart_colors(
+    theme: &gpui_kit::component::Theme,
+    is_favorite: bool,
+) -> (gpui_kit::Hsla, gpui_kit::Hsla) {
+    (
+        theme.background,
+        StatusIconPalette::for_theme(theme).favorite(is_favorite),
     )
 }
 
@@ -1893,6 +1915,46 @@ mod tests {
             );
             let _ = std::fs::remove_file(path);
         });
+    }
+
+    /// リスト行のお気に入りハートは、**本棚の行の状態アイコンと同じ配色**
+    /// （`StatusIconPalette` を共有）を使う。表紙の上に乗るカードは `cover_badge`。
+    /// 行の背景はテーマで変わるので、両テーマで固定する。
+    #[gpui_kit::test]
+    async fn history_row_heart_reuses_the_shelf_status_colors(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        for (name, mode) in [
+            ("light", gpui_kit::component::ThemeMode::Light),
+            ("dark", gpui_kit::component::ThemeMode::Dark),
+        ] {
+            let (on, off, palette) = cx.update(|cx| {
+                if mode == gpui_kit::component::ThemeMode::Light {
+                    crate::theme::apply_light_surfaces(cx);
+                } else {
+                    crate::theme::apply_dark_surfaces(cx);
+                }
+                gpui_kit::component::Theme::change(mode, None, cx);
+                let theme = cx.theme();
+                (
+                    row_heart_colors(theme, true),
+                    row_heart_colors(theme, false),
+                    StatusIconPalette::for_theme(theme),
+                )
+            });
+            assert_eq!(
+                on.1,
+                palette.favorite(true),
+                "{name}: 登録済みの色が本棚と違う"
+            );
+            assert_eq!(
+                off.1,
+                palette.favorite(false),
+                "{name}: 未登録の色が本棚と違う"
+            );
+            assert_ne!(on.1, off.1, "{name}: 登録 / 未登録で色が変わらない");
+            // 丸の地色は行の背景（テーマ）から取る
+            assert_eq!(on.0, off.0, "{name}: 丸の地色は状態で変わらない");
+        }
     }
 
     /// 選択移動の計算（本棚と同じ規則: dx は ±1、dy は行ぶん、端で止まる）。

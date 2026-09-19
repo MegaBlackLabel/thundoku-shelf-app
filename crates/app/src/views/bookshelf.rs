@@ -244,6 +244,91 @@ impl ChipPalette {
     }
 }
 
+/// リスト行の状態アイコン（ダウンロード済み / 未ダウンロード / お気に入り）の配色。
+///
+/// 表紙の上ではなく**行の背景**（`muted`、選択中は `secondary`）の上に描くので、表紙バッジ
+/// （[`CoverBadge`]）と違って**テーマで色を変える**（ライトは濃くしないと行の背景に沈む）。
+/// 16 px の細いアイコンなので、行の背景に対して **4.5:1** を下回らないこと
+/// （`status_icons_are_readable_on_list_rows`）。
+///
+/// 旧: ライトは `#059669` = 2.99:1 / `#b45309` = 3.99:1 / `#db2777` = 3.65:1 /
+/// `muted_foreground` = 3.76:1（いずれも選択中の行）で、16 px の細いアイコンが沈んでいた。
+/// ダークは元から 5.7〜9.1:1 あるので据え置き。
+#[derive(Clone, Copy)]
+pub(crate) struct StatusIconPalette {
+    downloaded: Hsla,
+    not_downloaded: Hsla,
+    favorite_on: Hsla,
+    favorite_off: Hsla,
+}
+
+impl StatusIconPalette {
+    /// ライト: 行の背景（ほぼ白）で読める濃色。
+    fn light() -> Self {
+        Self {
+            // emerald-700 (#047857) は選択中の行で 4.35:1 と僅かに足りないので一段濃くする
+            downloaded: gpui_kit::rgb(0x036e51).into(),
+            // amber-800
+            not_downloaded: gpui_kit::rgb(0x92400e).into(),
+            // pink-700（チップのハート #db2777 は行の背景では 3.65:1）
+            favorite_on: gpui_kit::rgb(0xbe185d).into(),
+            favorite_off: gpui_kit::rgb(0x616161).into(),
+        }
+    }
+
+    /// ダーク: 行の背景（暗いグレー）で読める明るい色。
+    fn dark() -> Self {
+        Self {
+            // emerald-400
+            downloaded: gpui_kit::rgb(0x34d399).into(),
+            // amber-400
+            not_downloaded: gpui_kit::rgb(0xfbbf24).into(),
+            // pink-400
+            favorite_on: gpui_kit::rgb(0xf472b6).into(),
+            // neutral-400（テーマの `muted_foreground` と同じ）
+            favorite_off: gpui_kit::rgb(0xa3a3a3).into(),
+        }
+    }
+
+    pub(crate) fn for_theme(theme: &gpui_kit::component::Theme) -> Self {
+        if theme.is_dark() {
+            Self::dark()
+        } else {
+            Self::light()
+        }
+    }
+
+    /// ダウンロード済み（ローカルにある）。
+    fn downloaded(self) -> Hsla {
+        self.downloaded
+    }
+
+    /// 未ダウンロード（クラウドのみ）。
+    fn not_downloaded(self) -> Hsla {
+        self.not_downloaded
+    }
+
+    /// お気に入りのハート（登録 / 未登録）。
+    pub(crate) fn favorite(self, on: bool) -> Hsla {
+        if on {
+            self.favorite_on
+        } else {
+            self.favorite_off
+        }
+    }
+
+    /// コントラスト検証用に全色を並べる。
+    #[cfg(test)]
+    fn all(self) -> [(&'static str, Hsla); 4] {
+        [
+            ("ダウンロード済み", self.downloaded),
+            ("未ダウンロード", self.not_downloaded),
+            ("お気に入り登録済み", self.favorite_on),
+            ("お気に入り未登録", self.favorite_off),
+        ]
+    }
+}
+
 /// 表紙に重ねる丸バッジの一辺。
 const COVER_BADGE_SIZE: f32 = 24.0;
 /// バッジの中に描くアイコンの一辺。文字グリフ（♥ ♡ ✓ ↓）は細くて潰れるのでアイコンを描く。
@@ -5579,6 +5664,8 @@ impl BookshelfView {
     ) -> Vec<gpui_kit::AnyElement> {
         let database_id = card.shelf.database_id.as_str();
         let downloaded = card.local.is_some();
+        // 状態アイコンの色（表紙の上ではなく行の背景の上。テーマで変わる）
+        let palette = StatusIconPalette::for_theme(theme);
         // 未読 / 読んでいる途中 / 既読（読了）の 3 状態（判定は `ReadingState` に集約）
         let state = card
             .local
@@ -5612,11 +5699,7 @@ impl BookshelfView {
                 database_id,
                 "downloaded",
                 AppIcon::HardDrive,
-                if theme.is_dark() {
-                    gpui_kit::rgb(0x34d399).into()
-                } else {
-                    gpui_kit::rgb(0x059669).into()
-                },
+                palette.downloaded(),
                 "ダウンロード済み",
                 None,
             ));
@@ -5626,11 +5709,7 @@ impl BookshelfView {
                 database_id,
                 "not-downloaded",
                 AppIcon::Cloud,
-                if theme.is_dark() {
-                    gpui_kit::rgb(0xfbbf24).into()
-                } else {
-                    gpui_kit::rgb(0xb45309).into()
-                },
+                palette.not_downloaded(),
                 "未ダウンロード",
                 None,
             ));
@@ -5638,7 +5717,6 @@ impl BookshelfView {
         // お気に入りは登録 / 未登録の両方を出し、**クリックでトグル**する
         // （アイコンだけだと行クリックに伝播してビューアーが開いてしまうため止める）。
         let is_favorite = card.shelf.is_favorite == 1;
-        let palette = ChipPalette::for_theme(theme);
         let favorite_card = card.clone();
         let favorite_handle = handle.clone();
         tags.push(status_icon(
@@ -5653,7 +5731,7 @@ impl BookshelfView {
             } else {
                 AppIcon::Heart
             },
-            palette.heart(theme.muted_foreground, is_favorite),
+            palette.favorite(is_favorite),
             if is_favorite {
                 "お気に入り（クリックで解除）"
             } else {
@@ -11796,6 +11874,48 @@ mod tests {
                 1,
                 "{badge:?}: 説明が他の状態と同じ（{text}）"
             );
+        }
+    }
+
+    /// リスト行の状態アイコン（ダウンロード済み / 未ダウンロード / お気に入り）は、
+    /// **行の背景**（`muted`、選択中は `secondary`）の上で読めること。
+    ///
+    /// 表紙の上に乗るカードのバッジ（`cover_badge_icons_stay_readable_on_any_cover`）と
+    /// 同じ 4.5:1 を目標にする（WCAG 2.2 SC 1.4.11 の 3:1 より厳しい。16 px の細い
+    /// アイコンは 3:1 だと薄く見える）。行の背景は表紙と違ってテーマで変わるので、
+    /// ライト / ダークの両方で固定する（旧: ライトは 2.99〜4.35:1 しかなかった）。
+    #[gpui_kit::test]
+    async fn status_icons_are_readable_on_list_rows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        for (name, mode) in [
+            ("light", gpui_kit::component::ThemeMode::Light),
+            ("dark", gpui_kit::component::ThemeMode::Dark),
+        ] {
+            let (palette, rows) = cx.update(|cx| {
+                if mode == gpui_kit::component::ThemeMode::Light {
+                    crate::theme::apply_light_surfaces(cx);
+                } else {
+                    crate::theme::apply_dark_surfaces(cx);
+                }
+                gpui_kit::component::Theme::change(mode, None, cx);
+                let theme = cx.theme();
+                (
+                    StatusIconPalette::for_theme(theme),
+                    [
+                        ("未選択の行", Rgba::from(theme.colors.muted)),
+                        ("選択中の行", Rgba::from(theme.colors.secondary)),
+                    ],
+                )
+            });
+            for (label, color) in palette.all() {
+                for (row_label, row) in rows {
+                    let ratio = contrast_ratio(Rgba::from(color), row);
+                    assert!(
+                        ratio >= 4.5,
+                        "{name}/{row_label}: {label} のコントラストが {ratio:.2}:1（4.5:1 未満）"
+                    );
+                }
+            }
         }
     }
 
