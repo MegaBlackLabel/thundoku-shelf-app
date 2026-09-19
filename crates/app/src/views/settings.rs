@@ -70,6 +70,9 @@ pub struct SettingsView {
     dlsite_viewer_mode: String,
     /// DLsite サイトのページめくり方向
     dlsite_page_turn: String,
+    /// ビューアのホイール方向（`down-to-next` = 下スクロールで次へ / `up-to-next`）。
+    /// サイトに依らない設定なので共通カードに出す。
+    viewer_wheel_direction: String,
     /// データベース情報: 未読/読んでいる途中/読了 の冊数
     status_counts: (usize, usize, usize),
     /// プロフィール再取得中フラグ（設定画面表示時のログイン状態チェック）
@@ -90,6 +93,16 @@ pub struct SettingsView {
     /// 入力の変更（Blur / Enter）を購読して確定するための Subscription。
     poll_interval_subscription: Option<Subscription>,
 }
+
+/// ビューアのホイール方向の設定キーと値。
+///
+/// Windows / macOS とも「ユーザーにとっての下（＝文書の先へ進む方向）で次へ」が自然:
+/// Windows はホイールを前方へ回す（`WM_MOUSEWHEEL` の +120）が下・次へ、
+/// macOS は AppKit がナチュラルスクロール設定を反映した delta を渡すので、
+/// 同じ規則でユーザーの「下」がそのまま次へになる。
+pub(crate) const WHEEL_DIRECTION_KEY: &str = "viewer.wheel_direction";
+pub(crate) const WHEEL_DIRECTION_DEFAULT: &str = "down-to-next";
+pub(crate) const WHEEL_DIRECTION_UP: &str = "up-to-next";
 
 /// Google の再ログインが必要なときの案内（生の `invalid_grant` JSON は出さない）。
 const GOOGLE_AUTH_EXPIRED_NOTICE: &str = "Google のログインが無効になりました（トークンが失効または取り消されています）。\
@@ -146,6 +159,10 @@ impl SettingsView {
             dlsite_page_turn: Self::read_setting(cx, "viewer.page_turn.dlsite")
                 .or_else(|| Self::read_setting(cx, "viewer.page_turn"))
                 .unwrap_or_else(|| "right-to-left".into()),
+            // ホイール方向は画面に入ったとき（`reload`）に読む。ここは既定値。
+            // Windows / macOS とも「ユーザーにとっての下（文書の先へ進む）」が次へ
+            // （macOS は AppKit がナチュラルスクロール設定を反映した値を渡す）。
+            viewer_wheel_direction: WHEEL_DIRECTION_DEFAULT.to_string(),
             status_counts: (0, 0, 0),
             profile_fetching: false,
             book_count: 0,
@@ -264,6 +281,13 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// ビューアのホイール方向を設定して保存する（サイトに依らない共通設定）。
+    pub fn set_wheel_direction(&mut self, cx: &mut Context<Self>, direction: &str) {
+        self.viewer_wheel_direction = direction.to_string();
+        Self::write_setting(cx, WHEEL_DIRECTION_KEY, direction);
+        cx.notify();
+    }
+
     /// 画面に入ったとき / データが変わったときに、表示に使う状態をまとめて読み込む。
     ///
     /// 呼び出し元は `Workspace::switch_to`（設定画面への切り替え時）と、この画面の
@@ -286,6 +310,10 @@ impl SettingsView {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         self.api_last_sync_at = Self::read_setting(cx, "api.last_sync_at");
+        // ビューアのホイール方向（未知の値は既定に倒す）
+        self.viewer_wheel_direction = Self::read_setting(cx, WHEEL_DIRECTION_KEY)
+            .filter(|value| value == WHEEL_DIRECTION_UP || value == WHEEL_DIRECTION_DEFAULT)
+            .unwrap_or_else(|| WHEEL_DIRECTION_DEFAULT.to_string());
         // 非表示リスト（設定画面から表示解除できるようにする）
         let state = AppState::global(cx);
         self.hidden_items = db::bookshelf::list_hidden(&state.db_pool).unwrap_or_default();
@@ -1217,6 +1245,92 @@ impl SettingsView {
         self.show_toast("ローカルデータをすべて削除しました", cx);
         cx.notify();
     }
+    /// ビューアの共通設定カード（サイトに依らない入力の割り当て）。
+    ///
+    /// ホイール方向の既定は「下スクロールで次へ」。Windows はホイールを前方へ回す
+    /// （`WM_MOUSEWHEEL` の +120）が下・次へ、macOS は AppKit がナチュラルスクロール設定を
+    /// 反映した delta を渡すので、どちらも「ユーザーにとっての下」がそのまま次へになる。
+    fn global_viewer_settings_card(
+        &self,
+        cx: &Context<Self>,
+        wheel_direction: String,
+    ) -> impl IntoElement + 'static {
+        let handle = cx.weak_entity();
+        let primary = cx.theme().primary;
+        let border = cx.theme().border;
+        let muted_fg = cx.theme().muted_foreground;
+        self.settings_card(
+            cx,
+            "ビューア共通設定",
+            Some("サイトに依らないビューアの操作"),
+            Icon::new(IconName::BookOpen)
+                .size(px(16.0))
+                .text_color(muted_fg),
+            div().p_5().flex().flex_col().gap_4().child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("ホイール 1 ノッチで 1 ページ送る向き"),
+                    )
+                    .child(
+                        div().flex().flex_row().gap_4().children(
+                            [
+                                (WHEEL_DIRECTION_DEFAULT, "下スクロールで次へ"),
+                                (WHEEL_DIRECTION_UP, "上スクロールで次へ"),
+                            ]
+                            .into_iter()
+                            .map(|(value, label)| {
+                                let selected = wheel_direction == value;
+                                let handle = handle.clone();
+                                let value = value.to_string();
+                                div()
+                                    .id(SharedString::from(format!("wheel-direction-{value}")))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .on_click(move |_, _window, cx| {
+                                        handle
+                                            .update(cx, |this, cx| {
+                                                this.set_wheel_direction(cx, &value);
+                                            })
+                                            .ok();
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .w(px(16.0))
+                                            .h(px(16.0))
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(if selected { primary } else { border })
+                                            .child(if selected {
+                                                div()
+                                                    .w(px(8.0))
+                                                    .h(px(8.0))
+                                                    .rounded_full()
+                                                    .bg(primary)
+                                            } else {
+                                                div()
+                                            }),
+                                    )
+                                    .child(label)
+                            }),
+                        ),
+                    ),
+            ),
+        )
+    }
+
     /// サイト別のビューアー設定カード（表示モード + ページめくり）。
     fn site_viewer_settings_card(
         &self,
@@ -1899,6 +2013,8 @@ impl Render for SettingsView {
         let muted_fg = cx.theme().muted_foreground;
 
         // Web の SettingsGroupCard 相当のカード
+        let global_viewer_settings =
+            self.global_viewer_settings_card(cx, self.viewer_wheel_direction.clone());
         let viewer_settings = self.site_viewer_settings_card(
             cx,
             "techbookfest",
@@ -2382,6 +2498,7 @@ impl Render for SettingsView {
                             ),
                     )
                     .child(account_settings)
+                    .child(global_viewer_settings)
                     .child(viewer_settings)
                     .child(booth_viewer_settings)
                     .child(fanza_viewer_settings)
@@ -2866,6 +2983,25 @@ mod tests {
             1,
             "描画で状態を読み直している（スクロールのたびに DB を引く原因）"
         );
+    }
+
+    /// ビューアのホイール方向設定が保存される（既定は「下スクロールで次へ」）。
+    #[gpui_kit::test]
+    async fn wheel_direction_setting_persists(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(SettingsView::new);
+        assert_eq!(
+            cx.read(|cx| view.read(cx).viewer_wheel_direction.clone()),
+            "down-to-next",
+            "ホイール方向の既定値が「下スクロールで次へ」になっていない"
+        );
+        cx.update(|cx| view.update(cx, |this, cx| this.set_wheel_direction(cx, "up-to-next")));
+        let stored = cx.read(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::settings::get(db, "viewer.wheel_direction").unwrap()
+        });
+        assert_eq!(stored.as_deref(), Some("up-to-next"));
     }
 
     #[gpui_kit::test]

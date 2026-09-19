@@ -38,6 +38,13 @@ pub const AUTOPLAY_DEFAULT_MS: u64 = 5000;
 pub const AUTOPLAY_STEP_MS: u64 = 1000;
 const OVERLAY_HIDE_MS: u64 = 5000;
 
+/// ホイールで 1 ページ送るのに必要な行数（1 ノッチ相当）。
+///
+/// Windows の既定は 1 ノッチ = 3 行（`WM_MOUSEWHEEL` の 120 と SPI_GETWHEELSCROLLLINES）。
+/// 累積してこの値に届いたら **1 回だけ** 動かす（フリースピンホイールやトラックパッドの
+/// 細かいイベントで何ページもめくれないように）。
+const WHEEL_TURN_LINES: f32 = 3.0;
+
 /// タイトルバーの高さ（px）。リーダーはタイトルバーを残すため、画像のフィット計算で
 /// ウィンドウ全体の高さから差し引く。実際の値は `workspace::TITLE_BAR_HEIGHT` が持つ
 /// （Windows はアプリ自前のタイトルバー 36 px、非 Windows は gpui-kit の 34 px）。
@@ -362,6 +369,11 @@ pub struct ImageViewer {
     overlay_visible: bool,
     /// トップパネルまたはボトムドックにマウスがある間は自動非表示しない。
     hovering_ui: bool,
+    /// ホイール方向（true = 下スクロールで次へ。既定）。
+    /// 設定 `viewer.wheel_direction` の値から決める。
+    wheel_down_to_next: bool,
+    /// ホイールの累積量（行）。1 ノッチ（`WHEEL_TURN_LINES`）溜まったら 1 ページ送る。
+    wheel_accum: f32,
     hide_generation: u64,
     /// 連続ページ送りの回数（2 回以上でトップ/ボトムメニューを非表示にする）
     page_turn_count: u32,
@@ -554,6 +566,18 @@ impl ImageViewer {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(AUTOPLAY_DEFAULT_MS)
         };
+        // ホイール方向（既定は「下スクロールで次へ」）。サイトに依らない共通設定。
+        // macOS は AppKit がユーザーのナチュラルスクロール設定を反映した delta を渡すので、
+        // 「ユーザーにとっての下」がそのまま次へになる。
+        let wheel_down_to_next = {
+            let state = crate::app_state::AppState::global(cx);
+            let db = &state.db_pool;
+            db::settings::get(db, crate::views::settings::WHEEL_DIRECTION_KEY)
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(crate::views::settings::WHEEL_DIRECTION_UP)
+        };
         let mut viewer = Self {
             loader,
             title: title.into(),
@@ -572,6 +596,8 @@ impl ImageViewer {
             thumbs: (0..page_count).map(|_| None).collect(),
             overlay_visible: true,
             hovering_ui: false,
+            wheel_down_to_next,
+            wheel_accum: 0.0,
             hide_generation: 0,
             page_turn_count: 0,
             autoplay: false,
@@ -2799,6 +2825,33 @@ impl Render for ImageViewer {
                                     });
                                     return;
                                 }
+                                // 通常ホイール = ページ送り（1 ノッチ = 1 ページ）。
+                                // 累積して 1 ノッチぶんになったら 1 回だけ動かす。
+                                // Ctrl はズーム、UI パネル上（ページ一覧など）は対象外。
+                                if !event.modifiers.control && !this.hovering_ui {
+                                    let lines = match event.delta {
+                                        gpui_kit::ScrollDelta::Pixels(point) => {
+                                            let line_height = _window
+                                                .line_height()
+                                                .as_f32()
+                                                .max(1.0);
+                                            f32::from(point.y) / line_height
+                                        }
+                                        gpui_kit::ScrollDelta::Lines(point) => point.y,
+                                    };
+                                    this.wheel_accum += lines;
+                                    if this.wheel_accum.abs() >= WHEEL_TURN_LINES {
+                                        // gpui の規約で負 = 下（文書の先へ進む方向）
+                                        let down = this.wheel_accum < 0.0;
+                                        this.wheel_accum = 0.0;
+                                        if down == this.wheel_down_to_next {
+                                            this.next_page(cx);
+                                        } else {
+                                            this.prev_page(cx);
+                                        }
+                                    }
+                                    return;
+                                }
                                 if !event.modifiers.control {
                                     return;
                                 }
@@ -3692,6 +3745,146 @@ mod tests {
             view.read_with(cx, |v, _| v.current_page),
             2,
             "shift+left must move a single page back"
+        );
+    }
+
+    /// ホイールを 1 回転がす。`lines` は gpui の行数デルタ。
+    ///
+    /// 符号は gpui の規約で **負 = 下（文書の先へ進む）**（`scroll_offset.y += delta` を
+    /// `[-max, 0]` にクランプするため）。Windows の 1 ノッチは既定で 3 行。
+    fn wheel(visual: &mut gpui_kit::VisualTestContext, lines: f32) {
+        visual.simulate_event(gpui_kit::ScrollWheelEvent {
+            position: gpui_kit::point(gpui_kit::px(400.0), gpui_kit::px(300.0)),
+            delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, lines)),
+            ..Default::default()
+        });
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    /// ホイール 1 ノッチで 1 ページ送る（既定は「下スクロールで次へ」）。
+    ///
+    /// macOS は AppKit がユーザー設定（ナチュラルスクロール）を反映した delta を渡すので、
+    /// 同じ規則で「ユーザーにとっての下」がそのまま次へになる（アプリ側で二重反転しない）。
+    #[gpui_kit::test]
+    async fn wheel_scroll_turns_one_page(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 5);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        wheel(visual, -3.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            1,
+            "下スクロールで次のページへ進んでいない"
+        );
+        wheel(visual, -3.0);
+        assert_eq!(view.read_with(cx, |v, _| v.current_page), 2);
+        wheel(visual, 3.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            1,
+            "上スクロールで前のページへ戻っていない"
+        );
+    }
+
+    /// 設定が「上スクロールで次へ」なら、上で進み、下で戻る。
+    #[gpui_kit::test]
+    async fn wheel_direction_setting_flips_the_page_turn(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        cx.update(|cx| {
+            let db = &crate::app_state::AppState::global(cx).db_pool;
+            thundoku_core::db::settings::set(db, "viewer.wheel_direction", "up-to-next").unwrap();
+        });
+        let view = viewer(cx, 5);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|cx| view.update(cx, |this, cx| this.set_page(cx, 2)));
+
+        wheel(visual, 3.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            3,
+            "「上スクロールで次へ」なのに上で進んでいない"
+        );
+        wheel(visual, -3.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            2,
+            "「上スクロールで次へ」なのに下で戻っていない"
+        );
+    }
+
+    /// 1 回のイベントで何ページもめくらない（トラックパッドの細かいイベント対策）。
+    #[gpui_kit::test]
+    async fn wheel_one_event_turns_at_most_one_page(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 10);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // 10 ノッチぶんを一度に送っても 1 ページだけ
+        wheel(visual, -30.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            1,
+            "1 イベントで複数ページめくっている"
+        );
+    }
+
+    /// スクロール（連続）モードではホイールをページ送りに使わない（普通にスクロールする）。
+    #[gpui_kit::test]
+    async fn wheel_does_not_turn_pages_in_scroll_mode(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 5);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Scroll)));
+
+        wheel(visual, -3.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            0,
+            "スクロールモードでページ送りしている"
         );
     }
 
