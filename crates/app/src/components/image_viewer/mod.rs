@@ -2826,6 +2826,8 @@ impl Render for ImageViewer {
                                     return;
                                 }
                                 // 通常ホイール = ページ送り（1 ノッチ = 1 ページ）。
+                                // 見開きモードでも 1 ページだけ送る（`*_page_shift` は
+                                // 見開きでも 1 ページ動く版）。
                                 // 累積して 1 ノッチぶんになったら 1 回だけ動かす。
                                 // Ctrl はズーム、UI パネル上（ページ一覧など）は対象外。
                                 if !event.modifiers.control && !this.hovering_ui {
@@ -2845,9 +2847,9 @@ impl Render for ImageViewer {
                                         let down = this.wheel_accum < 0.0;
                                         this.wheel_accum = 0.0;
                                         if down == this.wheel_down_to_next {
-                                            this.next_page(cx);
+                                            this.next_page_shift(cx);
                                         } else {
-                                            this.prev_page(cx);
+                                            this.prev_page_shift(cx);
                                         }
                                     }
                                     return;
@@ -3859,6 +3861,38 @@ mod tests {
             view.read_with(cx, |v, _| v.current_page),
             1,
             "1 イベントで複数ページめくっている"
+        );
+    }
+
+    /// 見開きモードでもホイール 1 ノッチ = 1 ページ（見開きで 2 ページ進めない）。
+    #[gpui_kit::test]
+    async fn wheel_scroll_turns_a_single_page_in_spread_mode(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 10);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
+
+        wheel(visual, -3.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            1,
+            "見開きで 1 ノッチが 2 ページ進んでいる"
+        );
+        wheel(visual, 3.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            0,
+            "見開きで 1 ノッチが 2 ページ戻っている"
         );
     }
 

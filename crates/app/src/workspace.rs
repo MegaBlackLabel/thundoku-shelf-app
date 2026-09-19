@@ -148,8 +148,13 @@ pub struct Workspace {
     restoring: bool,
     /// Google ログイン後に Drive バックアップ有効化の確認を表示中か。
     show_drive_prompt: bool,
-    /// ログイン中（専用のダミー画面を表示中）か。
+    /// ログイン中(専用のダミー画面を表示中)か。
     auth_loading: bool,
+    /// 現在のテーマモード（`theme.mode` のキャッシュ）。
+    ///
+    /// サイドバーのテーマ項目のラベルに使うため、描画のたびに DB を引かない
+    /// （起動時の `restore_theme_mode` と切替時の `set_theme` だけで更新する）。
+    theme_mode_name: String,
     /// ウィンドウを閉じる時に、バックアップ対象の変更を確認中か。
     exit_upload_prompt: bool,
     /// 終了時のバックアップアップロード実行中か。
@@ -189,6 +194,7 @@ impl Workspace {
             restoring: false,
             show_drive_prompt: false,
             auth_loading: false,
+            theme_mode_name: "system".to_string(),
             exit_upload_prompt: false,
             exit_uploading: false,
         };
@@ -496,24 +502,17 @@ impl Workspace {
 
     /// テーマモード（ライト → ダーク → システム）の循環切替。
     pub fn cycle_theme(&mut self, cx: &mut Context<Self>) {
-        let current = self.theme_mode(cx);
-        let next = match current.as_deref() {
-            Some("dark") => "system",
-            Some("system") => "light",
+        let next = match self.theme_mode_name.as_str() {
+            "dark" => "system",
+            "system" => "light",
             _ => "dark",
         };
         self.set_theme(next, cx);
     }
 
-    /// 現在のテーマモード（settings の theme.mode から）。
-    fn theme_mode(&self, cx: &Context<Self>) -> Option<String> {
-        db::settings::get(&AppState::global(cx).db_pool, "theme.mode")
-            .ok()
-            .flatten()
-    }
-
     /// テーマモードを設定して保存する。
     pub fn set_theme(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.theme_mode_name = mode.to_string();
         let _ = db::settings::set(&AppState::global(cx).db_pool, "theme.mode", mode);
         if mode == "system" {
             // システムの明暗に追従する
@@ -531,7 +530,11 @@ impl Workspace {
 
     /// 保存済みテーマモードの復元（起動時）。
     pub fn restore_theme_mode(&mut self, cx: &mut Context<Self>) {
-        let mode = self.theme_mode(cx).unwrap_or_else(|| "system".to_string());
+        let mode = db::settings::get(&AppState::global(cx).db_pool, "theme.mode")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "system".to_string());
+        self.theme_mode_name = mode.clone();
         if mode == "system" {
             Theme::sync_system_appearance(None, cx);
         } else {
@@ -1797,6 +1800,16 @@ pub const TITLE_BAR_HEIGHT: f32 = 36.0;
 #[cfg(not(windows))]
 pub const TITLE_BAR_HEIGHT: f32 = 34.0;
 
+/// 未読数バッジの地色（件数で変わる）と文字色。
+///
+/// 地色はテーマに依らない固定色なので、文字色も固定の濃色にする。WCAG のコントラストは
+/// 赤 5.6:1 / 黄 10.9:1 / 緑 8.3:1 で、テーマ由来の `primary_foreground` を使うと
+/// ライトテーマで白になり、黄の上で 1.9:1 まで落ちて読めなくなる。
+pub(crate) const BADGE_RED: u32 = 0xef4444;
+pub(crate) const BADGE_YELLOW: u32 = 0xeab308;
+pub(crate) const BADGE_GREEN: u32 = 0x10b981;
+pub(crate) const BADGE_TEXT: u32 = 0x0a0a0a;
+
 /// サイドバーの描画（72px の閉状態 ↔ 256px の開状態を 200ms でアニメーション）。
 impl Workspace {
     /// macOS / Linux のウィンドウ上部のタイトルバー（gpui-kit の `TitleBar`）。
@@ -1922,7 +1935,8 @@ impl Workspace {
         // 未読数は**本棚のときだけ**出す（履歴 / 付箋 / 設定などでは本棚の話ではないため）。
         // サイドバーを開いたときの「未読数 N 件」と、閉じたときのロゴのバッジで同じ扱いにする。
         let unread = (active == NavTarget::Bookshelf).then_some(unread_count);
-        let theme_mode_name = self.theme_mode(cx).unwrap_or_else(|| "system".to_string());
+        // テーマ名はキャッシュから（描画のたびに `theme.mode` を DB から読まない）
+        let theme_mode_name = self.theme_mode_name.clone();
         // レポート（GitHub にログインしているときだけ設定の上に出す）。
         // ログインしていないと Issue を作れないため導線も出さない。
         let github_logged_in = *AppState::global(cx).github_logged_in.lock();
@@ -1945,11 +1959,11 @@ impl Workspace {
         });
         // バッジ色分け: 100 件以上=赤 / 10〜99 件=黄 / 1〜9 件=緑
         let badge_color = if unread_count >= 100 {
-            gpui_kit::rgb(0xef4444)
+            gpui_kit::rgb(BADGE_RED)
         } else if unread_count >= 10 {
-            gpui_kit::rgb(0xeab308)
+            gpui_kit::rgb(BADGE_YELLOW)
         } else {
-            gpui_kit::rgb(0x10b981)
+            gpui_kit::rgb(BADGE_GREEN)
         };
 
         div()
@@ -2242,9 +2256,13 @@ impl Workspace {
                 }
             })
             .child(
-                Icon::new(AppIcon::BookMarked)
-                    .size(px(20.0))
-                    .text_color(theme.primary_foreground),
+                // ナビ行のアイコンと同じ 24px（箱は 36×36 で揃っているので、中身の大きさも
+                // 揃えないとロゴだけ小さく見える）
+                div().debug_selector(|| "sidebar-logo-glyph".into()).child(
+                    Icon::new(AppIcon::BookMarked)
+                        .size(px(24.0))
+                        .text_color(theme.primary_foreground),
+                ),
             )
             .child(match badge {
                 Some(count) => div()
@@ -2264,7 +2282,10 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(theme.primary_foreground)
+                    // 地色（赤 / 黄 / 緑）は件数で変わる固定色なので、文字色もテーマに
+                    // 依らず固定の濃色にする。`primary_foreground` はライトテーマで白に
+                    // なり、黄 (0xeab308) の上でコントラスト 1.9:1 まで落ちて読めない。
+                    .text_color(gpui_kit::rgb(BADGE_TEXT))
                     .text_size(px(9.0))
                     .child(Self::unread_badge_label(count))
                     .into_any_element(),
@@ -3636,6 +3657,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// テーマモードは起動時と切替時にだけ読み、描画では DB を引かない（キャッシュを持つ）。
+    ///
+    /// サイドバーのテーマ項目のラベルは描画のたびに必要になるため、`theme.mode` を毎回
+    /// 読むとスクロールのたびにクエリが走る。切替後にキャッシュが古いままだと表示が
+    /// 追従しないので、保存値と一致することも見る。
+    #[gpui_kit::test]
+    async fn theme_mode_is_cached_and_updated_on_change(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let before = ws.read_with(cx, |w, _| w.theme_mode_name.clone());
+        assert!(!before.is_empty(), "テーマモードが読み込まれていない");
+        cx.update(|cx| ws.update(cx, |w, cx| w.cycle_theme(cx)));
+        let after = ws.read_with(cx, |w, _| w.theme_mode_name.clone());
+        assert_ne!(before, after, "テーマ切替後にキャッシュが更新されていない");
+        let stored = cx.read(|cx| {
+            thundoku_core::db::settings::get(&AppState::global(cx).db_pool, "theme.mode").unwrap()
+        });
+        assert_eq!(
+            Some(after),
+            stored,
+            "キャッシュが保存値とずれている（表示が実際の設定と食い違う）"
+        );
+    }
+
+    /// 未読数バッジの文字は、どの地色の上でも読めること（WCAG 2.x の 4.5:1 以上）。
+    ///
+    /// 地色はテーマに依らない固定色なので、テーマ由来の色（`primary_foreground`）を
+    /// 文字色に使うとライトテーマで白になり、黄の上で読めなくなる。
+    #[test]
+    fn unread_badge_text_is_legible_on_every_badge_color() {
+        for (name, background) in [("赤", BADGE_RED), ("黄", BADGE_YELLOW), ("緑", BADGE_GREEN)]
+        {
+            let ratio = contrast_ratio(BADGE_TEXT, background);
+            assert!(ratio >= 4.5, "{name}のバッジで文字が読めない: {ratio:.2}:1");
+        }
+    }
+
+    /// WCAG 2.x のコントラスト比（1.0〜21.0）。
+    fn contrast_ratio(a: u32, b: u32) -> f32 {
+        fn luminance(color: u32) -> f32 {
+            let channel = |shift: u32| {
+                let value = ((color >> shift) & 0xff) as f32 / 255.0;
+                if value <= 0.03928 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+        }
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// ロゴのグリフは下のナビ行のアイコンと同じ 24px（箱は 36×36 で揃っているので、
+    /// 中身の大きさも揃えないとロゴだけ小さく見える）。
+    #[gpui_kit::test]
+    async fn sidebar_logo_glyph_is_as_large_as_nav_icons(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        let glyph = visual
+            .debug_bounds("sidebar-logo-glyph")
+            .expect("ロゴのグリフが無い");
+        // ナビ行のアイコンはすべて 24px（`Icon::new(...).size(px(24.0))`）
+        assert_eq!(
+            glyph.size.width.as_f32(),
+            24.0,
+            "ロゴのグリフがナビのアイコンと揃っていない"
+        );
+        assert_eq!(glyph.size.height.as_f32(), 24.0);
     }
 
     /// 未読数バッジがロゴのタイル（36×36）を覆い尽くさない。
