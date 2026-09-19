@@ -1863,6 +1863,9 @@ impl Workspace {
         let handle = cx.entity();
         let active = self.active;
         let unread_count = self.unread_count;
+        // 未読数は**本棚のときだけ**出す（履歴 / 付箋 / 設定などでは本棚の話ではないため）。
+        // サイドバーを開いたときの「未読数 N 件」と、閉じたときのロゴのバッジで同じ扱いにする。
+        let unread = (active == NavTarget::Bookshelf).then_some(unread_count);
         let theme_mode_name = self.theme_mode(cx).unwrap_or_else(|| "system".to_string());
         // レポート（GitHub にログインしているときだけ設定の上に出す）。
         // ログインしていないと Issue を作れないため導線も出さない。
@@ -1960,7 +1963,7 @@ impl Workspace {
                         // ロゴを右へ 8px（閉じた状態のアイコン列中央からの位置を揃える）
                         this.justify_start().gap_2().px(px(16.0))
                     })
-                    .child(self.sidebar_logo(unread_count, badge_color, open, handle.clone(), cx))
+                    .child(self.sidebar_logo(unread, badge_color, open, handle.clone(), cx))
                     .when(open, |this| {
                         this.child(
                             div()
@@ -1974,12 +1977,15 @@ impl Workspace {
                                         .whitespace_nowrap()
                                         .child("Thundoku Shelf"),
                                 )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("未読数 {unread_count} 件")),
-                                ),
+                                .when_some(unread, |this, count| {
+                                    this.child(
+                                        div()
+                                            .debug_selector(|| "sidebar-unread-count".into())
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!("未読数 {count} 件")),
+                                    )
+                                }),
                         )
                     }),
             )
@@ -2124,15 +2130,19 @@ impl Workspace {
     }
 
     /// サイドバーのロゴ（ブックマーク + 未読バッジ）。
+    ///
+    /// `unread` は**本棚のときだけ** `Some` が渡される（呼び出し側で判定する）。
     fn sidebar_logo(
         &self,
-        unread_count: usize,
+        unread: Option<usize>,
         badge_color: gpui_kit::Rgba,
         open: bool,
         handle: Entity<Workspace>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // バッジは閉じているときだけ。0 件では出さない。
+        let badge = unread.filter(|count| !open && *count > 0);
         div()
             .id("sidebar-logo")
             .debug_selector(|| "sidebar-logo".into())
@@ -2160,8 +2170,9 @@ impl Workspace {
                     .size(px(20.0))
                     .text_color(theme.primary_foreground),
             )
-            .child(if !open && unread_count > 0 {
-                div()
+            .child(match badge {
+                Some(count) => div()
+                    .debug_selector(|| "sidebar-unread-badge".into())
                     .absolute()
                     .right(px(-4.0))
                     .top(px(-4.0))
@@ -2175,10 +2186,9 @@ impl Workspace {
                     .justify_center()
                     .text_color(theme.primary_foreground)
                     .text_xs()
-                    .child(unread_count.to_string())
-                    .into_any_element()
-            } else {
-                div().into_any_element()
+                    .child(count.to_string())
+                    .into_any_element(),
+                None => div().into_any_element(),
             })
     }
 
@@ -3390,6 +3400,55 @@ mod tests {
         // ロゴは常に 40x40（閉状態でも潰れない）
         let logo_size = ws.read_with(cx, |w, _| (w.sidebar_open,));
         assert!(!logo_size.0);
+    }
+
+    /// 未読数は**本棚のときだけ**出す。サイドバーを開いたときの「未読数 N 件」と、
+    /// 閉じたときのロゴのバッジの両方で同じ扱いにする（履歴 / 付箋 / 設定などの
+    /// 画面では本棚の話ではないので出さない）。
+    #[gpui_kit::test]
+    async fn unread_count_shows_only_on_the_bookshelf_screen(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for open in [false, true] {
+            for (target, expected, label) in [
+                (NavTarget::Bookshelf, true, "本棚"),
+                (NavTarget::History, false, "閲覧履歴"),
+                (NavTarget::Notes, false, "付箋"),
+                (NavTarget::Checklist, false, "チェックリスト"),
+                (NavTarget::Settings, false, "設定"),
+                (NavTarget::About, false, "説明"),
+                (NavTarget::Report, false, "レポート"),
+            ] {
+                cx.update(|cx| {
+                    ws.update(cx, |w, cx| {
+                        w.sidebar_open = open;
+                        w.switch_to(target, cx);
+                        // 件数の算出は別テスト。ここは「どの画面で出すか」を見るので直接入れる
+                        w.unread_count = 18;
+                        cx.notify();
+                    });
+                });
+                draw_frames(visual);
+                let selector = if open {
+                    "sidebar-unread-count"
+                } else {
+                    "sidebar-unread-badge"
+                };
+                assert_eq!(
+                    visual.debug_bounds(selector).is_some(),
+                    expected,
+                    "{label}（サイドバー {}）: {selector} の表示が違う",
+                    if open { "開" } else { "閉" }
+                );
+            }
+        }
     }
 
     #[gpui_kit::test]
