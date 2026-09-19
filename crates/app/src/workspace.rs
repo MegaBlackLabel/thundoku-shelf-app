@@ -422,6 +422,10 @@ impl Workspace {
         if target == NavTarget::Notes {
             self.notes.update(cx, |n, cx| n.reload(cx));
         }
+        // 設定は開いた時点のデータを出す（描画のたびに読み直さない = スクロールを軽くする）
+        if target == NavTarget::Settings {
+            self.settings.update(cx, |s, cx| s.reload(cx));
+        }
         // ナビゲーションを切り替えたらログイン中のダミー画面を終了する
         // （例: ブックマークアイコンで説明画面を開いたとき）。
         self.auth_loading = false;
@@ -3098,6 +3102,22 @@ mod tests {
             }
         };
         draw(visual);
+        // サイドバーの幅は開閉アニメーション（180ms）で動く。行の位置が落ち着いてから
+        // 測ってクリックする（途中で測るとクリック位置がずれて、切り替わらないことがある）。
+        // 「位置が変わらなくなったら完了」とみなす（回数固定だと進み具合がぶれて不安定になる）。
+        let mut prev_x = gpui_kit::px(-1.0);
+        for _ in 0..20 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            draw(visual);
+            let x = visual.debug_bounds("sidebar-nav-notes").map(|b| b.origin.x);
+            if x == Some(prev_x) {
+                break;
+            }
+            if let Some(x) = x {
+                prev_x = x;
+            }
+        }
         let history = visual
             .debug_bounds("sidebar-nav-history")
             .expect("閲覧履歴の行");

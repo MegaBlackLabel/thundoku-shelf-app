@@ -79,6 +79,12 @@ pub struct SettingsView {
     book_count: usize,
     /// Drive 同期有効フラグ（render での毎回の DB 読みを避けるためのキャッシュ）
     drive_enabled: bool,
+    /// Drive の最終同期時刻 / 件数 / 合計バイト数（同じくキャッシュ。`reload` で更新）
+    drive_last_sync: Option<String>,
+    drive_file_count: usize,
+    drive_total_bytes: u64,
+    /// API の最終同期時刻（同じくキャッシュ。`reload` で更新）
+    api_last_sync_at: Option<String>,
     /// チェックリスト定期取得間隔の編集入力（render で遅延生成）。
     poll_interval_input: Option<Entity<InputState>>,
     /// 入力の変更（Blur / Enter）を購読して確定するための Subscription。
@@ -143,10 +149,12 @@ impl SettingsView {
             status_counts: (0, 0, 0),
             profile_fetching: false,
             book_count: 0,
-            drive_enabled: db::settings::get(&AppState::global(cx).db_pool, "drive.sync.enabled")
-                .ok()
-                .flatten()
+            drive_enabled: Self::read_setting(cx, "drive.sync.enabled")
                 .is_some_and(|v| v == "true"),
+            drive_last_sync: None,
+            drive_file_count: 0,
+            drive_total_bytes: 0,
+            api_last_sync_at: None,
             poll_interval_input: None,
             poll_interval_subscription: None,
         }
@@ -254,6 +262,35 @@ impl SettingsView {
         self.dlsite_page_turn = direction.to_string();
         Self::write_setting(cx, "viewer.page_turn.dlsite", direction);
         cx.notify();
+    }
+
+    /// 画面に入ったとき / データが変わったときに、表示に使う状態をまとめて読み込む。
+    ///
+    /// 呼び出し元は `Workspace::switch_to`（設定画面への切り替え時）と、この画面の
+    /// 操作で DB を書き換えた直後。**`render` からは呼ばない**（描画のたびに走ると、
+    /// スクロールのたびに全書籍ぶんの進捗クエリが引かれて引っかかる）。
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        // 同期中は DB の Mutex を長時間握るため、UI 側の DB 読みをスキップして
+        // フリーズを避ける（完了後は自動で再開される）
+        if self.busy {
+            return;
+        }
+        self.refresh_status_counts(cx);
+        self.drive_enabled =
+            Self::read_setting(cx, "drive.sync.enabled").is_some_and(|v| v == "true");
+        self.drive_last_sync = Self::read_setting(cx, "drive.last_sync_at");
+        self.drive_file_count = Self::read_setting(cx, "drive.file_count")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        self.drive_total_bytes = Self::read_setting(cx, "drive.total_bytes")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        self.api_last_sync_at = Self::read_setting(cx, "api.last_sync_at");
+        // 非表示リスト（設定画面から表示解除できるようにする）
+        let state = AppState::global(cx);
+        self.hidden_items = db::bookshelf::list_hidden(&state.db_pool).unwrap_or_default();
+        // 表紙キャッシュが無いものはバックグラウンドで取得する
+        self.fetch_missing_covers(cx);
     }
 
     /// 未読/読んでいる途中/読了 の冊数を集計（Web の getReadingStatusCounts 相当）。
@@ -961,6 +998,8 @@ impl SettingsView {
                                 &outcome.total_bytes.to_string(),
                             );
                         }
+                        // 表示に使う値を読み直す（`render` では DB を引かない）
+                        this.reload(cx);
                         this.show_toast(
                             format!(
                                 "同期完了（DL {} / UL {} / スキップ {} / 競合 {}）{}",
@@ -1173,6 +1212,8 @@ impl SettingsView {
             let state = AppState::global(cx);
             dir_size(&state.data_dir)
         };
+        // 冊数・非表示リストも消えているので読み直す（`render` では DB を引かない）
+        self.reload(cx);
         self.show_toast("ローカルデータをすべて削除しました", cx);
         cx.notify();
     }
@@ -1802,16 +1843,10 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // チェックリスト定期取得間隔の編集入力を確保（初回のみ生成・購読）
         self.ensure_poll_interval_input(_window, cx);
-        // 同期中は DB の Mutex を長時間握るため、UI 側の DB 読みをスキップ
-        // してフリーズを避ける（完了後は自動で再開される）
-        if !self.busy {
-            self.refresh_status_counts(cx);
-            // 非表示リスト（設定画面から表示解除できるようにする）
-            let state = AppState::global(cx);
-            self.hidden_items = db::bookshelf::list_hidden(&state.db_pool).unwrap_or_default();
-            // 表紙キャッシュが無いものはバックグラウンドで取得する
-            self.fetch_missing_covers(cx);
-        }
+        // 表示に使う状態（冊数・非表示リスト・同期情報）は `reload`（画面に入ったとき /
+        // データが変わったとき）で読み込んでおく。ここで DB を引くと、スクロールのたびに
+        // 描画が走るたびに全書籍ぶんの進捗クエリが走って引っかかる（実測: ホイール 1 ノッチで
+        // 約 600 クエリ → 修正後は 0）。
         // 保存済みトークンからログイン状態を復元（設定画面を開いたとき）
         #[cfg(not(test))]
         self.refresh_google_profile(cx);
@@ -1830,7 +1865,9 @@ impl Render for SettingsView {
         let confirm_clear_sync = self.confirm_clear_sync;
         let pending_data_dir = self.pending_data_dir.clone();
         let drive_enabled = self.drive_enabled;
-        let drive_last_sync = Self::read_setting(cx, "drive.last_sync_at")
+        let drive_last_sync = self
+            .drive_last_sync
+            .clone()
             // 保存は UTC なのでローカル時間（JST 等）で表示する
             .and_then(|v| {
                 chrono::NaiveDateTime::parse_from_str(&v, "%Y-%m-%d %H:%M:%S")
@@ -1843,12 +1880,8 @@ impl Render for SettingsView {
                     })
                     .ok()
             });
-        let drive_file_count = Self::read_setting(cx, "drive.file_count")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        let drive_total_bytes = Self::read_setting(cx, "drive.total_bytes")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+        let drive_file_count = self.drive_file_count;
+        let drive_total_bytes = self.drive_total_bytes;
         let storage_bytes = self.storage_bytes;
         let confirm_delete = self.confirm_delete;
         let tbf_viewer_mode = self.tbf_viewer_mode.clone();
@@ -1860,7 +1893,7 @@ impl Render for SettingsView {
         let dlsite_viewer_mode = self.dlsite_viewer_mode.clone();
         let dlsite_page_turn = self.dlsite_page_turn.clone();
         let status_counts = self.status_counts;
-        let last_synced_at = Self::read_setting(cx, "api.last_sync_at");
+        let last_synced_at = self.api_last_sync_at.clone();
         let handle = cx.entity();
         let border = cx.theme().border;
         let muted_fg = cx.theme().muted_foreground;
@@ -2740,6 +2773,98 @@ mod tests {
         assert!(
             !GOOGLE_AUTH_EXPIRED_NOTICE.contains('{'),
             "案内に生の応答が混ざっている: {GOOGLE_AUTH_EXPIRED_NOTICE}"
+        );
+    }
+
+    /// 非表示の本を 1 冊 seed する（設定画面の「非表示にした本」一覧に出る）。
+    fn seed_hidden_item(cx: &mut TestAppContext, site_id: &str, database_id: &str) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::bookshelf::upsert(
+                db,
+                &db::bookshelf::BookshelfItem {
+                    site_id: site_id.into(),
+                    database_id: database_id.into(),
+                    title: "非表示の本".into(),
+                    circle_name: "サークル".into(),
+                    author: String::new(),
+                    thumbnail_url: None,
+                    format: "PDF".into(),
+                    caused_at: None,
+                    event_name: None,
+                    event_slug: None,
+                    event_id: None,
+                    file_name: None,
+                    download_url: None,
+                    is_downloadable: 1,
+                    is_checked: 0,
+                    is_purchased: 1,
+                    is_new: 0,
+                    is_active: 1,
+                    is_favorite: 0,
+                    is_hidden: 1,
+                    hidden_at: Some("2026-08-21 00:00:00".into()),
+                    tags_json: None,
+                    synced_at: "2026-08-21 00:00:00".into(),
+                    created_at: "2026-08-21 00:00:00".into(),
+                    updated_at: "2026-08-21 00:00:00".into(),
+                    media_category: None,
+                    ai_type: None,
+                    is_drm: 0,
+                    release_date: None,
+                    description: None,
+                    theme: None,
+                    maker_id: None,
+                    page_count: None,
+                    age_rating: None,
+                    series_name: None,
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    /// 設定画面は、読み込んだ時点（`reload`）の状態をそのまま表示する。
+    ///
+    /// 以前はこれを `render` の中で毎回やっていた（`list_hidden` + 全書籍ぶんの進捗クエリ +
+    /// 表紙キャッシュの有無チェック）ため、**スクロールのたびに DB を引き直していた**
+    /// （実機の実測: ホイール 1 ノッチあたり約 600 クエリ）。描画はキャッシュを出すだけにする。
+    #[gpui_kit::test]
+    async fn render_uses_loaded_state_without_requerying(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_hidden_item(cx, "booth", "hidden-1");
+        let view = cx.new(SettingsView::new);
+        // 画面に入ったときに読み込む
+        cx.update(|cx| view.update(cx, |this, cx| this.reload(cx)));
+        assert_eq!(
+            cx.read(|cx| view.read(cx).hidden_items.len()),
+            1,
+            "reload で非表示の一覧が読み込まれていない"
+        );
+        // 画面を見ていない間にデータが変わる（本棚側で非表示が解除された、相当）
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::bookshelf::set_hidden(db, "booth", "hidden-1", false).unwrap();
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..3 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        assert_eq!(
+            cx.read(|cx| view.read(cx).hidden_items.len()),
+            1,
+            "描画で状態を読み直している（スクロールのたびに DB を引く原因）"
         );
     }
 
