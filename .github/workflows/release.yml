@@ -74,8 +74,15 @@ jobs:
               exit 1
               ;;
           esac
-          gh release download "chromium/7881" --repo bblanchon/pdfium-binaries \
-            --pattern "pdfium-${asset}.tgz" --output pdfium.tgz
+          # アセットは gh の API でアセット ID を引いてから落とす。
+          # `gh release download --pattern` は、タグに `/` を含むリリースで macOS ランナーの
+          # gh だと "no assets match the file pattern" になる（Windows ランナーでは成功する）。
+          # パターン照合に依存しない経路にして、ランナー差をなくす。
+          asset_id=$(gh api "repos/bblanchon/pdfium-binaries/releases/tags/chromium%2F7881" \
+            --jq ".assets[] | select(.name == \"pdfium-${asset}.tgz\") | .id")
+          test -n "$asset_id"
+          gh api "repos/bblanchon/pdfium-binaries/releases/assets/${asset_id}" \
+            -H "Accept: application/octet-stream" > pdfium.tgz
           echo "${sha}  pdfium.tgz" | shasum -a 256 -c -
           tar -xzf pdfium.tgz lib/libpdfium.dylib
 

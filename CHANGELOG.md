@@ -148,8 +148,10 @@
 - **Release ワークフローの pdfium 取得が macOS で 404 になる問題**: リリースのアセットを
   CDN の URL 直叩き（`curl` / `Invoke-WebRequest`）で取得していたため、macOS ランナーから
   404 が返って 2 ジョブが失敗した（同じタグの Windows 用アセットは取得できていた）。
-  `gh release download`（API 経由でアセットを解決）に変更した。ピン留めしている SHA256 は
-  3 アセットとも取得物と一致することを確認済み。
+  `gh api` でアセット ID を引いてから API 経由で落とす方式に変更した（`gh release download` の
+  `--pattern` は、タグに `/` を含むリリースで macOS ランナーの gh だと "no assets match the
+  file pattern" になるため）。ピン留めしている SHA256 は 3 アセットとも取得物と一致することを
+  確認済み。
 - **タイトルバーが埋もれていて信号機が押せない**: `TitleBar::window_options()` は透過タイトルバー +
   `app_owns_titlebar_drag` を指定する（＝タイトルバーはアプリが描く契約）。macOS ではタイトルバーを
   描いていなかったため、信号機（閉じる / 最小化 / 最大化）が本棚のヘッダーに重なって押せず、
