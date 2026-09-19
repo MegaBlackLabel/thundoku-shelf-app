@@ -19,24 +19,44 @@
 | macOS (Intel) | `thundoku-shelf-x.y.z-x86_64-macos.zip` |
 
 - **Windows**: 展開したフォルダに `pdfium.dll`（PDF 表示用）が入っています。**exe と同じフォルダに置いたまま**使ってください。初回起動時に SmartScreen の警告が出たら「詳細情報」→「実行」で進めます。
-- **macOS**: zip を展開すると `ThundokuShelf.app` が出てきます（Applications に移すと Launchpad からも起動できます）。署名・公証を行っていないため、初回は Gatekeeper に止められます。**macOS 15 (Sequoia) 以降は、右クリック →「開く」が Gatekeeper の回避として機能しません**（メニューには出ますが効きません）。次のいずれかで起動してください。
-  - アプリをダブルクリック → 警告が出たら「完了」→ **システム設定 →「プライバシーとセキュリティ」→「このまま開く」**（失敗から約 1 時間以内に表示されます）
-  - ターミナルで `xattr -dr com.apple.quarantine /Applications/ThundokuShelf.app`
-  - 最初から隔離させない場合は、ブラウザではなくターミナルで落とす（隔離属性が付かず Gatekeeper の判定自体が走りません。`x.y.z` と `arch` は実際の値に置き換え。`~/Applications` なら管理者権限は不要、`/Applications` でも構いません）
 
-    ```sh
-    mkdir -p ~/Applications
-    curl -fL -o /tmp/t.zip https://github.com/MegaBlackLabel/thundoku-shelf-app/releases/download/vx.y.z/thundoku-shelf-x.y.z-arch-macos.zip
-    shasum -a 256 /tmp/t.zip   # 下のコマンドが出す digest と一致することを確認
-    ditto -x -k /tmp/t.zip ~/Applications/
-    open ~/Applications/ThundokuShelf.app
-    ```
+### macOS の初回起動（Important）
 
-    整合性の確認（`vx.y.z` は実際のタグ）:
+> [!IMPORTANT]
+> **macOS は初回だけ Gatekeeper の解除が必要です。** このアプリは Apple の公証を受けていないため、ダウンロードしたままだと起動できません（現在 Developer ID を申請中で、取得でき次第この手順は不要になります）。
 
-    ```sh
-    curl -s https://api.github.com/repos/MegaBlackLabel/thundoku-shelf-app/releases/tags/vx.y.z | grep -o 'sha256:[0-9a-f]\{64\}'
-    ```
+macOS の zip を展開すると `ThundokuShelf.app` が出てきます。Applications に移してから、次の手順で起動してください。
+
+1. アプリをダブルクリック → 「開発元を検証できません」と表示されたら **「完了」** を押す
+2. **システム設定 →「プライバシーとセキュリティ」** を開き、「セキュリティ」の欄に出ている **「このまま開く」** を押す → 認証 → **「開く」**
+   - 「このまま開く」は 1 の失敗から**約 1 時間以内**しか表示されません
+3. 次回以降は普通のアプリと同じように起動できます
+
+> [!NOTE]
+> **macOS 15 (Sequoia) 以降では、右クリック →「開く」は Gatekeeper の回避として機能しません**（メニューには出ますが効きません）。上の 1〜2 を使ってください。
+
+うまくいかない場合は、ターミナルで隔離属性を外してから開きます:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/ThundokuShelf.app
+open /Applications/ThundokuShelf.app
+```
+
+最初から隔離させない方法もあります（ブラウザではなくターミナルで落とすと隔離属性が付かず、Gatekeeper の判定自体が走りません。`x.y.z` と `arch` は実際の値に置き換え。`~/Applications` なら管理者権限は不要、`/Applications` でも構いません）:
+
+```sh
+mkdir -p ~/Applications
+curl -fL -o /tmp/t.zip https://github.com/MegaBlackLabel/thundoku-shelf-app/releases/download/vx.y.z/thundoku-shelf-x.y.z-arch-macos.zip
+shasum -a 256 /tmp/t.zip   # 下のコマンドが出す digest と一致することを確認
+ditto -x -k /tmp/t.zip ~/Applications/
+open ~/Applications/ThundokuShelf.app
+```
+
+整合性の確認（`vx.y.z` は実際のタグ）:
+
+```sh
+curl -s https://api.github.com/repos/MegaBlackLabel/thundoku-shelf-app/releases/tags/vx.y.z | grep -o 'sha256:[0-9a-f]\{64\}'
+```
 
 ## 使い方
 
@@ -83,7 +103,7 @@
 - Google ログインはバックアップ用です。**書籍を読むのにログインは不要**です
 - 「レポート」の画像添付は、投稿先リポジトリへの書き込み権限が必要です。権限が無い場合は本文のみで送信できます
 - レポートの投稿先はこのアプリのリポジトリ（`MegaBlackLabel/thundoku-shelf-app`）に固定です
-- macOS 版は署名・公証を行っていません（起動方法は「ダウンロードとインストール」を参照）
+- macOS 版は署名・公証を行っていません（**Developer ID を申請中**）。初回起動の手順は「[macOS の初回起動](#macos-の初回起動important)」を参照
 
 ## 開発者向け
 
