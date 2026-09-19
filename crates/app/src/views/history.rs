@@ -25,10 +25,10 @@ use crate::actions::OpenReader;
 use crate::app_state::AppState;
 use crate::icons::AppIcon;
 use crate::views::bookshelf::{
-    CARD_TAGS_COLLAPSED_MAX, CHIP_HEART_BUTTON, CHIP_HEART_ICON, LIST_COVER_MIN_H, LIST_COVER_W,
-    LIST_INFO_W, LIST_TAGS_W_RATIO, SIDEBAR_W, TagOrder, ViewMode, cover_fit_inside_frame,
-    fit_cover_size, list_tags_visible_count, load_cached_cover, load_cover_image, no_image_cover,
-    owned_book_ids, placeholder_cover,
+    CARD_TAGS_COLLAPSED_MAX, CHIP_HEART_BUTTON, CHIP_HEART_ICON, CoverBadge, LIST_COVER_MIN_H,
+    LIST_COVER_W, LIST_INFO_W, LIST_TAGS_W_RATIO, SIDEBAR_W, TagOrder, ViewMode, cover_badge,
+    cover_fit_inside_frame, fit_cover_size, list_tags_visible_count, load_cached_cover,
+    load_cover_image, no_image_cover, owned_book_ids, placeholder_cover,
 };
 
 /// 期間フィルタ。
@@ -732,6 +732,8 @@ impl HistoryView {
             .clone()
             .or_else(|| placeholder_cover(&item.book.title, &item.book.circle_name))
             .or_else(no_image_cover);
+        // 表紙に重ねるバッジ（右上 = お気に入り / 右下 = ダウンロード済み）。本棚のカードと共有する
+        let (favorite_badge, downloaded_badge) = card_badges(item.book.is_favorite == 1);
         let cover_h: f32 = (card_width * 0.75).clamp(120.0, 320.0);
         let (draw_w, draw_h) = match &cover {
             Some(render) => {
@@ -794,32 +796,31 @@ impl HistoryView {
                 }
                 .into_any_element()
             })
-            // 右上: お気に入りハート（本棚のカードと同じ）
-            .child(Self::render_heart(theme, handle, item, 24.0))
-            // 右下: ダウンロード済みバッジ（本棚のカードと同じ。履歴はすべてローカル本）
+            // 右上: お気に入りハート（本棚のカードと同じ。表紙の上に重ねる）
             .child(
-                div()
-                    .debug_selector({
-                        let selector = format!("history-card-cover-downloaded-{database_id}");
-                        move || selector.clone()
-                    })
+                cover_badge(favorite_badge, format!("history-heart-{database_id}"))
                     .absolute()
                     .right_1()
-                    .bottom_1()
-                    .rounded_full()
-                    .w(px(24.0))
-                    .h(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui_kit::rgba(0x05966933))
-                    .child(
-                        div()
-                            .text_color(gpui_kit::rgb(0x059669))
-                            .text_sm()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child("✓"),
-                    ),
+                    .top_1()
+                    .cursor_pointer()
+                    .on_click({
+                        let handle = handle.clone();
+                        let book_id = database_id.clone();
+                        move |_, _, cx| {
+                            cx.stop_propagation();
+                            handle.update(cx, |this, cx| this.toggle_favorite(cx, &book_id));
+                        }
+                    }),
+            )
+            // 右下: ダウンロード済みバッジ（本棚のカードと同じ。履歴の本はすべてローカル本）
+            .child(
+                cover_badge(
+                    downloaded_badge,
+                    format!("history-card-cover-downloaded-{database_id}"),
+                )
+                .absolute()
+                .right_1()
+                .bottom_1(),
             );
 
         let image: AnyElement = div()
@@ -1315,7 +1316,8 @@ impl HistoryView {
             .into_any_element()
     }
 
-    /// お気に入りハート（本棚のカードと同じ丸ボタン）。
+    /// お気に入りハート（リストの状態列の丸ボタン）。行の背景の上に乗るのでテーマの色で塗る。
+    /// **表紙の上に重ねるカードは `cover_badge`**（本棚のカードと共有。表紙の上で読める配色）を使う。
     fn render_heart(
         theme: &gpui_kit::component::Theme,
         handle: &Entity<Self>,
@@ -1362,6 +1364,15 @@ impl HistoryView {
             )
             .into_any_element()
     }
+}
+
+/// 履歴カードの表紙に重ねるバッジ（本棚のカードと同じ `CoverBadge` を共有する）。
+/// 右上 = お気に入り（`books.is_favorite`）、右下 = ダウンロード済み（履歴の本は必ずローカル本）。
+fn card_badges(is_favorite: bool) -> (CoverBadge, CoverBadge) {
+    (
+        CoverBadge::favorite(is_favorite),
+        CoverBadge::downloaded(true),
+    )
 }
 
 /// 日付バーの背景色。カードの `muted` と区別できるようプライマリを薄く敷く
@@ -1778,6 +1789,107 @@ mod tests {
                 &state.data_dir.join("thumbnails"),
                 "techbookfest",
                 "db-cache-1",
+            );
+            let _ = std::fs::remove_file(path);
+        });
+    }
+
+    /// 履歴カードの表紙オーバーレイ（右上 = お気に入り / 右下 = ダウンロード済み）は、
+    /// **本棚のカードと同じ `CoverBadge`** を使う。表紙の上で読める配色（オフ = 60% 黒の
+    /// スクリム + 白アイコン / オン = 不透明の色チップ + 白アイコン）と、状態で形が変わること、
+    /// ホバー説明はこの共有で揃う。履歴はすべてローカル本なので、ダウンロードは常に「済み」。
+    #[test]
+    fn history_card_badges_reuse_the_shelf_cover_badges() {
+        assert_eq!(
+            card_badges(true),
+            (CoverBadge::favorite(true), CoverBadge::downloaded(true))
+        );
+        assert_eq!(
+            card_badges(false),
+            (
+                CoverBadge::favorite(false),
+                // 「未ダウンロード」にすると、取り込み済みの本に「カードをクリックで取り込み」と
+                // 出てしまう（履歴の本は必ずローカル本）
+                CoverBadge::downloaded(true)
+            )
+        );
+    }
+
+    /// カードの表紙オーバーレイ（右上 = お気に入り / 右下 = ダウンロード済み）は
+    /// **表紙の枠の内側**に乗る（本棚のカードと同じ位置。表紙の外＝隣のカードに食い込まない）。
+    #[gpui_kit::test]
+    async fn history_card_badges_sit_inside_the_cover(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::{Duration, Utc};
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book(cx, "b1", "本1", "techbookfest");
+        // 本棚アイテムに紐づけて、表紙のサムネイル（3:4）を置く
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let pool = &state.db_pool;
+            db::bookshelf::upsert(
+                pool,
+                &db::bookshelf::BookshelfItem {
+                    ..test_shelf_item("db-1")
+                },
+            )
+            .unwrap();
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = 'db-1' WHERE id = 'b1'")
+                    .execute(pool)
+                    .await
+            })
+            .unwrap();
+            let dir = state.data_dir.join("thumbnails");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = crate::views::bookshelf::cover_cache_path(&dir, "techbookfest", "db-1");
+            let image = image::RgbImage::from_pixel(300, 400, image::Rgb([10, 20, 30]));
+            image::DynamicImage::ImageRgb8(image).save(&path).unwrap();
+        });
+        add_session(cx, "s1", "b1", Utc::now() - Duration::hours(1), 10);
+
+        let view = cx.new(HistoryView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let cover = visual
+            .debug_bounds("history-card-cover-img-b1")
+            .expect("カードの表紙画像が出ていない");
+        for selector in ["history-heart-b1", "history-card-cover-downloaded-b1"] {
+            let badge = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} が出ていない"));
+            let (cx0, cy0) = (cover.origin.x.as_f32(), cover.origin.y.as_f32());
+            let (cw, ch) = (cover.size.width.as_f32(), cover.size.height.as_f32());
+            let (bx, by) = (badge.origin.x.as_f32(), badge.origin.y.as_f32());
+            let (bw, bh) = (badge.size.width.as_f32(), badge.size.height.as_f32());
+            assert!(
+                bx >= cx0 - 0.5
+                    && by >= cy0 - 0.5
+                    && bx + bw <= cx0 + cw + 0.5
+                    && by + bh <= cy0 + ch + 0.5,
+                "{selector} が表紙の外に出ている（表紙 {cx0},{cy0} {cw}x{ch} / \
+                 バッジ {bx},{by} {bw}x{bh}）"
+            );
+        }
+        // 後始末（temp のキャッシュを残さない）
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            let path = crate::views::bookshelf::cover_cache_path(
+                &state.data_dir.join("thumbnails"),
+                "techbookfest",
+                "db-1",
             );
             let _ = std::fs::remove_file(path);
         });

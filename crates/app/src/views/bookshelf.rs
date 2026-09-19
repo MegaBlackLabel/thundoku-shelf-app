@@ -312,19 +312,19 @@ impl BadgeGlyph {
     }
 }
 
-/// 表紙に重ねるバッジ（お気に入り / ダウンロード）。
+/// 表紙に重ねるバッジ（お気に入り / ダウンロード）。本棚と閲覧履歴のカードで共有する。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CoverBadge {
+pub(crate) enum CoverBadge {
     Favorite { on: bool },
     Downloaded { on: bool },
 }
 
 impl CoverBadge {
-    fn favorite(on: bool) -> Self {
+    pub(crate) fn favorite(on: bool) -> Self {
         Self::Favorite { on }
     }
 
-    fn downloaded(on: bool) -> Self {
+    pub(crate) fn downloaded(on: bool) -> Self {
         Self::Downloaded { on }
     }
 
@@ -362,7 +362,8 @@ impl CoverBadge {
 }
 
 /// 表紙に重ねる丸バッジ。位置（`.absolute()` など）とクリックは呼び出し側で付ける。
-fn cover_badge(badge: CoverBadge, id: String) -> gpui_kit::Stateful<gpui_kit::Div> {
+/// 本棚と閲覧履歴のカードで共有する。
+pub(crate) fn cover_badge(badge: CoverBadge, id: String) -> gpui_kit::Stateful<gpui_kit::Div> {
     let colors = badge.colors();
     let tooltip: SharedString = badge.tooltip().into();
     div()
