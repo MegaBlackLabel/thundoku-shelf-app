@@ -2185,6 +2185,19 @@ impl Workspace {
             )
     }
 
+    /// 未読数バッジに出すラベル。3 桁で頭打ちにする。
+    ///
+    /// バッジはロゴのタイル（36×36）の右上に載るので、桁が増えるほどタイルを覆う
+    /// （実測: 4 桁で ~34px = タイル幅の 94%、5 桁で ~40px = タイルより広い）。
+    /// 「99+」は「99 より多い」を保ったまま 3 グリフに収まる最大の表現。
+    fn unread_badge_label(count: usize) -> String {
+        if count > 99 {
+            "99+".to_string()
+        } else {
+            count.to_string()
+        }
+    }
+
     /// サイドバーのロゴ（ブックマーク + 未読バッジ）。
     ///
     /// `unread` は**本棚のときだけ** `Some` が渡される（呼び出し側で判定する）。
@@ -2235,17 +2248,21 @@ impl Workspace {
                     .absolute()
                     .right(px(-4.0))
                     .top(px(-4.0))
-                    .min_w(px(16.0))
-                    .h(px(16.0))
-                    .px_1()
+                    // タイル（36×36）の右上に載るので小さく保つ。10px フォント + 4px 余白で
+                    // 桁数無制限だと、3 桁で 28×16（タイルの 35%）になり、タイルの右上
+                    // 67% を覆ってロゴを隠していた（実機の実測）。9px / 3px 余白 / 14px 角で
+                    // タイルの 25% 前後に収まる。
+                    .min_w(px(14.0))
+                    .h(px(14.0))
+                    .px(px(3.0))
                     .rounded_full()
                     .bg(badge_color)
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_color(theme.primary_foreground)
-                    .text_xs()
-                    .child(count.to_string())
+                    .text_size(px(9.0))
+                    .child(Self::unread_badge_label(count))
                     .into_any_element(),
                 None => div().into_any_element(),
             })
@@ -3599,6 +3616,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 未読数バッジがロゴのタイル（36×36）を覆い尽くさない。
+    ///
+    /// バッジはタイルの右上に載るので、大きいとロゴそのものを隠す。実機（272 件）では
+    /// 10px フォント + 4px 余白のピルが 28×16 = タイルの **35%** になり、タイルの右上
+    /// 67% を覆っていた（ロゴのグリフの上端が隠れて見えない）。
+    /// 9px フォント / 3px 余白 / 14px 角に詰めると 23×14 = **25%** になる。
+    /// 面積がタイルの 30% 未満に収まっていることを見る。
+    #[gpui_kit::test]
+    async fn unread_badge_does_not_dominate_the_logo_tile(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = false;
+                w.switch_to(NavTarget::Bookshelf, cx);
+                w.unread_count = 272;
+                cx.notify();
+            });
+        });
+        draw_frames(visual);
+        let tile = visual
+            .debug_bounds("sidebar-logo")
+            .expect("ロゴのタイルが無い");
+        let badge = visual
+            .debug_bounds("sidebar-unread-badge")
+            .expect("未読数バッジが無い");
+        let ratio = (badge.size.width.as_f32() * badge.size.height.as_f32())
+            / (tile.size.width.as_f32() * tile.size.height.as_f32());
+        assert!(
+            ratio < 0.30,
+            "バッジがタイルを覆いすぎ: badge={:?} tile={:?} ratio={ratio:.3}",
+            badge.size,
+            tile.size
+        );
+    }
+
+    /// 未読数バッジのラベルは 3 桁で頭打ちにする。
+    ///
+    /// バッジはロゴのタイル（36×36）の右上に載るので、桁が増えるほどタイルを覆う。
+    /// 「99+」は「99 より多い」を保ったまま 3 グリフ（＝今の見た目と同じ幅）に収まる
+    /// 最大の表現。4 桁以上は数字を出さない。
+    #[test]
+    fn unread_badge_label_caps_at_three_glyphs() {
+        assert_eq!(Workspace::unread_badge_label(1), "1");
+        assert_eq!(Workspace::unread_badge_label(9), "9");
+        assert_eq!(Workspace::unread_badge_label(10), "10");
+        assert_eq!(Workspace::unread_badge_label(99), "99");
+        assert_eq!(Workspace::unread_badge_label(100), "99+");
+        assert_eq!(Workspace::unread_badge_label(272), "99+");
+        assert_eq!(Workspace::unread_badge_label(usize::MAX), "99+");
     }
 
     /// サイドバーの「お気に入り」: 本棚と同じビューを使い、**お気に入りの絞り込みボタンは
