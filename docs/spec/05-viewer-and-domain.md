@@ -30,8 +30,7 @@
 | `AUTOPLAY_DEFAULT_MS` | `5000` | ms | 自動再生間隔の既定値（`pub`） | `crates/app/src/components/image_viewer/mod.rs:36` |
 | `AUTOPLAY_STEP_MS` | `1000` | ms | スライダーの刻み / `+` `-` ボタンの増減量（`pub`） | `crates/app/src/components/image_viewer/mod.rs:37` |
 | `OVERLAY_HIDE_MS` | `5000` | ms | 無操作でトップパネル / ボトムドックを自動非表示にするまでの時間 | `crates/app/src/components/image_viewer/mod.rs:38` |
-| `WIN_TITLE_BAR_HEIGHT`（Windows） | `36.0` | px | カスタムタイトルバーの高さ。フィット計算でウィンドウ高から差し引く | `crates/app/src/components/image_viewer/mod.rs:43` |
-| `WIN_TITLE_BAR_HEIGHT`（非 Windows） | `0.0` | px | 同上（Mac は 0） | `crates/app/src/components/image_viewer/mod.rs:45` |
+| `WIN_TITLE_BAR_HEIGHT` | `workspace::TITLE_BAR_HEIGHT` を参照（`36.0` Windows / `34.0` 非 Windows） | px | タイトルバーの高さ。フィット計算でウィンドウ高から差し引く（リーダーはタイトルバーの下に描く） | `crates/app/src/components/image_viewer/mod.rs:44` |
 | `PAGE_THUMB_WIDTH` | `200.0` | px | ページ一覧サムネイルの幅（`load_thumb` の縮小先） | `crates/app/src/components/image_viewer/mod.rs:48` |
 | `MAX_PAGE_THUMBS` | `120` | 枚 | ページ一覧サムネイルの同時保持上限（超えたら古い順に捨てる。1 枚 ≒ 0.2MB → 24MB 程度） | `crates/app/src/components/image_viewer/mod.rs:51` |
 | `PAGE_TILE_WIDTH` | `108.0` | px | ページ一覧タイル幅 + gap（列数の計算に使う） | `crates/app/src/components/image_viewer/mod.rs:53` |
