@@ -38,7 +38,8 @@ pub const AUTOPLAY_DEFAULT_MS: u64 = 5000;
 pub const AUTOPLAY_STEP_MS: u64 = 1000;
 const OVERLAY_HIDE_MS: u64 = 5000;
 
-/// ホイールで 1 ページ送るのに必要な行数（1 ノッチ相当）。
+/// ホイールで 1 回送るのに必要な行数（1 ノッチ相当）。送り幅は表示モードに従う
+/// （見開き = 1 見開き、単一 = 1 ページ）。
 ///
 /// Windows の既定は 1 ノッチ = 3 行（`WM_MOUSEWHEEL` の 120 と SPI_GETWHEELSCROLLLINES）。
 /// 累積してこの値に届いたら **1 回だけ** 動かす（フリースピンホイールやトラックパッドの
@@ -372,7 +373,8 @@ pub struct ImageViewer {
     /// ホイール方向（true = 下スクロールで次へ。既定）。
     /// 設定 `viewer.wheel_direction` の値から決める。
     wheel_down_to_next: bool,
-    /// ホイールの累積量（行）。1 ノッチ（`WHEEL_TURN_LINES`）溜まったら 1 ページ送る。
+    /// ホイールの累積量（行）。1 ノッチ（`WHEEL_TURN_LINES`）溜まったら 1 回送る
+    /// （送り幅は表示モードに従う）。
     wheel_accum: f32,
     hide_generation: u64,
     /// 連続ページ送りの回数（2 回以上でトップ/ボトムメニューを非表示にする）
@@ -1385,10 +1387,14 @@ impl ImageViewer {
         self.ensure_loaded(cx, self.current_page);
         if self.mode != ViewMode::Scroll {
             let count = self.loader.page_count().saturating_sub(1);
-            // 前後 2 ページを先読み（libwebp デコードが数十 ms になったため
-            // 並列 5 ページでも CPU は飽和しない。これでページ送り時の
-            // 一瞬の「読込中」表示も消える）
-            for offset in 1..=2 {
+            // 前後を先読み（libwebp デコードが数十 ms になったため
+            // 並列に読んでも CPU は飽和しない。これでページ送り時の
+            // 一瞬の「読込中」表示も消える）。
+            // 見開きは表示が 2 ページ単位（[current, current+1]）なので、
+            // 次の見開きの 2 枚目（current+3）まで先読みしないと、送った直後に
+            // 片方が未読のままになり見開き全体が白い箱で描かれる（フラッシュ）。
+            let prefetch = if self.mode == ViewMode::Spread { 3 } else { 2 };
+            for offset in 1..=prefetch {
                 self.ensure_loaded(cx, self.current_page.saturating_sub(offset));
                 self.ensure_loaded(cx, (self.current_page + offset).min(count));
             }
@@ -2825,9 +2831,10 @@ impl Render for ImageViewer {
                                     });
                                     return;
                                 }
-                                // 通常ホイール = ページ送り（1 ノッチ = 1 ページ）。
-                                // 見開きモードでも 1 ページだけ送る（`*_page_shift` は
-                                // 見開きでも 1 ページ動く版）。
+                                // 通常ホイール = ページ送り（1 ノッチ = 1 回ぶん）。
+                                // 送り幅は表示モードに合わせる: 見開きは 1 見開き（2 ページ）、
+                                // 単一は 1 ページ。見開きで 1 ページ送りにすると綴じ位置が
+                                // 1 枚ずつズレていくため（`*_page_shift` は使わない）。
                                 // 累積して 1 ノッチぶんになったら 1 回だけ動かす。
                                 // Ctrl はズーム、UI パネル上（ページ一覧など）は対象外。
                                 if !event.modifiers.control && !this.hovering_ui {
@@ -2847,9 +2854,9 @@ impl Render for ImageViewer {
                                         let down = this.wheel_accum < 0.0;
                                         this.wheel_accum = 0.0;
                                         if down == this.wheel_down_to_next {
-                                            this.next_page_shift(cx);
+                                            this.next_page(cx);
                                         } else {
-                                            this.prev_page_shift(cx);
+                                            this.prev_page(cx);
                                         }
                                     }
                                     return;
@@ -3765,7 +3772,7 @@ mod tests {
         });
     }
 
-    /// ホイール 1 ノッチで 1 ページ送る（既定は「下スクロールで次へ」）。
+    /// 単一モードではホイール 1 ノッチで 1 ページ送る（既定は「下スクロールで次へ」）。
     ///
     /// macOS は AppKit がユーザー設定（ナチュラルスクロール）を反映した delta を渡すので、
     /// 同じ規則で「ユーザーにとっての下」がそのまま次へになる（アプリ側で二重反転しない）。
@@ -3864,9 +3871,10 @@ mod tests {
         );
     }
 
-    /// 見開きモードでもホイール 1 ノッチ = 1 ページ（見開きで 2 ページ進めない）。
+    /// 見開きモードのホイールは**見開き単位**で送る。
+    /// 1 ページずつ送ると綴じ位置が 1 枚ずつズレていく（[0,1] -> [1,2] -> [2,3]）。
     #[gpui_kit::test]
-    async fn wheel_scroll_turns_a_single_page_in_spread_mode(cx: &mut TestAppContext) {
+    async fn wheel_scroll_turns_a_spread_in_spread_mode(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         let view = viewer(cx, 10);
         let window = cx.open_window(
@@ -3881,18 +3889,62 @@ mod tests {
             let _ = window.draw(cx);
         });
         cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
+        assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![0, 1]);
 
+        // 1 ノッチ = 次の見開き。[0,1] -> [2,3]
         wheel(visual, -3.0);
         assert_eq!(
-            view.read_with(cx, |v, _| v.current_page),
-            1,
-            "見開きで 1 ノッチが 2 ページ進んでいる"
+            view.read_with(cx, |v, _| v.spread_pages()),
+            vec![2, 3],
+            "見開きのホイールが 1 ページずつズレている"
         );
+        // 続けて送っても見開きの組が崩れない
+        wheel(visual, -3.0);
+        assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![4, 5]);
+
+        // 戻りも見開き単位
         wheel(visual, 3.0);
-        assert_eq!(
-            view.read_with(cx, |v, _| v.current_page),
-            0,
-            "見開きで 1 ノッチが 2 ページ戻っている"
+        assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![2, 3]);
+        wheel(visual, 3.0);
+        assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![0, 1]);
+    }
+
+    /// 見開きで送った直後、次の見開きの 2 ページが揃っていること。
+    /// 揃っていないと `spread_ready` が false になり、見開き全体が白い箱で
+    /// 描かれて一瞬フラッシュする（読み込み済みのページまで消える）。
+    #[gpui_kit::test]
+    async fn spread_page_turn_has_the_next_pair_already_loaded(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 10);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
+        cx.run_until_parked();
+
+        let pair_loaded = |view: &Entity<ImageViewer>, cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| {
+                v.spread_pages()
+                    .iter()
+                    .all(|&index| v.images.get(index).is_some_and(|slot| slot.is_some()))
+            })
+        };
+        assert!(pair_loaded(&view, cx), "[0,1] が揃っていない");
+
+        // 送った直後（バックグラウンドのロード完了を待たずに）揃っていること
+        cx.update(|cx| view.update(cx, |this, cx| this.next_page(cx)));
+        assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![2, 3]);
+        assert!(
+            pair_loaded(&view, cx),
+            "次の見開き [2,3] が揃っておらず、白い箱（フラッシュ）が出る"
         );
     }
 
