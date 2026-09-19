@@ -38,12 +38,10 @@ pub const AUTOPLAY_DEFAULT_MS: u64 = 5000;
 pub const AUTOPLAY_STEP_MS: u64 = 1000;
 const OVERLAY_HIDE_MS: u64 = 5000;
 
-/// ウィンドウカスタムタイトルバーの高さ（px）。リーダーはタイトルバーを残すため、
-/// 画像のフィット計算でウィンドウ全体の高さから差し引く（Windows のみ。Mac は 0）。
-#[cfg(windows)]
-const WIN_TITLE_BAR_HEIGHT: f32 = 36.0;
-#[cfg(not(windows))]
-const WIN_TITLE_BAR_HEIGHT: f32 = 0.0;
+/// タイトルバーの高さ（px）。リーダーはタイトルバーを残すため、画像のフィット計算で
+/// ウィンドウ全体の高さから差し引く。実際の値は `workspace::TITLE_BAR_HEIGHT` が持つ
+/// （Windows はアプリ自前のタイトルバー 36 px、非 Windows は gpui-kit の 34 px）。
+const WIN_TITLE_BAR_HEIGHT: f32 = crate::workspace::TITLE_BAR_HEIGHT;
 
 /// ページ一覧に出すサムネイルの幅（px）。表示用のフル解像度ページとは別に持つ。
 const PAGE_THUMB_WIDTH: f32 = 200.0;

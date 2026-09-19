@@ -1476,7 +1476,7 @@ impl Render for Workspace {
                     Self::win_title_bar(window, &theme).into_any_element()
                 }
                 #[cfg(not(windows))]
-                div().into_any_element()
+                Self::title_bar().into_any_element()
             })
             .child(
                 div()
@@ -1498,18 +1498,19 @@ impl Render for Workspace {
                             .child(active_view),
                     ),
              )
-            // リーダーはサイドバー・タイトルバーの影響を受けないよう、ウィンドウ全体に
-            // absolute で重ねる（Mac はタイトルバーが無くリーダーが全ウィンドウに広がるため、
-            // Windows も同じ挙動にする）。これでリーダー内部のフィット計算
-            // （window.bounds().size）が実際の表示領域と一致し、見開き画像が右・下にはみ出さない。
+            // リーダーはサイドバーの影響を受けないよう、ウィンドウ幅いっぱいに absolute で
+            // 重ねる（上端はタイトルバーの下。タイトルバーは表示中も使えるように残す）。
+            // フィット計算（window.bounds().size - WIN_TITLE_BAR_HEIGHT）と実際の表示領域が
+            // 一致し、見開き画像が右・下にはみ出さない。
             .child(if let Some(reader) = &self.reader {
                 let view: AnyView = AnyView::from(reader.clone());
                 div()
                     .id("reader-overlay")
+                    .debug_selector(|| "reader-overlay".into())
                     .absolute()
                     // ウィンドウのタイトルバー（閉じる/最小化/最大化）は
                     // リーダー表示中も使えるように残す（top = タイトルバー高さ）。
-                    .top(px(36.0))
+                    .top(px(TITLE_BAR_HEIGHT))
                     .right_0()
                     .bottom_0()
                     .left_0()
@@ -1782,8 +1783,45 @@ impl Render for Workspace {
     }
 }
 
+/// ウィンドウ上部のタイトルバーの高さ（px）。
+///
+/// 非 Windows は gpui-kit の `TitleBar`（`TITLE_BAR_HEIGHT` = 34 px）を使うので、ここも
+/// 同じ値にする。リーダーのオーバーレイ上端（＝タイトルバーを隠さない位置）と、
+/// リーダー内部のフィット計算（`image_viewer::WIN_TITLE_BAR_HEIGHT`）がこの値を参照する。
+#[cfg(windows)]
+pub const TITLE_BAR_HEIGHT: f32 = 36.0;
+#[cfg(not(windows))]
+pub const TITLE_BAR_HEIGHT: f32 = 34.0;
+
 /// サイドバーの描画（72px の閉状態 ↔ 256px の開状態を 200ms でアニメーション）。
 impl Workspace {
+    /// macOS / Linux のウィンドウ上部のタイトルバー（gpui-kit の `TitleBar`）。
+    ///
+    /// `TitleBar::window_options()` は透過タイトルバー + `app_owns_titlebar_drag` を
+    /// 指定する。つまりタイトルバーはアプリが描く契約で、描かないと信号機（閉じる /
+    /// 最小化 / 最大化）が下のヘッダーに重なって押せなくなり、ウィンドウをドラッグ
+    /// する領域も無くなる。システムメニューバーがメニューを持つので、空いた左側は
+    /// ウィンドウ名に使う（gpui-kit の story アプリと同じ流儀）。
+    #[cfg(not(windows))]
+    fn title_bar() -> gpui_kit::AnyElement {
+        gpui_kit::component::TitleBar::new()
+            .child(
+                div()
+                    .debug_selector(|| "app-title-bar".into())
+                    .flex()
+                    .h_full()
+                    .items_center()
+                    .child(
+                        div()
+                            .debug_selector(|| "app-title-bar-title".into())
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .child("Thundoku Shelf"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Windows の自前タイトルバー（MangaReader 方式）。
     /// `.window_control_area()` でネイティブのドラッグ/最小化/最大化/閉じるを再現する。
     #[cfg(windows)]
@@ -1918,16 +1956,6 @@ impl Workspace {
             .flex_col()
             .relative()
             .overflow_hidden()
-            .pt({
-                #[cfg(windows)]
-                {
-                    px(0.0)
-                }
-                #[cfg(not(windows))]
-                {
-                    px(30.0)
-                }
-            })
             .on_click({
                 let handle = handle.clone();
                 move |_event, window, cx| {
@@ -1966,6 +1994,7 @@ impl Workspace {
             // ヘッダー（ロゴ行）
             .child(
                 div()
+                    .debug_selector(|| "sidebar-header".into())
                     .h(px(60.0))
                     .flex()
                     .items_center()
@@ -2736,6 +2765,109 @@ mod tests {
         });
         let after = ws.read_with(cx, |w, _| w.sidebar_open);
         assert_ne!(initial, after, "sidebar toggle must flip the open state");
+    }
+
+    /// ウィンドウ上部のタイトルバーにアプリ名が出て、信号機に重ならないこと。
+    ///
+    /// `TitleBar::window_options()` は透過タイトルバー + `app_owns_titlebar_drag` を
+    /// 指定する（＝タイトルバーはアプリが描く契約）。描かないと信号機が下のヘッダーに
+    /// 重なり、ウィンドウをドラッグする領域も無くなる。
+    #[cfg(target_os = "macos")]
+    #[gpui_kit::test]
+    async fn title_bar_shows_the_app_name_beside_the_traffic_lights(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        let title = visual
+            .debug_bounds("app-title-bar-title")
+            .expect("タイトルバーにアプリ名が出ていない");
+        // 信号機は左上 (9, 9) から 3 つ並ぶ（閉じる / 最小化 / 最大化）。
+        // 重なると押せなくなるので、その右から始まっていること。
+        assert!(
+            title.origin.x >= gpui_kit::px(80.0),
+            "タイトルバーのアプリ名が信号機に重なっている（x = {:?}）",
+            title.origin.x
+        );
+    }
+
+    /// リーダーを開いてもタイトルバーが隠れないこと（リーダーの上端がタイトルバーの直下）。
+    ///
+    /// リーダーは `absolute` のオーバーレイだが、ウィンドウのタイトルバー（閉じる /
+    /// 最小化 / 最大化）は表示中も使えるように残す。ずれるとタイトルバーが欠けるか、
+    /// 本棚のヘッダーが細く覗く。
+    #[cfg(target_os = "macos")]
+    #[gpui_kit::test]
+    async fn reader_overlay_starts_below_the_title_bar(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        let bar = visual
+            .debug_bounds("app-title-bar")
+            .expect("タイトルバーが出ていない");
+        let bar_bottom = bar.origin.y + bar.size.height;
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| w.open_reader(cx, "missing-book".into()));
+        });
+        draw_frames(visual);
+        let overlay = visual
+            .debug_bounds("reader-overlay")
+            .expect("リーダーのオーバーレイが出ていない");
+        assert!(
+            overlay.origin.y >= bar_bottom && overlay.origin.y <= bar_bottom + gpui_kit::px(1.0),
+            "リーダーの上端がタイトルバーの下端と合っていない（リーダー {:?} / タイトルバー下端 {:?}）",
+            overlay.origin.y,
+            bar_bottom
+        );
+    }
+
+    /// サイドバーの先頭（ロゴ行）が上端に張り付いていること。
+    ///
+    /// タイトルバーが信号機のぶんを確保しているので、サイドバー側にも同じ余白を置くと
+    /// 二重に下がる（macOS は 30 px が二重になっていた）。
+    #[cfg(target_os = "macos")]
+    #[gpui_kit::test]
+    async fn sidebar_header_sits_at_the_top(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        let sidebar = visual
+            .debug_bounds("sidebar")
+            .expect("サイドバーが出ていない");
+        let header = visual
+            .debug_bounds("sidebar-header")
+            .expect("サイドバーのロゴ行が出ていない");
+        assert_eq!(
+            header.origin.y, sidebar.origin.y,
+            "サイドバーのロゴ行が上端から下がっている（ロゴ行 {:?} / サイドバー上端 {:?}）",
+            header.origin.y, sidebar.origin.y
+        );
     }
 
     /// サイドバーの「閲覧履歴」行が出て、クリックで履歴ビューへ切り替わること。
