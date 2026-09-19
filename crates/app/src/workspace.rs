@@ -48,6 +48,8 @@ use thundoku_core::tbf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavTarget {
     Bookshelf,
+    /// お気に入り（本棚と同じビューをお気に入り固定で表示する）。
+    Favorites,
     History,
     Notes,
     Checklist,
@@ -85,6 +87,7 @@ pub fn app_menus(quit_enabled: bool, checklist_enabled: bool) -> Vec<Menu> {
         MenuItem::action("テーマを切り替え", crate::actions::ToggleTheme),
         MenuItem::separator(),
         MenuItem::action("本棚", crate::actions::ShowBookshelf),
+        MenuItem::action("お気に入り", crate::actions::ShowFavorites),
         MenuItem::action("閲覧履歴", crate::actions::ShowHistory),
         MenuItem::action("付箋", crate::actions::ShowNotes),
         MenuItem::action("チェックリスト", crate::actions::ShowChecklist)
@@ -385,6 +388,8 @@ impl Workspace {
     fn active_view(&self, _cx: &Context<Self>) -> AnyView {
         match self.active {
             NavTarget::Bookshelf => AnyView::from(self.bookshelf.clone()),
+            // お気に入りは本棚と同じビュー（表示中フラグでお気に入り固定にする）
+            NavTarget::Favorites => AnyView::from(self.bookshelf.clone()),
             NavTarget::History => AnyView::from(self.history.clone()),
             NavTarget::Notes => AnyView::from(self.notes.clone()),
             NavTarget::Checklist => AnyView::from(self.checklist.clone()),
@@ -396,6 +401,10 @@ impl Workspace {
     /// ナビゲーション先を切り替える。
     fn switch_to(&mut self, target: NavTarget, cx: &mut Context<Self>) {
         self.active = target;
+        // お気に入り画面は本棚と同じビューを共用する（表示と絞り込みだけ切り替える）
+        self.bookshelf.update(cx, |bookshelf, cx| {
+            bookshelf.set_favorites_only(target == NavTarget::Favorites, cx)
+        });
         let had_reader = self.reader.is_some();
         if self.reader.is_some() {
             self.reader = None;
@@ -1256,6 +1265,11 @@ impl Workspace {
             this.sidebar_open = true;
             cx.notify();
         });
+        reg!(crate::actions::ShowFavorites, |this, cx| {
+            this.switch_to(NavTarget::Favorites, cx);
+            this.sidebar_open = true;
+            cx.notify();
+        });
         reg!(crate::actions::ShowHistory, |this, cx| {
             this.switch_to(NavTarget::History, cx);
             this.sidebar_open = true;
@@ -2017,6 +2031,19 @@ impl Workspace {
                     })
                     .child(
                         self.nav_row(
+                            NavTarget::Favorites,
+                            Icon::new(AppIcon::HeartFilled)
+                                .size(px(24.0))
+                                .into_any_element(),
+                            "お気に入り",
+                            open,
+                            active,
+                            handle.clone(),
+                            cx,
+                        ),
+                    )
+                    .child(
+                        self.nav_row(
                             NavTarget::History,
                             Icon::new(AppIcon::History)
                                 .size(px(24.0))
@@ -2208,6 +2235,7 @@ impl Workspace {
         let label = label.to_string();
         let id = match target {
             NavTarget::Bookshelf => "sidebar-nav-bookshelf",
+            NavTarget::Favorites => "sidebar-nav-favorites",
             NavTarget::History => "sidebar-nav-history",
             NavTarget::Notes => "sidebar-nav-notes",
             NavTarget::Checklist => "sidebar-nav-checklist",
@@ -3419,6 +3447,7 @@ mod tests {
         for open in [false, true] {
             for (target, expected, label) in [
                 (NavTarget::Bookshelf, true, "本棚"),
+                (NavTarget::Favorites, false, "お気に入り"),
                 (NavTarget::History, false, "閲覧履歴"),
                 (NavTarget::Notes, false, "付箋"),
                 (NavTarget::Checklist, false, "チェックリスト"),
@@ -3449,6 +3478,139 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// サイドバーの「お気に入り」: 本棚と同じビューを使い、**お気に入りの絞り込みボタンは
+    /// 出さない**（画面そのものが絞り込み）。タイトルは「お気に入り」で、自動ダウンロードの
+    /// 説明を出す。
+    #[gpui_kit::test]
+    async fn favorites_screen_hides_the_favorite_filter_and_shows_the_note(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+
+        // 本棚: 絞り込みボタンは出る / 説明は出ない
+        cx.update(|cx| ws.update(cx, |w, cx| w.switch_to(NavTarget::Bookshelf, cx)));
+        draw_frames(visual);
+        assert!(
+            visual.debug_bounds("filter-favorite").is_some(),
+            "本棚にお気に入りの絞り込みボタンが出ていない"
+        );
+        assert!(
+            visual.debug_bounds("favorites-note").is_none(),
+            "本棚に自動ダウンロードの説明が出ている"
+        );
+
+        // お気に入り: 本棚のビューを出しつつ、絞り込みボタンは出さず説明を出す
+        cx.update(|cx| ws.update(cx, |w, cx| w.switch_to(NavTarget::Favorites, cx)));
+        draw_frames(visual);
+        assert!(
+            visual.debug_bounds("bookshelf-root").is_some(),
+            "お気に入り画面が本棚のビューを使っていない"
+        );
+        assert!(
+            visual.debug_bounds("filter-favorite").is_none(),
+            "お気に入り画面にお気に入りの絞り込みボタンが出ている"
+        );
+        assert!(
+            visual.debug_bounds("favorites-note").is_some(),
+            "お気に入り画面に自動ダウンロードの説明が出ていない"
+        );
+    }
+
+    /// お気に入り画面では「タグ取得」「同期」を出さない（本棚側の操作なので）。
+    #[gpui_kit::test]
+    async fn favorites_screen_hides_tag_fetch_and_sync(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+
+        // 本棚: どちらも出る
+        cx.update(|cx| ws.update(cx, |w, cx| w.switch_to(NavTarget::Bookshelf, cx)));
+        draw_frames(visual);
+        for selector in ["bookshelf-tag-fetch", "bookshelf-sync"] {
+            assert!(
+                visual.debug_bounds(selector).is_some(),
+                "本棚に {selector} が出ていない"
+            );
+        }
+
+        // お気に入り: どちらも出さない（お気に入り画面は本棚の操作を持たない）
+        cx.update(|cx| ws.update(cx, |w, cx| w.switch_to(NavTarget::Favorites, cx)));
+        draw_frames(visual);
+        for selector in ["bookshelf-tag-fetch", "bookshelf-sync"] {
+            assert!(
+                visual.debug_bounds(selector).is_none(),
+                "お気に入り画面に {selector} が出ている"
+            );
+        }
+    }
+
+    /// サイドバーの「お気に入り」行は本棚の下・閲覧履歴の上に出て、クリックで切り替わる。
+    #[gpui_kit::test]
+    async fn favorites_row_sits_below_bookshelf(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        let bookshelf = visual
+            .debug_bounds("sidebar-nav-bookshelf")
+            .expect("本棚の行が出ていない");
+        let favorites = visual
+            .debug_bounds("sidebar-nav-favorites")
+            .expect("お気に入りの行が出ていない");
+        let history = visual
+            .debug_bounds("sidebar-nav-history")
+            .expect("閲覧履歴の行が出ていない");
+        assert!(
+            bookshelf.origin.y < favorites.origin.y && favorites.origin.y < history.origin.y,
+            "並びが 本棚 → お気に入り → 閲覧履歴 になっていない: \
+             bookshelf_y={} favorites_y={} history_y={}",
+            bookshelf.origin.y.as_f32(),
+            favorites.origin.y.as_f32(),
+            history.origin.y.as_f32()
+        );
+
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| w.switch_to(NavTarget::Favorites, cx));
+        });
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Favorites,
+            "お気に入りへ切り替わっていない"
+        );
     }
 
     #[gpui_kit::test]

@@ -29,6 +29,8 @@ actions!(
         ToggleSidebar,
         /// Switch the main area to the bookshelf (メニュー用)。
         ShowBookshelf,
+        /// Switch the main area to the favorites (メニュー用)。
+        ShowFavorites,
         /// Switch the main area to the viewing history (メニュー用)。
         ShowHistory,
         /// Switch the main area to the page notes (付箋) screen (メニュー用)。

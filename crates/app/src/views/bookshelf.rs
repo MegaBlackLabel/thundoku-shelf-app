@@ -1132,6 +1132,11 @@ pub struct BookshelfView {
     focus_initialized: bool,
     /// 選択中のカード（filtered 内のインデックス）
     selected_index: Option<usize>,
+    /// サイドバーの「お気に入り」画面として表示中か（ワークスペースが切り替える）。
+    ///
+    /// 本棚と同じビューを共用し、**お気に入りだけ**を出す（画面そのものが絞り込みなので
+    /// お気に入りの絞り込みボタンは出さない）。
+    favorites_only: bool,
 }
 
 /// 取り込みの成功結果（読み飛ばしたエントリの警告付き）。
@@ -1182,6 +1187,11 @@ const IMPORT_CHOICES_MAX_H: f32 = 360.0;
 
 /// 他の本を取り込み中に開こうとしたときの案内。
 const DOWNLOADING_NOTICE: &str = "ダウンロード中です。終わってから開いてください";
+
+/// お気に入り画面の説明（注意書き）。`auto_download_favorites` の条件をそのまま書く
+/// （起動時と、各サイトの同期が終わったときに未ダウンロードのお気に入りを落とす）。
+const FAVORITES_NOTE: &str =
+    "お気に入りにした本は、同期時に未ダウンロードだと自動でダウンロードされます";
 
 /// 選択肢 1 行の高さ（名前 + 種別・詳細の 2 行ぶん）。
 /// リストの高さを「行数 × これ」で決めるために使う（上限で打ち切る）。
@@ -1462,6 +1472,7 @@ impl BookshelfView {
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
             selected_index: Some(0),
+            favorites_only: false,
         };
         view.reload(cx);
         view
@@ -2591,8 +2602,8 @@ impl BookshelfView {
         {
             return false;
         }
-        if let Some(site) = &self.site_filter
-            && shelf.site_id != *site
+        if let Some(site) = self.effective_site_filter()
+            && shelf.site_id != site
         {
             return false;
         }
@@ -2641,7 +2652,7 @@ impl BookshelfView {
         {
             return false;
         }
-        match self.read_filter {
+        match self.effective_read_filter() {
             ReadFilter::All => true,
             // 未読 / 読書中 / 既読（読了）は `ReadingState` の 3 状態で分ける
             ReadFilter::Unread => {
@@ -2655,6 +2666,29 @@ impl BookshelfView {
                 card.local.as_ref().map(|e| e.reading_state) == Some(progress::ReadingState::Read)
             }
             ReadFilter::Favorite => card.shelf.is_favorite == 1,
+        }
+    }
+
+    /// 実際に効いている既読フィルタ。お気に入り画面では常にお気に入り
+    /// （画面そのものが絞り込みなので、全項目で解除しても外れない）。
+    fn effective_read_filter(&self) -> ReadFilter {
+        if self.favorites_only {
+            ReadFilter::Favorite
+        } else {
+            self.read_filter
+        }
+    }
+
+    /// 実際に効いているサイトの絞り込み。
+    ///
+    /// サイトスコープ（サイドバーの本棚の下のサブメニュー）は**本棚の閲覧スコープ**なので、
+    /// お気に入り画面では適用しない。適用すると「お気に入りを見ようとしたら 0 件」になり、
+    /// お気に入り画面にはサイトを出す見出しが無いため理由が画面から分からなくなる。
+    fn effective_site_filter(&self) -> Option<&str> {
+        if self.favorites_only {
+            None
+        } else {
+            self.site_filter.as_deref()
         }
     }
 
@@ -2906,6 +2940,8 @@ impl BookshelfView {
                             format!("BOOTH サイトから {count} 件取得しました"),
                         );
                         this.reload(cx);
+                        // 同期で入ってきた未ダウンロードのお気に入りを自動で落とす
+                        this.auto_download_favorites(cx);
                     }
                     Err(message) => {
                         log::error!("sync_booth failed: {message}");
@@ -2983,6 +3019,8 @@ impl BookshelfView {
                             format!("FANZA サイトから {count} 件取得しました"),
                         );
                         this.reload(cx);
+                        // 同期で入ってきた未ダウンロードのお気に入りを自動で落とす
+                        this.auto_download_favorites(cx);
                     }
                     Err(message) => {
                         log::error!("sync_fanza failed: {message}");
@@ -3061,6 +3099,8 @@ impl BookshelfView {
                             format!("DLsite サイトから {count} 件取得しました"),
                         );
                         this.reload(cx);
+                        // 同期で入ってきた未ダウンロードのお気に入りを自動で落とす
+                        this.auto_download_favorites(cx);
                     }
                     Err(message) => {
                         log::error!("sync_dlsite failed: {message}");
@@ -3138,6 +3178,8 @@ impl BookshelfView {
                             format!("技術書典サイトから {count} 件取得しました"),
                         );
                         this.reload(cx);
+                        // 同期で入ってきた未ダウンロードのお気に入りを自動で落とす
+                        this.auto_download_favorites(cx);
                     }
                     Err(message) => {
                         log::error!("sync_tbf failed: {message}");
@@ -3766,7 +3808,17 @@ impl BookshelfView {
             queue.len(),
             Self::MAX_AUTO_DOWNLOADS
         );
-        self.auto_download_queue = queue;
+        // 同期完了のたびに呼ばれるため、すでに実行中 / 待ち行列にある本は積み直さない
+        for item in queue {
+            let already_queued = self
+                .auto_download_queue
+                .iter()
+                .any(|queued| queued.database_id == item.database_id);
+            if already_queued || self.download_states.contains_key(&item.database_id) {
+                continue;
+            }
+            self.auto_download_queue.push(item);
+        }
         self.pump_auto_downloads(cx);
     }
 
@@ -3993,6 +4045,8 @@ impl BookshelfView {
             || !self.selected_tags.is_empty()
             || self.circle_filter.is_some()
             || self.author_filter.is_some()
+            // お気に入り画面のお気に入り固定は「画面そのもの」なので数えない
+            // （数えると解除できない「絞込中 ×」が常に出てしまう）
             || self.read_filter != ReadFilter::All
     }
 
@@ -4341,6 +4395,19 @@ impl BookshelfView {
 
     fn set_read_filter(&mut self, cx: &mut Context<Self>, filter: ReadFilter) {
         self.read_filter = filter;
+        self.filtered_dirty = true;
+        cx.notify();
+    }
+
+    /// お気に入り画面として表示するか（ワークスペースが画面切替のたびに設定する）。
+    ///
+    /// 本棚と同じビューを共用するため、切り替えは表示と絞り込みだけに効かせる
+    /// （検索・サイト・並び替えなどの状態は本棚と共通のまま）。
+    pub(crate) fn set_favorites_only(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.favorites_only == on {
+            return;
+        }
+        self.favorites_only = on;
         self.filtered_dirty = true;
         cx.notify();
     }
@@ -6464,9 +6531,9 @@ impl Render for BookshelfView {
             self.start_tag_edit(window, cx, &book_id);
         }
         // 技術書典以外のサイト（BOOTH）ではイベント/タグ取得を非表示にする
-        let is_booth = self.site_filter.as_deref() == Some("booth");
+        let is_booth = self.effective_site_filter() == Some("booth");
         // イベントフィルタは技術書典の本棚の概念なので、それ以外のサイトでは出さない
-        let is_techbookfest = self.site_filter.as_deref() == Some("techbookfest");
+        let is_techbookfest = self.effective_site_filter() == Some("techbookfest");
         let visible_count = self.filtered.len();
         let view_mode = self.view_mode;
         let tag_fetch_enabled = self.tag_fetch_enabled;
@@ -6482,7 +6549,7 @@ impl Render for BookshelfView {
         );
         let favorite_tags = {
             let favs = self.favorite_tags.clone();
-            let sorted = match self.site_filter.as_deref() {
+            let sorted = match self.effective_site_filter() {
                 // サイト選択中はそのサイトのタグでお気に入りタグフィルタを絞る
                 Some(site) => {
                     let state = Self::app_state(cx);
@@ -6559,16 +6626,16 @@ impl Render for BookshelfView {
             .px_3()
             .pt_3()
             .bg(cx.theme().background)
-            // 1 段目: サイト情報（選択中のサイトに応じて表示）
+            // 1 段目: サイト情報（選択中のサイトに応じて表示）。お気に入り画面は専用の見出しと説明。
             .child({
-                let (site_title, site_subtitle) = match self.site_filter.as_deref() {
+                let (site_title, site_subtitle) = match self.effective_site_filter() {
                     Some("booth") => ("BOOTH", "BOOTH の本棚"),
                     Some("techbookfest") => ("技術書典", "TechBookFest の本棚"),
                     Some("fanza") => ("FANZA同人", "FANZA同人の本棚"),
                     Some("dlsite") => ("DLsite", "DLsite の本棚"),
                     _ => ("すべての本", "すべてのサイトの本棚"),
-        };
-                div()
+                };
+                let mut row = div()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -6577,14 +6644,30 @@ impl Render for BookshelfView {
                         div()
                             .text_lg()
                             .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child(site_title),
-                    )
-                    .child(
+                            .child(if self.favorites_only {
+                                "お気に入り"
+                            } else {
+                                site_title
+                            }),
+                    );
+                if self.favorites_only {
+                    // 画面そのものが絞り込みなので、絞り込みボタンは出さずに説明を出す
+                    row = row.child(
+                        div()
+                            .debug_selector(|| "favorites-note".into())
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(FAVORITES_NOTE),
+                    );
+                } else {
+                    row = row.child(
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(site_subtitle),
-                    )
+                    );
+                }
+                row
             })
             // 2 段目: 件数・フィルタ・検索（左）と表示切替・タグ取得・同期（右）
             .child(
@@ -6696,23 +6779,32 @@ impl Render for BookshelfView {
                                     }
                                 }),
                             )
-                            .child(
-                                {
-                                    let mut button =
-                                        Button::new("filter-favorite").cursor_pointer().label("お気に入り");
-                                    if read_filter == ReadFilter::Favorite {
-                                        button = button.primary();
-                                    }
-                                    button
-                                }.cursor_pointer().on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| {
-                                            this.set_read_filter(cx, ReadFilter::Favorite)
-                                        });
-                                    }
-                                }),
-                            )
+                            // お気に入り画面では画面そのものが絞り込みなので、このボタンは出さない
+                            .when(!self.favorites_only, |this| {
+                                this.child(
+                                    div()
+                                        .id("filter-favorite-btn")
+                                        .debug_selector(|| "filter-favorite".into())
+                                        .child({
+                                            let mut button = Button::new("filter-favorite")
+                                                .cursor_pointer()
+                                                .label("お気に入り");
+                                            if read_filter == ReadFilter::Favorite {
+                                                button = button.primary();
+                                            }
+                                            button
+                                        })
+                                        .cursor_pointer()
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.set_read_filter(cx, ReadFilter::Favorite)
+                                                });
+                                            }
+                                        }),
+                                )
+                            })
                             // イベントフィルタ（Web の eventDropdown 相当: Popover + チェックボックス行）。
                             // 技術書典の本棚の概念なので、技術書典以外のサイトでは出さない
                             .child(
@@ -7033,45 +7125,60 @@ impl Render for BookshelfView {
                                         }),
                                     ),
                             )
-                            .child(
-                                if is_booth {
-                                    div().hidden().into_any_element()
-                                } else {
-                                {
-                                    let mut button =
-                                        Button::new("bookshelf-tag-fetch").cursor_pointer().label(format!(
-                                            "タグ取得{}",
-                                            if tag_fetch_enabled { "ON" } else { "OFF" }
-                                        ));
-                                    if tag_fetch_enabled {
-                                        button = button.primary();
-                                    } else {
-                                        button = button.outline();
-                                    }
-                                    button
-                                }.cursor_pointer().on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| {
-                                            this.toggle_tag_fetch(cx);
-                                        });
-                                    }
-                                })
-                                .into_any_element()
-                            },
-                            )
-                            .child(
-                                Button::new("bookshelf-sync").cursor_pointer()
-                                    .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
-                                    .label(if busy { "同期中" } else { "同期" })
-                                    .loading(busy)
-                                    .cursor_pointer().on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.sync_all(cx));
-                                    }
-                                }),
-                            ),
+                            // タグ取得 ON/OFF（Web の tagFetchEnabled トグル、デフォルト OFF）。
+                            // 本棚側の操作なので、BOOTH とお気に入り画面では出さない
+                            .when(!is_booth && !self.favorites_only, |this| {
+                                this.child(
+                                    div()
+                                        .id("bookshelf-tag-fetch-btn")
+                                        .debug_selector(|| "bookshelf-tag-fetch".into())
+                                        .child({
+                                            let mut button = Button::new("bookshelf-tag-fetch")
+                                                .cursor_pointer()
+                                                .label(format!(
+                                                    "タグ取得{}",
+                                                    if tag_fetch_enabled { "ON" } else { "OFF" }
+                                                ));
+                                            if tag_fetch_enabled {
+                                                button = button.primary();
+                                            } else {
+                                                button = button.outline();
+                                            }
+                                            button
+                                        })
+                                        .cursor_pointer()
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.toggle_tag_fetch(cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                            })
+                            // 同期（本棚側の操作なので、お気に入り画面では出さない）
+                            .when(!self.favorites_only, |this| {
+                                this.child(
+                                    div()
+                                        .debug_selector(|| "bookshelf-sync".into())
+                                        .child(
+                                            Button::new("bookshelf-sync").cursor_pointer()
+                                                .icon(Icon::new(AppIcon::RefreshCw).size(px(14.0)))
+                                                .label(if busy { "同期中" } else { "同期" })
+                                                .loading(busy)
+                                                .cursor_pointer()
+                                                .on_click({
+                                                    let handle = handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.sync_all(cx)
+                                                        });
+                                                    }
+                                                }),
+                                        ),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -9310,6 +9417,121 @@ mod tests {
             running + queued,
             5,
             "開始済み + 待ち行列が全件になっていない: running={running} queued={queued}"
+        );
+    }
+
+    /// お気に入り画面（サイドバーの「お気に入り」）: 本棚と同じビューを使いつつ、
+    /// **お気に入りだけ**を出す。画面そのものがお気に入りの絞り込みなので、
+    /// 「全項目」（絞り込み解除）で解除してもお気に入りは外れない。
+    #[gpui_kit::test]
+    async fn favorites_only_locks_the_favorite_filter(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_sort_item(cx, "fanza", "db-1", "お気に入りの本", None, None);
+        seed_sort_item(cx, "fanza", "db-2", "普通の本", None, None);
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            bookshelf::set_favorite(db, "fanza", "db-1", true).unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        let ids = |cx: &mut TestAppContext| {
+            view.read_with(cx, |this, cx| {
+                this.visible_shelf_cards(cx)
+                    .iter()
+                    .map(|card| card.shelf.database_id.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(ids(cx).len(), 2, "前提: お気に入り以外も出る");
+
+        view.update(cx, |this, cx| this.set_favorites_only(true, cx));
+        assert_eq!(
+            ids(cx),
+            vec!["db-1".to_string()],
+            "お気に入りだけになっていない"
+        );
+
+        // 「全項目」で絞り込みを解除しても、お気に入り画面のお気に入りは外れない
+        view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::All));
+        assert_eq!(
+            ids(cx),
+            vec!["db-1".to_string()],
+            "絞り込み解除でお気に入りが外れている"
+        );
+
+        // 本棚に戻すと全件に戻る（フィルタの状態を持ち越さない）
+        view.update(cx, |this, cx| this.set_favorites_only(false, cx));
+        assert_eq!(ids(cx).len(), 2, "本棚に戻しても絞り込みが残っている");
+    }
+
+    /// お気に入り画面は**本棚のサイトスコープを無視**して、すべてのサイトのお気に入りを出す。
+    ///
+    /// サイトスコープはサイドバーの本棚の下のサブメニュー（本棚の閲覧スコープ）で、
+    /// お気に入り画面にはサイトを出す見出しが無い。適用すると「お気に入りが 0 件」に
+    /// なった理由が画面から分からなくなる。
+    #[gpui_kit::test]
+    async fn favorites_only_ignores_the_shelf_site_scope(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_sort_item(cx, "fanza", "db-1", "FANZA のお気に入り", None, None);
+        seed_sort_item(cx, "techbookfest", "db-2", "技術書典の本", None, None);
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            bookshelf::set_favorite(db, "fanza", "db-1", true).unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        // 本棚のサイトスコープを技術書典にする（お気に入りは FANZA に 1 件）
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_site_filter(cx, Some("techbookfest"))
+            })
+        });
+        let ids = |cx: &mut TestAppContext| {
+            view.read_with(cx, |this, cx| {
+                this.visible_shelf_cards(cx)
+                    .iter()
+                    .map(|card| card.shelf.database_id.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            ids(cx),
+            vec!["db-2".to_string()],
+            "前提: 本棚はサイトスコープで絞られている"
+        );
+
+        view.update(cx, |this, cx| this.set_favorites_only(true, cx));
+        assert_eq!(
+            ids(cx),
+            vec!["db-1".to_string()],
+            "お気に入り画面がサイトスコープに引きずられている（他サイトのお気に入りが出ない）"
+        );
+    }
+
+    /// 同期完了のたびに `auto_download_favorites` を呼んでも、実行中 / 待ち行列に
+    /// ある本を積み直さない（同じ本を二重にダウンロードしない）。
+    #[gpui_kit::test]
+    async fn auto_download_does_not_queue_the_same_book_twice(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        for index in 0..3 {
+            let database_id = format!("db-{index}");
+            seed_sort_item(cx, "fanza", &database_id, &format!("本{index}"), None, None);
+            cx.update(|cx| {
+                let db = &AppState::global(cx).db_pool;
+                bookshelf::set_favorite(db, "fanza", &database_id, true).unwrap();
+            });
+        }
+        let view = cx.new(BookshelfView::new);
+        view.update(cx, |this, cx| this.auto_download_favorites(cx));
+        view.update(cx, |this, cx| this.auto_download_favorites(cx));
+        let (running, queued) = view.read_with(cx, |this, _| {
+            (this.auto_download_running, this.auto_download_queue.len())
+        });
+        assert_eq!(
+            running + queued,
+            3,
+            "同じ本が二重に積まれている: running={running} queued={queued}"
         );
     }
 
