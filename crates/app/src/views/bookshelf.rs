@@ -1174,6 +1174,7 @@ impl BookshelfView {
         });
         // 並び替えは前回の設定を復元する（表示モードと同じ扱い）
         let sort = Self::load_sort(&Self::app_state(cx).db_pool);
+        let view_mode = Self::load_view_mode(&Self::app_state(cx).db_pool);
         let mut view = Self {
             entries: Vec::new(),
             shelf_items: Vec::new(),
@@ -1202,7 +1203,7 @@ impl BookshelfView {
             pending_tag_edit: None,
             expanded_tag_rows: std::collections::HashSet::new(),
             read_filter: ReadFilter::All,
-            view_mode: ViewMode::Card,
+            view_mode,
             tag_fetch_enabled: true,
             sync_busy: 0,
             fetching_covers: false,
@@ -2112,6 +2113,26 @@ impl BookshelfView {
     /// 並び替え設定の保存キー（表示モードと同じく DB の settings に置く）。
     const SORT_FIELD_KEY: &'static str = "bookshelf.sort_field";
     const SORT_ASCENDING_KEY: &'static str = "bookshelf.sort_ascending";
+    /// 表示形式（カード / リスト）の保存キー。
+    const VIEW_MODE_KEY: &'static str = "bookshelf.view_mode";
+
+    /// 表示形式を保存する（次回起動で復元される）。
+    fn persist_view_mode(&self, cx: &App) {
+        let value = match self.view_mode {
+            ViewMode::Card => "card",
+            ViewMode::List => "list",
+        };
+        let _ = db::settings::set(&Self::app_state(cx).db_pool, Self::VIEW_MODE_KEY, value);
+    }
+
+    /// 保存された表示形式（無ければカード表示）。
+    fn load_view_mode(pool: &sqlx::SqlitePool) -> ViewMode {
+        let saved = db::settings::get(pool, Self::VIEW_MODE_KEY).ok().flatten();
+        match saved.as_deref() {
+            Some("list") => ViewMode::List,
+            _ => ViewMode::Card,
+        }
+    }
 
     /// 並び替え設定を保存する（次回起動で復元される）。
     fn persist_sort(&self, cx: &App) {
@@ -3680,12 +3701,13 @@ impl BookshelfView {
         cx.notify();
     }
 
-    /// 表示モードを切り替える（Web の viewMode トグル相当）。
+    /// 表示モードを切り替える（Web の viewMode トグル相当）。次回起動のため保存する。
     fn toggle_view_mode(&mut self, cx: &mut Context<Self>) {
         self.view_mode = match self.view_mode {
             ViewMode::Card => ViewMode::List,
             ViewMode::List => ViewMode::Card,
         };
+        self.persist_view_mode(cx);
         cx.notify();
     }
 
@@ -8953,6 +8975,42 @@ mod tests {
             ),
             (SortField::PurchaseDate, false),
             "既定に戻した設定が永続化されていない"
+        );
+    }
+
+    /// 表示形式（カード / リスト）も永続化され、次に開いたときも復元される。
+    #[gpui_kit::test]
+    async fn view_mode_persists_across_views(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "b1", "本1", "サークルA");
+
+        // 未設定ならカード表示
+        let view = cx.new(BookshelfView::new);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.view_mode),
+            ViewMode::Card,
+            "既定がカード表示になっていない"
+        );
+
+        // リストへ切り替える
+        view.update(cx, |this, cx| this.toggle_view_mode(cx));
+
+        // 別のインスタンス（＝次回起動相当）でもリスト表示
+        let reopened = cx.new(BookshelfView::new);
+        assert_eq!(
+            reopened.read_with(cx, |this, _| this.view_mode),
+            ViewMode::List,
+            "表示形式が永続化・復元されていない"
+        );
+
+        // カードへ戻しても保存される
+        view.update(cx, |this, cx| this.toggle_view_mode(cx));
+        let reopened = cx.new(BookshelfView::new);
+        assert_eq!(
+            reopened.read_with(cx, |this, _| this.view_mode),
+            ViewMode::Card,
+            "カード表示に戻した設定が永続化されていない"
         );
     }
 
