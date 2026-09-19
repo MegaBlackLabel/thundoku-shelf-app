@@ -145,15 +145,12 @@
 
 ### Fixed
 
-- **Release ワークフローの pdfium 取得が macOS で落ちる問題**: リリースのアセットを CDN の URL
-  直叩き（`curl` / `Invoke-WebRequest`）で取得していたため、macOS ランナーから 404 が返って
-  2 ジョブが失敗した（同じタグの Windows 用アセットは取得できていた）。未認証の取得は混雑時に
-  404 を返すことがあるため、**認証ヘッダ付きの `curl` で取得し、失敗したら間を置いて再試行、
-  それでも駄目なら API 経由（アセット ID 指定）に切り替える**ようにした（`gh release download`
-  の `--pattern` は、タグに `/` を含むリリースで macOS ランナーの gh だと "no assets match the
-  file pattern" になるため使わない）。macOS ランナー上で 4 方式（未認証 curl / 認証つき curl /
-  API 経由 / `gh release download`）を一時ワークフローで実際に検証し、取得物の SHA256 が
-  ピン留め値と一致することを確認済み。
+- **Release ワークフローの pdfium 取得が macOS で 404 になる問題**: macOS のステップだけ
+  アセット名を `pdfium-${asset}.tgz` と組み立てていたが、`asset` 側に既に `pdfium-` が
+  入っていたため **`pdfium-pdfium-mac-arm64.tgz`** を要求して 404 になっていた
+  （Windows のステップは `pdfium-win-x64.tgz` と正しい名前を直書きしていたため成功していた）。
+  参照を `${asset}.tgz` に直し、あわせて混雑時のための**再試行（15 秒 / 30 秒）**と
+  **API 経由（アセット ID 指定）へのフォールバック**を入れた。取得物の SHA256 検証は維持。
 - **タイトルバーが埋もれていて信号機が押せない**: `TitleBar::window_options()` は透過タイトルバー +
   `app_owns_titlebar_drag` を指定する（＝タイトルバーはアプリが描く契約）。macOS ではタイトルバーを
   描いていなかったため、信号機（閉じる / 最小化 / 最大化）が本棚のヘッダーに重なって押せず、
