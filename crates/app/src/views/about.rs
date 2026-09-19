@@ -124,6 +124,15 @@ const LICENSES_LEAD: &str = "このアプリが利用しているオープンソ
 const NO_LICENSE_TEXT: &str =
     "ライセンス全文はクレートに同梱されていません（配布元を確認してください）";
 
+/// 説明画面のロゴの角丸（px）。
+///
+/// ロゴ画像（アプリアイコン）は白地の内側に濃紺の枠線が描かれている。角丸を**枠線の
+/// 外側の丸み**に合わせないと、大きいと枠線の角が削れて見え、小さいと白い角が
+/// はみ出して見える。値はアセットから測った（画像サイズの 8%: 1024px で外側半径
+/// 81.9px → 128px へ縮小して 64px で表示するので 5.12px）。
+/// `about_logo_radius_matches_the_icon_frame` がアセットと一致していることを見る。
+const APP_LOGO_RADIUS: f32 = 5.12;
+
 /// ライセンス一覧の行の高さの目安。
 /// 仮想化リストのスクロールバーを最初から正しい大きさで出すために使う（行の高さは
 /// レンダリング時に実測されて置き換わる）。
@@ -231,15 +240,23 @@ impl AboutView {
                                     .justify_center()
                                     .w(px(64.0))
                                     .h(px(64.0))
-                                    .rounded_xl()
+                                    // ロゴ画像の角丸（アイコンの枠線の外側の丸み）と揃える。
+                                    // 揃えないと角に下地（`primary`）が覗く
+                                    .rounded(px(APP_LOGO_RADIUS))
                                     .overflow_hidden()
                                     .bg(primary)
                                     .child(
                                         if let Some(logo) = crate::views::bookshelf::app_logo_image()
                                         {
+                                            // ロゴ画像（アプリアイコン）は白地の内側に濃紺の
+                                            // 枠線が描かれている。枠線の外側の丸みに合わせて
+                                            // 角を切る（大きいと枠線の角が削れ、小さいと白い角が
+                                            // はみ出して見える。`overflow_hidden` では画像は
+                                            // 切れないので画像側にも角丸が要る）
                                             gpui_kit::img(logo)
                                                 .w(px(64.0))
                                                 .h(px(64.0))
+                                                .rounded(px(APP_LOGO_RADIUS))
                                                 .object_fit(gpui_kit::ObjectFit::Contain)
                                                 .into_any_element()
                                         } else {
@@ -1134,6 +1151,42 @@ mod tests {
             !LICENSES_LEAD.contains("AGPL"),
             "削除したライブラリのライセンス（AGPL）を説明文が挙げている: {LICENSES_LEAD}"
         );
+    }
+
+    /// 説明画面のロゴの角丸は、**アイコン自身の枠線の外側の丸み**に合わせること。
+    ///
+    /// ロゴ画像は白地の内側に濃紺の枠線が描かれている。角丸がこれより大きいと枠線の角が
+    /// 削れて見え、小さいと白い角がはみ出して見える。アイコンを差し替えたら気づけるよう、
+    /// アセットから測った値と定数の一致を見る。
+    #[test]
+    fn about_logo_radius_matches_the_icon_frame() {
+        let decoded =
+            image::load_from_memory(include_bytes!("../../assets/app-icon/icon_1024.png"))
+                .expect("アプリアイコンを読む")
+                .to_rgba8();
+        let size = decoded.width();
+        let raw = decoded.as_raw();
+        let is_ink = |x: u32, y: u32| {
+            let i = ((y * size + x) * 4) as usize;
+            !(raw[i] > 230 && raw[i + 1] > 230 && raw[i + 2] > 230)
+        };
+        // 上辺の中央で、枠線の外側エッジまでの余白（直線部分）
+        let inset = (0..200)
+            .find(|&y| is_ink(size / 2, y))
+            .expect("アイコンに枠線が無い");
+        // 左上の角からの対角線で、枠線の外側エッジまでの距離
+        let diagonal = (0..300)
+            .find(|&t| is_ink(t, t))
+            .expect("アイコンに枠線が無い");
+        // 角丸の外側半径: 角から対角線上の距離 d、直線部の余白 s のとき r = (d - s) / (1 - 1/√2)
+        let radius = (diagonal as f32 - inset as f32) / (1.0 - std::f32::consts::FRAC_1_SQRT_2);
+        // 表示は 64px（1024px のアセットを 128px へ縮小して 64px で描く = 1/16）
+        let expected = radius / 16.0;
+        assert!(
+            (APP_LOGO_RADIUS - expected).abs() < 0.5,
+            "ロゴの角丸がアイコンの枠線と合っていない: 定数 {APP_LOGO_RADIUS} / 実測 {expected:.2}"
+        );
+        // 角丸が実質 0（白い四角）に戻ると上の一致で落ちる（実測は 5px 前後）
     }
 
     /// バージョンを画面に出すこと。
