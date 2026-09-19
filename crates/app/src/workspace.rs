@@ -3664,6 +3664,7 @@ mod tests {
                 let (reply, _answer) = std::sync::mpsc::channel();
                 b.request_pending_import(
                     crate::views::bookshelf::PendingImport {
+                        database_id: "db-1".into(),
                         title: "総集編".into(),
                         choices: Vec::new(),
                         selected: 0,
@@ -3707,6 +3708,7 @@ mod tests {
                 let (reply, _answer) = std::sync::mpsc::channel();
                 b.request_pending_import(
                     crate::views::bookshelf::PendingImport {
+                        database_id: "db-1".into(),
                         title: "総集編".into(),
                         choices: Vec::new(),
                         selected: 0,

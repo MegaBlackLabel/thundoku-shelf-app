@@ -75,6 +75,8 @@ pub enum TbfError {
     Upstream(String),
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,15 +556,16 @@ impl TbfClient {
 
     /// Download a file from a resolved URL with the session cookies attached.
     pub fn download(&mut self, url: &str) -> Result<Vec<u8>, TbfError> {
-        self.download_with_progress(url, &mut |_, _| {})
+        self.download_with_progress(url, &mut |_, _| true)
     }
 
     /// Download a file while reporting `(downloaded, total)` bytes to
-    /// `on_progress` (called from the background executor).
+    /// `on_progress` (called from the background executor). The callback
+    /// returns whether to continue; `false` aborts with [`TbfError::Cancelled`].
     pub fn download_with_progress(
         &mut self,
         url: &str,
-        on_progress: &mut dyn FnMut(u64, u64),
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, TbfError> {
         let mut headers: Vec<(String, String)> =
             vec![("User-Agent".to_string(), USER_AGENT.to_string())];

@@ -54,16 +54,23 @@ pub trait Transport: Send {
     fn send(&mut self, spec: RequestSpec) -> Result<ResponseSpec, TbfError>;
 
     /// Download a response body while reporting `(downloaded, total)` bytes.
+    ///
+    /// The callback returns whether the transfer should continue. Returning
+    /// `false` aborts it (`TbfError::Cancelled`) and discards the bytes read so
+    /// far — a partial body must never be imported.
+    ///
     /// Default implementation falls back to [`Self::send`] and reports the
     /// whole body at once (no live progress).
     fn send_download(
         &mut self,
         spec: RequestSpec,
-        on_progress: &mut dyn FnMut(u64, u64),
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<ResponseSpec, TbfError> {
         let resp = self.send(spec)?;
         let total = resp.body.len() as u64;
-        on_progress(total, total);
+        if !on_progress(total, total) {
+            return Err(TbfError::Cancelled);
+        }
         Ok(resp)
     }
 }
@@ -124,6 +131,45 @@ fn read_body(reader: &mut impl std::io::Read) -> Vec<u8> {
     body
 }
 
+/// 本文を読みながら `on_progress(downloaded, total)` を通知する。
+///
+/// - 進捗は**1% 刻み**で間引く（チャンクごとに通知すると受信側の UI を詰まらせ、
+///   ダウンロード自体がストールする）
+/// - コールバックが `false` を返すと読み込みを中断し、`None` を返す
+///   （途中まで読んだバイト列は呼び出し側に渡さない。部分的な本文を取り込まない）
+/// - `total` が 0（Content-Length 無し）のときは進捗を通知しない
+pub(crate) fn read_body_with_progress(
+    reader: &mut impl std::io::Read,
+    total: u64,
+    on_progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    let mut last_pct = u32::MAX;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                downloaded += n as u64;
+                out.extend_from_slice(&buf[..n]);
+                if total > 0 {
+                    let pct = (downloaded * 100).checked_div(total).unwrap_or(0) as u32;
+                    if pct != last_pct {
+                        last_pct = pct;
+                        if !on_progress(downloaded, total) {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    Some(out)
+}
+
 impl Transport for UreqTransport {
     fn send(&mut self, spec: RequestSpec) -> Result<ResponseSpec, TbfError> {
         // `redirects` is an agent-level setting in ureq; keep one agent per
@@ -156,7 +202,7 @@ impl Transport for UreqTransport {
     fn send_download(
         &mut self,
         spec: RequestSpec,
-        on_progress: &mut dyn FnMut(u64, u64),
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<ResponseSpec, TbfError> {
         let agent = if spec.redirects == 0 {
             &self.manual_redirect_agent
@@ -177,35 +223,13 @@ impl Transport for UreqTransport {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(0);
                 let mut reader = resp.into_reader();
-                let mut out = Vec::new();
-                let mut buf = vec![0u8; 64 * 1024];
-                let mut downloaded = 0u64;
-                // Report progress at most once per whole percent — per-chunk
-                // callbacks flood the channel and stall the download when the
-                // consumer is throttled (UI thread).
-                let mut last_pct = u32::MAX;
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            downloaded += n as u64;
-                            out.extend_from_slice(&buf[..n]);
-                            if total > 0 {
-                                let pct = (downloaded * 100).checked_div(total).unwrap_or(0) as u32;
-                                if pct != last_pct {
-                                    last_pct = pct;
-                                    on_progress(downloaded, total);
-                                }
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    }
-                }
+                let Some(body) = read_body_with_progress(&mut reader, total, on_progress) else {
+                    return Err(TbfError::Cancelled);
+                };
                 Ok(ResponseSpec {
                     status,
                     headers,
-                    body: out,
+                    body,
                 })
             }
             Err(ureq::Error::Status(status, resp)) => Ok(ResponseSpec {
@@ -215,5 +239,96 @@ impl Transport for UreqTransport {
             }),
             Err(other) => Err(TbfError::Network(other.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> RequestSpec {
+        RequestSpec {
+            method: "GET".into(),
+            url: "https://example.com/file.bin".into(),
+            headers: Vec::new(),
+            body: None,
+            redirects: 3,
+        }
+    }
+
+    /// 進捗コールバックが `false` を返したら中止する（本文は返さない）。
+    #[test]
+    fn send_download_aborts_when_the_callback_returns_false() {
+        let mut transport: Box<dyn FnMut(RequestSpec) -> Result<ResponseSpec, TbfError> + Send> =
+            Box::new(|_spec: RequestSpec| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: vec![1, 2, 3],
+                })
+            });
+        let error = transport
+            .send_download(spec(), &mut |_, _| false)
+            .expect_err("中止を要求したのに本文が返っている");
+        assert!(
+            matches!(error, TbfError::Cancelled),
+            "中止が Cancelled として伝わっていない: {error:?}"
+        );
+    }
+
+    /// 中止しなければ本文全体と (total, total) の進捗を返す（既定実装）。
+    #[test]
+    fn send_download_reports_the_full_body_when_not_cancelled() {
+        let mut transport: Box<dyn FnMut(RequestSpec) -> Result<ResponseSpec, TbfError> + Send> =
+            Box::new(|_spec: RequestSpec| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: vec![1, 2, 3],
+                })
+            });
+        let mut progress: Vec<(u64, u64)> = Vec::new();
+        let response = transport
+            .send_download(spec(), &mut |downloaded, total| {
+                progress.push((downloaded, total));
+                true
+            })
+            .expect("中止していないのに失敗した");
+        assert_eq!(response.body, vec![1, 2, 3]);
+        assert_eq!(progress, vec![(3, 3)]);
+    }
+
+    /// 1% 刻みで通知し、同じ % のうちは呼ばない（UI を詰まらせない）。
+    #[test]
+    fn read_body_with_progress_reports_once_per_percent() {
+        let total = 64 * 1024 * 2;
+        let mut reader = std::io::Cursor::new(vec![0u8; total as usize]);
+        let mut calls: Vec<u64> = Vec::new();
+        let body = read_body_with_progress(&mut reader, total as u64, &mut |downloaded, _| {
+            calls.push(downloaded);
+            true
+        })
+        .expect("中止していないのに本文が無い");
+        assert_eq!(body.len(), total as usize);
+        assert_eq!(calls, vec![64 * 1024, total as u64], "通知が 1% 刻みでない");
+    }
+
+    /// 中止すると途中まで読んだバイト列は返さず、読み進めもしない。
+    #[test]
+    fn read_body_with_progress_discards_partial_data_on_cancel() {
+        let total = 64 * 1024 * 4;
+        let mut reader = std::io::Cursor::new(vec![7u8; total as usize]);
+        let mut seen: Vec<u64> = Vec::new();
+        let body = read_body_with_progress(&mut reader, total as u64, &mut |downloaded, _| {
+            seen.push(downloaded);
+            false
+        });
+        assert!(body.is_none(), "中止したのに途中のデータが返っている");
+        assert_eq!(seen, vec![64 * 1024], "最初のチャンクで通知していない");
+        assert_eq!(
+            reader.position(),
+            64 * 1024,
+            "中止後も読み進めている（転送が止まっていない）"
+        );
     }
 }

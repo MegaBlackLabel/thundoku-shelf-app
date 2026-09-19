@@ -33,6 +33,7 @@
 | Info | `ログインしてから同期してください`（技術書典） | `crates/app/src/views/bookshelf.rs:2640` |
 | Info | `技術書典サイトのデータを取得中です` | `crates/app/src/views/bookshelf.rs:2649` |
 | Info | ダウンロード中/キャンセル等の案内（成功時は Success、それ以外 Info） `crates/app/src/views/bookshelf.rs:3208-3220` | |
+| Info | `ダウンロードを中止しました`（中止したダウンロードの worker 完了時） | `crates/app/src/views/bookshelf.rs:1094-1096` |
 | Info | `表紙の取得後に再取得します` / `再取得を開始しました` | `crates/app/src/views/bookshelf.rs:3378`, `:3383` |
 | Info | `FANZA にログインしてください` | `crates/app/src/views/bookshelf.rs:3765` |
 | Info | `ダウンロード中です。完了したら開きます` | `crates/app/src/views/bookshelf.rs:3818` |

@@ -898,8 +898,8 @@
 | 設定画面の表紙再取得の並列度 | 4 スレッド（接続 5 秒 / 読み取り 15 秒） | `crates/app/src/views/settings.rs:311-319` |
 | 同期結果ポーリング間隔 | 120 ms | `crates/app/src/views/bookshelf.rs:2443` |
 | ログイン URL 監視間隔 | 1 秒 | `crates/app/src/views/booth_login.rs:83` |
-| ダウンロード読み取りバッファ | 65,536 バイト（64 KiB） | `crates/core/src/booth.rs:343` |
-| ダウンロード総量の上限 | **なし**（`Vec<u8>` に全量保持） | `crates/core/src/booth.rs:342-355` |
+| ダウンロード読み取りバッファ | 65,536 バイト（64 KiB）。読み取りループは BOOTH と 3 ストア（TBF/FANZA/DLsite）で共有し、**進捗コールバックが `false` を返すと中断**して途中のバイト列は破棄する（`read_body_with_progress`） | `crates/core/src/tbf/transport.rs:134-171` |
+| ダウンロード総量の上限 | **なし**（`Vec<u8>` に全量保持）。ただしユーザーの中止（本棚の「ダウンロード中止」）で中断・破棄される | `crates/core/src/tbf/transport.rs:141-171`; `crates/app/src/views/bookshelf.rs:2986-3002,4197-4220` |
 | BOOTH 側の一時 URL 有効期限 | 署名付き S3 URL は 180 秒（コメント記載） | `crates/core/src/booth.rs:301-302` |
 | ページ数の安全弁 | 最大 100 ページ（library / orders 共通） | `crates/core/src/booth.rs:258-260`,`:291-293` |
 

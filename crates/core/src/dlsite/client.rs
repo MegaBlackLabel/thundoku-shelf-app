@@ -233,7 +233,7 @@ impl DlsiteClient {
     pub fn download_with_progress(
         &mut self,
         down_url: &str,
-        on_progress: &mut dyn FnMut(u64, u64),
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, DlsiteError> {
         // 1) down_url を manual（redirects=0）で叩いて 302 Location を取得
         let proxy_spec = RequestSpec {
@@ -688,7 +688,7 @@ mod tests {
             Box::new(transport),
             DlsiteSession::new(HashMap::from([("__DLsite_SID".into(), "abc".into())])),
         );
-        let mut on = |_: u64, _: u64| {};
+        let mut on = |_: u64, _: u64| true;
         let bytes = client
             .download_with_progress(
                 "https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html",

@@ -288,7 +288,7 @@ impl FanzaClient {
     pub fn download_with_progress(
         &mut self,
         download_url: &str,
-        on_progress: &mut dyn FnMut(u64, u64),
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, FanzaError> {
         // 1) proxy を manual（redirects=0）で叩いて 302 Location を取得
         let proxy_headers = vec![
@@ -636,7 +636,7 @@ mod tests {
             Box::new(transport),
             FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())])),
         );
-        let mut on = |_: u64, _: u64| {};
+        let mut on = |_: u64, _: u64| true;
         let bytes = client
             .download_with_progress(
                 "https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=x/",
@@ -744,7 +744,7 @@ mod tests {
             body: None,
             redirects: 3,
         };
-        let mut on = |_: u64, _: u64| {};
+        let mut on = |_: u64, _: u64| true;
         let r = t.send_download(c_spec, &mut on).unwrap();
         eprintln!(
             "CDN status={} len={} ct={:?}",

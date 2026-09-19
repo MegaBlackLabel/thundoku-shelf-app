@@ -109,6 +109,14 @@ pub struct RedownloadBook {
     pub site_id: SharedString,
 }
 
+/// 進行中のダウンロードを中止する（コンテキストメニュー「ダウンロード中止」/
+/// Backspace）。確認ダイアログを出し、確定すると転送を中断する。
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, gpui_kit::Action)]
+#[action(namespace = thundoku, no_json)]
+pub struct CancelDownload {
+    pub database_id: SharedString,
+}
+
 /// Hide a book from the shelf.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, gpui_kit::Action)]
 #[action(namespace = thundoku, no_json)]

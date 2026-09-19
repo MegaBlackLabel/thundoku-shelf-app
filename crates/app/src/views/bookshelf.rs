@@ -2,6 +2,7 @@
 //! ダウンロード導線 + インポート。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use gpui_kit::StyledImage as _;
@@ -34,7 +35,8 @@ use thundoku_core::fanza::client::FanzaClient;
 use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE, UreqTransport};
 
 use crate::actions::{
-    DeleteBook, EditBookTags, HideBook, OpenAuth, OpenAuthProvider, OpenReader, SyncDrive,
+    CancelDownload, DeleteBook, EditBookTags, HideBook, OpenAuth, OpenAuthProvider, OpenReader,
+    SyncDrive,
 };
 use crate::app_state::{AppState, ToastKind};
 use crate::components::dialog::dialog_button;
@@ -814,6 +816,9 @@ pub struct BookshelfView {
     shelf_items: Vec<bookshelf::BookshelfItem>,
     shelf_cards: Vec<ShelfCard>,
     download_states: HashMap<String, DownloadState>,
+    /// 進行中のダウンロードの中止フラグ（database_id → フラグ）。worker スレッドが
+    /// 進捗のたびに読み、立っていれば転送を中断する（取り込みは行わない）。
+    download_cancels: HashMap<String, Arc<AtomicBool>>,
     /// 直近に通知へ出したダウンロード/取り込みの文言（変わったときだけ積む）
     download_notice: Option<String>,
     /// 直近に通知を積んだ時刻（置き換えの連打を防ぐ）
@@ -882,6 +887,8 @@ pub struct BookshelfView {
     last_search: String,
     /// 未ダウンロード本のダウンロード確認（はい / いいえ）
     pending_download_confirm: Option<bookshelf::BookshelfItem>,
+    /// ダウンロード中止の確認ダイアログ（表示中だけ Some）
+    pending_cancel_download: Option<PendingCancelDownload>,
     /// ダウンロード完了後に開く本（リモート本棚の database_id）。
     /// 「はい」でダウンロードを始めた本・すでにダウンロード中の本を記録する。
     pending_open_after_download: Option<String>,
@@ -915,6 +922,8 @@ struct ImportOutcome {
 /// ダウンロード済みの bytes は worker スレッドが保持したまま `reply` を待つ
 /// （モーダル側は要約だけを持つ）。
 pub(crate) struct PendingImport {
+    /// 中止（Backspace / コンテキストメニュー）でこの待ちを解放するための id
+    pub(crate) database_id: String,
     /// 本のタイトル（見出しに出す）
     pub(crate) title: String,
     /// コンテンツごとの要約
@@ -923,6 +932,13 @@ pub(crate) struct PendingImport {
     pub(crate) selected: usize,
     /// 選択（`None` = キャンセル）を返す先。worker が `recv` で待っている。
     pub(crate) reply: std::sync::mpsc::Sender<Option<usize>>,
+}
+
+/// ダウンロード中止の確認ダイアログの内容（表示中だけ持つ）。
+pub(crate) struct PendingCancelDownload {
+    pub(crate) database_id: String,
+    /// 本文に出す本のタイトル
+    pub(crate) title: String,
 }
 
 /// 確認モーダルに出す 1 コンテンツ分の要約。
@@ -984,11 +1000,13 @@ fn import_choices(plan: &thundoku_core::import::ImportPlan) -> Vec<ImportChoice>
 /// ダウンロード済みの `bytes` はこの間 worker が保持し続ける（モーダルは要約だけ持つ）。
 fn ask_import_confirmation(
     prompt_tx: &std::sync::mpsc::Sender<PendingImport>,
+    database_id: &str,
     title: &str,
     plan: &thundoku_core::import::ImportPlan,
 ) -> Option<usize> {
     let (reply, answer) = std::sync::mpsc::channel();
     let request = PendingImport {
+        database_id: database_id.to_string(),
         title: title.to_string(),
         choices: import_choices(plan),
         selected: plan.primary,
@@ -1006,8 +1024,22 @@ enum ImportFailure {
     NotAReadable,
     /// 取り込み確認モーダルでキャンセルされた
     Cancelled,
+    /// ユーザーがダウンロードを中止した（転送を中断し、取り込みは行わない）
+    DownloadCancelled,
     /// それ以外（DRM・通信・解析失敗など）。文言はそのまま出す
     Message(String),
+}
+
+/// ダウンロードの失敗を UI の失敗種別にする。
+///
+/// 転送は中止要求で `Err`（各クライアントの `Cancelled`）になるが、中止かどうかは
+/// エラーの種類ではなく中止フラグで判断する（サイトごとのエラー型に依存しない）。
+fn download_failure(error: impl std::fmt::Display, cancel: &AtomicBool) -> ImportFailure {
+    if cancel.load(Ordering::SeqCst) {
+        ImportFailure::DownloadCancelled
+    } else {
+        ImportFailure::Message(error.to_string())
+    }
 }
 
 impl From<String> for ImportFailure {
@@ -1064,6 +1096,9 @@ fn download_messages(
             ),
         ),
         Err(ImportFailure::Cancelled) => (Some("取り込みをキャンセルしました".to_string()), None),
+        Err(ImportFailure::DownloadCancelled) => {
+            (Some("ダウンロードを中止しました".to_string()), None)
+        }
         Err(ImportFailure::Message(message)) => (None, Some(message.clone())),
     }
 }
@@ -1110,6 +1145,15 @@ impl BookshelfView {
                     .ok();
             },
         );
+        let cancel_handle = handle.clone();
+        App::on_action(cx, move |action: &CancelDownload, cx: &mut App| {
+            let database_id = action.database_id.to_string();
+            cancel_handle
+                .update(cx, |this, cx| {
+                    this.request_cancel_download(cx, &database_id);
+                })
+                .ok();
+        });
         let handle = handle.clone();
         App::on_action(cx, move |action: &HideBook, cx: &mut App| {
             let database_id = action.database_id.to_string();
@@ -1135,6 +1179,7 @@ impl BookshelfView {
             shelf_items: Vec::new(),
             shelf_cards: Vec::new(),
             download_states: HashMap::new(),
+            download_cancels: HashMap::new(),
             download_notice: None,
             download_notice_at: None,
             favorite_tags: Vec::new(),
@@ -1173,6 +1218,7 @@ impl BookshelfView {
             sort_ascending: sort.1,
             last_search: String::new(),
             pending_download_confirm: None,
+            pending_cancel_download: None,
             pending_open_after_download: None,
             auto_download_queue: Vec::new(),
             auto_download_running: 0,
@@ -1278,6 +1324,13 @@ impl BookshelfView {
             "left" | "h" => self.shift_selection(-1, 0, window, cx),
             "down" | "j" => self.shift_selection(0, 1, window, cx),
             "up" | "k" => self.shift_selection(0, -1, window, cx),
+            // Backspace: 選択中（＝フォーカス位置）の本のダウンロード中止を確認する。
+            // 進行中でなければ何もしない（絞り込み解除など他の操作は無い）。
+            "backspace" => {
+                if self.request_cancel_selected_download(cx) {
+                    cx.stop_propagation();
+                }
+            }
             // ESC: 絞り込み中ならすべて解除（全項目へ戻す）。絞り込みが無いときは
             // 何もせず、親（ワークスペース）の ESC 処理へ流す。
             "escape" if self.is_filtering(cx) => {
@@ -2880,6 +2933,10 @@ impl BookshelfView {
         let database_id = item.database_id.clone();
         self.download_states
             .insert(database_id.clone(), DownloadState::Downloading(0.0));
+        // 中止フラグ: UI（確認ダイアログ）が立て、worker が進捗のたびに読んで転送を切る。
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.download_cancels
+            .insert(database_id.clone(), cancel.clone());
         self.notify_download_progress(cx);
         let handle = cx.entity();
         let state = Self::app_state(cx);
@@ -2933,7 +2990,12 @@ impl BookshelfView {
                     let url = item.download_url.as_deref().unwrap_or_default().to_string();
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
+                    // 中止要求（UI スレッド）が立っていたら転送を中断する。
+                    let download_cancel = cancel.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
+                        if download_cancel.load(Ordering::SeqCst) {
+                            return false;
+                        }
                         let fraction = if total > 0 {
                             downloaded as f32 / total as f32
                         } else {
@@ -2943,10 +3005,11 @@ impl BookshelfView {
                             download_progress_id.clone(),
                             DownloadState::Downloading(fraction),
                         ));
+                        true
                     };
                     client
                         .download_with_progress(&url, &mut on_download)
-                        .map_err(|e| e.to_string())?
+                        .map_err(|error| download_failure(error, &cancel))?
                 } else if site_id == "fanza" {
                     // FANZA: 一覧では download_url を持たないため、details API で
                     // download_link を取得してから ZIP をダウンロードする。
@@ -2970,7 +3033,12 @@ impl BookshelfView {
                     }
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
+                    // 中止要求（UI スレッド）が立っていたら転送を中断する。
+                    let download_cancel = cancel.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
+                        if download_cancel.load(Ordering::SeqCst) {
+                            return false;
+                        }
                         let fraction = if total > 0 {
                             downloaded as f32 / total as f32
                         } else {
@@ -2980,10 +3048,11 @@ impl BookshelfView {
                             download_progress_id.clone(),
                             DownloadState::Downloading(fraction),
                         ));
+                        true
                     };
                     client
                         .download_with_progress(&url, &mut on_download)
-                        .map_err(|e| e.to_string())?
+                        .map_err(|error| download_failure(error, &cancel))?
                 } else if site_id == "dlsite" {
                     // DLsite: 一覧 sync で保存した down_url（`.../download/=/product_id/{id}.html`）
                     // から 302 → download.dlsite.com（jwt 署名 Cookie）で ZIP を取得する。
@@ -3008,7 +3077,12 @@ impl BookshelfView {
                     site_author = client.work_page_author(&product_id).unwrap_or_default();
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
+                    // 中止要求（UI スレッド）が立っていたら転送を中断する。
+                    let download_cancel = cancel.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
+                        if download_cancel.load(Ordering::SeqCst) {
+                            return false;
+                        }
                         let fraction = if total > 0 {
                             downloaded as f32 / total as f32
                         } else {
@@ -3018,10 +3092,11 @@ impl BookshelfView {
                             download_progress_id.clone(),
                             DownloadState::Downloading(fraction),
                         ));
+                        true
                     };
                     client
                         .download_with_progress(&url, &mut on_download)
-                        .map_err(|e| e.to_string())?
+                        .map_err(|error| download_failure(error, &cancel))?
                 } else {
                     let mut client = tbf_client.lock();
                     // The bookshelf item's `downloadURL` (GraphQL
@@ -3040,7 +3115,12 @@ impl BookshelfView {
                         .map_err(|e| e.to_string())?;
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
+                    // 中止要求（UI スレッド）が立っていたら転送を中断する。
+                    let download_cancel = cancel.clone();
                     let mut on_download = move |downloaded: u64, total: u64| {
+                        if download_cancel.load(Ordering::SeqCst) {
+                            return false;
+                        }
                         let fraction = if total > 0 {
                             downloaded as f32 / total as f32
                         } else {
@@ -3050,15 +3130,21 @@ impl BookshelfView {
                             download_progress_id.clone(),
                             DownloadState::Downloading(fraction),
                         ));
+                        true
                     };
                     let bytes = client
                         .download_with_progress(&resolved, &mut on_download)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|error| download_failure(error, &cancel))?;
                     // TBF クライアントのロックを解放してから重い処理（PDF レンダリング）
                     // に入る。保持したままだと同期等の他操作がブロックされる。
                     drop(client);
                     bytes
                 };
+                // 転送が終わった時点で中止が確定していたら、取り込まずに中止として返す
+                // （中止かどうかはフラグで判定する。サイトごとのエラー型に依存しない）
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(ImportFailure::DownloadCancelled);
+                }
                 let mut file_name = item_file_name(&title, &item);
                 // FANZA は ZIP（画像セット）または PDF。ファイル名由来の拡張子
                 // （既定 .pdf）で誤判定して PDF レンダリングするのを防ぐため、
@@ -3183,8 +3269,18 @@ impl BookshelfView {
                             let mut plan = thundoku_core::import::analyze_zip(&bytes)
                                 .map_err(import_failure)?;
                             if import_needs_confirmation(&plan) {
-                                match ask_import_confirmation(&prompt_tx, &item.title, &plan) {
+                                match ask_import_confirmation(
+                                    &prompt_tx,
+                                    &product_id,
+                                    &item.title,
+                                    &plan,
+                                ) {
                                     Some(index) => plan.primary = index,
+                                    // モーダルが閉じた理由が「ダウンロード中止」なら
+                                    // 中止として扱う（文言が変わる）。
+                                    None if cancel.load(Ordering::SeqCst) => {
+                                        return Err(ImportFailure::DownloadCancelled);
+                                    }
                                     None => return Err(ImportFailure::Cancelled),
                                 }
                             }
@@ -3355,6 +3451,7 @@ impl BookshelfView {
             let complete_start = std::time::Instant::now();
             handle.update(cx, |this, cx| {
                 this.download_states.remove(&database_id);
+                this.download_cancels.remove(&database_id);
                 this.notify_download_progress(cx);
                 let (toast, error) = download_messages(&result);
                 let succeeded = result.is_ok();
@@ -4033,6 +4130,120 @@ impl BookshelfView {
         !self.download_states.is_empty()
     }
 
+    /// その本のダウンロードが進行中か（中止できるか）。
+    fn is_downloading(&self, database_id: &str) -> bool {
+        self.download_states.contains_key(database_id)
+    }
+
+    /// テスト用: その本に中止が要求されているか（worker に伝わる signal）。
+    #[cfg(test)]
+    pub(crate) fn is_download_cancelled(&self, database_id: &str) -> bool {
+        self.download_cancels
+            .get(database_id)
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    /// ダウンロード中止の確認ダイアログを出す（進行中の本でなければ何もしない）。
+    ///
+    /// 中止そのものはここでは行わない。転送を中断するのは「中止する」を押した後
+    /// （[`Self::confirm_cancel_download`]）で、フラグが worker に伝わる。
+    fn request_cancel_download(&mut self, cx: &mut Context<Self>, database_id: &str) {
+        if !self.is_downloading(database_id) {
+            return;
+        }
+        let Some(card) = self
+            .shelf_cards
+            .iter()
+            .find(|card| card.shelf.database_id == database_id)
+        else {
+            return;
+        };
+        self.pending_cancel_download = Some(PendingCancelDownload {
+            database_id: database_id.to_string(),
+            title: card.shelf.title.clone(),
+        });
+        cx.notify();
+    }
+
+    /// 選択中の本のダウンロード中止を確認する（Backspace）。確認を出したら true。
+    ///
+    /// 対象は「選択中の本」。選択が実行中の本でなければ、走っているダウンロードが
+    /// 1 件だけのときにそれを対象にする（お気に入りの自動ダウンロードのように、
+    /// クリックせずに始まったものを止められる）。複数走っていて選択も別なら、
+    /// どれを止めるか決められないので何もしない（コンテキストメニューで選ぶ）。
+    fn request_cancel_selected_download(&mut self, cx: &mut Context<Self>) -> bool {
+        let target = self
+            .selected_database_id()
+            .filter(|database_id| self.is_downloading(database_id))
+            .or_else(|| {
+                let mut running = self.download_states.keys();
+                match (running.next(), running.next()) {
+                    (Some(only), None) => Some(only.clone()),
+                    _ => None,
+                }
+            });
+        let Some(database_id) = target else {
+            return false;
+        };
+        self.request_cancel_download(cx, &database_id);
+        true
+    }
+
+    /// 指定した本棚アイテムを選択状態にする（クリック / 右クリックから呼ぶ）。
+    fn select_database_id(&mut self, cx: &App, database_id: &str) {
+        // filtered が未構築なら再計算する（並びはソート順）。
+        if self.filtered_dirty {
+            self.rebuild_filtered(cx);
+        }
+        if let Some(pos) = self
+            .filtered
+            .iter()
+            .position(|&card_idx| self.shelf_cards[card_idx].shelf.database_id == database_id)
+        {
+            self.selected_index = Some(pos);
+        }
+    }
+
+    /// 選択中のカードの `database_id`（絞り込み後の並びで解決する）。
+    fn selected_database_id(&self) -> Option<String> {
+        let card_index = *self.filtered.get(self.selected_index?)?;
+        Some(self.shelf_cards[card_index].shelf.database_id.clone())
+    }
+
+    /// 中止確認を閉じる（中止しない）。
+    fn dismiss_cancel_download(&mut self, cx: &mut Context<Self>) {
+        self.pending_cancel_download = None;
+        cx.notify();
+    }
+
+    /// 中止確認の「中止する」: 転送を中断させる。
+    ///
+    /// 進捗リングと通知はここで即座に消し、実際の中断（接続を切って本文を捨てる）は
+    /// worker が次の進捗通知で行う。取り込み確認モーダル待ちなら、先に worker を
+    /// 解放して取り込みへ進ませない。
+    fn confirm_cancel_download(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_cancel_download.take() else {
+            return;
+        };
+        if let Some(flag) = self.download_cancels.get(&pending.database_id) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        self.download_states.remove(&pending.database_id);
+        self.notify_download_progress(cx);
+        // 中止したのに完了後に開いてしまわないよう、約束も取り消す。
+        if self.pending_open_after_download.as_deref() == Some(pending.database_id.as_str()) {
+            self.pending_open_after_download = None;
+        }
+        if self
+            .pending_import
+            .as_ref()
+            .is_some_and(|import| import.database_id == pending.database_id)
+        {
+            self.cancel_pending_import(cx);
+        }
+        cx.notify();
+    }
+
     /// クリック / Enter からの起動。ローカル本なら開き、未ダウンロードなら取り込む。
     /// ダウンロード中の本は無視する（二重ダウンロード防止）。
     ///
@@ -4047,6 +4258,9 @@ impl BookshelfView {
         item: &bookshelf::BookshelfItem,
         confirm_undownloaded: bool,
     ) {
+        // クリックした本を選択状態にする。Backspace（ダウンロード中止）などの
+        // キーボード操作の対象を、ポインタで指した本と一致させるため。
+        self.select_database_id(cx, database_id);
         if self.download_states.contains_key(database_id) {
             // 取り込み中にクリックされたら、終わったら開くようにしておく
             self.pending_open_after_download = Some(database_id.to_string());
@@ -4489,6 +4703,17 @@ impl BookshelfView {
                 });
             }
         });
+        // 右クリックでも対象を選択する（コンテキストメニューと Backspace の対象を揃える）
+        card_el = card_el.on_mouse_down(gpui_kit::MouseButton::Right, {
+            let handle = handle.clone();
+            let right_click_database_id = database_id.clone();
+            move |_, _window, cx| {
+                handle.update(cx, |this, cx| {
+                    this.select_database_id(cx, &right_click_database_id);
+                    cx.notify();
+                });
+            }
+        });
 
         card_el = card_el
             // 表紙（カードのヘッダー）: 端まで出す。読了は少し薄く表示する
@@ -4675,6 +4900,15 @@ impl BookshelfView {
                         downloading,
                     );
                 }
+                // 進行中のダウンロードだけ中止できる（中止は転送を中断する）
+                let downloading_this = menu_handle.read(cx).is_downloading(&edit_id_for_menu);
+                menu = menu.menu_with_disabled(
+                    "ダウンロード中止",
+                    Box::new(CancelDownload {
+                        database_id: edit_id_for_menu.clone().into(),
+                    }),
+                    !downloading_this,
+                );
                 menu = menu.menu(
                     "タグ編集",
                     Box::new(EditBookTags {
@@ -5686,6 +5920,17 @@ impl BookshelfView {
                 });
             }
         });
+        // 右クリックでも対象を選択する（コンテキストメニューと Backspace の対象を揃える）
+        row = row.on_mouse_down(gpui_kit::MouseButton::Right, {
+            let handle = handle.clone();
+            let right_click_database_id = database_id.clone();
+            move |_, _window, cx| {
+                handle.update(cx, |this, cx| {
+                    this.select_database_id(cx, &right_click_database_id);
+                    cx.notify();
+                });
+            }
+        });
 
         // 情報列（幅固定）: タイトル / 購入日 / サークル・作者 / ページ数 / 状態
         let info_selector = format!("list-info-{database_id}");
@@ -5917,6 +6162,7 @@ impl BookshelfView {
 
         row.context_menu({
             let has_local = delete_id.is_some();
+            let menu_handle = handle.clone();
             let open_id_for_menu = delete_id.clone().unwrap_or_else(|| open_id.clone());
             let edit_id_for_menu = database_id.clone();
             let delete_id_for_menu = delete_id.clone();
@@ -5942,6 +6188,15 @@ impl BookshelfView {
                         }),
                     );
                 }
+                // 進行中のダウンロードだけ中止できる（中止は転送を中断する）
+                let downloading_this = menu_handle.read(cx).is_downloading(&edit_id_for_menu);
+                menu = menu.menu_with_disabled(
+                    "ダウンロード中止",
+                    Box::new(CancelDownload {
+                        database_id: edit_id_for_menu.clone().into(),
+                    }),
+                    !downloading_this,
+                );
                 menu = menu.menu(
                     "タグ編集",
                     Box::new(EditBookTags {
@@ -6070,6 +6325,11 @@ impl Render for BookshelfView {
         let busy = self.sync_busy > 0;
         // 未ダウンロード本のダウンロード確認（はい / いいえ）
         let pending_download_confirm = self.pending_download_confirm.clone();
+        // ダウンロード中止の確認（表示中だけ）
+        let pending_cancel_download = self
+            .pending_cancel_download
+            .as_ref()
+            .map(|pending| (pending.database_id.clone(), pending.title.clone()));
         // 取り込み確認モーダル（§6.3）: 要約だけなので clone して描画に使う
         let pending_import = self.pending_import.as_ref().map(|pending| {
             (
@@ -6978,6 +7238,63 @@ impl Render for BookshelfView {
                                                     move |_, _window, cx| {
                                                         handle.update(cx, |this, cx| {
                                                             this.confirm_download(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .into_any_element()
+                        .into()
+                } else {
+                    None
+                },
+            )
+            // ダウンロード中止の確認（Backspace / コンテキストメニュー）
+            .children(
+                if let Some((_, title)) = pending_cancel_download {
+                    let no_handle = handle.clone();
+                    let yes_handle = handle.clone();
+                    Dialog::new(cx)
+                        .title(div().child(format!("「{title}」のダウンロードを中止しますか？")))
+                        .content(move |content, _window, _cx| {
+                            content.child(div().text_sm().child(
+                                "取り込みは行われず、途中まで取得した内容は破棄されます。",
+                            ))
+                        })
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "cancel-download-no".into())
+                                        .child(
+                                            dialog_button("cancel-download-no", "キャンセル")
+                                                .on_click({
+                                                    let handle = no_handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.dismiss_cancel_download(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "cancel-download-yes".into())
+                                        .child(
+                                            Button::new("cancel-download-yes")
+                                                .cursor_pointer()
+                                                .primary()
+                                                .label("中止する")
+                                                .on_click({
+                                                    let handle = yes_handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.confirm_cancel_download(cx);
                                                         });
                                                     }
                                                 }),
@@ -9079,6 +9396,7 @@ mod tests {
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 this.pending_import = Some(PendingImport {
+                    database_id: "db-1".into(),
                     title: "総集編".into(),
                     choices: vec![
                         ImportChoice {
@@ -9134,6 +9452,7 @@ mod tests {
         cx.update(|cx| {
             view.update(cx, |this, _| {
                 this.pending_import = Some(PendingImport {
+                    database_id: "db-1".into(),
                     title: "総集編".into(),
                     choices: Vec::new(),
                     selected: 0,
@@ -13216,6 +13535,7 @@ mod tests {
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 this.pending_import = Some(PendingImport {
+                    database_id: "db-1".into(),
                     title: "総集編".into(),
                     choices: (0..40)
                         .map(|i| ImportChoice {
@@ -13280,6 +13600,7 @@ mod tests {
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 this.pending_import = Some(PendingImport {
+                    database_id: "db-1".into(),
                     title: "総集編".into(),
                     choices: (1..=40)
                         .map(|i| ImportChoice {
@@ -13517,5 +13838,371 @@ mod tests {
             "Enter で確認ダイアログが出ている（そのまま取り込むこと）"
         );
         assert!(downloading, "Enter で取り込みが始まっていない");
+    }
+
+    /// ダウンロード中の状態にする（中止フラグ付き。worker は起動しない）。
+    fn mark_downloading(cx: &mut TestAppContext, view: &Entity<BookshelfView>, database_id: &str) {
+        view.update(cx, |this, cx| {
+            this.download_states
+                .insert(database_id.to_string(), DownloadState::Downloading(0.3));
+            this.download_cancels
+                .insert(database_id.to_string(), Arc::new(AtomicBool::new(false)));
+            cx.notify();
+        });
+    }
+
+    /// キーを 1 回押す（フォーカスは本棚にある前提）。
+    fn press_key(visual: &mut gpui_kit::VisualTestContext, key: &str) {
+        visual.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: gpui_kit::Keystroke::parse(key).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+    }
+
+    /// 本棚をウィンドウに出して描画する（キー操作を使うテスト用）。
+    fn open_shelf(
+        cx: &mut TestAppContext,
+        view: &Entity<BookshelfView>,
+    ) -> gpui_kit::WindowHandle<gpui_kit::component::Root> {
+        cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(900.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        )
+    }
+
+    /// ダウンロード中止: Backspace で確認を出し、「中止する」で転送を中断する。
+    #[gpui_kit::test]
+    async fn backspace_asks_before_cancelling_a_download(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        mark_downloading(cx, &view, "db-1");
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        press_key(visual, "backspace");
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_cancel_download
+                .as_ref()
+                .map(|pending| pending.database_id.clone())),
+            Some("db-1".to_string()),
+            "Backspace で中止の確認ダイアログが出ていない"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.is_downloading("db-1")),
+            "確認する前に進捗リングが消えている"
+        );
+        assert!(
+            !view.read_with(cx, |this, _| this.is_download_cancelled("db-1")),
+            "確認する前に中止している"
+        );
+
+        draw_frames(visual);
+        let yes = visual
+            .debug_bounds("cancel-download-yes")
+            .expect("「中止する」ボタンが出ていない");
+        visual.simulate_click(yes.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            view.read_with(cx, |this, _| this.pending_cancel_download.is_none()),
+            "「中止する」で確認が閉じていない"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.is_download_cancelled("db-1")),
+            "中止が worker に伝わっていない（転送が止まらない）"
+        );
+        assert!(
+            !view.read_with(cx, |this, _| this.is_downloading("db-1")),
+            "中止したのに進行中の表示が残っている"
+        );
+    }
+
+    /// 中止の確認で「キャンセル」を選んだら中止しない（ダウンロードは続く）。
+    #[gpui_kit::test]
+    async fn declining_the_cancel_dialog_keeps_downloading(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        mark_downloading(cx, &view, "db-1");
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        press_key(visual, "backspace");
+        cx.run_until_parked();
+        draw_frames(visual);
+
+        let no = visual
+            .debug_bounds("cancel-download-no")
+            .expect("「キャンセル」ボタンが出ていない");
+        visual.simulate_click(no.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            view.read_with(cx, |this, _| this.pending_cancel_download.is_none()),
+            "「キャンセル」で確認が閉じていない"
+        );
+        assert!(
+            !view.read_with(cx, |this, _| this.is_download_cancelled("db-1")),
+            "「キャンセル」なのに中止している"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.is_downloading("db-1")),
+            "「キャンセル」なのに進行中の表示が消えている"
+        );
+    }
+
+    /// ダウンロードしていない本で Backspace を押しても何も起きない。
+    #[gpui_kit::test]
+    async fn backspace_without_a_running_download_does_nothing(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        press_key(visual, "backspace");
+        cx.run_until_parked();
+
+        assert!(
+            view.read_with(cx, |this, _| this.pending_cancel_download.is_none()),
+            "ダウンロードしていないのに中止の確認が出ている"
+        );
+    }
+
+    /// コンテキストメニューの「ダウンロード中止」は同じ確認を出す（進行中の本だけ）。
+    #[gpui_kit::test]
+    async fn cancel_download_action_confirms_only_running_downloads(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        mark_downloading(cx, &view, "db-1");
+
+        // メニュー項目が発火するアクション
+        cx.update(|cx| {
+            cx.dispatch_action(&CancelDownload {
+                database_id: "db-1".into(),
+            })
+        });
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_cancel_download
+                .as_ref()
+                .map(|pending| pending.database_id.clone())),
+            Some("db-1".to_string()),
+            "「ダウンロード中止」で確認ダイアログが出ていない"
+        );
+
+        // 進行中でない本では出ない
+        cx.update(|cx| {
+            view.update(cx, |this, cx| this.dismiss_cancel_download(cx));
+        });
+        cx.update(|cx| {
+            cx.dispatch_action(&CancelDownload {
+                database_id: "db-2".into(),
+            })
+        });
+        assert!(
+            view.read_with(cx, |this, _| this.pending_cancel_download.is_none()),
+            "進行中でない本で中止の確認が出ている"
+        );
+    }
+
+    /// 中止したら「完了後に開く」約束も取り消し、取り込み確認待ちの worker を解放する。
+    #[gpui_kit::test]
+    async fn confirming_cancel_releases_the_waiting_worker(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        mark_downloading(cx, &view, "db-1");
+
+        let (reply, answer) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                // 完了後に開く約束と、取り込み確認モーダル待ちの状態を作る
+                this.pending_open_after_download = Some("db-1".to_string());
+                this.pending_import = Some(PendingImport {
+                    database_id: "db-1".into(),
+                    title: "総集編".into(),
+                    choices: Vec::new(),
+                    selected: 0,
+                    reply,
+                });
+                this.request_cancel_download(cx, "db-1");
+                this.confirm_cancel_download(cx);
+            });
+        });
+
+        assert_eq!(
+            answer.recv().unwrap(),
+            None,
+            "中止したのに取り込み確認の worker が解放されていない"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.pending_import.is_none()),
+            "中止したのに取り込み確認モーダルが残っている"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.pending_open_after_download.is_none()),
+            "中止したのに『完了後に開く』約束が残っている"
+        );
+    }
+
+    /// 選択を指定した本に合わせる（テストの前提を固定する。描画後に呼ぶ）。
+    fn select_by_database_id(
+        cx: &mut TestAppContext,
+        view: &Entity<BookshelfView>,
+        database_id: &str,
+    ) {
+        view.update(cx, |this, cx| {
+            this.selected_index = this
+                .filtered
+                .iter()
+                .position(|&card_idx| this.shelf_cards[card_idx].shelf.database_id == database_id);
+            cx.notify();
+        });
+    }
+
+    /// カードのクリックでそのカードが選択される
+    /// （Backspace の対象がポインタと一致する。以前は選択がキーボードでしか動かず、
+    /// クリックで始めたダウンロードを Backspace で中止できなかった）。
+    #[gpui_kit::test]
+    async fn clicking_a_card_selects_it(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        select_by_database_id(cx, &view, "db-1");
+        draw_frames(visual);
+
+        let card = visual
+            .debug_bounds("book-card-db-2")
+            .expect("db-2 のカードが描画されていない");
+        visual.simulate_click(card.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |this, _| this.selected_database_id()),
+            Some("db-2".to_string()),
+            "クリックしたカードが選択されていない"
+        );
+    }
+
+    /// ダウンロード中のカードをクリック → Backspace で**そのカード**の中止確認が出る。
+    #[gpui_kit::test]
+    async fn backspace_targets_the_clicked_downloading_card(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        mark_downloading(cx, &view, "db-2");
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        select_by_database_id(cx, &view, "db-1");
+        draw_frames(visual);
+
+        // ダウンロード中のカードをクリック（＝その本を対象にする）
+        let card = visual
+            .debug_bounds("book-card-db-2")
+            .expect("db-2 のカードが描画されていない");
+        visual.simulate_click(card.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+
+        press_key(visual, "backspace");
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_cancel_download
+                .as_ref()
+                .map(|pending| pending.database_id.clone())),
+            Some("db-2".to_string()),
+            "クリックして開始した（ダウンロード中の）本で Backspace が効いていない"
+        );
+    }
+
+    /// 選択が別の本でも、走っているダウンロードが 1 件だけなら Backspace はそれを中止する
+    /// （お気に入りの自動ダウンロードのように、クリックせずに始まったダウンロードを止められる）。
+    #[gpui_kit::test]
+    async fn backspace_targets_the_only_running_download(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        mark_downloading(cx, &view, "db-2");
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        select_by_database_id(cx, &view, "db-1");
+        draw_frames(visual);
+
+        press_key(visual, "backspace");
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_cancel_download
+                .as_ref()
+                .map(|pending| pending.database_id.clone())),
+            Some("db-2".to_string()),
+            "1 件だけ走っているダウンロードが Backspace の対象になっていない"
+        );
+    }
+
+    /// 複数のダウンロードが走っていて選択も別の本なら、どれを止めるか決められないので何もしない。
+    #[gpui_kit::test]
+    async fn backspace_does_nothing_when_multiple_downloads_run_unselected(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        seed_shelf_item(cx, "db-3", "本3", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        mark_downloading(cx, &view, "db-2");
+        mark_downloading(cx, &view, "db-3");
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        select_by_database_id(cx, &view, "db-1");
+        draw_frames(visual);
+
+        press_key(visual, "backspace");
+        cx.run_until_parked();
+
+        assert!(
+            view.read_with(cx, |this, _| this.pending_cancel_download.is_none()),
+            "対象を決められないのに中止の確認が出ている"
+        );
     }
 }

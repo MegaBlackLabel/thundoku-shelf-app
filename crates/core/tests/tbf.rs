@@ -141,6 +141,31 @@ fn login_failure_returns_invalid_credentials() {
     ));
 }
 
+/// 進捗コールバックが `false` を返したらダウンロードを中止する
+/// （本棚の「ダウンロード中止」が使う経路。本文は返さない）。
+#[test]
+fn download_with_progress_aborts_when_the_callback_returns_false() {
+    let mut client = TbfClient::with_transport(Box::new(Mock(Box::new(|_spec| {
+        Ok(ResponseSpec {
+            status: 200,
+            headers: vec![],
+            body: vec![1, 2, 3, 4, 5],
+        })
+    }))));
+    client.restore_session(thundoku_core::tbf::TbfSession {
+        cookies: vec![("session".into(), "s".into())],
+        xsrf_raw: "x".into(),
+        xsrf_token: "x".into(),
+    });
+    let error = client
+        .download_with_progress("https://example.com/file.pdf", &mut |_, _| false)
+        .expect_err("中止を要求したのに本文が返っている");
+    assert!(
+        matches!(error, TbfError::Cancelled),
+        "中止が Cancelled として伝わっていない: {error:?}"
+    );
+}
+
 #[test]
 fn download_with_progress_reports_full_body_and_cookies() {
     let captured = Arc::new(Mutex::new(Vec::<RequestSpec>::new()));
@@ -162,6 +187,7 @@ fn download_with_progress_reports_full_body_and_cookies() {
     let bytes = client
         .download_with_progress("https://example.com/file.pdf", &mut |downloaded, total| {
             progress.push((downloaded, total));
+            true
         })
         .unwrap();
     assert_eq!(bytes, vec![1, 2, 3, 4, 5]);

@@ -41,6 +41,8 @@ pub enum BoothError {
     NotFound,
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// ライブラリ（購入品一覧）の 1 商品。
@@ -301,15 +303,17 @@ impl BoothClient {
     /// 検証して 302 リダイレクトを返し、Location は署名付きの一時 S3 URL
     /// （180 秒有効）。ureq の自動リダイレクト追跡で最終的にファイル本体が返る。
     pub fn download(&self, download_url: &str) -> Result<Vec<u8>, BoothError> {
-        self.download_with_progress(download_url, &mut |_, _| {})
+        self.download_with_progress(download_url, &mut |_, _| true)
     }
 
     /// 進捗コールバック付きで商品ファイルをダウンロードする。
     /// `on_progress(downloaded, total)` — total は Content-Length が無い場合は 0。
+    /// コールバックが `false` を返すと中止し（`BoothError::Cancelled`）、
+    /// 途中まで読んだバイト列は返さない。
     pub fn download_with_progress(
         &self,
         download_url: &str,
-        on_progress: &mut dyn FnMut(u64, u64),
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, BoothError> {
         let mut request = self
             .agent
@@ -337,23 +341,9 @@ impl BoothClient {
             .header("Content-Length")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
-        use std::io::Read;
         let mut reader = response.into_reader();
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; 65536];
-        let mut downloaded = 0u64;
-        loop {
-            let count = reader
-                .read(&mut buffer)
-                .map_err(|e| BoothError::Network(e.to_string()))?;
-            if count == 0 {
-                break;
-            }
-            downloaded += count as u64;
-            bytes.extend_from_slice(&buffer[..count]);
-            on_progress(downloaded, total);
-        }
-        Ok(bytes)
+        crate::tbf::transport::read_body_with_progress(&mut reader, total, on_progress)
+            .ok_or(BoothError::Cancelled)
     }
 
     /// 商品詳細 API から表紙画像（オリジナルサイズ）を取得する。
