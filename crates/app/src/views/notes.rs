@@ -1,8 +1,10 @@
 //! 付箋画面: `page_notes` を **追加が新しい順** に並べる。
 //!
-//! 行は本棚のリスト形式と同じ 4 列（表紙枠 / 情報列 / タグ列 / 右端の操作）で、
-//! **サムネイルは付箋を付けたページの画像**、情報に加えて**メモ**と**付箋登録日**を出す。
-//! カルーセルは出さない。右端の「本を見る →」でビューアを**そのページ・その見開き側**で開く。
+//! 行は本棚のリスト形式と同じ **6 列**（表紙枠 / 情報列 / タグ列 / 付箋ページ / メモ / 右端の操作）で、
+//! 1 列目は**本の表紙**（本棚のリストと同じ表紙枠。サイトの表紙キャッシュ → pack の cover →
+//! プレースホルダの順に解決）、4 列目は**付箋を付けたページの画像**。
+//! 情報に加えて**メモ**と**付箋登録日**を出す。カルーセルは出さない。
+//! 右端の「本を見る →」でビューアを**そのページ・その見開き側**で開く。
 
 use std::sync::Arc;
 
@@ -27,7 +29,7 @@ use crate::icons::AppIcon;
 use crate::views::bookshelf::{
     CHIP_HEART_BUTTON, CHIP_HEART_ICON, LIST_COVER_MIN_H, LIST_COVER_W, LIST_INFO_W,
     LIST_TAGS_W_RATIO, TagOrder, count_tag_usage, cover_fit_inside_frame, list_tags_visible_count,
-    owned_book_ids, placeholder_cover,
+    load_cached_cover, load_cover_image, owned_book_ids, placeholder_cover,
 };
 use crate::views::history::shelf_event_text;
 
@@ -36,6 +38,8 @@ use crate::views::history::shelf_event_text;
 struct NoteRow {
     note: db::notes::PageNote,
     book: books::Book,
+    /// 対応する本棚アイテム（あればサイトの表紙キャッシュを引ける。無ければ pack の表紙を使う）
+    shelf: Option<db::bookshelf::BookshelfItem>,
     /// 本棚と同じ表記のイベント名 / 購入日。
     event_text: String,
     reading_state: progress::ReadingState,
@@ -57,14 +61,23 @@ struct ThumbRequest {
     page: i64,
 }
 
+/// まだ読んでいない**本の表紙**の読み込み要求（描く行 1 件分）。
+struct CoverRequest {
+    /// [`NotesView::cover_key`]（本）。
+    key: String,
+    book: books::Book,
+    /// サイトの表紙キャッシュを引くための本棚アイテム。
+    shelf: Option<db::bookshelf::BookshelfItem>,
+}
+
 pub struct NotesView {
     rows: Vec<NoteRow>,
     favorite_circles: Vec<String>,
     favorite_authors: Vec<String>,
     favorite_tags: Vec<String>,
     tag_counts: Arc<std::collections::HashMap<String, usize>>,
-    /// 表示中の行のページ画像（サムネイル）。上限つき（`MAX_THUMB_CACHE`）の LRU で、
-    /// キーは [`Self::thumb_key`]（本 + ページ）。
+    /// 表示中の行の画像（**本の表紙**と**付箋を付けたページ**）。上限つき（`MAX_THUMB_CACHE`）
+    /// の LRU で、キーは [`Self::cover_key`]（本）と [`Self::thumb_key`]（本 + ページ）。
     thumb_cache: std::collections::HashMap<String, Arc<RenderImage>>,
     /// サムネイルを読んだ順（上限を超えたら先頭 = 最も古いものから捨てる）。
     thumb_order: std::collections::VecDeque<String>,
@@ -163,6 +176,7 @@ impl NotesView {
             // 描画で必要になった行だけ `ensure_thumb_loaded` が背景で読む。
             rows.push(NoteRow {
                 book: book.clone(),
+                shelf: shelf.cloned(),
                 event_text: shelf_event_text(shelf),
                 reading_state: progress::ReadingState::from_progress(
                     progress::get(pool, &book.id).ok().flatten().as_ref(),
@@ -190,6 +204,11 @@ impl NotesView {
     /// 行ごとのページ画像のキー（本 + ページ。`notes-page-<id>` などの id と同じ）。
     fn thumb_key(row: &NoteRow) -> String {
         format!("{}-{}", row.book.id, row.note.page)
+    }
+
+    /// 行ごとの本の表紙のキー（ページ画像のキーと混ざらないよう接頭辞を付ける）。
+    fn cover_key(row: &NoteRow) -> String {
+        format!("cover:{}", row.book.id)
     }
 
     /// 付箋を付けたページのサムネイルを背景でデコードする（1 行につき 1 回だけ）。
@@ -239,6 +258,41 @@ impl NotesView {
                     // 1 枚読めなくても画面は壊さない（プレースホルダのまま）
                     Err(error) => log::warn!("付箋のページ画像を読めません: {error}"),
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 本の表紙（本棚のリストの 1 列目と同じ枠）を背景で読む（1 行につき 1 回だけ）。
+    ///
+    /// ページ画像と同じキャッシュ（`thumb_cache`）を共有し、保持数は `MAX_THUMB_CACHE` で
+    /// 頭打ちにする（行を仮想化していないため）。解決順は本棚と同じ
+    /// 「サイトの表紙キャッシュ → pack の cover → プレースホルダ」。
+    fn ensure_cover_loaded(
+        &mut self,
+        window: &Window,
+        request: CoverRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let CoverRequest { key, book, shelf } = request;
+        if self.thumb_cache.contains_key(&key) || !self.thumb_requested.insert(key.clone()) {
+            return;
+        }
+        let state = AppState::global(cx);
+        let packs_dir = state.packs_dir.clone();
+        let thumbnails_dir = state.data_dir.join("thumbnails");
+        // pack の展開は重いので背景で回し、終わったら notify で描き直す
+        let task = cx.background_executor().spawn(async move {
+            load_note_cover(&thumbnails_dir, &packs_dir, &book, shelf.as_ref())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(image) = loaded {
+                    this.cache_thumb(window, key.clone(), image);
+                }
+                // 読めない本はプレースホルダのまま（1 行の失敗で画面は壊さない）
                 cx.notify();
             });
         })
@@ -708,8 +762,14 @@ impl NotesView {
     ) -> AnyElement {
         let note_id = Self::thumb_key(row);
         let page = row.note.page;
-        // 表紙枠には付箋を付けたページの画像を収める。
-        // まだ読めていない行（上限で捨てられた行を含む）はプレースホルダを出す
+        // 1 列目は**本の表紙**（サイトの表紙キャッシュ → pack の cover → プレースホルダ）。
+        let book_cover = self
+            .thumb_cache
+            .get(&Self::cover_key(row))
+            .cloned()
+            .or_else(|| placeholder_cover(&row.book.title, &row.book.circle_name));
+        // 4 列目は**付箋を付けたページ**の画像。まだ読めていない行（上限で捨てられた行を含む）は
+        // プレースホルダを出す
         let page_image = self
             .thumb_cache
             .get(&note_id)
@@ -739,11 +799,11 @@ impl NotesView {
             .border_color(theme.border)
             .bg(theme.muted)
             .hover(|style| style.bg(theme.secondary))
-            // 1 列目: 付箋を付けたページの画像（本棚の行と同じ枠）
+            // 1 列目: 本の表紙（本棚のリストと同じ枠・同じ解決順）
             .child(
                 div()
                     .debug_selector({
-                        let selector = format!("notes-page-{note_id}");
+                        let selector = format!("notes-cover-{note_id}");
                         move || selector.clone()
                     })
                     .relative()
@@ -753,8 +813,8 @@ impl NotesView {
                     .overflow_hidden()
                     .bg(theme.muted)
                     .child(cover_fit_inside_frame(
-                        page_image.as_ref(),
-                        format!("notes-page-img-{note_id}"),
+                        book_cover.as_ref(),
+                        format!("notes-cover-img-{note_id}"),
                     )),
             )
             // 2 列目: 情報（本棚のリストと同じ）+ メモ + 付箋登録日
@@ -869,7 +929,25 @@ impl NotesView {
                         tags_expanded,
                     )),
             )
-            // 4 列目: メモ（タグ列の右。残り幅いっぱいに広げる）
+            // 4 列目: 付箋を付けたページの画像（本棚の行と同じ枠。以前は 1 列目だった）
+            .child(
+                div()
+                    .debug_selector({
+                        let selector = format!("notes-page-{note_id}");
+                        move || selector.clone()
+                    })
+                    .relative()
+                    .w(px(LIST_COVER_W))
+                    .h(px(LIST_COVER_MIN_H))
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .bg(theme.muted)
+                    .child(cover_fit_inside_frame(
+                        page_image.as_ref(),
+                        format!("notes-page-img-{note_id}"),
+                    )),
+            )
+            // 5 列目: メモ（付箋ページの右。残り幅いっぱいに広げる）
             .child(
                 div()
                     .debug_selector({
@@ -920,7 +998,7 @@ impl NotesView {
                         .child(Self::render_memo_edit_button(theme, handle, row))
                     }),
             )
-            // 5 列目: 本を見る（該当ページ・見開き側で開く）。
+            // 6 列目: 本を見る（該当ページ・見開き側で開く）。
             // 行の高さいっぱいに広げ、押せることが分かるよう塗りボタンにする。
             .child(
                 div()
@@ -996,6 +1074,20 @@ fn load_note_thumb(
     loader.load_thumb((page - 1).max(0) as usize)
 }
 
+/// 行の表紙を解決する（本棚のリストと同じ: サイトの表紙キャッシュ → pack の cover）。
+///
+/// どちらも無ければ `None` を返す（呼び出し側が `placeholder_cover` を出す）。背景実行用。
+fn load_note_cover(
+    thumbnails_dir: &std::path::Path,
+    packs_dir: &std::path::Path,
+    book: &books::Book,
+    shelf: Option<&db::bookshelf::BookshelfItem>,
+) -> Option<Arc<RenderImage>> {
+    shelf
+        .and_then(|item| load_cached_cover(thumbnails_dir, item))
+        .or_else(|| load_cover_image(packs_dir, book))
+}
+
 /// `YYYY-MM-DD HH:MM:SS`（UTC）をローカルの「YYYY年MM月DD日」にする。
 fn local_date_label(utc: &str) -> String {
     use chrono::{Local, NaiveDateTime, TimeZone as _};
@@ -1038,6 +1130,23 @@ impl Render for NotesView {
                 .collect();
         for request in pending {
             self.ensure_thumb_loaded(window, request, cx);
+        }
+        // 1 列目の本の表紙も同じ遅延読み込みに乗せる（ページ画像と同じキャッシュを共有）。
+        let pending_covers: Vec<CoverRequest> =
+            self.visible_note_rows(cx)
+                .into_iter()
+                .filter_map(|row| {
+                    let key = Self::cover_key(row);
+                    (!self.thumb_cache.contains_key(&key) && !self.thumb_requested.contains(&key))
+                        .then(|| CoverRequest {
+                            key,
+                            book: row.book.clone(),
+                            shelf: row.shelf.clone(),
+                        })
+                })
+                .collect();
+        for request in pending_covers {
+            self.ensure_cover_loaded(window, request, cx);
         }
         let visible = self.visible_note_rows(cx);
         let count = visible.len();
@@ -1254,12 +1363,13 @@ mod tests {
                 arena_clear.clear(cx);
             });
         }
-        // 行（ページ画像 / 情報列 / タグ列 / 本を見る）が出る
+        // 行（表紙 / 情報列 / タグ列 / 付箋ページ / メモ列 / 本を見る）が出る
         for selector in [
-            "notes-page-b2-7",
+            "notes-cover-b2-7",
             "notes-info-b2-7",
             "notes-created-b2-7",
             "notes-tag-area-b2-7",
+            "notes-page-b2-7",
             "notes-memo-area-b2-7",
             "notes-memo-b2-7",
             "notes-open-b2-7",
@@ -1267,6 +1377,31 @@ mod tests {
             assert!(
                 visual.debug_bounds(selector).is_some(),
                 "{selector} が出ていない"
+            );
+        }
+        // 左から 表紙 → 情報 → タグ → 付箋ページ → メモ → 本を見る の順に並ぶ
+        let mut positions: Vec<(&str, f32)> = Vec::new();
+        for selector in [
+            "notes-cover-b2-7",
+            "notes-info-b2-7",
+            "notes-tag-area-b2-7",
+            "notes-page-b2-7",
+            "notes-memo-area-b2-7",
+            "notes-open-b2-7",
+        ] {
+            let bounds = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} が出ていない"));
+            positions.push((selector, bounds.origin.x.as_f32()));
+        }
+        for pair in positions.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].1,
+                "{} が {} より左に無い（{} < {}）",
+                pair[0].0,
+                pair[1].0,
+                pair[0].1,
+                pair[1].1
             );
         }
         // 「本を見る」は矢印なしで、行の内容の高さいっぱいに広がる
@@ -1279,20 +1414,42 @@ mod tests {
             "本を見るボタンが行の高さいっぱいになっていない: {} (期待 {expected})",
             open.size.height.as_f32()
         );
-        // メモはタグ列の右にあり、残り幅いっぱい（タグ列より広い）
+        // 付箋ページはタグ列の右（以前は 1 列目だった）。枠は本の表紙と同じ大きさ
         let tag_area = visual.debug_bounds("notes-tag-area-b2-7").expect("タグ列");
-        let memo_area = visual.debug_bounds("notes-memo-area-b2-7").expect("メモ列");
+        let page_area = visual.debug_bounds("notes-page-b2-7").expect("付箋ページ");
+        let cover_area = visual.debug_bounds("notes-cover-b2-7").expect("表紙");
         assert!(
-            memo_area.origin.x > tag_area.origin.x,
-            "メモがタグ列の右に無い: tag={} memo={}",
+            page_area.origin.x > tag_area.origin.x,
+            "付箋ページがタグ列の右に無い: tag={} page={}",
             tag_area.origin.x.as_f32(),
-            memo_area.origin.x.as_f32()
+            page_area.origin.x.as_f32()
+        );
+        // 表紙枠は本棚のリスト（と履歴）と同じ固定サイズ（200x133）
+        assert!(
+            (cover_area.size.width.as_f32() - LIST_COVER_W).abs() < 1.0
+                && (cover_area.size.height.as_f32() - LIST_COVER_MIN_H).abs() < 1.0,
+            "表紙枠が本棚と違う: {}x{}（期待 {}x{}）",
+            cover_area.size.width.as_f32(),
+            cover_area.size.height.as_f32(),
+            LIST_COVER_W,
+            LIST_COVER_MIN_H
         );
         assert!(
-            memo_area.size.width.as_f32() > tag_area.size.width.as_f32(),
-            "メモの幅がタグ列より広くなっていない: tag={} memo={}",
-            tag_area.size.width.as_f32(),
-            memo_area.size.width.as_f32()
+            (cover_area.size.width.as_f32() - page_area.size.width.as_f32()).abs() < 0.5
+                && (cover_area.size.height.as_f32() - page_area.size.height.as_f32()).abs() < 0.5,
+            "表紙と付箋ページの枠がそろっていない: cover={}x{} page={}x{}",
+            cover_area.size.width.as_f32(),
+            cover_area.size.height.as_f32(),
+            page_area.size.width.as_f32(),
+            page_area.size.height.as_f32()
+        );
+        // メモは付箋ページの右にあり、本を見るボタンの左端まで届く（残り幅いっぱい）
+        let memo_area = visual.debug_bounds("notes-memo-area-b2-7").expect("メモ列");
+        assert!(
+            memo_area.origin.x > page_area.origin.x,
+            "メモが付箋ページの右に無い: page={} memo={}",
+            page_area.origin.x.as_f32(),
+            memo_area.origin.x.as_f32()
         );
         // メモ列は本を見るボタンの左端まで届く（残り幅を埋める）
         let open = visual.debug_bounds("notes-open-b2-7").expect("本を見る");
@@ -1771,6 +1928,41 @@ mod tests {
             age_rating: None,
             series_name: None,
         }
+    }
+
+    /// 表紙は pack の cover（`thumbnail.webp` / `cover.webp`）から読む。
+    /// 読めなければ `None` を返し、呼び出し側がプレースホルダを出す。
+    #[test]
+    fn note_cover_reads_the_pack_cover() {
+        let root =
+            std::env::temp_dir().join(format!("thundoku-notes-cover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let packs = root.join("packs");
+        let thumbnails = root.join("thumbnails");
+        std::fs::create_dir_all(&packs).unwrap();
+        std::fs::create_dir_all(&thumbnails).unwrap();
+
+        // cover.webp を持つ pack を置く
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 6, image::Rgba([10, 20, 30, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut builder = opfspack::PackBuilder::new(1);
+        builder.add_entry("cover.webp", png.clone(), "image/webp", false);
+        let bytes = builder.build(None, false).unwrap();
+        std::fs::write(packs.join("b1.opfspack"), &bytes).unwrap();
+
+        assert!(
+            load_note_cover(&thumbnails, &packs, &test_book("b1"), None).is_some(),
+            "pack の cover.webp から表紙を読めていない"
+        );
+        // pack が無い本は None（呼び出し側がプレースホルダを出す）
+        assert!(
+            load_note_cover(&thumbnails, &packs, &test_book("b2"), None).is_none(),
+            "pack が無いのに表紙が返っている"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 付箋登録日は UTC 保存なので、ローカル日付に直して出す。
