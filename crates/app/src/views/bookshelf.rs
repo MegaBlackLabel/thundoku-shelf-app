@@ -4129,6 +4129,13 @@ impl BookshelfView {
     /// 分からない。終われば文言が `None` になって積まなくなり、既定の 5 秒で消える。
     fn notify_download_progress(&mut self, cx: &mut Context<Self>) {
         let message = download_notice_message(&self.download_states);
+        // 進行中が無くなったら控えを消す。残したままだと、次に同じ文言（1 件など）で
+        // 始まるダウンロードが「変わっていない」と判定され、通知が二度と出なくなる。
+        if message.is_none() {
+            self.download_notice = None;
+            self.download_notice_at = None;
+            return;
+        }
         if message == self.download_notice {
             return;
         }
@@ -7069,8 +7076,10 @@ impl Render for BookshelfView {
                 if let Some((title, choices, selected)) = pending_import {
                     let handle = handle.clone();
                     let content_handle = handle.clone();
-                    // 面（背景色）と縁（`border`）はテーマの既定をそのまま使う
+                    // 面は「浮いた面」に揃える（背景と同色だとダークで同化する）。
+                    // 縁（`border`）はテーマの既定をそのまま使う
                     Dialog::new(cx)
+                        .bg(cx.theme().colors.popover)
                         .title(div().child("取り込み内容の確認"))
                         // バツは置かない（このモーダルは worker が回答を待っているので、
                         // キャンセル / 取り込む のどちらかで必ず答える必要がある）
@@ -7223,6 +7232,8 @@ impl Render for BookshelfView {
                     let no_handle = handle.clone();
                     let title = item.title.clone();
                     Dialog::new(cx)
+                        // 面は「浮いた面」に揃える（背景と同色だとダークで同化する）
+                        .bg(cx.theme().colors.popover)
                         .title(div().child("未ダウンロードです。ダウンロードしますか？"))
                         .content(move |content, _window, _cx| {
                             content.child(div().text_sm().child(title.clone()))
@@ -9381,6 +9392,52 @@ mod tests {
     /// 進行中の通知は、文言が変わったときだけ積む。
     ///
     /// 16ms ごとの進捗で積み直すと、通知の置き換えが絶え間なく起きる。
+    /// 進行中が無くなったら控えを消す（同じ文言の次のダウンロードでも通知が出る）。
+    ///
+    /// 控えを残したままだと、10 秒フロアで弾かれた完了時に文言が更新されず、
+    /// 次に同じ文言（1 件）で始まるダウンロードが `message == download_notice` で
+    /// 即 return になり、通知が二度と出なくなる。
+    #[gpui_kit::test]
+    async fn download_progress_notice_is_pushed_again_in_the_next_session(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        let generation =
+            |cx: &mut TestAppContext| cx.update(|cx| *AppState::global(cx).toast_generation.lock());
+
+        // 1 冊目: 開始で積まれる
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_states
+                    .insert("db-1".to_string(), DownloadState::Downloading(0.0));
+                this.notify_download_progress(cx);
+            })
+        });
+        let first = generation(cx);
+        assert!(first > 0, "1 冊目で通知が積まれていない");
+
+        // 完了（進行中ゼロ）。10 秒フロアに弾かれても控えは消えていること
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_states.clear();
+                this.notify_download_progress(cx);
+            })
+        });
+
+        // 2 冊目: 同じ文言でも積まれる
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.download_states
+                    .insert("db-2".to_string(), DownloadState::Downloading(0.0));
+                this.notify_download_progress(cx);
+            })
+        });
+        assert!(
+            generation(cx) > first,
+            "同じ文言の次のダウンロードで通知が積まれない"
+        );
+    }
+
     #[gpui_kit::test]
     async fn download_progress_notice_is_pushed_only_when_the_text_changes(
         cx: &mut TestAppContext,

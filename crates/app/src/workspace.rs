@@ -1600,6 +1600,8 @@ impl Render for Workspace {
                     .unwrap_or_default();
                 gpui_kit::deferred(
                     Dialog::new(cx)
+                        // 面は「浮いた面」に揃える（背景と同色だとダークで同化する）
+                        .bg(cx.theme().colors.popover)
                         .title(div().child("Drive バックアップが見つかりました"))
                         .content(move |content, _window, _cx| {
                             content.child(div().text_sm().child(format!(
@@ -1648,6 +1650,8 @@ impl Render for Workspace {
                 let handle = cx.entity();
                 gpui_kit::deferred(
                     Dialog::new(cx)
+                        // 面は「浮いた面」に揃える（背景と同色だとダークで同化する）
+                        .bg(cx.theme().colors.popover)
                         .title(div().child("Google Drive と同期しますか？"))
                         .content(move |content, _window, _cx| {
                             content.child(div().text_sm().child(

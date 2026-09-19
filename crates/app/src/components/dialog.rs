@@ -76,9 +76,13 @@ pub fn dialog_surface(cx: &App) -> gpui_kit::Div {
         .gap_3()
         .p_5()
         .rounded_xl()
-        // 面は背景色（ライト＝白 / ダーク＝neutral-950）。浮かせるのは縁と膜と影で行う。
-        // 面を明るくすると、その上のボタン（`button`）が沈んで読めなくなる。
-        .bg(theme.colors.background)
+        // 面は「浮いた面」(`popover`)。背景と同色にすると、ダークでは膜と影がほとんど
+        // 効かず（実測: 面 #0a0a0a vs 膜を重ねた背景 #060606 = 明度差 0.0015、
+        // コントラスト比 1.02:1）、境界の手がかりがヘアラインだけになる。
+        // 背景より 4〜8 明度ポイント明るくすると境界が面そのもので分かる
+        // （#0a0a0a → #171717 で約 5.7 ポイント）。その上のボタンは縁
+        // （`dialog_button`）と塗りで面から切り離す。
+        .bg(theme.colors.popover)
         .text_color(theme.colors.popover_foreground)
         .border_1()
         .border_color(theme.colors.border)

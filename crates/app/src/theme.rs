@@ -23,8 +23,9 @@ use gpui_kit::component::{Theme, ThemeMode};
 /// 背景（neutral-950）→ カード・入力（neutral-800）→ 浮いた面（neutral-900）→
 /// 縁（neutral-700）の階層に引き直す。ライトは既定のままで問題ない。
 ///
-/// ダイアログの面は背景色のまま（ライトと同じ流儀）で、縁と膜と影で浮かせる。
-/// 面を明るくしすぎると、その上のボタン（既定 neutral-800 相当）が沈むため。
+/// ダイアログの面は「浮いた面」(`popover`) に統一した。背景と同色のままだと、
+/// ダークでは膜と影がほとんど効かず境界がヘアライン頼みになる（実測 1.02:1）。
+/// 背景より 4〜8 明度ポイント明るくすると境界が面そのもので分かる。
 ///
 /// モード切替（[`Theme::change`]）がこの設定を読むので、切替より前に呼ぶこと
 /// （[`crate::workspace::Workspace::new`] が保存済みモードの適用前に呼ぶ）。
@@ -91,8 +92,8 @@ mod tests {
             Theme::change(ThemeMode::Dark, None, cx);
             let theme = cx.theme();
             let raised = theme.colors.popover.l - theme.colors.background.l;
-            // ダイアログの面（背景色）と、その上のボタン（既定 variant）の明度差
-            let button = (theme.colors.button.l - theme.colors.background.l).abs();
+            // ダイアログの面（`popover`）と、その上のボタン（既定 variant）の明度差
+            let button = (theme.colors.button.l - theme.colors.popover.l).abs();
             (raised, button, theme.colors.overlay.a)
         })
     }
@@ -117,8 +118,9 @@ mod tests {
 
     /// ダーク: ダイアログの面と、その上のボタン（キャンセル等）が同化しないこと。
     ///
-    /// ダイアログの面は背景色。ボタンの面（`button` / `button_secondary`）が背景と
-    /// 同じ明るさだと、キャンセル / 保存せずに終了が背景に溶けて読めなくなる。
+    /// ダイアログの面は「浮いた面」(`popover`)。ボタンの面（`button` /
+    /// `button_secondary`）がそれと同じ明るさだと、キャンセル / 保存せずに終了が
+    /// 面に溶けて読めなくなる（比較対象は背景ではなく**ダイアログの面**）。
     #[gpui_kit::test]
     async fn dark_dialog_buttons_do_not_blend_into_the_surface(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
@@ -127,7 +129,7 @@ mod tests {
             apply_dark_surfaces(cx);
             Theme::change(ThemeMode::Dark, None, cx);
             let theme = cx.theme();
-            (theme.colors.button_secondary.l - theme.colors.background.l).abs()
+            (theme.colors.button_secondary.l - theme.colors.popover.l).abs()
         });
         for (name, gap) in [("button", button), ("button_secondary", secondary)] {
             assert!(
