@@ -7567,6 +7567,8 @@ impl Render for BookshelfView {
                     let no_handle = handle.clone();
                     let yes_handle = handle.clone();
                     Dialog::new(cx)
+                        // 面は「浮いた面」に揃える（背景と同色だとダークで同化する）
+                        .bg(cx.theme().colors.popover)
                         .title(div().child(format!("「{title}」のダウンロードを中止しますか？")))
                         .content(move |content, _window, _cx| {
                             content.child(div().text_sm().child(
