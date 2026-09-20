@@ -88,6 +88,9 @@ pub struct AppState {
     pub toast_autohide: Arc<Mutex<bool>>,
     /// 進行中のトーストか（通知に Spinner を添えて「動いている」ことを示す）
     pub toast_progress: Arc<Mutex<bool>>,
+    /// 保護つき通知（タグ取得の完了など）の保護期限。この時刻まではバックグラウンドの
+    /// 通知（進行中・定期同期の完了）で上書きしない（`set_protected_notice` が立てる）
+    pub toast_protected_until: Arc<Mutex<Option<std::time::Instant>>>,
     /// トーストホストを持つ workspace（トースト表示時の notify 用）
     pub workspace: Arc<Mutex<Option<gpui_kit::WeakEntity<crate::workspace::Workspace>>>>,
     /// 本棚の再読込が必要（設定画面の非表示解除等）。render で確認して reload する
@@ -325,6 +328,7 @@ impl AppState {
             toast_generation: Arc::new(Mutex::new(0)),
             toast_autohide: Arc::new(Mutex::new(true)),
             toast_progress: Arc::new(Mutex::new(false)),
+            toast_protected_until: Arc::new(Mutex::new(None)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
             exit_checked: Arc::new(AtomicBool::new(false)),
@@ -401,6 +405,7 @@ impl AppState {
             toast_generation: Arc::new(Mutex::new(0)),
             toast_autohide: Arc::new(Mutex::new(true)),
             toast_progress: Arc::new(Mutex::new(false)),
+            toast_protected_until: Arc::new(Mutex::new(None)),
             workspace: Arc::new(Mutex::new(None)),
             bookshelf_invalidated: Arc::new(Mutex::new(false)),
             exit_checked: Arc::new(AtomicBool::new(false)),
@@ -563,9 +568,42 @@ pub fn set_toast_kind(cx: &mut App, kind: ToastKind, message: impl Into<String>)
 /// 何度積んでも通知は増えず、1 つが更新される。既定では 5 秒で消えるので、
 /// 進行中は進捗が変わったときに積み直す（終われば自然に消える）。
 pub fn set_progress_notice(cx: &mut App, message: impl Into<String>) {
+    // 保護つきの通知（タグ取得の完了など）が表示中なら、進行中の通知で上書きしない
+    // （進行中は進捗のたびに積み直すため、放っておくと読む前に消してしまう）
+    if !background_notice_allowed(cx, ToastKind::Info) {
+        return;
+    }
     // `set_toast_kind_with` が進行中フラグを false に戻すので、あとから立てる
     set_toast_kind_with(cx, ToastKind::Info, message, true);
     *AppState::global(cx).toast_progress.lock() = true;
+}
+
+/// 保護つき通知（`set_protected_notice`）を、バックグラウンドの通知で
+/// 上書きしない時間。自動消滅（5 秒）と同じにして、読み終わる前に消えないようにする。
+pub const NOTICE_PROTECT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 保護つきの通知を出す（`NOTICE_PROTECT` のあいだは、進行中・定期同期の完了などの
+/// バックグラウンド通知に上書きされない）。タグ取得の完了のように「読んでほしい」
+/// 通知で使う。
+pub fn set_protected_notice(cx: &mut App, kind: ToastKind, message: impl Into<String>) {
+    *AppState::global(cx).toast_protected_until.lock() =
+        Some(std::time::Instant::now() + NOTICE_PROTECT);
+    set_toast_kind(cx, kind, message);
+}
+
+/// 保護つき通知がまだ表示中か（`until` が保護期限、`now` が現在時刻）。
+fn notice_is_protected(until: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    until.is_some_and(|until| now < until)
+}
+
+/// バックグラウンドの通知（進行中・定期同期の完了）を出してよいか。
+/// 保護つき通知が表示中のあいだは見送る（エラーは見送らない = 必ず出す）。
+pub fn background_notice_allowed(cx: &App, kind: ToastKind) -> bool {
+    if kind == ToastKind::Error {
+        return true;
+    }
+    let until = *AppState::global(cx).toast_protected_until.lock();
+    !notice_is_protected(until, std::time::Instant::now())
 }
 
 /// **進行中のまま消えない**メッセージを積む（終了時のアップロードなど）。
@@ -595,7 +633,9 @@ pub fn set_toast_kind_with(
     set_toast(cx, message);
 }
 
-pub fn set_toast(cx: &mut App, message: impl Into<String>) {
+/// 生のトースト差し替え。**`set_toast_kind*` からだけ呼ぶ**（直接呼ぶと `autohide` /
+/// 種別 / 進行中フラグが前の値のまま残り、「消えない通知」がそのまま残る不具合になる）。
+fn set_toast(cx: &mut App, message: impl Into<String>) {
     // workspace（トーストホスト）は notify 用に先に取り出しておく
     let ws = {
         let state = AppState::global(cx);
@@ -866,6 +906,97 @@ mod tests {
         // メモリバックエンドはプロセス内で共有されるため後始末する
         cx.update(|cx| {
             let _ = clear_github_token(cx);
+        });
+    }
+
+    /// 保護期限は 5 秒（自動消滅と同じ）。
+    #[test]
+    fn notice_is_protected_only_within_the_window() {
+        let now = std::time::Instant::now();
+        assert!(!notice_is_protected(None, now), "保護していなければ素通し");
+        assert!(
+            notice_is_protected(Some(now + std::time::Duration::from_millis(1)), now),
+            "期限内は保護する"
+        );
+        assert!(
+            !notice_is_protected(Some(now), now),
+            "期限ちょうどは保護しない（自動消滅と同じ）"
+        );
+        assert!(
+            !notice_is_protected(Some(now), now + NOTICE_PROTECT),
+            "5 秒経ったら上書きを許す"
+        );
+    }
+
+    /// 保護つきの通知（タグ取得の完了など）は、進行中の通知に上書きされない。
+    #[gpui_kit::test]
+    async fn progress_notice_does_not_overwrite_a_protected_notice(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            set_protected_notice(
+                cx,
+                ToastKind::Success,
+                "FANZA のタグ情報を 20 件取得しました",
+            );
+            set_progress_notice(cx, "ダウンロード中です…");
+            let state = AppState::global(cx);
+            assert_eq!(
+                state.toast_message.lock().as_deref(),
+                Some("FANZA のタグ情報を 20 件取得しました"),
+                "進行中の通知が保護つき通知を消している"
+            );
+            assert!(
+                !*state.toast_progress.lock(),
+                "進行中のままになっている（スピナーが付く）"
+            );
+        });
+    }
+
+    /// 保護つき通知が無いときは、進行中の通知は今までどおり出る。
+    #[gpui_kit::test]
+    async fn progress_notice_is_shown_without_a_protected_notice(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            set_toast_kind(cx, ToastKind::Info, "本棚を更新しました");
+            set_progress_notice(cx, "ダウンロード中です…");
+            let state = AppState::global(cx);
+            assert_eq!(
+                state.toast_message.lock().as_deref(),
+                Some("ダウンロード中です…"),
+                "保護つきでないときは進行中の通知を止めてはいけない"
+            );
+            assert!(*state.toast_progress.lock(), "進行中の印が立っていない");
+        });
+    }
+
+    /// 「消えない通知」（終了時アップロード）のあとでも、通常の通知は自動消滅に戻る。
+    ///
+    /// 生の `set_toast` を直に呼んでいた経路（Drive 同期の「同期完了」など）は
+    /// `autohide = false` を引き継いでしまい、**通知が消えずに残り続けていた**。
+    #[gpui_kit::test]
+    async fn notice_after_a_sticky_one_autohides_again(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            set_sticky_progress_notice(cx, "アップロード中です…");
+            assert!(!*AppState::global(cx).toast_autohide.lock());
+            set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "同期完了（DL 1 / UL 0 / スキップ 0 / 競合 0）",
+            );
+            let state = AppState::global(cx);
+            assert!(
+                *state.toast_autohide.lock(),
+                "消えない通知の設定が残っている（他と同じ時間で消えない）"
+            );
+            assert!(!*state.toast_progress.lock(), "進行中フラグが残っている");
         });
     }
 

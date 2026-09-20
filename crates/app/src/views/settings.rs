@@ -683,7 +683,9 @@ impl SettingsView {
 
     /// アプリ全体の通知を出す（Workspace が gpui-kit の Notification に流す。既定 5 秒で自動消滅）
     fn show_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        crate::app_state::set_toast(cx, message);
+        // `set_toast` を直に呼ぶと autohide / 種別が前の値のまま残り、
+        // 前段で「消えない通知」を出していたときにこの通知も消えなくなる。
+        crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Info, message);
         cx.notify();
     }
 
@@ -1028,21 +1030,28 @@ impl SettingsView {
                         }
                         // 表示に使う値を読み直す（`render` では DB を引かない）
                         this.reload(cx);
-                        this.show_toast(
-                            format!(
-                                "同期完了（DL {} / UL {} / スキップ {} / 競合 {}）{}",
-                                outcome.downloaded.len(),
-                                outcome.uploaded.len(),
-                                outcome.skipped.len(),
-                                outcome.conflicts.len(),
-                                if outcome.database_backed_up {
-                                    " / DB バックアップ"
-                                } else {
-                                    ""
-                                }
-                            ),
+                        // 直前に別の通知（タグ取得の完了など）が出ていたら見送る。
+                        // 定期同期の完了で上書きして隠してしまわないようにする。
+                        if crate::app_state::background_notice_allowed(
                             cx,
-                        );
+                            crate::app_state::ToastKind::Info,
+                        ) {
+                            this.show_toast(
+                                format!(
+                                    "同期完了（DL {} / UL {} / スキップ {} / 競合 {}）{}",
+                                    outcome.downloaded.len(),
+                                    outcome.uploaded.len(),
+                                    outcome.skipped.len(),
+                                    outcome.conflicts.len(),
+                                    if outcome.database_backed_up {
+                                        " / DB バックアップ"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                                cx,
+                            );
+                        }
                     }
                     Err(message) => {
                         log::error!("sync_drive_now failed: {message}");
@@ -3207,5 +3216,36 @@ mod tests {
             db::settings::get(db, "drive.sync.enabled").unwrap()
         });
         assert_eq!(sync_enabled.as_deref(), Some("true")); // app_settings preserved
+    }
+
+    /// Drive 同期の「同期完了」通知は、他の通知と同じく自動で消える。
+    ///
+    /// 以前は生の `set_toast` を直に呼んでいたため、前段で「消えない通知」
+    /// （終了時アップロード）を出していると `autohide = false` を引き継ぎ、
+    /// 同期完了の通知が**消えずに残り続けていた**（タグ取得の完了通知を隠していた）。
+    #[gpui_kit::test]
+    async fn drive_sync_toast_autohides_like_other_notices(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // 終了時アップロード相当の「消えない通知」を先に出しておく
+        cx.update(|cx| crate::app_state::set_sticky_progress_notice(cx, "アップロード中です…"));
+        let view = cx.new(SettingsView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.show_toast("同期完了（DL 1 / UL 0 / スキップ 0 / 競合 0）", cx)
+            })
+        });
+        cx.read(|cx| {
+            let state = AppState::global(cx);
+            assert!(
+                *state.toast_autohide.lock(),
+                "同期完了の通知が消えない（他の通知と同じ時間で消えること）"
+            );
+            assert_eq!(
+                state.toast_message.lock().as_deref(),
+                Some("同期完了（DL 1 / UL 0 / スキップ 0 / 競合 0）")
+            );
+            assert!(!*state.toast_progress.lock(), "進行中のままになっている");
+        });
     }
 }

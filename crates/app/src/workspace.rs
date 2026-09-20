@@ -722,9 +722,17 @@ impl Workspace {
                     if restored {
                         // 本棚を再読込して復元結果を反映する
                         this.bookshelf.update(cx, |b, cx| b.reload(cx));
-                        crate::app_state::set_toast(cx, "Drive バックアップを復元しました");
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            crate::app_state::ToastKind::Success,
+                            "Drive バックアップを復元しました",
+                        );
                     } else {
-                        crate::app_state::set_toast(cx, "バックアップの復元に失敗しました");
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            crate::app_state::ToastKind::Error,
+                            "バックアップの復元に失敗しました",
+                        );
                     }
                     cx.notify();
                 });
@@ -1711,7 +1719,11 @@ impl Render for Workspace {
                                                     let _ = db::settings::set(db, "drive.sync.enabled", "true");
                                                     // 有効化だけでなく、実際に今すぐ同期を実行する。
                                                     this.sync_drive(cx);
-                                                    crate::app_state::set_toast(cx, "Google Drive と同期しました");
+                                                    crate::app_state::set_toast_kind(
+                                                        cx,
+                                                        crate::app_state::ToastKind::Success,
+                                                        "Google Drive と同期しました",
+                                                    );
                                                     cx.notify();
                                                 });
                                             }

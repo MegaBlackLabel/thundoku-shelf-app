@@ -1494,6 +1494,24 @@ fn download_messages(
     }
 }
 
+/// 未ダウンロード本のタグ取得の結果を通知文言にする（取得 0 件なら通知しない）。
+///
+/// 「同期のついでにタグが増えた」ことを伝えるのが目的なので、失敗だけ・打ち切りだけの
+/// ときは出さない（同期そのものの失敗は別の通知が受け持つ）。
+fn tag_fetch_notice(outcome: &thundoku_core::fanza::sync::TagFetchOutcome) -> Option<String> {
+    (outcome.fetched > 0).then(|| {
+        let mut notice = format!(
+            "FANZA の未ダウンロードのタグ情報を {} 件取得しました",
+            outcome.fetched
+        );
+        // まだ残っているときは、あと何件あるかを後ろにつける
+        if outcome.remaining > 0 {
+            notice.push_str(&format!("（残り {} 件が未取得）", outcome.remaining));
+        }
+        notice
+    })
+}
+
 impl BookshelfView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let handle = cx.weak_entity();
@@ -3452,20 +3470,27 @@ impl BookshelfView {
                 return;
             };
             handle.update(cx, |this, cx| {
-                if outcome.fetched > 0 {
+                if let Some(notice) = tag_fetch_notice(&outcome) {
                     log::info!(
-                        "タグ取得: {} 件（失敗 {} 件 / 打切 {}）",
+                        "タグ取得: {} 件（失敗 {} 件 / 打切 {} / 残り {} 件）",
                         outcome.fetched,
                         outcome.skipped,
-                        outcome.stopped
+                        outcome.stopped,
+                        outcome.remaining
                     );
                     // 取れたタグを絞り込み・チップに反映する
                     this.reload(cx);
+                    // 通知は**最後に**出す。トーストは 1 つしか出せず（あとから出たものが
+                    // 上書きする）、reload は表紙取得の通知を出すことがあるため、
+                    // 先に出すと隠れてしまう。さらに**保護つき**にして、進行中通知や
+                    // 定期同期の完了通知に 5 秒間は上書きされないようにする。
+                    crate::app_state::set_protected_notice(cx, ToastKind::Success, notice);
                 } else if outcome.skipped > 0 || outcome.stopped {
                     log::warn!(
-                        "タグ取得: 0 件（失敗 {} 件 / 打切 {}）",
+                        "タグ取得: 0 件（失敗 {} 件 / 打切 {} / 残り {} 件）",
                         outcome.skipped,
-                        outcome.stopped
+                        outcome.stopped,
+                        outcome.remaining
                     );
                 }
             });
@@ -12352,6 +12377,31 @@ mod tests {
         // それ以外の失敗はそのまま出す
         let (_, error) = download_messages(&Err(ImportFailure::Message("通信に失敗".into())));
         assert_eq!(error.as_deref(), Some("通信に失敗"));
+    }
+
+    /// 未ダウンロード本のタグ取得は、取得できた件数を通知する（0 件なら出さない）。
+    #[test]
+    fn tag_fetch_notice_reports_only_when_books_were_fetched() {
+        let notice = |fetched: usize, skipped: usize, stopped: bool, remaining: usize| {
+            tag_fetch_notice(&thundoku_core::fanza::sync::TagFetchOutcome {
+                fetched,
+                skipped,
+                stopped,
+                remaining,
+            })
+        };
+        assert_eq!(
+            notice(20, 0, false, 0).as_deref(),
+            Some("FANZA の未ダウンロードのタグ情報を 20 件取得しました")
+        );
+        // 未取得が残っているときは、残り件数を後ろにつける
+        assert_eq!(
+            notice(20, 0, false, 212).as_deref(),
+            Some("FANZA の未ダウンロードのタグ情報を 20 件取得しました（残り 212 件が未取得）")
+        );
+        // 失敗だけ / 打ち切りだけのときは出さない（同期自体の失敗は別の通知が受け持つ）
+        assert_eq!(notice(0, 3, false, 5), None);
+        assert_eq!(notice(0, 0, true, 5), None);
     }
 
     #[gpui_kit::test]
