@@ -93,6 +93,7 @@ Drive 同期設定など）。
 | is_downloadable / is_checked / is_purchased / is_new / is_active | INTEGER | フラグ群 |
 | is_favorite / is_hidden | INTEGER | お気に入り・非表示 |
 | tags_json | TEXT | タグの JSON スナップショット |
+| tags_fetched | INTEGER | タグ取得済みフラグ（0 = 未取得）。FANZA の**未ダウンロード本**のタグを同期のたびに少しずつ取るための印（`fanza::sync::fetch_pending_tags`）。タグが 0 件でも 1 を立てて再取得しない |
 | synced_at / created_at / updated_at | TEXT | |
 
 ### reading_progress
@@ -306,6 +307,9 @@ Google Drive との同期状態（pack ごと）。
   （新しいマイグレーションファイルは作らない方針）
 - `books.page_turn` は `ensure_column`（`books` / `page_turn` / `page_turn TEXT`）で
   冪等に追加する（本ごとの綴じ方向。NULL はサイト別設定 `viewer.page_turn.{site}` に従う）
+- `bookshelf_items.tags_fetched` は `ensure_column`
+  （`bookshelf_items` / `tags_fetched` / `tags_fetched INTEGER NOT NULL DEFAULT 0`）で
+  冪等に追加する（未ダウンロード本のタグ取得済みフラグ）
 - `content_formats.label` の旧値（`画像` / `PDF` / `EPUB`）は `migrate()` 内の
   データ移行（`contents::migrate_legacy_labels`）で実データに合わせて書き換える
   （画像 = 拡張子名、PDF/EPUB = 種別名）

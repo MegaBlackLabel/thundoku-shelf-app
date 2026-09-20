@@ -10,7 +10,7 @@
 
 [Releases](https://github.com/MegaBlackLabel/thundoku-shelf-app/releases) からお使いの OS の zip をダウンロードして、展開して起動してください（インストーラーはありません）。
 
-ファイル名の `x.y.z` はバージョンです（例: `thundoku-shelf-0.2.3-aarch64-macos.zip`）。
+ファイル名の `x.y.z` はバージョンです（例: `thundoku-shelf-0.2.4-aarch64-macos.zip`）。
 
 | OS | ファイル |
 |---|---|
