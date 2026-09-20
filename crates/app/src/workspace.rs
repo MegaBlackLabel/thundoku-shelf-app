@@ -161,6 +161,99 @@ pub struct Workspace {
     exit_uploading: bool,
 }
 
+/// いずれかのサイト（技術書典 / BOOTH / FANZA同人 / DLsite）にログイン済みか。
+///
+/// Google / GitHub はアカウント連携用で本の供給元（サイト）ではないため含めない。
+/// 本棚のサイト行を出す判定と同じ 4 サイトを見る。
+fn any_site_logged_in(cx: &App) -> bool {
+    let state = AppState::global(cx);
+    *state.tbf_logged_in.lock()
+        || *state.booth_logged_in.lock()
+        || *state.fanza_logged_in.lock()
+        || *state.dlsite_logged_in.lock()
+}
+
+/// サイドバーの行（アイコン + ラベル）の見た目。
+///
+/// 選択状態は**色だけに頼らず**、下地とラベルの太さでも示す（アイコンだけの幅でも
+/// 「いまどこに居るか」が分かるようにするため。Design Guides の「State must be
+/// visible」「Do not encode meaning by color alone」）。選択の強調色は `primary`
+/// （ガイドの「`primary` for the principal action or selection emphasis」）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SidebarRowStyle {
+    icon_color: gpui_kit::Hsla,
+    label_color: gpui_kit::Hsla,
+    /// ラベルを太字にするか（選択中だけ）。
+    label_emphasis: bool,
+    /// 行の下地（選択中だけ敷く）。
+    background: Option<gpui_kit::Hsla>,
+}
+
+/// サイドバーの行の見た目を決める（選択中 / 非選択）。
+///
+/// 選択中は**塗りつぶし**（`primary` の下地 + `primary_foreground` のアイコン / ラベル）
+/// にする。下地だけ・文字色だけの違いは、テーマ（とくにダーク）で `primary` と
+/// `muted_foreground` の差が小さいと沈んで見えなくなるため、コントラストが保証された
+/// 組み合わせ（ガイドの `primary` + `primary_foreground`）で示す。
+/// 非選択はアイコンもラベルも `muted_foreground` に落とす。
+fn sidebar_row_style(theme: &gpui_kit::component::Theme, selected: bool) -> SidebarRowStyle {
+    if selected {
+        SidebarRowStyle {
+            icon_color: theme.primary_foreground,
+            label_color: theme.primary_foreground,
+            label_emphasis: true,
+            background: Some(theme.primary),
+        }
+    } else {
+        SidebarRowStyle {
+            icon_color: theme.muted_foreground,
+            label_color: theme.muted_foreground,
+            label_emphasis: false,
+            background: None,
+        }
+    }
+}
+
+/// サイドバーの行のアイコン色（選択状態に応じる）。
+///
+/// `Icon` は親の文字色を継承せず自前の既定色で描かれるので、行に `text_color` を
+/// 置くだけでは選択色にならない。アイコンを作る側でこれを使う。
+fn sidebar_icon_color(
+    theme: &gpui_kit::component::Theme,
+    target: NavTarget,
+    active: NavTarget,
+) -> gpui_kit::Hsla {
+    sidebar_row_style(theme, active == target).icon_color
+}
+
+/// サイドバーのロゴ（説明画面への入口）のタイル地色。
+///
+/// 説明画面を開いているときだけ `primary`（＝サイドバーの選択中と同じ塗りつぶし）、
+/// それ以外は控えめな `muted`。ロゴは常に `primary` で塗ってあったため、
+/// 説明画面を開いているかどうかがサイドバーから分からなかった。
+fn sidebar_logo_background(
+    theme: &gpui_kit::component::Theme,
+    about_active: bool,
+) -> gpui_kit::Hsla {
+    if about_active {
+        theme.primary
+    } else {
+        theme.muted
+    }
+}
+
+/// ロゴのグリフ色（タイル地色に対して読める色）。
+fn sidebar_logo_glyph_color(
+    theme: &gpui_kit::component::Theme,
+    about_active: bool,
+) -> gpui_kit::Hsla {
+    if about_active {
+        theme.primary_foreground
+    } else {
+        theme.muted_foreground
+    }
+}
+
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let settings = cx.new(SettingsView::new);
@@ -171,8 +264,18 @@ impl Workspace {
         let about = cx.new(AboutView::new);
         let report = cx.new(ReportView::new);
 
+        // どのサイトにもログインしていなければ、本棚ではなく説明画面を初期表示に
+        // する（本が 1 冊も入らない空の本棚より、各ストアのログイン手順が書かれた
+        // 説明画面のほうが入口として機能する）。Google / GitHub だけのログインは
+        // サイトのログインではないため本棚を出さない。
+        let active = if any_site_logged_in(cx) {
+            NavTarget::Bookshelf
+        } else {
+            NavTarget::About
+        };
+
         let mut this = Self {
-            active: NavTarget::Bookshelf,
+            active,
             sidebar_open: false,
             sidebar_close_generation: 0,
             bookshelf_submenu_open: false,
@@ -310,6 +413,9 @@ impl Workspace {
                     tbf_was_logged_in = tbf_now;
                     let _ = handle.update(cx, |_this, cx| sync_app_menus(cx));
                 }
+                // サイトのログインが完了していたら、そのサイトの同期を始める
+                // （要求は `AuthDialog` が立て、ここで 1 回だけ消費する）。
+                let _ = handle.update(cx, |this, cx| this.handle_login_sync_request(cx));
             }
         })
         .detach();
@@ -589,10 +695,24 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Google プロフィールの復元（起動時）。
+    /// Google プロフィールの復元(起動時)。
     pub fn restore_google_profile(&mut self, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
         settings.update(cx, |s, cx| s.refresh_google_profile(cx));
+    }
+
+    /// サイトのログイン完了で立った同期要求を消費して、そのサイトを同期する。
+    ///
+    /// ログイン直後の本棚は購入済みの一覧が空なので、手動で「同期」を押させない。
+    /// 監視タスク（`start_login_done_watcher`）が 100ms ごとに呼ぶ。要求は 1 回で
+    /// 消費するので、同じサイトを何度も同期しない。要求が無ければ何もしない。
+    pub(crate) fn handle_login_sync_request(&mut self, cx: &mut Context<Self>) {
+        let Some(site) = AppState::global(cx).login_sync_requested.lock().take() else {
+            return;
+        };
+        log::info!("site login done: {site} を自動同期する");
+        let bookshelf = self.bookshelf.clone();
+        bookshelf.update(cx, |b, bx| b.sync_site(&site, bx));
     }
 
     /// 起動時: Google ログイン済みなら Drive の DB バックアップを確認し、
@@ -1958,10 +2078,11 @@ impl Workspace {
                 "sidebar-nav-report",
                 Icon::new(AppIcon::Megaphone)
                     .size(px(24.0))
-                    .text_color(theme.muted_foreground)
+                    .text_color(sidebar_icon_color(&theme, NavTarget::Report, active))
                     .into_any_element(),
                 "レポート",
                 open,
+                active == NavTarget::Report,
                 |this, cx| {
                     this.switch_to(NavTarget::Report, cx);
                 },
@@ -2036,7 +2157,14 @@ impl Workspace {
                         // ロゴを右へ 8px（閉じた状態のアイコン列中央からの位置を揃える）
                         this.justify_start().gap_2().px(px(16.0))
                     })
-                    .child(self.sidebar_logo(unread, badge_color, open, handle.clone(), cx))
+                    .child(self.sidebar_logo(
+                        unread,
+                        badge_color,
+                        open,
+                        active == NavTarget::About,
+                        handle.clone(),
+                        cx,
+                    ))
                     .when(open, |this| {
                         this.child(
                             div()
@@ -2077,6 +2205,11 @@ impl Workspace {
                             NavTarget::Bookshelf,
                             Icon::new(AppIcon::LibraryBig)
                                 .size(px(24.0))
+                                .text_color(sidebar_icon_color(
+                                    &theme,
+                                    NavTarget::Bookshelf,
+                                    active,
+                                ))
                                 .into_any_element(),
                             "本棚",
                             open,
@@ -2093,6 +2226,11 @@ impl Workspace {
                             NavTarget::Favorites,
                             Icon::new(AppIcon::HeartFilled)
                                 .size(px(24.0))
+                                .text_color(sidebar_icon_color(
+                                    &theme,
+                                    NavTarget::Favorites,
+                                    active,
+                                ))
                                 .into_any_element(),
                             "お気に入り",
                             open,
@@ -2106,6 +2244,7 @@ impl Workspace {
                             NavTarget::History,
                             Icon::new(AppIcon::History)
                                 .size(px(24.0))
+                                .text_color(sidebar_icon_color(&theme, NavTarget::History, active))
                                 .into_any_element(),
                             "閲覧履歴",
                             open,
@@ -2119,6 +2258,7 @@ impl Workspace {
                             NavTarget::Notes,
                             Icon::new(AppIcon::StickyNote)
                                 .size(px(24.0))
+                                .text_color(sidebar_icon_color(&theme, NavTarget::Notes, active))
                                 .into_any_element(),
                             "付箋",
                             open,
@@ -2135,6 +2275,11 @@ impl Workspace {
                                 NavTarget::Checklist,
                                 Icon::new(AppIcon::ListChecks)
                                     .size(px(24.0))
+                                    .text_color(sidebar_icon_color(
+                                        &theme,
+                                        NavTarget::Checklist,
+                                        active,
+                                    ))
                                     .into_any_element(),
                                 "チェックリスト",
                                 open,
@@ -2161,10 +2306,11 @@ impl Workspace {
                             "sidebar-nav-settings",
                             Icon::new(IconName::Settings)
                                 .size(px(24.0))
-                                .text_color(theme.muted_foreground)
+                                .text_color(sidebar_icon_color(&theme, NavTarget::Settings, active))
                                 .into_any_element(),
                             "設定",
                             open,
+                            active == NavTarget::Settings,
                             |this, cx| {
                                 this.switch_to(NavTarget::Settings, cx);
                             },
@@ -2181,7 +2327,6 @@ impl Workspace {
                                 _ => AppIcon::Sun,
                             })
                             .size(px(24.0))
-                            .text_color(theme.muted_foreground)
                             .into_any_element(),
                             match theme_mode_name.as_str() {
                                 "dark" => "ダーク",
@@ -2189,6 +2334,8 @@ impl Workspace {
                                 _ => "ライト",
                             },
                             open,
+                            // テーマは画面ではなく切替操作なので選択状態を持たない
+                            false,
                             |this, cx| {
                                 this.cycle_theme(cx);
                             },
@@ -2201,10 +2348,11 @@ impl Workspace {
                             "sidebar-nav-account",
                             Icon::new(AppIcon::CircleUserRound)
                                 .size(px(24.0))
-                                .text_color(theme.muted_foreground)
                                 .into_any_element(),
                             "アカウント",
                             open,
+                            // アカウントはパネルを開く操作なので選択状態を持たない
+                            false,
                             |this, cx| {
                                 this.open_auth_panel(cx);
                             },
@@ -2236,6 +2384,7 @@ impl Workspace {
         unread: Option<usize>,
         badge_color: gpui_kit::Rgba,
         open: bool,
+        about_active: bool,
         handle: Entity<Workspace>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2253,7 +2402,8 @@ impl Workspace {
             .w(px(if open { 40.0 } else { 36.0 }))
             .h(px(if open { 40.0 } else { 36.0 }))
             .rounded_xl()
-            .bg(theme.primary)
+            // 説明画面を開いているときだけ選択中と同じ塗りつぶしにする
+            .bg(sidebar_logo_background(&theme, about_active))
             .flex()
             .items_center()
             .justify_center()
@@ -2273,7 +2423,7 @@ impl Workspace {
                 div().debug_selector(|| "sidebar-logo-glyph".into()).child(
                     Icon::new(AppIcon::BookMarked)
                         .size(px(24.0))
-                        .text_color(theme.primary_foreground),
+                        .text_color(sidebar_logo_glyph_color(&theme, about_active)),
                 ),
             )
             .child(match badge {
@@ -2328,6 +2478,7 @@ impl Workspace {
             _ => "sidebar-nav-other",
         };
         let is_active = active == target;
+        let row = sidebar_row_style(&theme, is_active);
         let site_menu = target == NavTarget::Bookshelf;
         div()
             .id(id)
@@ -2337,11 +2488,13 @@ impl Workspace {
             .gap_2()
             .py(px(6.0))
             .rounded_xl()
+            // アイコンは行の色を継承する（`Icon` 側で色を指定しない）
+            .text_color(row.icon_color)
+            .when_some(row.background, |this, bg| this.bg(bg))
             .when(open, |this| this.ml(px(18.0)).px(px(6.0)))
             .when(open, |this| this.w_full())
             .when(!open, |this| this.w(px(36.0)).h(px(36.0)).justify_center())
-            .when(is_active, |this| this.bg(theme.secondary))
-            .hover(|style| style.bg(theme.secondary))
+            .hover(|style| style.bg(theme.muted))
             .cursor_pointer()
             .on_click({
                 let handle = handle.clone();
@@ -2369,7 +2522,12 @@ impl Workspace {
                     div()
                         .flex_1()
                         .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
+                        .font_weight(if row.label_emphasis {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .text_color(row.label_color)
                         .whitespace_nowrap()
                         .child(label.clone()),
                 )
@@ -2415,12 +2573,14 @@ impl Workspace {
         icon: gpui_kit::AnyElement,
         label: &str,
         open: bool,
+        selected: bool,
         on_click: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
         handle: Entity<Workspace>,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let theme = cx.theme().clone();
         let label = label.to_string();
+        let row = sidebar_row_style(&theme, selected);
         div()
             .id(id)
             .debug_selector(move || id.into())
@@ -2429,10 +2589,13 @@ impl Workspace {
             .gap_2()
             .py(px(6.0))
             .rounded_xl()
+            // アイコンは行の色を継承する（`Icon` 側で色を指定しない）
+            .text_color(row.icon_color)
+            .when_some(row.background, |this, bg| this.bg(bg))
             .when(open, |this| this.ml(px(18.0)).px(px(6.0)))
             .when(open, |this| this.w_full())
             .when(!open, |this| this.w(px(36.0)).h(px(36.0)).justify_center())
-            .hover(|style| style.bg(theme.secondary))
+            .hover(|style| style.bg(theme.muted))
             .cursor_pointer()
             .on_click({
                 let handle = handle.clone();
@@ -2448,7 +2611,12 @@ impl Workspace {
                 this.child(
                     div()
                         .text_sm()
-                        .text_color(theme.muted_foreground)
+                        .font_weight(if row.label_emphasis {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .text_color(row.label_color)
                         .child(label.clone()),
                 )
             })
@@ -2509,8 +2677,12 @@ impl Workspace {
                             .px_2()
                             .py_1p5()
                             .text_xs()
-                            .when(site_filter.is_none(), |this| this.bg(theme.secondary))
-                            .hover(|style| style.bg(theme.secondary))
+                            .when(site_filter.is_none(), |this| {
+                                this.bg(theme.secondary)
+                                    .text_color(theme.primary)
+                                    .font_weight(FontWeight::MEDIUM)
+                            })
+                            .hover(|style| style.bg(theme.muted))
                             .cursor_pointer()
                             .on_click({
                                 let handle = handle.clone();
@@ -2540,8 +2712,10 @@ impl Workspace {
                                 .text_xs()
                                 .when(site_filter.as_deref() == Some("techbookfest"), |this| {
                                     this.bg(theme.secondary)
+                                        .text_color(theme.primary)
+                                        .font_weight(FontWeight::MEDIUM)
                                 })
-                                .hover(|style| style.bg(theme.secondary))
+                                .hover(|style| style.bg(theme.muted))
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
@@ -2572,8 +2746,10 @@ impl Workspace {
                                 .text_xs()
                                 .when(site_filter.as_deref() == Some("booth"), |this| {
                                     this.bg(theme.secondary)
+                                        .text_color(theme.primary)
+                                        .font_weight(FontWeight::MEDIUM)
                                 })
-                                .hover(|style| style.bg(theme.secondary))
+                                .hover(|style| style.bg(theme.muted))
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
@@ -2604,8 +2780,10 @@ impl Workspace {
                                 .text_xs()
                                 .when(site_filter.as_deref() == Some("fanza"), |this| {
                                     this.bg(theme.secondary)
+                                        .text_color(theme.primary)
+                                        .font_weight(FontWeight::MEDIUM)
                                 })
-                                .hover(|style| style.bg(theme.secondary))
+                                .hover(|style| style.bg(theme.muted))
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
@@ -2637,8 +2815,10 @@ impl Workspace {
                                 .text_xs()
                                 .when(site_filter.as_deref() == Some("dlsite"), |this| {
                                     this.bg(theme.secondary)
+                                        .text_color(theme.primary)
+                                        .font_weight(FontWeight::MEDIUM)
                                 })
-                                .hover(|style| style.bg(theme.secondary))
+                                .hover(|style| style.bg(theme.muted))
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
@@ -2792,6 +2972,199 @@ mod tests {
                 .notifications()
                 .len()
         })
+    }
+
+    /// 起動時の初期表示を決めるテスト用の土台（指定したサイトだけログイン済みにする）。
+    fn setup_with_logins(
+        cx: &mut TestAppContext,
+        logged_in_sites: &[&str],
+        google_logged_in: bool,
+        github_logged_in: bool,
+    ) -> gpui_kit::Entity<Workspace> {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            *state.google_logged_in.lock() = google_logged_in;
+            *state.github_logged_in.lock() = github_logged_in;
+            for site in logged_in_sites {
+                match *site {
+                    "tbf" => *state.tbf_logged_in.lock() = true,
+                    "booth" => *state.booth_logged_in.lock() = true,
+                    "fanza" => *state.fanza_logged_in.lock() = true,
+                    "dlsite" => *state.dlsite_logged_in.lock() = true,
+                    other => panic!("未知のサイト: {other}"),
+                }
+            }
+        });
+        cx.new(Workspace::new)
+    }
+
+    /// どのサイトにもログインしていなければ、起動時は本棚ではなく説明画面を出す。
+    ///
+    /// 本が 1 冊も入らない状態で空の本棚を出しても行き先が無く、説明画面には
+    /// ストアのログイン手順が書いてあるのでそちらを入口にする。
+    #[gpui_kit::test]
+    async fn starts_on_the_about_view_when_no_site_is_logged_in(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &[], false, false);
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::About,
+            "全サイト未ログインなのに本棚が初期表示になっている"
+        );
+    }
+
+    /// Google / GitHub にログインしていても、サイトにログインしていなければ説明画面。
+    ///
+    /// Google / GitHub はアカウント連携用で本の供給元（サイト）ではないため、
+    /// それだけでは本棚を初期表示にしない。
+    #[gpui_kit::test]
+    async fn google_and_github_login_alone_do_not_start_on_the_bookshelf(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &[], true, true);
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::About,
+            "Google / GitHub だけのログインで本棚が初期表示になっている"
+        );
+    }
+
+    /// どのサイトでもよいので 1 つログイン済みなら、本棚を初期表示にする。
+    #[gpui_kit::test]
+    async fn starts_on_the_bookshelf_when_a_site_is_logged_in(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &["tbf"], false, false);
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Bookshelf,
+            "サイトにログイン済みなのに本棚が初期表示になっていない"
+        );
+    }
+
+    /// サイトのログインが完了したら、そのサイトの同期を始めること。
+    ///
+    /// ログイン直後の本棚は購入済みの一覧がまだ入っていないので、手動で「同期」を
+    /// 押させない。要求は 1 回で消費する（毎フレーム同期しない）。
+    #[gpui_kit::test]
+    async fn site_login_request_starts_that_sites_sync(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            *state.booth_logged_in.lock() = true;
+            *state.login_sync_requested.lock() = Some("booth".to_string());
+        });
+        cx.update(|cx| ws.update(cx, |w, cx| w.handle_login_sync_request(cx)));
+        let toast = cx.update(|cx| AppState::global(cx).toast_message.lock().clone());
+        assert_eq!(
+            toast.as_deref(),
+            Some("BOOTH サイトのデータを取得中です"),
+            "ログイン後にそのサイトの同期が始まっていない"
+        );
+        assert!(
+            cx.update(|cx| AppState::global(cx).login_sync_requested.lock().is_none()),
+            "同期の要求が消費されていない（要求が残ると毎回同期してしまう）"
+        );
+    }
+
+    /// 同期の要求が無いときは何もしないこと。
+    #[gpui_kit::test]
+    async fn no_site_login_request_does_not_sync(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| ws.update(cx, |w, cx| w.handle_login_sync_request(cx)));
+        assert!(
+            cx.update(|cx| AppState::global(cx).toast_message.lock().is_none()),
+            "要求が無いのに同期が走っている"
+        );
+    }
+
+    /// サイドバーの選択状態は塗りつぶし（`primary` の下地 + `primary_foreground`）で示すこと。
+    ///
+    /// 以前は下地（`secondary`）だけだったため、アイコンだけの幅では「いまどこに居るか」が
+    /// 分からなかった（ホバーの下地とも同じ色で、余計に紛らわしかった）。文字色だけを
+    /// 変える案も、ダークテーマでは `primary` と `muted_foreground` の差が小さく沈む。
+    #[gpui_kit::test]
+    async fn sidebar_row_style_marks_the_selected_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            let theme = cx.theme();
+            let selected = sidebar_row_style(theme, true);
+            let unselected = sidebar_row_style(theme, false);
+
+            assert_eq!(
+                selected.icon_color, theme.primary_foreground,
+                "選択中のアイコンが primary_foreground になっていない"
+            );
+            assert_eq!(
+                selected.label_color, theme.primary_foreground,
+                "選択中のラベルが primary_foreground になっていない"
+            );
+            assert_eq!(
+                selected.background,
+                Some(theme.primary),
+                "選択中の下地が primary の塗りつぶしになっていない"
+            );
+            assert!(
+                selected.label_emphasis,
+                "選択中のラベルが強調（太字）になっていない"
+            );
+            assert_ne!(
+                selected.icon_color, unselected.icon_color,
+                "選択中と非選択のアイコン色が同じ"
+            );
+
+            assert_eq!(
+                unselected.icon_color, theme.muted_foreground,
+                "非選択のアイコンが控えめな色になっていない"
+            );
+            assert_eq!(
+                unselected.label_color, theme.muted_foreground,
+                "非選択のラベルが控えめな色になっていない"
+            );
+            assert!(!unselected.label_emphasis, "非選択のラベルが強調されている");
+            assert!(
+                unselected.background.is_none(),
+                "非選択の行に下地が敷かれている"
+            );
+        });
+    }
+
+    /// ロゴのタイルは説明画面を開いているときだけ `primary`（＝選択中）で、
+    /// それ以外は控えめな `muted`。グリフは地色に対して読める色にする。
+    ///
+    /// サイドバーの他の行は選択中が `primary` の塗りつぶしなので、ロゴも同じ色使いに
+    /// そろえる（ロゴは常に `primary` で塗ってあったため、説明画面を開いているか
+    /// どうかが分からなかった）。
+    #[gpui_kit::test]
+    async fn sidebar_logo_tile_marks_the_about_view(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            let theme = cx.theme();
+            assert_eq!(
+                sidebar_logo_background(theme, true),
+                theme.primary,
+                "説明画面を開いているときのロゴの地色が primary でない"
+            );
+            assert_eq!(
+                sidebar_logo_background(theme, false),
+                theme.muted,
+                "説明画面以外のときのロゴの地色が控えめな色でない"
+            );
+            assert_ne!(
+                sidebar_logo_background(theme, true),
+                sidebar_logo_background(theme, false),
+                "説明画面のときとそれ以外でロゴの地色が同じ"
+            );
+            assert_eq!(
+                sidebar_logo_glyph_color(theme, true),
+                theme.primary_foreground,
+                "選択中のロゴのグリフが primary_foreground でない"
+            );
+            assert_eq!(
+                sidebar_logo_glyph_color(theme, false),
+                theme.muted_foreground,
+                "非選択のロゴのグリフが控えめな色でない"
+            );
+        });
     }
 
     /// メニューの「終了」（`QuitApp`）で終了確認（アップロードの確認）が出ること。

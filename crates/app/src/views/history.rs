@@ -145,8 +145,6 @@ struct HistoryDay {
 
 pub struct HistoryView {
     days: Vec<HistoryDay>,
-    /// フィルタ後の件数（ヘッダの「n件」）。
-    count: usize,
     /// 履歴に含まれるサイト（`すべてのサイト` + 各サイト）。
     sites: Vec<String>,
     view_mode: ViewMode,
@@ -178,7 +176,6 @@ impl HistoryView {
         let view_mode = Self::read_view_mode(cx);
         let mut view = Self {
             days: Vec::new(),
-            count: 0,
             sites: Vec::new(),
             view_mode,
             period: HistoryPeriod::default(),
@@ -227,7 +224,6 @@ impl HistoryView {
 
         let mut days: Vec<HistoryDay> = Vec::new();
         let mut sites: Vec<String> = Vec::new();
-        let mut count = 0;
         // 表紙は同じ本が複数の日に出るので、この reload 内でデコード結果を共有する
         // （1 冊 1 回。以前は日ごとに 1MB の表紙をデコードし直していた）
         let mut cover_cache: std::collections::HashMap<String, Option<Arc<RenderImage>>> =
@@ -299,7 +295,6 @@ impl HistoryView {
                     .map(|p| (p.current_page, p.total_pages)),
                 tags,
             };
-            count += 1;
             match days.iter_mut().find(|day| day.date == session.day) {
                 Some(day) => day.items.push(item),
                 None => days.push(HistoryDay {
@@ -324,7 +319,6 @@ impl HistoryView {
                 .map(|item| item.tags.as_slice()),
         ));
         self.days = days;
-        self.count = count;
         self.sites = sites;
         // 選択位置を表示中の件数に合わせる（初回・範囲外は先頭）
         let len = self.flat_book_ids().len();
@@ -559,7 +553,6 @@ impl HistoryView {
         let site = self.site.clone();
         let sites = self.sites.clone();
         let view_mode = self.view_mode;
-        let count = self.count;
         let handle = cx.entity();
 
         div()
@@ -572,12 +565,6 @@ impl HistoryView {
                     .text_lg()
                     .font_weight(gpui_kit::FontWeight::BOLD)
                     .child("閲覧履歴"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{count}件")),
             )
             .child(
                 div()
@@ -2143,7 +2130,7 @@ mod tests {
         visual.simulate_click(label.center(), gpui_kit::Modifiers::default());
         draw(visual);
         assert_eq!(
-            view.read_with(cx, |this, _| this.count),
+            view.read_with(cx, |this, _| this.flat_book_ids().len()),
             1,
             "タグで絞り込めていない"
         );
@@ -2349,7 +2336,7 @@ mod tests {
             "1 日 1 本に集約されていない"
         );
         assert!(
-            view.read_with(cx, |this, _| this.count) == 2,
+            view.read_with(cx, |this, _| this.flat_book_ids().len()) == 2,
             "件数が 1 日 1 本になっていない"
         );
         // 日付は背景色つきのバー（内容幅いっぱいに伸びる）
@@ -2437,7 +2424,7 @@ mod tests {
             "「今日」で昨日の履歴が残っている"
         );
         assert!(
-            view.read_with(cx, |this, _| this.count) == 1,
+            view.read_with(cx, |this, _| this.flat_book_ids().len()) == 1,
             "「今日」の件数が合わない"
         );
         assert!(
@@ -2488,7 +2475,7 @@ mod tests {
             }
         };
         draw(visual);
-        assert_eq!(view.read_with(cx, |this, _| this.count), 2);
+        assert_eq!(view.read_with(cx, |this, _| this.flat_book_ids().len()), 2);
         assert!(
             view.read_with(cx, |this, _| this.sites.len()) == 2,
             "サイトの候補が出ていない"
@@ -2504,7 +2491,7 @@ mod tests {
         visual.simulate_click(fanza.center(), gpui_kit::Modifiers::default());
         draw(visual);
         assert_eq!(
-            view.read_with(cx, |this, _| this.count),
+            view.read_with(cx, |this, _| this.flat_book_ids().len()),
             1,
             "サイトで絞れていない"
         );

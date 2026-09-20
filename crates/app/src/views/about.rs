@@ -29,6 +29,161 @@ const TARGET_NOTICE: &str = "本アプリが対象にするのは、購入済み
 /// ログイン手順の見出し（技術書典だけでなく各ストア共通の手順）。
 const LOGIN_SECTION_TITLE: &str = "ストアのログイン手順";
 
+/// 「はじめての方へ」の見出し（「このアプリについて」の次に出す）。
+const FIRST_STEPS_TITLE: &str = "はじめての方へ";
+
+/// はじめて使う人向けの導入文。
+///
+/// 初回の案内は短く保ち、細かい説明は下の節（サイドバー / 本棚 / 各機能）に任せる。
+/// **最初の 1 冊を読むところまで**を 3 ステップで示すのが目的。
+/// 「ローカルの本だけでも読める」とは書かない（アプリの管理外のダウンロードファイルまで
+/// 使えると読めてしまう）。
+const FIRST_STEPS_LEAD: &str = "Thundoku Shelf は「ストアにログイン → 本棚に取り込む → 読む」の \
+                                3 ステップで使い始められます。";
+
+/// はじめて使う人向けの 3 ステップ（見出し / 説明）。
+const FIRST_STEPS: [(&str, &str); 3] = [
+    (
+        "1. ストアにログインする",
+        "サイドバー下部の「アカウント」から、本を買ったストア（技術書典 / BOOTH / FANZA同人 / \
+         DLsite）にログインします。一度ログインすると、次回以降は不要です",
+    ),
+    (
+        "2. 本棚に取り込む",
+        "ストアにログインすると自動で同期が始まり、購入済みの本の一覧が本棚に並びます\
+         （右上の「同期」でいつでもやり直せます）。ページ画像は本を開いたときに\
+         ダウンロードされます",
+    ),
+    (
+        "3. 読む",
+        "本をクリックすると取り込みが始まり、終わるとビューアーが開きます。\
+         読んだページ・付箋・閲覧履歴は自動で保存され、次に開くと続きから読めます",
+    ),
+];
+
+/// 3 ステップのあとに添える補足（はじめの 1 冊 / うまくいかないとき）。
+const FIRST_STEPS_NOTES: [(&str, &str); 2] = [
+    (
+        "まずは 1 冊から",
+        "全部を先に取り込む必要はありません。気になる 1 冊から始めてください",
+    ),
+    (
+        "同期できないときは",
+        "そのストアのセッションが切れていないか確認し、必要ならログインし直してください。\
+         アプリの不具合は、サイドバーの「レポート」から GitHub に報告できます\
+         （GitHub にログイン時のみ表示）",
+    ),
+];
+
+/// 「サイドバーの使い方」の見出しと概要。
+const SIDEBAR_TITLE: &str = "サイドバーの使い方";
+const SIDEBAR_LEAD: &str = "画面の左端に縦に並ぶメニューです。普段はアイコンだけの幅で、\
+                            マウスを乗せるとラベル付きで開きます（離れてしばらくすると元に戻ります。\
+                            「表示」メニューの「サイドバーを切り替え」で開いたままにもできます）。\
+                            一番上のロゴをクリックすると、この説明画面が開きます。";
+
+/// サイドバーの項目（名前 / 説明）。**上から並ぶ順に書く**（実際の行と同じ順）。
+const SIDEBAR_ITEMS: [(&str, &str); 9] = [
+    (
+        "本棚",
+        "本の一覧。下に続くサイト別メニューで、ストアごとの本棚に切り替えられます",
+    ),
+    (
+        "お気に入り",
+        "ハートを付けた本。同期時に未ダウンロードなら自動でダウンロードされます",
+    ),
+    (
+        "閲覧履歴",
+        "ビューアーで開いた本を日付ごとにまとめて表示します",
+    ),
+    ("付箋", "付箋を付けた本と、そのページ・メモの一覧です"),
+    (
+        "チェックリスト",
+        "技術書典のイベントの購入チェック（技術書典にログイン時のみ表示）",
+    ),
+    (
+        "レポート",
+        "アプリの不具合などを GitHub に報告します（GitHub にログイン時のみ表示）",
+    ),
+    ("設定", "保存先・バックアップ・アカウントなどの設定"),
+    (
+        "テーマ",
+        "ライト / ダーク / システムを切り替え（現在のモード名がラベルに出ます）",
+    ),
+    (
+        "アカウント",
+        "一番下。各サービスのログイン状態と、ログイン / ログアウト",
+    ),
+];
+
+/// サイドバーのアカウントからのログイン方法（見出し / 手順 / サービス別の認証方法）。
+const ACCOUNT_LOGIN_TITLE: &str = "アカウントのログイン方法";
+const ACCOUNT_LOGIN_STEPS: [&str; 4] = [
+    "1. サイドバー下部の「アカウント」をクリックして一覧を開く",
+    "2. ログインするサービスを選ぶ（Google / GitHub / 技術書典 / BOOTH / FANZA同人 / DLsite）",
+    "3. 「ログイン」を押し、画面の案内に従って認証する",
+    "4. ログインできると行の右端に緑のチェックが付く（ログアウトも同じ位置のアイコン）",
+];
+const ACCOUNT_LOGIN_METHODS: [(&str, &str); 3] = [
+    (
+        "Google",
+        "システムブラウザが開くので、Google アカウントで認証します",
+    ),
+    (
+        "GitHub",
+        "画面に出るコードをコピーし、ブラウザで github.com/login/device に入力します",
+    ),
+    (
+        "ストア（技術書典 / BOOTH / FANZA同人 / DLsite）",
+        "そのストアのメールアドレスとパスワードを入力します",
+    ),
+];
+const ACCOUNT_LOGIN_NOTE: &str =
+    "Google ログインは Google ドライブへのバックアップに使うもので、本を読むだけなら不要です。";
+
+/// 「本棚の基本的な使い方」の見出しと項目（見出し / 説明）。
+const SHELF_BASICS_TITLE: &str = "本棚の基本的な使い方";
+const SHELF_BASICS: [(&str, &str); 6] = [
+    (
+        "本を取り込む（同期）",
+        "ストアにログインすると自動で同期が始まり、購入済みの一覧が本棚に入ります。\
+         右上の「同期」でも取り込めます（サイト絞り込み中はそのサイトだけ）",
+    ),
+    (
+        "本を読む",
+        "本をクリックします。未ダウンロードなら取り込みが始まり、済んでいればビューアーが開きます",
+    ),
+    (
+        "探す（絞り込みと検索）",
+        "見出しの下の「全項目 / 未読 / 読んでいる途中 / 既読 / お気に入り」と、\
+         タグ・イベント・検索欄で絞り込めます。解除は「全項目」または ESC です",
+    ),
+    (
+        "並べ替える",
+        "「並び替え」で購入日 / 発売日 / タイトル / 最終閲覧日 / 閲覧回数 / 閲覧時間 / サイズを\
+         選べます（データが無い項目は出ません）",
+    ),
+    (
+        "表示を切り替える",
+        "カード / リストを切り替えられます。選んだ形式は次に開いたときも同じです",
+    ),
+    (
+        "マウスとキーボード",
+        "右クリックで「開く / ダウンロード中止 / タグ編集 / 非表示」、キーボードは \
+         ← → ↑ ↓ で選択、Enter で開く、Backspace でダウンロード中止です",
+    ),
+];
+
+/// Google ドライブの注意（**ストアのログイン手順の次**に出す）。
+const DRIVE_NOTICE_LABEL: &str = "ご利用前の注意";
+const DRIVE_NOTICE_TITLE: &str = "Google ログインは Google ドライブでのバックアップに使用します";
+const DRIVE_NOTICE_BODY: &str = "書籍を読むのに Google ログインは必要ありません。Google ログインを\
+                                 行うと、本棚の DB や画像を Google Drive にバックアップ・同期できます。\
+                                 サイドバーのアカウントアイコンからログインしてください。";
+const DRIVE_NOTICE_STORE: &str = "技術書典で購入済みの書籍を同期する場合は、サイドバーまたは\
+                                  本棚の同期ボタンから技術書典にログイン（メールアドレスと\
+                                  パスワード）してください。";
+
 /// 説明画面の「主な機能」に出す項目（タイトル / アイコン / 説明）。
 /// **実装済みの機能をここに並べる**（テスト `about_lists_the_implemented_features` が
 /// 主要機能の記載漏れを防ぐ）。
@@ -204,6 +359,220 @@ impl Render for AboutView {
 }
 
 impl AboutView {
+    /// 説明画面の 1 節（見出し + カード）。`debug_id` は並び順のテストから引く。
+    fn about_section(
+        &self,
+        debug_id: &'static str,
+        title: &'static str,
+        body: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .debug_selector(move || debug_id.into())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().muted)
+                    .p_6()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(body),
+            )
+    }
+
+    /// 名前 / 説明の 2 列の行（サイドバーの項目と本棚の使い方で共有する）。
+    ///
+    /// 名前の列幅を固定するので、行が変わっても説明の頭が揃って縦に読める。
+    fn about_rows(
+        rows: &[(&'static str, &'static str)],
+        name_w: f32,
+        muted_fg: gpui_kit::Hsla,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(rows.iter().map(move |(name, desc)| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(name_w))
+                            .flex_shrink_0()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(*name),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .line_height(relative(1.6))
+                            .child(*desc),
+                    )
+            }))
+    }
+
+    /// 「はじめての方へ」（初回の 3 ステップ + 補足）。
+    fn first_steps_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .line_height(relative(1.7))
+                    .child(FIRST_STEPS_LEAD),
+            )
+            .children(FIRST_STEPS.into_iter().map(|(title, desc)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .line_height(relative(1.7))
+                            .child(desc),
+                    )
+            }))
+            .children(FIRST_STEPS_NOTES.into_iter().map(|(title, desc)| {
+                div()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .pt_4()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .line_height(relative(1.7))
+                            .child(desc),
+                    )
+            }));
+        self.about_section("about-first-steps", FIRST_STEPS_TITLE, body, cx)
+    }
+
+    /// 「サイドバーの使い方」（概要 + 項目一覧 + アカウントのログイン方法）。
+    fn sidebar_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .line_height(relative(1.7))
+                    .child(SIDEBAR_LEAD),
+            )
+            .child(Self::about_rows(&SIDEBAR_ITEMS, 160.0, muted_fg))
+            .child(
+                div()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .pt_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(ACCOUNT_LOGIN_TITLE),
+                    )
+                    .children(
+                        ACCOUNT_LOGIN_STEPS
+                            .into_iter()
+                            .map(|step| div().text_sm().text_color(muted_fg).child(step)),
+                    )
+                    .child(Self::about_rows(&ACCOUNT_LOGIN_METHODS, 260.0, muted_fg))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .line_height(relative(1.7))
+                            .child(ACCOUNT_LOGIN_NOTE),
+                    ),
+            );
+        self.about_section("about-sidebar", SIDEBAR_TITLE, body, cx)
+    }
+
+    /// 「本棚の基本的な使い方」。
+    fn shelf_basics_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        let body = Self::about_rows(&SHELF_BASICS, 200.0, muted_fg);
+        self.about_section("about-shelf-basics", SHELF_BASICS_TITLE, body, cx)
+    }
+
+    /// Google ドライブの注意（**ストアのログイン手順の次**に置く）。
+    fn drive_notice_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let warning = cx.theme().warning;
+        let muted_fg = cx.theme().muted_foreground;
+        div()
+            .debug_selector(|| "about-drive-notice".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_xl()
+            .border_1()
+            .border_color(warning.opacity(0.35))
+            .bg(warning.opacity(0.10))
+            .p_4()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(warning)
+                    .child(DRIVE_NOTICE_LABEL),
+            )
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(DRIVE_NOTICE_TITLE),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .line_height(relative(1.7))
+                    .child(DRIVE_NOTICE_BODY),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .line_height(relative(1.7))
+                    .child(DRIVE_NOTICE_STORE),
+            )
+    }
+
     /// 案内（説明）ページ。
     fn render_about(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = window;
@@ -328,6 +697,7 @@ impl AboutView {
                     // このアプリについて
                     .child(
                         div()
+                            .debug_selector(|| "about-intro".into())
                             .flex()
                             .flex_col()
                             .gap_3()
@@ -355,62 +725,16 @@ impl AboutView {
                                     ),
                             ),
                     )
-                    // ご利用前の注意
-                    .child(
-                        div()
-                            .rounded_xl()
-                            .border_1()
-                            .border_color(gpui_kit::rgb(0xfcd34d))
-                            .bg(gpui_kit::rgb(0xfefce8))
-                            .p_6()
-                            .flex()
-                            .flex_col()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(gpui_kit::rgb(0xfef3c7))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(gpui_kit::rgb(0x92400e))
-                                            .child("ご利用前の注意"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(gpui_kit::rgb(0x78350f))
-                                    								.child("Google ログインは Google ドライブでのバックアップに使用します"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(gpui_kit::rgb(0x92400e))
-                                    .line_height(relative(1.7))
-                                    								.child(
-									"書籍を読むのに Google ログインは必要ありません。Google ログインを行うと、本棚の DB や画像を Google Drive にバックアップ・同期できます。サイドバーのアカウントアイコンからログインしてください。",
-								),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(gpui_kit::rgb(0x92400e))
-                                    .line_height(relative(1.7))
-                                    .child(
-                                        "技術書典で購入済みの書籍を同期する場合は、サイドバーまたは本棚の同期ボタンから技術書典にログイン（メールアドレスとパスワード）してください。",
-                                    ),
-                            ),
-                    )
+                    // はじめての方へ（初回の案内。「このアプリについて」の次に置く）
+                    .child(self.first_steps_section(cx))
+                    // サイドバーの使い方（項目の説明 + アカウントのログイン方法）
+                    .child(self.sidebar_section(cx))
+                    // 本棚の基本的な使い方
+                    .child(self.shelf_basics_section(cx))
                     // 主な機能
                     .child(
                         div()
+                            .debug_selector(|| "about-features".into())
                             .flex()
                             .flex_col()
                             .gap_4()
@@ -659,6 +983,7 @@ impl AboutView {
                     // 技術書典ログインについて（Web の Cookie 手順の置き換え）
                     .child(
                         div()
+                            .debug_selector(|| "about-store-login".into())
                             .flex()
                             .flex_col()
                             .gap_4()
@@ -710,6 +1035,8 @@ impl AboutView {
                                     ),
                             ),
                     )
+                    // Google ドライブの注意（ストアのログイン手順の次に置く）
+                    .child(self.drive_notice_section(cx))
                     // フッター（保存場所の注意 + ライセンス表示への導線）
                     .child(
                         div()
@@ -1189,6 +1516,162 @@ mod tests {
         // 角丸が実質 0（白い四角）に戻ると上の一致で落ちる（実測は 5px 前後）
     }
 
+    /// 初めて使う人向けの 3 ステップが、実装どおりの操作を案内していること。
+    #[test]
+    fn first_steps_cover_login_import_and_read() {
+        assert_eq!(
+            FIRST_STEPS.len(),
+            3,
+            "はじめての方への手順は 3 ステップに保つ（詳細は下の節に置く）"
+        );
+        let all = FIRST_STEPS
+            .iter()
+            .map(|(title, body)| format!("{title} {body}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for keyword in ["ログイン", "同期", "ビューアー"] {
+            assert!(
+                all.contains(keyword),
+                "はじめての方への手順に「{keyword}」の案内が無い: {all}"
+            );
+        }
+        for store in ["技術書典", "BOOTH", "FANZA", "DLsite"] {
+            assert!(
+                all.contains(store),
+                "はじめての方への手順に対応ストア（{store}）の案内が無い: {all}"
+            );
+        }
+        assert!(
+            FIRST_STEPS[1].1.contains("自動"),
+            "ログインすると自動で同期が始まることに触れていない: {}",
+            FIRST_STEPS[1].1
+        );
+        assert!(
+            FIRST_STEPS_LEAD.contains("3 ステップ"),
+            "3 ステップで使い始められることが書かれていない: {FIRST_STEPS_LEAD}"
+        );
+        // ログインしていない本（管理外のダウンロードファイル）まで読めるように読める書き方はしない。
+        // 「ローカルの本」と書くと、アプリの管理外のファイルを使えると誤解される。
+        for text in [
+            FIRST_STEPS_LEAD,
+            FIRST_STEPS_NOTES[0].1,
+            FIRST_STEPS_NOTES[1].1,
+        ] {
+            assert!(
+                !text.contains("ローカルの本"),
+                "管理外のファイルが使えると読める書き方が残っている: {text}"
+            );
+        }
+        // 「同期」は購入済みの一覧を取り込む操作で、残りをまとめて取り込む機能は無い。
+        assert!(
+            !FIRST_STEPS_NOTES[0].1.contains("まとめて取り込め"),
+            "「同期」に無い一括取り込みを案内している: {}",
+            FIRST_STEPS_NOTES[0].1
+        );
+    }
+
+    /// サイドバーの項目が実際の行と同じ顔ぶれ・同じ順で説明されていること。
+    #[test]
+    fn sidebar_items_match_the_real_rows() {
+        let names: Vec<&str> = SIDEBAR_ITEMS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "本棚",
+                "お気に入り",
+                "閲覧履歴",
+                "付箋",
+                "チェックリスト",
+                "レポート",
+                "設定",
+                "テーマ",
+                "アカウント",
+            ],
+            "サイドバーの項目一覧が実際の行（上から順）と違う"
+        );
+        for (name, desc) in SIDEBAR_ITEMS {
+            assert!(!desc.trim().is_empty(), "「{name}」の説明が空");
+        }
+        assert_eq!(
+            ACCOUNT_LOGIN_STEPS.len(),
+            4,
+            "アカウントのログイン手順は 4 ステップ（開く → 選ぶ → 認証 → 完了）"
+        );
+        let steps = ACCOUNT_LOGIN_STEPS.join(" ");
+        for keyword in ["アカウント", "Google", "GitHub"] {
+            assert!(
+                steps.contains(keyword),
+                "ログイン手順に「{keyword}」が無い: {steps}"
+            );
+        }
+    }
+
+    /// 本棚の基本操作（取り込み / 読む / 探す / 並べ替え / 表示切替 / ショートカット）が揃っていること。
+    #[test]
+    fn shelf_basics_cover_the_main_operations() {
+        let all = SHELF_BASICS
+            .iter()
+            .map(|(title, body)| format!("{title} {body}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for keyword in [
+            "同期",
+            "ビューアー",
+            "並び替え",
+            "カード",
+            "未読",
+            "ESC",
+            "Backspace",
+        ] {
+            assert!(
+                all.contains(keyword),
+                "本棚の説明に「{keyword}」が無い: {all}"
+            );
+        }
+    }
+
+    /// 説明画面の節の上端 Y（節が無ければ panic）。並び順の検証に使う。
+    fn section_top(visual: &mut gpui_kit::VisualTestContext, id: &'static str) -> gpui_kit::Pixels {
+        visual
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("説明画面に {id} が無い"))
+            .origin
+            .y
+    }
+
+    /// 初回の案内の並び順。
+    ///
+    /// 「はじめての方へ」は「このアプリについて」の次（「主な機能」より上）に置き、
+    /// Google ドライブの注意はストアのログイン手順より後ろに置く。
+    #[gpui_kit::test]
+    async fn about_orders_the_first_run_guide_before_the_reference_sections(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let visual = open_about(cx);
+        draw(visual);
+        let intro = section_top(visual, "about-intro");
+        let first_steps = section_top(visual, "about-first-steps");
+        let features = section_top(visual, "about-features");
+        let store_login = section_top(visual, "about-store-login");
+        let drive_notice = section_top(visual, "about-drive-notice");
+        assert!(
+            intro < first_steps,
+            "「はじめての方へ」が「このアプリについて」より上にある"
+        );
+        assert!(
+            first_steps < features,
+            "「はじめての方へ」が「主な機能」より下にある"
+        );
+        assert!(
+            features < store_login,
+            "「ストアのログイン手順」が「主な機能」より上にある"
+        );
+        assert!(
+            store_login < drive_notice,
+            "Google ドライブの注意がストアのログイン手順より上にある"
+        );
+    }
+
     /// バージョンを画面に出すこと。
     ///
     /// `.github/ISSUE_TEMPLATE/bug.yml` が「「このアプリについて」画面の下部で確認できます」と
@@ -1217,7 +1700,8 @@ mod tests {
     /// 案内画面を縦に長いウィンドウで開く。
     ///
     /// 「ライセンスについて」のリンクは画面の一番下にあるため、スクロールせずに
-    /// クリックできる高さが要る。
+    /// クリックできる高さが要る（はじめての方へ / サイドバー / 本棚の使い方を足したぶん、
+    /// ページはさらに長くなっている）。
     fn open_about(cx: &mut gpui_kit::TestAppContext) -> &mut gpui_kit::VisualTestContext {
         cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
@@ -1225,7 +1709,7 @@ mod tests {
         let window = cx.open_window(
             gpui_kit::Size {
                 width: gpui_kit::px(1000.0),
-                height: gpui_kit::px(4000.0),
+                height: gpui_kit::px(8000.0),
             },
             |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
         );

@@ -37,6 +37,22 @@ pub enum AuthProvider {
     Dlsite,
 }
 
+impl AuthProvider {
+    /// 本の供給元（サイト）なら、本棚の絞り込みと同じサイト id を返す。
+    ///
+    /// Google / GitHub はアカウント連携用で本の供給元ではないため `None`
+    /// （本棚の同期は無い）。
+    fn site_sync_id(self) -> Option<&'static str> {
+        match self {
+            AuthProvider::TechBookFest => Some("techbookfest"),
+            AuthProvider::Booth => Some("booth"),
+            AuthProvider::Fanza => Some("fanza"),
+            AuthProvider::Dlsite => Some("dlsite"),
+            AuthProvider::Google | AuthProvider::Github => None,
+        }
+    }
+}
+
 pub struct AuthDialog {
     /// None = プロバイダ選択画面
     provider: Option<AuthProvider>,
@@ -77,6 +93,20 @@ pub struct AuthDialog {
 }
 
 impl AuthDialog {
+    /// サイトのログインが完了したときに、そのサイトの同期を `Workspace` へ要求する。
+    ///
+    /// ここでは同期そのものは実行しない（本棚の状態を持つのは `BookshelfView` なので、
+    /// 要求を `AppState` に置いて `Workspace` の監視タスクが拾う。`AuthDialog` から
+    /// `Workspace` を直接 update すると RefCell の再入で固まる）。
+    /// Google / GitHub のログインでは何もしない。
+    fn request_site_sync_after_login(&self, provider: AuthProvider, cx: &mut Context<Self>) {
+        let Some(site) = provider.site_sync_id() else {
+            return;
+        };
+        log::info!("site login done: {site} の同期を要求する");
+        *AppState::global(cx).login_sync_requested.lock() = Some(site.to_string());
+    }
+
     pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             provider: None,
@@ -175,6 +205,7 @@ impl AuthDialog {
                         // 次回は新しい WebView + 監視を開始する
                         this.booth_login = None;
                         this.booth_subscription = None;
+                        this.request_site_sync_after_login(AuthProvider::Booth, cx);
                         cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
                     },
                 );
@@ -203,6 +234,7 @@ impl AuthDialog {
                         this.show_fanza_login = false;
                         this.fanza_login = None;
                         this.fanza_subscription = None;
+                        this.request_site_sync_after_login(AuthProvider::Fanza, cx);
                         cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
                     },
                 );
@@ -231,6 +263,7 @@ impl AuthDialog {
                         this.show_dlsite_login = false;
                         this.dlsite_login = None;
                         this.dlsite_subscription = None;
+                        this.request_site_sync_after_login(AuthProvider::Dlsite, cx);
                         cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
                     },
                 );
@@ -356,6 +389,7 @@ impl AuthDialog {
                         // 次回は新しい WebView + 監視を開始する
                         this.tbf_login = None;
                         this.tbf_subscription = None;
+                        this.request_site_sync_after_login(AuthProvider::TechBookFest, cx);
                         cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
                     },
                 );
@@ -795,6 +829,38 @@ mod dialog_render_tests {
     use crate::app_state::AppState;
 
     use super::*;
+
+    /// サイトのログインが完了したら、そのサイトの同期を要求すること。
+    ///
+    /// Google / GitHub はアカウント連携用で本の供給元（サイト）ではないため要求しない。
+    #[gpui_kit::test]
+    async fn site_login_completion_requests_that_sites_sync(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let dialog = cx.new(AuthDialog::new);
+        for (provider, expected) in [
+            (AuthProvider::TechBookFest, Some("techbookfest")),
+            (AuthProvider::Booth, Some("booth")),
+            (AuthProvider::Fanza, Some("fanza")),
+            (AuthProvider::Dlsite, Some("dlsite")),
+            (AuthProvider::Google, None),
+            (AuthProvider::Github, None),
+        ] {
+            cx.update(|cx| {
+                *AppState::global(cx).login_sync_requested.lock() = None;
+            });
+            cx.update(|cx| {
+                dialog.update(cx, |d, cx| d.request_site_sync_after_login(provider, cx));
+            });
+            let requested =
+                cx.update(|cx| AppState::global(cx).login_sync_requested.lock().clone());
+            assert_eq!(
+                requested.as_deref(),
+                expected,
+                "{provider:?} のログイン完了で同期の要求が変わっている"
+            );
+        }
+    }
 
     #[gpui_kit::test]
     async fn auth_dialog_renders_without_panic(cx: &mut TestAppContext) {

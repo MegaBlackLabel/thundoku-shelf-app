@@ -1351,6 +1351,10 @@ const DOWNLOADING_NOTICE: &str = "ダウンロード中です。終わってか�
 const FAVORITES_NOTE: &str =
     "お気に入りにした本は、同期時に未ダウンロードだと自動でダウンロードされます";
 
+/// 同期できるサイトの id（本棚の絞り込み・サイドバーのサイト行と同じ表記）。
+/// 「すべての本」での同期（`sync_all`）と、ログイン直後の自動同期が同じ一覧を使う。
+const SYNC_SITE_IDS: [&str; 4] = ["techbookfest", "booth", "fanza", "dlsite"];
+
 /// 選択肢 1 行の高さ（名前 + 種別・詳細の 2 行ぶん）。
 /// リストの高さを「行数 × これ」で決めるために使う（上限で打ち切る）。
 const IMPORT_CHOICE_ROW_H: f32 = 48.0;
@@ -3090,21 +3094,36 @@ impl BookshelfView {
             return;
         }
         // サイドバーでサイトを選択中は、そのサイトだけ同期する
-        match self.site_filter.as_deref() {
-            Some("techbookfest") => self.sync_tbf(cx),
-            Some("booth") => self.sync_booth(cx),
-            Some("fanza") => self.sync_fanza(cx),
-            Some("dlsite") => self.sync_dlsite(cx),
+        // （`self` を可変借用して同期するため、先に絞り込みを複製する）
+        let site_filter = self.site_filter.clone();
+        match site_filter.as_deref() {
+            Some(site @ ("techbookfest" | "booth" | "fanza" | "dlsite")) => {
+                self.sync_site(site, cx)
+            }
             _ => {
-                self.sync_tbf(cx);
-                self.sync_booth(cx);
-                self.sync_fanza(cx);
-                self.sync_dlsite(cx);
+                for site in SYNC_SITE_IDS {
+                    self.sync_site(site, cx);
+                }
             }
         }
         let drive_ready = *AppState::global(cx).google_logged_in.lock();
         if drive_ready {
             cx.defer(move |cx| cx.dispatch_action(&SyncDrive));
+        }
+    }
+
+    /// 指定したサイトだけを同期する（サイト id は本棚の絞り込み・サイドバーと同じ表記）。
+    ///
+    /// サイトのログイン完了直後の自動同期（`Workspace::handle_login_sync_request`）と、
+    /// 同期ボタン（`sync_all`）の両方から呼ばれる。未知の id では何もしない。
+    /// 未ログインならそのサイトの `sync_*` がログイン導線を出す。
+    pub fn sync_site(&mut self, site: &str, cx: &mut Context<Self>) {
+        match site {
+            "techbookfest" => self.sync_tbf(cx),
+            "booth" => self.sync_booth(cx),
+            "fanza" => self.sync_fanza(cx),
+            "dlsite" => self.sync_dlsite(cx),
+            _ => {}
         }
     }
 

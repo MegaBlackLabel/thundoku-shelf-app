@@ -78,6 +78,13 @@ pub struct AppState {
     /// DLsite（www.dlsite.com）のセッション Cookie
     pub dlsite_session: Arc<Mutex<Option<DlsiteSession>>>,
     pub dlsite_logged_in: Arc<Mutex<bool>>,
+    /// サイトのログイン完了で立てる同期要求（サイト id。`Workspace` が消費する）。
+    ///
+    /// ログイン直後の本棚は購入済みの一覧が空なので、手動で「同期」を押させずに
+    /// そのサイトを同期する。ログインの完了イベント（`*LoginDone`）は実際にログイン
+    /// 操作をしたときだけ発火する（起動時のセッション復元では発火しない）ため、
+    /// 再起動のたびに同期が走ることはない。
+    pub login_sync_requested: Arc<Mutex<Option<String>>>,
     /// アプリ全体のトーストメッセージ（workspace が表示する）
     pub toast_message: Arc<Mutex<Option<String>>>,
     /// トーストの種別（gpui-kit の Notification に流すときの Info / Success / Error）
@@ -323,6 +330,7 @@ impl AppState {
             fanza_logged_in: Arc::new(Mutex::new(fanza_logged_in)),
             dlsite_session: Arc::new(Mutex::new(dlsite_session)),
             dlsite_logged_in: Arc::new(Mutex::new(dlsite_logged_in)),
+            login_sync_requested: Arc::new(Mutex::new(None)),
             toast_message: Arc::new(Mutex::new(None)),
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
             toast_generation: Arc::new(Mutex::new(0)),
@@ -400,6 +408,7 @@ impl AppState {
             fanza_logged_in: Arc::new(Mutex::new(false)),
             dlsite_session: Arc::new(Mutex::new(None)),
             dlsite_logged_in: Arc::new(Mutex::new(false)),
+            login_sync_requested: Arc::new(Mutex::new(None)),
             toast_message: Arc::new(Mutex::new(None)),
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
             toast_generation: Arc::new(Mutex::new(0)),
