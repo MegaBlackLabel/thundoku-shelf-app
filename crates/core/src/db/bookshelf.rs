@@ -198,7 +198,8 @@ pub fn update_tags(
     let json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
     crate::db::block_on(async {
         sqlx::query(
-            "UPDATE bookshelf_items SET tags_json = ?1, updated_at = CURRENT_TIMESTAMP \
+            "UPDATE bookshelf_items SET tags_json = ?1, tags_fetched = 1, \
+             updated_at = CURRENT_TIMESTAMP \
              WHERE site_id = ?2 AND database_id = ?3",
         )
         .bind(json)
@@ -207,6 +208,31 @@ pub fn update_tags(
         .execute(pool)
         .await?;
         Ok(())
+    })
+}
+
+/// タグ未取得の**未ダウンロード**作品の `database_id` を最大 `limit` 件返す。
+///
+/// ダウンロード済みの本は取り込み時にタグを取っているため対象外
+/// （取り込み時に失敗したぶんは手動の「ジャンル再取得」で拾う）。
+/// タグが 0 件でも取得済みの印は立つので、同じ作品を毎回叩き続けることはない。
+pub fn pending_tag_fetch(
+    pool: &SqlitePool,
+    site_id: &str,
+    limit: usize,
+) -> Result<Vec<String>, sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query_scalar(
+            "SELECT b.database_id FROM bookshelf_items b \
+             WHERE b.site_id = ?1 AND b.is_active = 1 AND b.tags_fetched = 0 \
+               AND NOT EXISTS (SELECT 1 FROM books WHERE books.tbf_product_id = b.database_id) \
+             ORDER BY b.causedAt DESC, b.database_id \
+             LIMIT ?2",
+        )
+        .bind(site_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
     })
 }
 

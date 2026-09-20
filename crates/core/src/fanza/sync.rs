@@ -100,6 +100,63 @@ pub fn save_purchases(pool: &SqlitePool, client: &mut FanzaClient) -> Result<usi
     Ok(saved)
 }
 
+/// 1 回の実行で取る未取得タグの件数（同期のたびに少しずつ進める）。
+///
+/// タグは作品ページの HTML にしか無く **1 件 = 1 リクエスト**になる。数百件を
+/// まとめて叩くと DMM 側の bot 判定に引っかかり、同期そのものが失敗しうる。
+pub const TAG_FETCH_PER_RUN: usize = 20;
+
+/// 連続で叩くときの間隔（サーバーに負荷をかけない）。
+pub const TAG_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// 未取得タグの遅延取得の結果。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TagFetchOutcome {
+    /// タグを取り込んだ件数（タグ 0 件も「取得済み」として数える）。
+    pub fetched: usize,
+    /// 失敗して次回に回した件数。
+    pub skipped: usize,
+    /// セッション切れ（401/403）で打ち切ったか。
+    pub stopped: bool,
+}
+
+/// タグ未取得の**未ダウンロード**作品のタグを最大 `limit` 件、直列 + `interval` 間隔で取る。
+///
+/// 同期のたびに小さめの `limit` で呼び、`tags_fetched` が立った作品は次回の対象から
+/// 外れる（＝何回かの同期で徐々に埋まる）。**失敗した作品は印を立てない**ので次回に
+/// 再試行される。セッション切れは叩き続けずに即打ち切る（ブロックを避ける）。
+pub fn fetch_pending_tags(
+    pool: &SqlitePool,
+    client: &mut FanzaClient,
+    limit: usize,
+    interval: std::time::Duration,
+) -> Result<TagFetchOutcome, FanzaError> {
+    let ids = bookshelf::pending_tag_fetch(pool, SITE_ID_FANZA, limit)?;
+    let mut outcome = TagFetchOutcome::default();
+    for (index, database_id) in ids.iter().enumerate() {
+        if index > 0 && !interval.is_zero() {
+            std::thread::sleep(interval);
+        }
+        match client.product_page(database_id) {
+            Ok(page) => {
+                // タグが 0 件でも「取得済み」にする（毎回同じ作品を叩かない）
+                bookshelf::update_tags(pool, SITE_ID_FANZA, database_id, &page.genre_tags)?;
+                outcome.fetched += 1;
+            }
+            Err(error @ (FanzaError::Unauthorized(_) | FanzaError::SessionExpired)) => {
+                log::warn!("タグ取得を打ち切ります（セッション無効）: {error}");
+                outcome.stopped = true;
+                break;
+            }
+            Err(error) => {
+                log::warn!("タグ取得に失敗（次回に再試行します）: {database_id}: {error}");
+                outcome.skipped += 1;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +273,250 @@ mod tests {
         let d1 = rows.iter().find(|r| r.database_id == "d_1").unwrap();
         assert_eq!(d1.media_category.as_deref(), Some("comic"));
         assert_eq!(d1.ai_type.as_deref(), Some("none"));
+    }
+
+    // ---- 未取得タグの遅延取得（1 回の同期で少しずつ） ----------------------------
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// 未取得（未ダウンロード）の FANZA アイテムを N 件用意する（同期で保存した状態）。
+    fn seed_pending_items(pool: &SqlitePool, count: usize) {
+        let items: Vec<Value> = (1..=count)
+            .map(|i| purchase(&format!("d_{i}"), "コミック", "comic"))
+            .collect();
+        let body = json_body(page_json(items));
+        let transport = MockTransport {
+            handler: Box::new(move |_| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: body.clone(),
+                })
+            }),
+        };
+        let session = FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]));
+        let mut client = FanzaClient::with_transport(Box::new(transport), session);
+        save_purchases(pool, &mut client).unwrap();
+    }
+
+    /// 商品ページ（`genreTag__txt` 入り HTML）を返す。叩かれた回数を数える。
+    fn tag_transport(
+        calls: Arc<AtomicUsize>,
+        tags: Vec<&'static str>,
+        status: u16,
+    ) -> MockTransport {
+        MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                assert!(
+                    spec.url.contains("/detail/=/cid="),
+                    "商品ページ以外を叩いた: {}",
+                    spec.url
+                );
+                calls.fetch_add(1, Ordering::SeqCst);
+                if status != 200 {
+                    return Ok(ResponseSpec {
+                        status,
+                        headers: vec![],
+                        body: Vec::new(),
+                    });
+                }
+                let items: Vec<String> = tags
+                    .iter()
+                    .map(|tag| format!(r#"<li><a href="/x" class="genreTag__txt">{tag}</a></li>"#))
+                    .collect();
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: format!(r#"<ul class="genreTagList">{}</ul>"#, items.join(""))
+                        .into_bytes(),
+                })
+            }),
+        }
+    }
+
+    fn session() -> FanzaSession {
+        FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]))
+    }
+
+    /// 保存済みのタグと取得済みフラグ。
+    fn tags_of(pool: &SqlitePool, database_id: &str) -> (Option<String>, i64) {
+        crate::db::block_on(async {
+            sqlx::query_as::<_, (Option<String>, i64)>(
+                "SELECT tags_json, tags_fetched FROM bookshelf_items WHERE database_id = ?1",
+            )
+            .bind(database_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        })
+    }
+
+    /// 1 回の実行で取るのは `limit` 件まで（同期のたびに少しずつ進める）。
+    #[test]
+    fn fetch_pending_tags_takes_at_most_the_limit_and_stores_them() {
+        let pool = crate::db::test_pool();
+        seed_pending_items(&pool, 5);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut client = FanzaClient::with_transport(
+            Box::new(tag_transport(calls.clone(), vec!["タグA", "タグB"], 200)),
+            session(),
+        );
+
+        let outcome = fetch_pending_tags(&pool, &mut client, 2, Duration::ZERO).unwrap();
+
+        assert_eq!(outcome.fetched, 2);
+        assert_eq!(outcome.skipped, 0);
+        assert!(!outcome.stopped);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "limit を超えて叩いている");
+        let (tags, fetched) = tags_of(&pool, "d_1");
+        assert_eq!(tags.as_deref(), Some(r#"["タグA","タグB"]"#));
+        assert_eq!(fetched, 1, "取得済みの印が立っていない");
+        assert_eq!(
+            bookshelf::pending_tag_fetch(&pool, SITE_ID_FANZA, 10)
+                .unwrap()
+                .len(),
+            3,
+            "残りは次回に回す"
+        );
+    }
+
+    /// タグが 0 件でも「取得済み」にする（毎回同じ作品を叩かない）。
+    #[test]
+    fn fetch_pending_tags_marks_items_without_tags_as_fetched() {
+        let pool = crate::db::test_pool();
+        seed_pending_items(&pool, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut client = FanzaClient::with_transport(
+            Box::new(tag_transport(calls.clone(), vec![], 200)),
+            session(),
+        );
+
+        let outcome = fetch_pending_tags(&pool, &mut client, 1, Duration::ZERO).unwrap();
+
+        assert_eq!(outcome.fetched, 1);
+        let (tags, fetched) = tags_of(&pool, "d_1");
+        assert_eq!(tags.as_deref(), Some("[]"));
+        assert_eq!(fetched, 1);
+        assert!(
+            bookshelf::pending_tag_fetch(&pool, SITE_ID_FANZA, 10)
+                .unwrap()
+                .is_empty(),
+            "タグ無しの作品を再取得しようとしている"
+        );
+    }
+
+    /// 失敗した項目は「取得済み」にせず、次回に再試行する（1 件の失敗で全体を止めない）。
+    #[test]
+    fn fetch_pending_tags_retries_failures_next_run() {
+        let pool = crate::db::test_pool();
+        seed_pending_items(&pool, 3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |_| {
+                let nth = counter.fetch_add(1, Ordering::SeqCst);
+                // 2 件目だけ失敗させる
+                let status = if nth == 1 { 500 } else { 200 };
+                let body = if status == 200 {
+                    r#"<ul class="genreTagList"><li><a href="/x" class="genreTag__txt">タグ</a></li></ul>"#
+                        .as_bytes()
+                        .to_vec()
+                } else {
+                    Vec::new()
+                };
+                Ok(ResponseSpec {
+                    status,
+                    headers: vec![],
+                    body,
+                })
+            }),
+        };
+        let mut client = FanzaClient::with_transport(Box::new(transport), session());
+
+        let outcome = fetch_pending_tags(&pool, &mut client, 3, Duration::ZERO).unwrap();
+
+        assert_eq!(outcome.fetched, 2);
+        assert_eq!(outcome.skipped, 1);
+        assert!(!outcome.stopped);
+        let pending = bookshelf::pending_tag_fetch(&pool, SITE_ID_FANZA, 10).unwrap();
+        assert_eq!(
+            pending,
+            vec!["d_2"],
+            "失敗した項目が次回の対象から外れている"
+        );
+    }
+
+    /// セッション切れ（401/403）は打ち切る（叩き続けてブロックされない）。
+    #[test]
+    fn fetch_pending_tags_stops_on_unauthorized() {
+        let pool = crate::db::test_pool();
+        seed_pending_items(&pool, 5);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut client = FanzaClient::with_transport(
+            Box::new(tag_transport(calls.clone(), vec!["タグA"], 403)),
+            session(),
+        );
+
+        let outcome = fetch_pending_tags(&pool, &mut client, 5, Duration::ZERO).unwrap();
+
+        assert!(outcome.stopped);
+        assert_eq!(outcome.fetched, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "403 のあとも叩いている");
+        assert_eq!(
+            bookshelf::pending_tag_fetch(&pool, SITE_ID_FANZA, 10)
+                .unwrap()
+                .len(),
+            5,
+            "打ち切り分を取得済みにしてしまっている"
+        );
+    }
+
+    /// ダウンロード済み・取得済みの項目は対象にしない（未DLのぶんだけ拾う）。
+    #[test]
+    fn pending_tag_fetch_excludes_downloaded_and_fetched_items() {
+        let pool = crate::db::test_pool();
+        seed_pending_items(&pool, 3);
+        // d_1 は取得済み
+        bookshelf::update_tags(&pool, SITE_ID_FANZA, "d_1", &["既存".to_string()]).unwrap();
+        // d_2 はダウンロード済み（books に紐づく）
+        crate::db::books::insert(
+            &pool,
+            &crate::db::books::Book {
+                id: "b_2".into(),
+                title: "本".into(),
+                author: String::new(),
+                circle_name: "サークル".into(),
+                purchase_date: None,
+                file_name: "b_2.pdf".into(),
+                file_size: 10,
+                opfs_path: "b_2.opfspack".into(),
+                cover_thumbnail: None,
+                tbf_product_id: Some("d_2".into()),
+                site_id: Some(SITE_ID_FANZA.into()),
+                tags_fetched: 0,
+                pack_id: Some("b_2".into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: "2026-08-21 00:00:00".into(),
+                updated_at: "2026-08-21 00:00:00".into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
+            },
+        )
+        .unwrap();
+
+        let pending = bookshelf::pending_tag_fetch(&pool, SITE_ID_FANZA, 10).unwrap();
+
+        assert_eq!(pending, vec!["d_3"], "未DL の未取得だけを対象にする");
     }
 }

@@ -272,6 +272,16 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         // `viewer.page_turn.{site}` に従う。既存の migration ファイルは checksum
         // 管理されるため変更せず、PRAGMA で存在確認してから ALTER TABLE する）
         ensure_column(&mut conn, "books", "page_turn", "page_turn TEXT").await?;
+        // 表紙タグの取得済みフラグ（プログラム的マイグレーション。未ダウンロード本の
+        // タグを同期のたびに少しずつ取るため、「取得済み」を持って再取得を防ぐ。
+        // 0 = 未取得。タグが 0 件でも 1 を立てる）
+        ensure_column(
+            &mut conn,
+            "bookshelf_items",
+            "tags_fetched",
+            "tags_fetched INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
         // 閲覧履歴（プログラム的マイグレーション。既存の migration ファイルは
         // checksum 管理されるため変更せず、IF NOT EXISTS で冪等に適用する）
         sqlx::query(
