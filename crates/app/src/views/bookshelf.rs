@@ -3378,6 +3378,8 @@ impl BookshelfView {
                         this.reload(cx);
                         // 同期で入ってきた未ダウンロードのお気に入りを自動で落とす
                         this.auto_download_favorites(cx);
+                        // 未ダウンロード本のタグを少しずつ取る（全件まとめて叩かない）
+                        this.fetch_missing_fanza_tags(cx);
                     }
                     Err(message) => {
                         log::error!("sync_fanza failed: {message}");
@@ -3393,6 +3395,79 @@ impl BookshelfView {
                     }
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 未ダウンロード本のタグを**少しずつ**取る（1 回 = 最大 20 件・直列・300 ms 間隔）。
+    ///
+    /// FANZA のタグ（ジャンル）は作品ページの HTML にしか無く **1 件 = 1 リクエスト**なので、
+    /// 同期のたびに全件まとめて叩くと DMM 側の bot 判定で同期ごと失敗しうる
+    /// （アカウントのログイン状態にも影響が出る）。同期が成功したときに少量ずつ進め、
+    /// 取得済みの作品は次回の対象から外して何回かの同期で埋めていく。
+    fn fetch_missing_fanza_tags(&mut self, cx: &mut Context<Self>) {
+        // ヘッダーの「タグ取得」トグル（`tag.fetch.enabled`）が OFF なら取りに行かない。
+        // サイトへタグを取りに行く操作なので、自動生成タグと同じスイッチで止められるようにする。
+        if !self.tag_fetch_enabled {
+            log::info!("タグ取得: OFF のためスキップ");
+            return;
+        }
+        let state = Self::app_state(cx);
+        let Some(session) = state.fanza_session.lock().clone() else {
+            return;
+        };
+        let db = state.db_pool.clone();
+        let handle = cx.entity();
+        let (tx, rx) = std::sync::mpsc::channel::<thundoku_core::fanza::sync::TagFetchOutcome>();
+        // 直列 + 間隔を空けるので、GPUI のワーカーを占有しないよう専用スレッドで実行する
+        std::thread::spawn(move || {
+            let mut client = FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+            match thundoku_core::fanza::sync::fetch_pending_tags(
+                &db,
+                &mut client,
+                thundoku_core::fanza::sync::TAG_FETCH_PER_RUN,
+                thundoku_core::fanza::sync::TAG_FETCH_INTERVAL,
+            ) {
+                Ok(outcome) => {
+                    let _ = tx.send(outcome);
+                }
+                Err(error) => log::warn!("タグ取得を中断しました: {error}"),
+            }
+        });
+        cx.spawn(async move |_window, cx| {
+            let outcome = loop {
+                match rx.try_recv() {
+                    Ok(outcome) => break Some(outcome),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(150))
+                            .await;
+                    }
+                    // 送信前にスレッドが終わった（理由は向こうでログ済み）
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                }
+            };
+            let Some(outcome) = outcome else {
+                return;
+            };
+            handle.update(cx, |this, cx| {
+                if outcome.fetched > 0 {
+                    log::info!(
+                        "タグ取得: {} 件（失敗 {} 件 / 打切 {}）",
+                        outcome.fetched,
+                        outcome.skipped,
+                        outcome.stopped
+                    );
+                    // 取れたタグを絞り込み・チップに反映する
+                    this.reload(cx);
+                } else if outcome.skipped > 0 || outcome.stopped {
+                    log::warn!(
+                        "タグ取得: 0 件（失敗 {} 件 / 打切 {}）",
+                        outcome.skipped,
+                        outcome.stopped
+                    );
+                }
             });
         })
         .detach();
