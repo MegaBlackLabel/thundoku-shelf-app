@@ -211,6 +211,20 @@ pub fn update_tags(
     })
 }
 
+/// タグ未取得の**未ダウンロード**作品の件数（通知に残り件数を出すため）。
+pub fn pending_tag_fetch_count(pool: &SqlitePool, site_id: &str) -> Result<i64, sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM bookshelf_items b \
+             WHERE b.site_id = ?1 AND b.is_active = 1 AND b.tags_fetched = 0 \
+               AND NOT EXISTS (SELECT 1 FROM books WHERE books.tbf_product_id = b.database_id)",
+        )
+        .bind(site_id)
+        .fetch_one(pool)
+        .await
+    })
+}
+
 /// タグ未取得の**未ダウンロード**作品の `database_id` を最大 `limit` 件返す。
 ///
 /// ダウンロード済みの本は取り込み時にタグを取っているため対象外

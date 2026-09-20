@@ -118,6 +118,8 @@ pub struct TagFetchOutcome {
     pub skipped: usize,
     /// セッション切れ（401/403）で打ち切ったか。
     pub stopped: bool,
+    /// この実行のあとに残っている未取得の件数（通知に出す）。
+    pub remaining: usize,
 }
 
 /// タグ未取得の**未ダウンロード**作品のタグを最大 `limit` 件、直列 + `interval` 間隔で取る。
@@ -154,6 +156,8 @@ pub fn fetch_pending_tags(
             }
         }
     }
+    // 通知に出す残り件数（この実行で取得済みにしたぶんは減っている）
+    outcome.remaining = bookshelf::pending_tag_fetch_count(pool, SITE_ID_FANZA)? as usize;
     Ok(outcome)
 }
 
@@ -369,6 +373,7 @@ mod tests {
         assert_eq!(outcome.fetched, 2);
         assert_eq!(outcome.skipped, 0);
         assert!(!outcome.stopped);
+        assert_eq!(outcome.remaining, 3, "残り件数を返していない");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "limit を超えて叩いている");
         let (tags, fetched) = tags_of(&pool, "d_1");
         assert_eq!(tags.as_deref(), Some(r#"["タグA","タグB"]"#));
