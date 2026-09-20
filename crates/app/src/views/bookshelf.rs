@@ -475,8 +475,6 @@ struct BookEntry {
     reading_state: progress::ReadingState,
     /// (current_page, total_pages) — None when no reading progress exists.
     progress: Option<(i64, Option<i64>)>,
-    /// Decoded thumbnail/cover image.
-    cover: Option<Arc<RenderImage>>,
 }
 
 /// 並び替えの項目。既定は購入日（新しい順）で、従来の `causedAt DESC` と一致させる。
@@ -657,8 +655,155 @@ impl SortValue {
     }
 }
 
-/// A single bookshelf card: a `bookshelf_items` row plus its resolved cover
-/// and optional local book (downloaded pack).
+/// 表紙の読み込み状態。
+///
+/// 表紙はデコード後 1 枚 1 MB 前後（448px RGBA）になるため、全カードぶんを先に
+/// 読まずに**可視になった行から順に**読む。`reload` は状態を決めるだけで、デコードは
+/// 描画（可視行）をきっかけに走る。
+#[derive(Clone, Default)]
+pub(crate) enum CoverSlot {
+    /// まだ読んでいない（可視になったら読む）
+    #[default]
+    Pending,
+    /// 読み込み中（描画はプレースホルダ）
+    Loading,
+    /// 読み込み済み
+    Ready(Arc<RenderImage>),
+    /// ローカルに無く、リモート取得の対象（未取得のあいだは非表示 = `matches_filter`）
+    Remote,
+    /// 取得にもデコードにも失敗した（NoImage ダミーを表示する）
+    Failed,
+}
+
+impl CoverSlot {
+    /// 描画に使える画像（未読み込みは `None` = プレースホルダ）。
+    fn image(&self) -> Option<&Arc<RenderImage>> {
+        match self {
+            Self::Ready(image) => Some(image),
+            _ => None,
+        }
+    }
+
+    /// リモート取得の対象か（未取得）。
+    fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote)
+    }
+}
+
+/// 表紙キャッシュのキー（`site_id` + `database_id`）。ディスクのキャッシュファイル名と
+/// 同じ組み合わせで、`reload` をまたいで同じ本の表紙を再利用する。
+fn cover_key(site_id: &str, database_id: &str) -> String {
+    format!("{site_id}_{database_id}")
+}
+
+/// デコード済み画像のバイト数（RGBA = w×h×4）。
+fn render_image_bytes(image: &Arc<RenderImage>) -> usize {
+    let size = image.size(0);
+    (size.width.0.max(0) as usize) * (size.height.0.max(0) as usize) * 4
+}
+
+/// 表紙キャッシュのバイト予算。
+///
+/// 448px の表紙は 1 枚 1 MB 前後（実測平均 0.83 MB）。**可視 + 先読み余白
+/// （カード表示で最大 30 + 24×2 = 78 枚 ≈ 65 MB）を必ず収める**必要がある
+/// （収まらないと「追い出し → 次の描画で再デコード」を往復する）。
+/// その余裕を見て 96 MiB にしてある（全 612 枚 = 507 MB は常駐させない）。
+pub(crate) const COVER_CACHE_BUDGET_BYTES: usize = 96 * 1024 * 1024;
+
+/// 可視カードの前後に先読みする枚数（`filtered` の位置）。速くスクロールしても
+/// プレースホルダが見えないように、1 画面ぶんより少し多めに取る。
+const COVER_PREFETCH_MARGIN: usize = 24;
+
+/// デコード済み表紙の LRU キャッシュ（バイト予算つき）。
+///
+/// `reload` のたびに全カードの表紙をディスクから読み直していたのを、デコード結果を
+/// 使い回すようにする。予算を超えたら**可視でない古い順**に落とし、GPU のテクスチャは
+/// 描画時に `window.drop_image` で解放する（Arc を落とすだけでは残る）。
+struct CoverCache {
+    images: HashMap<String, Arc<RenderImage>>,
+    /// 使用順（先頭が最も古い）
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl CoverCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            images: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.images.len()
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// 取り出して「最近使った」へ移す（`reload` をまたいだ再利用はここで効く）。
+    fn get(&mut self, key: &str) -> Option<Arc<RenderImage>> {
+        let image = self.images.get(key)?.clone();
+        self.touch(key);
+        Some(image)
+    }
+
+    fn insert(&mut self, key: String, image: Arc<RenderImage>) {
+        if let Some(old) = self.images.insert(key.clone(), image.clone()) {
+            self.bytes = self.bytes.saturating_sub(render_image_bytes(&old));
+        }
+        self.bytes += render_image_bytes(&image);
+        self.touch(&key);
+    }
+
+    /// エントリを捨てる（再ダウンロード・削除で古い表紙が残らないようにする）。
+    fn remove(&mut self, key: &str) -> Option<Arc<RenderImage>> {
+        let removed = self.images.remove(key);
+        if let Some(image) = &removed {
+            self.bytes = self.bytes.saturating_sub(render_image_bytes(image));
+        }
+        if let Some(pos) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(pos);
+        }
+        removed
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.to_owned());
+    }
+
+    /// 予算を超えたぶんを古い順に落とす。`protected`（可視の表紙）は落とさない。
+    /// 落とした画像は戻り値で返す（GPU テクスチャの解放に使う）。
+    fn evict(&mut self, protected: &std::collections::HashSet<String>) -> Vec<Arc<RenderImage>> {
+        let mut dropped = Vec::new();
+        let mut index = self.order.len();
+        while self.bytes > self.budget && index > 0 {
+            index -= 1;
+            let key = self.order[index].clone();
+            if protected.contains(&key) {
+                continue;
+            }
+            self.order.remove(index);
+            if let Some(image) = self.images.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(render_image_bytes(&image));
+                dropped.push(image);
+            }
+        }
+        dropped
+    }
+}
+
+/// A single bookshelf card: a `bookshelf_items` row plus its optional local book
+/// (downloaded pack).
 #[derive(Clone)]
 pub(crate) struct ShelfCard {
     shelf: bookshelf::BookshelfItem,
@@ -666,9 +811,8 @@ pub(crate) struct ShelfCard {
     /// Tags shown on the card: local book tags when downloaded, otherwise
     /// the `bookshelf_items.tags_json` snapshot (Web `getBookTags` parity).
     tags: Vec<String>,
-    cover: Option<Arc<RenderImage>>,
-    /// 表紙の取得・デコードが失敗したカード（NoImage ダミーを表示する）
-    cover_fetch_failed: bool,
+    /// 表紙（可視になったら読む。`reload` では読まない）
+    cover: CoverSlot,
     /// 関連書籍（同一サークル / 同一作者）の `shelf_cards` インデックス。`reload` で作る。
     related: Vec<usize>,
     /// 閲覧回数（`view_history` のセッション数）。`reload` で一括取得する。
@@ -1089,6 +1233,17 @@ pub struct BookshelfView {
     sync_busy: usize,
     /// 表紙取得（fetch_remote_covers）の実行中フラグ（二重実行防止）
     fetching_covers: bool,
+    /// デコード済み表紙の LRU（`reload` をまたいで再利用する）
+    cover_cache: CoverCache,
+    /// 表紙を読み込み中のキー（同じ表紙を二重に読まない）
+    covers_loading: std::collections::HashSet<String>,
+    /// 直前の描画で見えていたカード位置（`filtered` の範囲）。先読みの計算に使う。
+    /// 描画中は `&self` のため `Cell` で記録し、描画の最後にまとめて処理する。
+    visible_cards: std::cell::Cell<Option<(usize, usize)>>,
+    /// 関連書籍カルーセルの表紙も読み込み対象にする（可視行のものだけ積む）
+    carousel_cards: std::cell::RefCell<Vec<usize>>,
+    /// GPU のテクスチャを描画時に解放するための待ち行列（`window` が要る）
+    pending_image_drops: Vec<Arc<RenderImage>>,
     /// 表紙取得の再実行済みフラグ（同期 reload で後から増えたカード分を 1 回だけ再取得）
     cover_fetch_retried: bool,
     /// 取り込み確認モーダル（§6.3。曖昧な構造のときだけ出る）
@@ -1444,6 +1599,11 @@ impl BookshelfView {
             tag_fetch_enabled: true,
             sync_busy: 0,
             fetching_covers: false,
+            cover_cache: CoverCache::new(COVER_CACHE_BUDGET_BYTES),
+            covers_loading: std::collections::HashSet::new(),
+            visible_cards: std::cell::Cell::new(None),
+            carousel_cards: std::cell::RefCell::new(Vec::new()),
+            pending_image_drops: Vec::new(),
             cover_fetch_retried: false,
             pending_import: None,
             pending_download: None,
@@ -1756,13 +1916,11 @@ impl BookshelfView {
                                 .filter(|d| d.total_pages > 0)
                                 .map(|d| (1, Some(d.total_pages)))
                         });
-                let cover = load_cover_image(&packs_dir, &book);
                 entries.push(BookEntry {
                     book,
                     tags,
                     reading_state,
                     progress: progress_tuple,
-                    cover,
                 });
             }
             let mut shelf_items = bookshelf::list_all(db).unwrap_or_default();
@@ -1887,16 +2045,21 @@ impl BookshelfView {
                 let local = entries.iter().find(|entry| {
                     entry.book.tbf_product_id.as_deref() == Some(shelf.database_id.as_str())
                 });
-                // カードの表紙は**サイトから取得した画像**（同期時のサムネイル）を優先する。
-                // 取得できていないときだけ pack の表紙（ローカル取り込み）へ落とす。
+                // カードの表紙は**サイトから取得した画像**（同期時のサムネイル）を優先し、
+                // 無ければ pack の表紙（ローカル取り込み）を使う。どちらも**ここでは読まない**
+                // （612 件 × 1 MB を reload のたびにデコードしていた）。デコード済みなら
+                // キャッシュから再利用し、ローカルに元があれば可視になったときに読む。
                 //
-                // ここで placeholder を入れてはいけない。`cover` が `None` であることが
-                // 「未取得＝fetch_remote_covers の取得対象」の印であり、埋めてしまうと
-                // 取得対象の判定（cover.is_none()）が成立せず実表紙が取りに行かれなくなる
-                // （プレースホルダのまま固定される）。プレースホルダは描画側で
-                // フォールバックしているので、ここでは None のまま返す。
-                let cover = load_cached_cover(&thumbnails_dir, shelf)
-                    .or_else(|| local.and_then(|entry| entry.cover.clone()));
+                // `CoverSlot::Remote` が「未取得＝fetch_remote_covers の取得対象」の印。
+                // ここで placeholder を表紙として入れてはいけない（取得対象の判定が
+                // 成立しなくなる）。プレースホルダは描画側でフォールバックしている。
+                let pack_path = local.map(|entry| cover_pack_path(&packs_dir, &entry.book));
+                let cover = self.cover_slot(
+                    &shelf.site_id,
+                    &shelf.database_id,
+                    pack_path.as_deref(),
+                    &thumbnails_dir,
+                );
                 let tags = if shelf.site_id == "fanza" || shelf.site_id == "dlsite" {
                     // FANZA / DLsite: タグは shelf.tags_json を正とする（book_tags は重複本で
                     // 分かれるため）。保存/ジャンル取得で両方に書くが、表示は安定。
@@ -1912,14 +2075,12 @@ impl BookshelfView {
                     view_seconds: stats.map_or(0, |stats| stats.total_seconds),
                     last_viewed_at: stats.and_then(|stats| stats.last_viewed_at.clone()),
                     shelf: shelf.clone(),
-                    cover_fetch_failed: false,
                     local: local.map(|entry| {
                         Box::new(BookEntry {
                             book: entry.book.clone(),
                             tags: entry.tags.clone(),
                             reading_state: entry.reading_state,
                             progress: entry.progress,
-                            cover: entry.cover.clone(),
                         })
                     }),
                     tags,
@@ -1936,6 +2097,13 @@ impl BookshelfView {
                         == entry.book.tbf_product_id.as_deref().unwrap_or_default()
                 });
                 if !linked {
+                    let pack_path = cover_pack_path(&packs_dir, &entry.book);
+                    let cover = self.cover_slot(
+                        entry.book.site_id.as_deref().unwrap_or_default(),
+                        &entry.book.id,
+                        Some(&pack_path),
+                        &thumbnails_dir,
+                    );
                     shelf_cards.push(ShelfCard {
                         shelf: bookshelf::BookshelfItem {
                             site_id: entry.book.site_id.clone().unwrap_or_default(),
@@ -1976,8 +2144,7 @@ impl BookshelfView {
                         },
                         local: Some(Box::new(entry.clone())),
                         tags: entry.tags.clone(),
-                        cover: entry.cover.clone(),
-                        cover_fetch_failed: false,
+                        cover,
                         related: Vec::new(),
                         view_count: view_stats
                             .get(&entry.book.id)
@@ -2049,6 +2216,152 @@ impl BookshelfView {
         cx.notify();
     }
 
+    /// 可視カードの位置（`filtered` の範囲）を記録する。描画中は `&self` のため `Cell`。
+    /// 記録した範囲は次の描画の `apply_cover_requests` で先読みに使う。
+    fn record_visible_cards(&self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let merged = match self.visible_cards.get() {
+            Some((first, last)) => (first.min(start), last.max(end - 1)),
+            None => (start, end - 1),
+        };
+        self.visible_cards.set(Some(merged));
+    }
+
+    /// 関連書籍カルーセルの表紙を読み込み対象として記録する（可視行のみ呼ばれる）。
+    fn note_carousel_card(&self, card_index: usize) {
+        let mut cards = self.carousel_cards.borrow_mut();
+        if !cards.contains(&card_index) {
+            cards.push(card_index);
+        }
+    }
+
+    /// カードの表紙キャッシュキー（`site_id` + `database_id`）。
+    fn shelf_card_key(&self, card_index: usize) -> Option<String> {
+        let card = self.shelf_cards.get(card_index)?;
+        Some(cover_key(&card.shelf.site_id, &card.shelf.database_id))
+    }
+
+    /// 表紙の状態を決める（**ディスクは読まない**。stat だけ）。
+    ///
+    /// すでにデコード済みならキャッシュから再利用し、ローカルに元（キャッシュファイル /
+    /// pack）があれば可視になったときに読み、無ければリモート取得の対象にする。
+    fn cover_slot(
+        &mut self,
+        site_id: &str,
+        database_id: &str,
+        pack_path: Option<&std::path::Path>,
+        thumbnails_dir: &std::path::Path,
+    ) -> CoverSlot {
+        let key = cover_key(site_id, database_id);
+        if let Some(image) = self.cover_cache.get(&key) {
+            return CoverSlot::Ready(image);
+        }
+        if cover_cache_path(thumbnails_dir, site_id, database_id).exists()
+            || pack_path.is_some_and(|path| path.exists())
+        {
+            return CoverSlot::Pending;
+        }
+        CoverSlot::Remote
+    }
+
+    /// 可視になったカードの表紙を読み込む（同じ表紙は二重に読まない）。
+    ///
+    /// 読み込みは背景スレッド（キャッシュファイル → pack の順に試す）で行い、完了したら
+    /// `Ready` にしてキャッシュへ入れる。失敗したらリモート取得の対象へ回す
+    /// （URL が無ければ NoImage ダミー）。
+    fn ensure_cover_loaded(&mut self, card_index: usize, cx: &mut Context<Self>) {
+        let Some(key) = self.shelf_card_key(card_index) else {
+            return;
+        };
+        let pending = matches!(self.shelf_cards[card_index].cover, CoverSlot::Pending);
+        if !pending || self.covers_loading.contains(&key) {
+            return;
+        }
+        self.shelf_cards[card_index].cover = CoverSlot::Loading;
+        self.covers_loading.insert(key.clone());
+        let state = Self::app_state(cx);
+        let thumbnails_dir = state.data_dir.join("thumbnails");
+        let packs_dir = state.packs_dir.clone();
+        let shelf = self.shelf_cards[card_index].shelf.clone();
+        let book = self.shelf_cards[card_index]
+            .local
+            .as_ref()
+            .map(|entry| entry.book.clone());
+        let handle = cx.entity();
+        let task = cx.background_executor().spawn(async move {
+            load_cover_from_disk(&thumbnails_dir, &shelf, book.as_ref(), &packs_dir)
+        });
+        cx.spawn(async move |_window, cx| {
+            let decoded = task.await;
+            handle.update(cx, |this, cx| {
+                this.covers_loading.remove(&key);
+                let Some(card_index) = this.shelf_cards.iter().position(|card| {
+                    cover_key(&card.shelf.site_id, &card.shelf.database_id) == key
+                }) else {
+                    // reload でカードごと入れ替わっている（次に可視になったら読み直す）
+                    return;
+                };
+                let slot = match decoded {
+                    Some(image) => {
+                        this.cover_cache.insert(key.clone(), image.clone());
+                        CoverSlot::Ready(image)
+                    }
+                    // ローカルの表紙が壊れていた: リモートで取り直せるなら対象に戻す
+                    None if this.shelf_cards[card_index].shelf.thumbnail_url.is_some() => {
+                        CoverSlot::Remote
+                    }
+                    None => CoverSlot::Failed,
+                };
+                this.shelf_cards[card_index].cover = slot;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 描画の最後に、可視カード（＋前後の余白）の表紙を読み込み、予算を超えた分を捨てる。
+    ///
+    /// 可視カードの位置は `render` の**前の描画**で `visible_cards` に記録している
+    /// （描画中は `&self` のため、読み込みの開始はここでまとめて行う）。
+    fn apply_cover_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.visible_cards.replace(None);
+        let carousel: Vec<usize> = std::mem::take(&mut *self.carousel_cards.borrow_mut());
+        let last_position = self.filtered.len().saturating_sub(1);
+        let wanted: Vec<usize> = match visible {
+            Some((first, last)) => {
+                let start = first.saturating_sub(COVER_PREFETCH_MARGIN);
+                let end = (last + COVER_PREFETCH_MARGIN).min(last_position);
+                (start..=end).collect()
+            }
+            // まだ描画していない（初回）ときは先頭だけ読む
+            None => (0..=last_position.min(COVER_PREFETCH_MARGIN)).collect(),
+        };
+        for &card_index in &carousel {
+            self.ensure_cover_loaded(card_index, cx);
+        }
+        for position in wanted {
+            if let Some(&card_index) = self.filtered.get(position) {
+                self.ensure_cover_loaded(card_index, cx);
+            }
+        }
+        // 予算を超えたぶんを落とす（可視の表紙は残す）
+        let protected: std::collections::HashSet<String> = match visible {
+            Some((first, last)) => (first..=last)
+                .filter_map(|position| self.filtered.get(position).copied())
+                .filter_map(|card_index| self.shelf_card_key(card_index))
+                .collect(),
+            None => std::collections::HashSet::new(),
+        };
+        let dropped = self.cover_cache.evict(&protected);
+        self.pending_image_drops.extend(dropped);
+        // GPU のテクスチャは明示的に消すまで残る（この PC は内蔵 GPU なので RAM を食う）
+        for image in std::mem::take(&mut self.pending_image_drops) {
+            let _ = window.drop_image(image);
+        }
+    }
+
     /// For cards that only have a placeholder cover, fetch the remote
     /// thumbnail (TBF session), save it to `thumbnails/{site}_{db}.{ext}`
     /// and apply it to the card as each image finishes (1 枚ずつ追加表示).
@@ -2056,7 +2369,7 @@ impl BookshelfView {
         let pending: Vec<(String, String, String)> = self
             .shelf_cards
             .iter()
-            .filter(|card| card.cover.is_none())
+            .filter(|card| card.cover.is_remote())
             .filter_map(|card| {
                 card.shelf.thumbnail_url.as_ref().map(|url| {
                     (
@@ -2193,15 +2506,18 @@ impl BookshelfView {
                                cx: &mut gpui_kit::AsyncApp| {
                 handle.update(cx, |this, cx| {
                     for (site_id, database_id, image) in batch {
-                        if let Some(card) = this.shelf_cards.iter_mut().find(|c| {
+                        let key = cover_key(&site_id, &database_id);
+                        let target = this.shelf_cards.iter_mut().find(|c| {
                             c.shelf.site_id == site_id && c.shelf.database_id == database_id
-                        }) {
-                            card.cover = Some(image);
-                        } else {
-                            log::warn!(
+                        });
+                        match target {
+                            Some(card) => card.cover = CoverSlot::Ready(image.clone()),
+                            None => log::warn!(
                                 "表紙の適用先カードが見つからない: {site_id} / {database_id}"
-                            );
+                            ),
                         }
+                        // デコード済みを持ち回る（次回の reload で再利用する）
+                        this.cover_cache.insert(key, image);
                     }
                     // 表紙が届いたカードをフィルタ結果に反映する（表示対象の再計算）
                     this.filtered_dirty = true;
@@ -2241,9 +2557,9 @@ impl BookshelfView {
                     if let Some(card) = this.shelf_cards.iter_mut().find(|c| {
                         c.shelf.site_id == site_id
                             && c.shelf.database_id == database_id
-                            && c.cover.is_none()
+                            && c.cover.is_remote()
                     }) {
-                        card.cover_fetch_failed = true;
+                        card.cover = CoverSlot::Failed;
                     }
                     this.filtered_dirty = true;
                     cx.notify();
@@ -2267,7 +2583,7 @@ impl BookshelfView {
                 // （例: BOOTH 完了 → reload → fetch 後に技術書典 307 件が reload される）、
                 // 残っているカードの表紙を取得するため 1 回だけ再実行する
                 let still_pending = this.shelf_cards.iter().any(|c| {
-                    c.local.is_none() && c.cover.is_none() && c.shelf.thumbnail_url.is_some()
+                    c.local.is_none() && c.cover.is_remote() && c.shelf.thumbnail_url.is_some()
                 });
                 if still_pending && ok > 0 && !this.cover_fetch_retried {
                     this.cover_fetch_retried = true;
@@ -2640,11 +2956,7 @@ impl BookshelfView {
         // 隠すのは「未取得（取得待ち）」のあいだだけ。取得に失敗したものは
         // NoImage ダミー付きで表示する（失敗も隠すと、全件失敗時に本棚が
         // 空に見えてしまう）。
-        if card.local.is_none()
-            && card.cover.is_none()
-            && !card.cover_fetch_failed
-            && card.shelf.thumbnail_url.is_some()
-        {
+        if card.local.is_none() && card.cover.is_remote() && card.shelf.thumbnail_url.is_some() {
             return false;
         }
         if let Some(site) = self.effective_site_filter()
@@ -3951,6 +4263,16 @@ impl BookshelfView {
             let path = state.packs_dir.join(format!("{book_id}.opfspack"));
             let _ = std::fs::remove_file(path);
         }
+        // デコード済みの表紙も捨てる（同じ id が再利用されても古い表紙を出さない）
+        for card_index in 0..self.shelf_cards.len() {
+            let matches_book = self.shelf_cards[card_index]
+                .local
+                .as_ref()
+                .is_some_and(|entry| entry.book.id == book_id);
+            if matches_book && let Some(key) = self.shelf_card_key(card_index) {
+                self.cover_cache.remove(&key);
+            }
+        }
         crate::app_state::set_toast_kind(cx, ToastKind::Success, "本を削除しました");
         self.reload(cx);
     }
@@ -3964,6 +4286,11 @@ impl BookshelfView {
         // 表紙は消さない。消すと `matches_filter` が
         // 「ローカル無し + 表紙無し + thumbnail_url あり」でカードを隠すため、
         // 再取得中にカードが消える（再取得後は pack の表紙が reload で入る）。
+        //
+        // ただし**デコード済みの表紙キャッシュは捨てる**。pack が入れ替わっても
+        // 同じキー（site_id + database_id）なので、残すと古い表紙を出し続ける。
+        self.cover_cache
+            .remove(&cover_key(&card.shelf.site_id, &card.shelf.database_id));
         //
         // 表紙取得中・同期中は `download_item` が無視するので、完了後に実行するよう積む。
         if self.fetching_covers || self.sync_busy > 0 {
@@ -4780,8 +5107,8 @@ impl BookshelfView {
         // ないため、イベント名の代わりに購入日を表示する
         let purchase_date = shelf.caused_at.as_deref().map(format_purchase_date);
         let database_id = shelf.database_id.clone();
-        let cover = card.cover.clone().or_else(|| {
-            if card.cover_fetch_failed {
+        let cover = card.cover.image().cloned().or_else(|| {
+            if matches!(card.cover, CoverSlot::Failed) {
                 no_image_cover()
             } else {
                 placeholder_cover(&shelf.title, &shelf.circle_name)
@@ -6127,8 +6454,8 @@ impl BookshelfView {
         let event_text = event.unwrap_or_else(|| "イベント不明".to_string());
         let purchase_date = shelf.caused_at.as_deref().map(format_purchase_date);
         let database_id = shelf.database_id.clone();
-        let cover = card.cover.clone().or_else(|| {
-            if card.cover_fetch_failed {
+        let cover = card.cover.image().cloned().or_else(|| {
+            if matches!(card.cover, CoverSlot::Failed) {
                 no_image_cover()
             } else {
                 placeholder_cover(&shelf.title, &shelf.circle_name)
@@ -6444,12 +6771,14 @@ impl BookshelfView {
                     .enumerate()
                     .filter_map(|(position, index)| {
                         let target = self.shelf_cards.get(*index)?;
+                        // カルーセルの表紙も可視のうちに読む（プレースホルダを見せない）
+                        self.note_carousel_card(*index);
                         Some(RelatedThumb {
                             position,
                             title: target.shelf.title.clone(),
                             book_id: target.local.as_ref().map(|entry| entry.book.id.clone()),
                             item: target.shelf.clone(),
-                            cover: target.cover.clone(),
+                            cover: target.cover.image().cloned(),
                         })
                     })
                     .collect();
@@ -6569,6 +6898,9 @@ impl Render for BookshelfView {
         if self.filtered_dirty {
             self.rebuild_filtered(cx);
         }
+        // 表紙は可視になった行から順に読む（前の描画で「見えていた範囲」を使う）。
+        // デコード結果は `cover_cache` に貯め、予算を超えたぶんはここで GPU ごと捨てる。
+        self.apply_cover_requests(window, cx);
         // 絞り込みの適用・解除でスクロール位置を失わないようにする（下のリスト構築で使う）
         let scroll_target = self.filter_scroll_target(cx);
         if !self.auto_download_started {
@@ -7254,6 +7586,8 @@ impl Render for BookshelfView {
                                                     let start = ix * columns;
                                                     let end =
                                                         (start + columns).min(view.filtered.len());
+                                                    // 可視カードを記録する（表紙の遅延読み込みに使う）
+                                                    view.record_visible_cards(start, end);
                                                     let cards = view.filtered[start..end]
                                                         .iter()
                                                         .enumerate()
@@ -7355,6 +7689,8 @@ impl Render for BookshelfView {
                                         let Some(&card_idx) = view.filtered.get(ix) else {
                                             return div().into_any_element();
                                         };
+                                        // 可視行を記録する（表紙の遅延読み込みに使う）
+                                        view.record_visible_cards(ix, ix + 1);
                                         let selected = view.selected_index == Some(ix);
                                         view.render_list_row(
                                             window,
@@ -8249,25 +8585,42 @@ pub(crate) fn format_event_label(event_name: &str) -> String {
     trimmed.to_string()
 }
 
+/// ローカル本の pack のパス（表紙の読み込み元）。
+fn cover_pack_path(packs_dir: &std::path::Path, book: &books::Book) -> std::path::PathBuf {
+    let pack_id = book.pack_id.as_deref().unwrap_or(&book.id);
+    packs_dir.join(format!("{pack_id}.opfspack"))
+}
+
+/// 表紙をディスクから読んで 448px へ縮小する（キャッシュファイル → pack の順）。
+///
+/// 背景スレッドで実行する（I/O とデコードを UI スレッドで行わない）。
+fn load_cover_from_disk(
+    thumbnails_dir: &std::path::Path,
+    shelf: &bookshelf::BookshelfItem,
+    book: Option<&books::Book>,
+    packs_dir: &std::path::Path,
+) -> Option<Arc<RenderImage>> {
+    if let Some(image) = load_cached_cover(thumbnails_dir, shelf) {
+        return Some(image);
+    }
+    book.and_then(|book| load_cover_image(packs_dir, book))
+}
+
 pub(crate) fn load_cover_image(
     packs_dir: &std::path::Path,
     book: &books::Book,
 ) -> Option<Arc<RenderImage>> {
     let pack_id = book.pack_id.as_deref().unwrap_or(&book.id);
     let path = packs_dir.join(format!("{pack_id}.opfspack"));
-    let bytes = std::fs::read(path).ok()?;
-    let reader = opfspack::PackReader::open(&bytes).ok()?;
+    // pack 全体（この環境には 354 MB のものがある）を読まずに、ヘッダ + インデックス +
+    // 表紙エントリだけを読む。表紙は表示サイズ（448px）へ縮小してから保持する
+    // （リモート表紙と同じ経路・同じ解像度に揃える）。
+    let mut reader = opfspack::PackFileReader::open(&path).ok()?;
     for entry in ["thumbnail.webp", "cover.webp"] {
-        if let Ok(data) = reader.read_entry(entry, None)
-            && let Ok(decoded) = image::load_from_memory(&data)
+        if let Ok(data) = reader.read_entry_with_key(entry, None)
+            && let Some(image) = decode_and_resize(&data, 448)
         {
-            let mut rgba = decoded.to_rgba8();
-            // GPUI は BGRA を期待（R/B を入れ替えないと赤と青が入れ替わる）
-            for pixel in rgba.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-            let frame = image::Frame::new(rgba);
-            return Some(Arc::new(RenderImage::new([frame])));
+            return Some(image);
         }
     }
     None
@@ -8919,10 +9272,10 @@ mod tests {
                 // 残留キャッシュを拾うと cover が Some になり、この検証が空振りする
                 // （その場合はここで気付けるようにしておく）。
                 assert!(
-                    this.shelf_cards[0].cover.is_none(),
-                    "前提: 未取得カード（残留キャッシュがあると検証が無意味になる）"
+                    matches!(this.shelf_cards[0].cover, CoverSlot::Remote),
+                    "前提: 未取得カード（残留キャッシュがあると Ready になり検証が無意味になる）"
                 );
-                this.shelf_cards[0].cover_fetch_failed = true;
+                this.shelf_cards[0].cover = CoverSlot::Failed;
             });
             let this = view.read(cx);
             let card = this.shelf_cards[0].clone();
@@ -8933,9 +9286,9 @@ mod tests {
         });
     }
 
-    /// 未取得のリモート本は `cover` を `None` のままにする（＝取得対象として残す）。
+    /// 未取得のリモート本は `CoverSlot::Remote` のままにする（＝取得対象として残す）。
     ///
-    /// `None` が「未取得」の印で、`fetch_remote_covers` はこの印を見て取得する。
+    /// `Remote` が「未取得」の印で、`fetch_remote_covers` はこの印を見て取得する。
     /// reload で placeholder を入れてしまうと印が消え、実表紙が取りに行かれず
     /// プレースホルダのまま固定される（表紙が表示されない不具合）。
     #[gpui_kit::test]
@@ -8957,8 +9310,8 @@ mod tests {
             let this = view.read(cx);
             let card = &this.shelf_cards[0];
             assert!(
-                card.cover.is_none(),
-                "未取得のリモート本は cover を None のままにする（取得対象の印を消さない）"
+                card.cover.is_remote(),
+                "未取得のリモート本は Remote のままにする（取得対象の印を消さない）"
             );
             assert!(
                 !this.matches_filter(cx, card),
@@ -8979,12 +9332,12 @@ mod tests {
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 // 表紙を持たせ、表紙取得中（busy）の状態にする
-                this.shelf_cards[0].cover = Some(test_cover_image(400, 600));
+                this.shelf_cards[0].cover = CoverSlot::Ready(test_cover_image(400, 600));
                 this.fetching_covers = true;
                 let card = this.shelf_cards[0].clone();
                 this.redownload_item(cx, &card);
                 assert!(
-                    this.shelf_cards[0].cover.is_some(),
+                    this.shelf_cards[0].cover.image().is_some(),
                     "再取得でカードの表紙を消さない（消すとカードが隠れる）"
                 );
                 assert!(
@@ -10336,6 +10689,140 @@ mod tests {
         );
     }
 
+    /// 表紙の遅延読み込み: `reload` では 1 枚もデコードしない。
+    ///
+    /// 以前は 612 件ぶんの表紙を reload のたびにデコードしていて、実測で 507 MB を
+    /// 常駐させていた（さらにリロードのたびに作り直していた）。
+    #[gpui_kit::test]
+    async fn reload_does_not_decode_covers(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        for index in 0..30 {
+            // 他テストと共有の data_dir を使うため id は一意にする
+            seed_shelf_item(
+                cx,
+                &format!("cover-lazy-{index}"),
+                &format!("本{index}"),
+                "サークルA",
+                Some("https://example.invalid/cover.png"),
+            );
+        }
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.reload(cx)));
+
+        let (cache_len, decoded) = view.read_with(cx, |v, _| {
+            (
+                v.cover_cache.len(),
+                v.shelf_cards
+                    .iter()
+                    .filter(|card| card.cover.image().is_some())
+                    .count(),
+            )
+        });
+        assert_eq!(cache_len, 0, "reload で表紙をデコードしている");
+        assert_eq!(decoded, 0, "reload で表紙をデコードしている");
+    }
+
+    /// 表紙の遅延読み込み: 可視になって初めて読み、`reload` をまたいで使い回す。
+    #[gpui_kit::test]
+    async fn cover_load_happens_on_demand_and_is_reused_across_reloads(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_book(cx, "cover-lazy-book", "本1", "サークルA");
+        seed_shelf_item(cx, "cover-lazy-db", "本1", "サークルA", None);
+        link_shelf_item_to_book(cx, "cover-lazy-db", "cover-lazy-book");
+        write_cover_pack(cx, "cover-lazy-book");
+
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.reload(cx)));
+        let pending = view.read_with(cx, |v, _| {
+            matches!(v.shelf_cards[0].cover, CoverSlot::Pending)
+        });
+        assert!(
+            pending,
+            "pack があるのに読む候補になっていない（reload でデコードしている可能性）"
+        );
+
+        // 可視になったタイミングで読む
+        cx.update(|cx| view.update(cx, |this, cx| this.ensure_cover_loaded(0, cx)));
+        cx.run_until_parked();
+        let first = view.read_with(cx, |v, _| v.shelf_cards[0].cover.image().cloned());
+        assert!(first.is_some(), "可視になったのに表紙が読まれていない");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.cover_cache.len()),
+            1,
+            "読んだ表紙がキャッシュに入っていない"
+        );
+
+        // reload をまたいでも同じデコード結果を使い回す（Arc が同一 = 再デコードしていない）
+        cx.update(|cx| view.update(cx, |this, cx| this.reload(cx)));
+        let second = view.read_with(cx, |v, _| v.shelf_cards[0].cover.image().cloned());
+        let second = second.expect("reload 後に表紙が消えている");
+        assert!(
+            Arc::ptr_eq(&first.unwrap(), &second),
+            "reload で表紙をデコードし直している（キャッシュを使っていない）"
+        );
+    }
+
+    /// 表紙キャッシュは予算を超えたぶんを古い順に落とし、落とした画像を返す
+    /// （呼び出し側が GPU テクスチャを解放する）。可視（`protected`）は落とさない。
+    #[test]
+    fn cover_cache_evicts_over_budget_and_returns_dropped_images() {
+        // 400x600 RGBA = 960,000 バイト。予算を 1 枚ぶんにする
+        let mut cache = CoverCache::new(960_000);
+        cache.insert("a".into(), test_cover_image(400, 600));
+        cache.insert("b".into(), test_cover_image(400, 600));
+        let dropped = cache.evict(&std::collections::HashSet::new());
+        assert_eq!(dropped.len(), 1, "予算を超えたぶんを落としていない");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.bytes() <= 960_000);
+
+        // 可視の表紙は残す（見えている画像が消えるとフラッシュする）
+        cache.insert("c".into(), test_cover_image(400, 600));
+        let protected: std::collections::HashSet<String> = ["c".to_string()].into_iter().collect();
+        let dropped = cache.evict(&protected);
+        assert!(cache.get("c").is_some(), "可視の表紙を落としている");
+        assert_eq!(dropped.len(), 1, "可視以外を落としていない");
+    }
+
+    /// 本棚アイテムとローカル本を紐づける（カードが「ダウンロード済み」として見える）。
+    fn link_shelf_item_to_book(cx: &mut TestAppContext, database_id: &str, book_id: &str) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE books SET tbf_product_id = ?1 WHERE id = ?2")
+                    .bind(database_id)
+                    .bind(book_id)
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
+        });
+    }
+
+    /// 表紙つきの pack を実際に書く（`thumbnail.webp` の中身は PNG でも
+    /// `image::load_from_memory` が判別する）。
+    fn write_cover_pack(cx: &mut TestAppContext, book_id: &str) {
+        let mut png = Vec::new();
+        let mut rgb = image::RgbImage::new(400, 600);
+        for pixel in rgb.pixels_mut() {
+            *pixel = image::Rgb([200, 40, 40]);
+        }
+        image::DynamicImage::ImageRgb8(rgb)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut builder = opfspack::PackBuilder::new(1_728_000_000_000);
+        builder.add_entry("thumbnail.webp", png, "image/webp", false);
+        let bytes = builder.build(None, false).unwrap();
+        cx.update(|cx| {
+            let path = AppState::global(cx)
+                .packs_dir
+                .join(format!("{book_id}.opfspack"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        });
+    }
+
     /// テスト用の単色 RenderImage（表紙の比率を固定して検証するため）。
     fn test_cover_image(w: u32, h: u32) -> Arc<RenderImage> {
         let rgba = image::RgbaImage::from_pixel(w, h, image::Rgba([30, 60, 90, 255]));
@@ -10354,7 +10841,7 @@ mod tests {
             view.update(cx, |this, cx| {
                 this.view_mode = ViewMode::List;
                 // 表紙を縦長（400x600）に固定する（取得経路に依存せず検証するため）
-                this.shelf_cards[0].cover = Some(test_cover_image(400, 600));
+                this.shelf_cards[0].cover = CoverSlot::Ready(test_cover_image(400, 600));
                 cx.notify();
             });
         });
