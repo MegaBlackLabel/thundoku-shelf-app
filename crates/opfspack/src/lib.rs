@@ -31,7 +31,7 @@ mod format;
 mod reader;
 
 pub use builder::PackBuilder;
-pub use reader::PackReader;
+pub use reader::{PackFileReader, PackReader};
 
 /// Magic bytes at offset 0 of every pack.
 pub const MAGIC: [u8; 4] = [0x4f, 0x50, 0x46, 0x53];
@@ -115,6 +115,8 @@ pub enum PackError {
     NotFound(String),
     #[error("invalid range: {0}")]
     InvalidRange(String),
+    #[error("pack I/O error: {0}")]
+    Io(String),
 }
 
 /// SHA-256(`"opfspack:v1:{sub}"`) as lowercase hex — matches
