@@ -79,11 +79,89 @@ pub trait PageLoader: Send + Sync + 'static {
         let image = self.load(index)?;
         Ok(downscale_render_image(&image, PAGE_THUMB_WIDTH))
     }
+
+    /// 表示用のページ画像。`target_width`（物理ピクセル・ページ 1 枚ぶん）へ
+    /// 前縮小してから返す（既定は [`downscale_for_display`]）。
+    ///
+    /// GPUI には補間 / mipmap の指定が無いため、フル解像度をそのまま渡すと GPU が
+    /// 単純なサンプリングで縮小して網点がモアレになる。デコード直後（背景スレッド）に
+    /// 落としておくと、モアレが出ずメモリも縮小率の 2 乗ぶん小さくなる。
+    /// `target_width` が 0 以下（表示サイズ未確定）なら元の解像度のまま返す。
+    fn load_for_display(
+        &self,
+        index: usize,
+        target_width: f32,
+    ) -> Result<Arc<RenderImage>, String> {
+        let image = self.load(index)?;
+        Ok(downscale_for_display(&image, target_width))
+    }
 }
 
 /// RenderImage（BGRA のまま）を幅 `max_width` に縮小した新しい RenderImage を返す。
 /// チャンネル順は触らない（縮小は色に依存しない）。すでに小さければそのまま返す。
 fn downscale_render_image(image: &Arc<RenderImage>, max_width: f32) -> Arc<RenderImage> {
+    // ページ一覧のサムネイル用。22 倍以上縮小することがあり、枚数も多いので
+    // 速度優先の `Triangle` のまま（見る大きさの画像は `downscale_for_display`）。
+    downscale_render_image_with(image, max_width, image::imageops::FilterType::Triangle)
+}
+
+/// 表示用に縮小する（高品質フィルタ + 2 段縮小）。
+///
+/// GPUI には補間 / mipmap の指定が無く、フル解像度のページを渡すと GPU が
+/// 単純なサンプリング（実質 1 タップ）で縮小する。そのため網点（スクリーントーン）が
+/// モアレになって潰れる（実測: 4441px のページを見開きで 690px 幅に描画したときに発生）。
+/// デコード直後（背景スレッド）にここで落としておくと、モアレが出ず、
+/// メモリも縮小率の 2 乗ぶん小さくなる。
+///
+/// 縮小は 2 段: まず高速な面積平均（`thumbnail`）で目標の 2 倍強まで落とし、
+/// 最後に高品質フィルタ（`Lanczos3`）で仕上げる。27MP のページにいきなり
+/// `Lanczos3` を 6 倍縮小でかけると 1 秒近くかかるため。
+///
+/// `target_width` が 0 以下（表示サイズ未確定）のときは元の画像を返す。
+fn downscale_for_display(image: &Arc<RenderImage>, target_width: f32) -> Arc<RenderImage> {
+    if target_width <= 0.0 {
+        return image.clone();
+    }
+    let size = image.size(0);
+    let (width, height) = (size.width.0.max(1) as u32, size.height.0.max(1) as u32);
+    if width as f32 <= target_width {
+        return image.clone();
+    }
+    let Some(bytes) = image.as_bytes(0) else {
+        return image.clone();
+    };
+    let Some(source) = image::RgbaImage::from_raw(width, height, bytes.to_vec()) else {
+        return image.clone();
+    };
+
+    // 1 段目: 面積平均で 2 倍強まで（縮小率が大きいときだけ）
+    let mut current = source;
+    if (width as f32) > target_width * 2.0 {
+        let intermediate_w = (target_width * 2.0).ceil() as u32;
+        let intermediate_h = ((height as f64 * intermediate_w as f64) / width.max(1) as f64)
+            .round()
+            .max(1.0) as u32;
+        current = image::imageops::thumbnail(&current, intermediate_w, intermediate_h);
+    }
+
+    // 2 段目: 目標幅へ高品質フィルタで
+    let (current_w, current_h) = current.dimensions();
+    let scale = target_width / current_w as f32;
+    let resized = image::imageops::resize(
+        &current,
+        ((current_w as f32 * scale).max(1.0)) as u32,
+        ((current_h as f32 * scale).max(1.0)) as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    Arc::new(RenderImage::new([image::Frame::new(resized)]))
+}
+
+/// フィルタを指定して縮小する。
+fn downscale_render_image_with(
+    image: &Arc<RenderImage>,
+    max_width: f32,
+    filter: image::imageops::FilterType,
+) -> Arc<RenderImage> {
     let size = image.size(0);
     let (width, height) = (size.width.0.max(1) as u32, size.height.0.max(1) as u32);
     if width as f32 <= max_width {
@@ -100,7 +178,7 @@ fn downscale_render_image(image: &Arc<RenderImage>, max_width: f32) -> Arc<Rende
         &source,
         ((width as f32 * scale).max(1.0)) as u32,
         ((height as f32 * scale).max(1.0)) as u32,
-        image::imageops::FilterType::Triangle,
+        filter,
     );
     Arc::new(RenderImage::new([image::Frame::new(resized)]))
 }
@@ -384,6 +462,11 @@ pub struct ImageViewer {
     autoplay_generation: u64,
     zoomed: bool,
     zoom_scale: f32,
+    /// 表示に必要なページ幅（物理ピクセル・ページ 1 枚ぶん）。0 = 未確定。
+    ///
+    /// ページ画像はこの幅へ前縮小してから GPU に渡す（`downscale_for_display`）。
+    /// 値は表示（`ImageViewer::render`）が毎回の描画で更新する。
+    display_target_width: f32,
     /// ズーム時のパン（ドラッグ移動）オフセット（ピクセル）
     pan_offset: gpui_kit::Point<f32>,
     /// ドラッグ中の開始位置
@@ -606,6 +689,7 @@ impl ImageViewer {
             autoplay_generation: 0,
             zoomed: false,
             zoom_scale: 1.5,
+            display_target_width: 0.0,
             pan_offset: gpui_kit::Point::new(0.0, 0.0),
             drag_start: None,
             last_click_at: None,
@@ -1577,6 +1661,52 @@ impl ImageViewer {
         .into_any_element()
     }
 
+    /// 表示に必要なページ幅（物理ピクセル）を更新し、解像度が足りないページを読み直す。
+    ///
+    /// ページ画像は表示サイズ相当へ前縮小してキャッシュしているので、ズームや
+    /// ウィンドウ拡大で必要幅が増えたときは、そのページを読み直さないとぼやける。
+    /// 縮小方向（必要幅が減ったとき）と 1.2 倍以内の増加は読み直さない
+    /// （ズームの端数で何度も読み込み直さないため）。
+    fn update_display_target(
+        &mut self,
+        viewport: gpui_kit::Point<f32>,
+        scale_factor: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let per_page = if self.mode == ViewMode::Spread {
+            2.0
+        } else {
+            1.0
+        };
+        let zoom = if self.zoomed {
+            self.zoom_scale.max(1.0)
+        } else {
+            1.0
+        };
+        let target = (viewport.x / per_page * scale_factor * zoom).ceil();
+        if !target.is_finite() || target <= 0.0 {
+            return;
+        }
+        let previous = self.display_target_width;
+        self.display_target_width = target;
+        if target <= previous * 1.2 {
+            return;
+        }
+        for index in self.visible_pages() {
+            let Some(existing) = self.images.get(index).and_then(|slot| slot.as_ref()) else {
+                // 未読み込みのページは本来の経路（ensure_loaded）に任せる
+                continue;
+            };
+            if existing.size(0).width.0 as f32 * 1.2 >= target {
+                continue;
+            }
+            if let Some(image) = self.images[index].take() {
+                self.pending_image_drops.push(image);
+            }
+            self.ensure_loaded(cx, index);
+        }
+    }
+
     fn ensure_loaded(&mut self, cx: &mut Context<Self>, index: usize) {
         if index >= self.images.len()
             || self.images[index].is_some()
@@ -1586,10 +1716,12 @@ impl ImageViewer {
         }
         self.loading.insert(index);
         let loader = self.loader.clone();
+        // 表示に必要な幅へ前縮小してから受け取る（モアレ対策。`downscale_for_display`）
+        let target_width = self.display_target_width;
         let handle = cx.entity();
         let task = cx
             .background_executor()
-            .spawn(async move { loader.load(index) });
+            .spawn(async move { loader.load_for_display(index, target_width) });
         cx.spawn(async move |_window, cx| {
             let result = task.await;
             handle.update(cx, |this, cx| {
@@ -2286,6 +2418,13 @@ impl Render for ImageViewer {
         // 付箋ダイアログの入力中はフォーカスを奪わない（奪うとメモが打ち込めない）
         // 追い出した画像を GPU からも解放する（window が要るのでここで行う）
         self.release_evicted_images(window);
+        // 表示に必要なページ幅（物理ピクセル）を更新する。ページ画像はこの幅へ
+        // 前縮小してから GPU に渡す（`downscale_for_display`。モアレ対策）。
+        let viewport = gpui_kit::Point::new(
+            window.bounds().size.width.as_f32(),
+            (window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT).max(1.0),
+        );
+        self.update_display_target(viewport, window.scale_factor(), cx);
         if !input_focused && !self.note_dialog_open && !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
@@ -3394,6 +3533,89 @@ mod tests {
     use gpui_kit::component::slider::SliderValue;
 
     use super::*;
+
+    /// 表示用の縮小は前縮小なし（GPU の単純サンプリング相当）より十分ムラが少ないこと。
+    ///
+    /// GPUI には補間 / mipmap の指定が無いため、フル解像度のページをそのまま渡すと
+    /// GPU が実質 1 タップで縮小し、網点（スクリーントーン）がモアレになって潰れる
+    /// （実測: 4441px のページを見開きで 690px 幅に描画したときに発生）。
+    /// ここで高品質フィルタを使っておけば網点は平均化されてムラが減る。
+    #[test]
+    fn display_downscale_averages_screentones() {
+        let image = rgba_to_render_image(synthetic_screentone(1024, 768, 8));
+        // 前縮小なしの代わりに 1 タップ相当（`Nearest`）で縮小したものを基準にする
+        let raw = downscale_render_image_with(&image, 240.0, image::imageops::FilterType::Nearest);
+        let display = downscale_for_display(&image, 240.0);
+        let (raw_uneven, disp_uneven) = (unevenness(&raw), unevenness(&display));
+        assert!(
+            disp_uneven * 3.0 < raw_uneven,
+            "表示用縮小のムラが前縮小なしと大差ない（網点がモアレのまま）: \
+             display={disp_uneven:.1} raw={raw_uneven:.1}"
+        );
+    }
+
+    /// `load_for_display` は表示に必要な幅まで縮小して返すこと（フル解像度を渡さない）。
+    #[test]
+    fn page_loader_downscales_for_display() {
+        struct FakeLoader;
+        impl PageLoader for FakeLoader {
+            fn page_count(&self) -> usize {
+                1
+            }
+            fn page_size(&self, _index: usize) -> Option<(u32, u32)> {
+                Some((4000, 6000))
+            }
+            fn load(&self, _index: usize) -> Result<Arc<RenderImage>, String> {
+                Ok(rgba_to_render_image(image::RgbaImage::new(4000, 6000)))
+            }
+        }
+        let loader = FakeLoader;
+        let display = loader.load_for_display(0, 800.0).expect("load");
+        assert_eq!(
+            display.size(0).width.0,
+            800,
+            "表示に必要な幅まで縮小されていない"
+        );
+        let full = loader.load_for_display(0, 0.0).expect("load");
+        assert_eq!(
+            full.size(0).width.0,
+            4000,
+            "表示幅が未確定（0）のときは元の解像度のまま返す"
+        );
+    }
+
+    /// 網点（規則正しい点格子）の合成画像。縮小したときのムラを見るために使う。
+    fn synthetic_screentone(width: u32, height: u32, period: u32) -> image::RgbaImage {
+        let mut image = image::RgbaImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let dot = (x % period) < period / 2 && (y % period) < period / 2;
+            let value = if dot { 0 } else { 255 };
+            *pixel = image::Rgba([value, value, value, 255]);
+        }
+        image
+    }
+
+    /// 中央部分のムラ（標準偏差）。網点を正しく平均化できていれば小さくなる。
+    fn unevenness(image: &Arc<RenderImage>) -> f64 {
+        let size = image.size(0);
+        let (width, height) = (size.width.0 as u32, size.height.0 as u32);
+        let bytes = image.as_bytes(0).expect("rgba");
+        let mut sum = 0.0;
+        let mut sum2 = 0.0;
+        let mut n = 0.0;
+        // 端はフィルタの影響が出るので中央だけ見る
+        for y in (height / 4)..(height * 3 / 4) {
+            for x in (width / 4)..(width * 3 / 4) {
+                let offset = ((y * width + x) * 4) as usize;
+                let value = bytes[offset] as f64;
+                sum += value;
+                sum2 += value * value;
+                n += 1.0;
+            }
+        }
+        let mean = sum / n;
+        (sum2 / n - mean * mean).max(0.0).sqrt()
+    }
 
     fn make_png(width: u32, height: u32) -> Vec<u8> {
         let mut image = image::RgbImage::new(width, height);
