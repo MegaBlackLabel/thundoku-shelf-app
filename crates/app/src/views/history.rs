@@ -90,6 +90,26 @@ fn next_selection_index(
     Some(next as usize)
 }
 
+/// 選択中の出現（何日目の何冊目か）。`selected_index` は `flat_book_ids()` の通し番号。
+///
+/// **本 id ではなく出現で選ぶ**（同じ本が複数の日に出ても選択枠は 1 つだけになる。
+/// 本 id で比べると、同じ本の全出現が同時に選択中になってしまう）。
+/// 範囲外は `None`（まだ選択していない / 表示が減った直後）。
+fn selected_occurrence(
+    selected_index: Option<usize>,
+    days: &[HistoryDay],
+) -> Option<(usize, usize)> {
+    let index = selected_index?;
+    let mut offset = 0;
+    for (day_index, day) in days.iter().enumerate() {
+        if index < offset + day.items.len() {
+            return Some((day_index, index - offset));
+        }
+        offset += day.items.len();
+    }
+    None
+}
+
 /// `YYYY-MM-DD` の週の始まり（月曜）。パースできないときは同じ日を返す。
 fn week_start(today: &str) -> String {
     use chrono::{Datelike as _, Duration, NaiveDate};
@@ -160,7 +180,8 @@ pub struct HistoryView {
     favorite_authors: Vec<String>,
     /// タグ名 → そのタグを持つ本の数（チップの並び替えキー）。
     tag_counts: std::sync::Arc<std::collections::HashMap<String, usize>>,
-    /// タグ列を展開している本（「+n」→「閉じる」）。
+    /// タグ列を展開している出現（「+n」→「閉じる」）。本 id ではなく要素 id
+    /// （出現キー付き）で覚える: 同じ本が複数の日に出ても、開いた 1 枚だけが展開される。
     expanded_tag_rows: std::collections::HashSet<String>,
     /// キーボード操作の選択位置（日付 → 本の順に平坦化したインデックス）。
     selected_index: Option<usize>,
@@ -473,10 +494,11 @@ impl HistoryView {
         cx.notify();
     }
 
-    /// タグ列の折りたたみ / 展開を切り替える（本棚と同じ。行ごと）。
-    fn toggle_tag_expansion(&mut self, book_id: &str, cx: &mut Context<Self>) {
-        if !self.expanded_tag_rows.remove(book_id) {
-            self.expanded_tag_rows.insert(book_id.to_string());
+    /// タグ列の折りたたみ / 展開を切り替える（本棚と同じ。**出現ごと**）。
+    /// `element_id` は出現キー付きの要素 id（`render_tag_row` と同じ組み立て）。
+    fn toggle_tag_expansion(&mut self, element_id: &str, cx: &mut Context<Self>) {
+        if !self.expanded_tag_rows.remove(element_id) {
+            self.expanded_tag_rows.insert(element_id.to_string());
         }
         cx.notify();
     }
@@ -705,16 +727,23 @@ impl HistoryView {
     /// 購入日 + サークル / 作者 + 進捗 + 種別 + お気に入りハート）。
     /// 引数が多く clippy が警告するが、本棚の `render_card` と同じ構成にする
     /// （表示状態を引数で受け取り、ビューの状態をここへ持ち込まない）。
+    ///
+    /// `key` は出現キー（`{日付}-{その日の連番}`）。同じ本が複数の日に出ると
+    /// 要素 id が本 id だけでは重複し、GPUI の要素 id は一意でなければならないため
+    /// 2 つ目以降をクリックできなくなる。カードが描く要素 id にはすべてこれを前置する。
     #[allow(clippy::too_many_arguments)]
     fn render_card(
         window: &mut Window,
         theme: &gpui_kit::component::Theme,
         handle: &Entity<Self>,
         item: &HistoryItem,
+        key: &str,
         card_width: f32,
         state: &ItemState<'_>,
     ) -> AnyElement {
         let database_id = item.book.id.clone();
+        // 要素 id に前置する「この出現ぶん」の id（`{キー}-{本 id}`）。
+        let element_id = format!("{key}-{database_id}");
         let cover = item
             .cover
             .clone()
@@ -744,7 +773,7 @@ impl HistoryView {
             .child(match &cover {
                 Some(render) => {
                     let mut el = img(render.clone()).w_full().h_full().debug_selector({
-                        let selector = format!("history-card-cover-img-{database_id}");
+                        let selector = format!("history-card-cover-img-{element_id}");
                         move || selector.clone()
                     });
                     if fits_width {
@@ -786,7 +815,7 @@ impl HistoryView {
             })
             // 右上: お気に入りハート（本棚のカードと同じ。表紙の上に重ねる）
             .child(
-                cover_badge(favorite_badge, format!("history-heart-{database_id}"))
+                cover_badge(favorite_badge, format!("history-heart-{element_id}"))
                     .absolute()
                     .right_1()
                     .top_1()
@@ -804,7 +833,7 @@ impl HistoryView {
             .child(
                 cover_badge(
                     downloaded_badge,
-                    format!("history-card-cover-downloaded-{database_id}"),
+                    format!("history-card-cover-downloaded-{element_id}"),
                 )
                 .absolute()
                 .right_1()
@@ -824,9 +853,9 @@ impl HistoryView {
 
         let book = &item.book;
         div()
-            .id(SharedString::from(format!("history-card-{database_id}")))
+            .id(SharedString::from(format!("history-card-{element_id}")))
             .debug_selector({
-                let selector = format!("history-card-{database_id}");
+                let selector = format!("history-card-{element_id}");
                 move || selector.clone()
             })
             .w(px(card_width))
@@ -885,6 +914,7 @@ impl HistoryView {
                         theme,
                         handle,
                         item,
+                        key,
                         state.favorite_circles,
                         state.favorite_authors,
                     ))
@@ -903,6 +933,7 @@ impl HistoryView {
                 theme,
                 handle,
                 item,
+                key,
                 state.tag_order,
                 state.tags_expanded,
                 true,
@@ -913,26 +944,31 @@ impl HistoryView {
     /// リスト 1 行。**本棚の行と同じ 4 列構成**にする:
     /// 表紙(200x133 固定) / 情報列(320px 固定: タイトル・イベント名 or 購入日・サークル/作者・
     /// 進捗・状態) / タグ列(行幅の 20%) / 残り（本棚はカルーセル。履歴では空ける）。
+    /// `key` は出現キー（`render_card` と同じ。同じ本が複数の日に出ても
+    /// 要素 id が重複しないように前置する）。
     fn render_row(
         window: &mut Window,
         theme: &gpui_kit::component::Theme,
         handle: &Entity<Self>,
         item: &HistoryItem,
+        key: &str,
         state: &ItemState<'_>,
     ) -> AnyElement {
         let database_id = item.book.id.clone();
+        // 要素 id に前置する「この出現ぶん」の id（`{キー}-{本 id}`）。
+        let element_id = format!("{key}-{database_id}");
         let cover = item
             .cover
             .clone()
             .or_else(|| placeholder_cover(&item.book.title, &item.book.circle_name))
             .or_else(no_image_cover);
-        let info_selector = format!("history-info-{database_id}");
-        let tag_area_selector = format!("history-tag-area-{database_id}");
+        let info_selector = format!("history-info-{element_id}");
+        let tag_area_selector = format!("history-tag-area-{element_id}");
 
         div()
-            .id(SharedString::from(format!("history-row-{database_id}")))
+            .id(SharedString::from(format!("history-row-{element_id}")))
             .debug_selector({
-                let selector = format!("history-row-{database_id}");
+                let selector = format!("history-row-{element_id}");
                 move || selector.clone()
             })
             .flex()
@@ -973,7 +1009,7 @@ impl HistoryView {
             .child(
                 div()
                     .debug_selector({
-                        let selector = format!("history-cover-{database_id}");
+                        let selector = format!("history-cover-{element_id}");
                         move || selector.clone()
                     })
                     .relative()
@@ -985,7 +1021,7 @@ impl HistoryView {
                     .bg(theme.muted)
                     .child(cover_fit_inside_frame(
                         cover.as_ref(),
-                        format!("history-cover-img-{database_id}"),
+                        format!("history-cover-img-{element_id}"),
                     )),
             )
             // 2 列目: 情報列（幅固定。タイトル / イベント名 or 購入日 / サークル・作者 / 進捗 / 状態）
@@ -1013,6 +1049,7 @@ impl HistoryView {
                         theme,
                         handle,
                         item,
+                        key,
                         state.favorite_circles,
                         state.favorite_authors,
                     ))
@@ -1025,7 +1062,7 @@ impl HistoryView {
                         )
                     })
                     // 状態（読了 / 未読 + ♡）は本棚と同じくページ数の下
-                    .child(Self::render_state_chips(theme, handle, item)),
+                    .child(Self::render_state_chips(theme, handle, item, key)),
             )
             // 3 列目: タグ列（行幅の 20%。本棚と同じ幅の取り方）
             .child(
@@ -1038,6 +1075,7 @@ impl HistoryView {
                         theme,
                         handle,
                         item,
+                        key,
                         state.tag_order,
                         state.tags_expanded,
                         false,
@@ -1049,16 +1087,21 @@ impl HistoryView {
     }
 
     /// タグ行（本棚と同じ見た目: チップ + 「+n」/「閉じる」）。履歴ではタグ編集（✎）は出さない。
+    /// `key` は出現キー（`render_card` / `render_row` と同じ。タグ行とチップの id にも前置する）。
+    #[allow(clippy::too_many_arguments)]
     fn render_tag_row(
         window: &mut Window,
         theme: &gpui_kit::component::Theme,
         handle: &Entity<Self>,
         item: &HistoryItem,
+        key: &str,
         tag_order: &TagOrder,
         expanded: bool,
         card: bool,
     ) -> AnyElement {
         let database_id = item.book.id.clone();
+        // タグ行 / チップの要素 id に前置する「この出現ぶん」の id（`{キー}-{本 id}`）。
+        let element_id = format!("{key}-{database_id}");
         let ordered = tag_order.sorted(&item.tags);
         let visible = if expanded {
             ordered.len()
@@ -1070,7 +1113,7 @@ impl HistoryView {
         let chips = crate::views::bookshelf::BookshelfView::render_tag_chips(
             theme,
             tag_order,
-            &database_id,
+            &element_id,
             &ordered[..visible],
             {
                 let handle = handle.clone();
@@ -1089,9 +1132,9 @@ impl HistoryView {
         );
         let hidden = ordered.len() - visible;
         let mut row = div()
-            .id(SharedString::from(format!("history-tag-row-{database_id}")))
+            .id(SharedString::from(format!("history-tag-row-{element_id}")))
             .debug_selector({
-                let selector = format!("history-tag-row-{database_id}");
+                let selector = format!("history-tag-row-{element_id}");
                 move || selector.clone()
             })
             .flex()
@@ -1105,14 +1148,15 @@ impl HistoryView {
         if expanded || hidden > 0 {
             row = row.child(crate::views::bookshelf::BookshelfView::render_tag_toggle(
                 theme,
-                format!("history-tag-toggle-{database_id}"),
+                format!("history-tag-toggle-{element_id}"),
                 hidden,
                 expanded,
                 {
                     let handle = handle.clone();
-                    let database_id = database_id.clone();
+                    // 展開状態は出現ごと（同じ本が複数の日に出ても 1 枚だけ開く）
+                    let element_id = element_id.clone();
                     move |_window, cx| {
-                        handle.update(cx, |this, cx| this.toggle_tag_expansion(&database_id, cx));
+                        handle.update(cx, |this, cx| this.toggle_tag_expansion(&element_id, cx));
                     }
                 },
             ));
@@ -1125,10 +1169,12 @@ impl HistoryView {
         theme: &gpui_kit::component::Theme,
         handle: &Entity<Self>,
         item: &HistoryItem,
+        key: &str,
         favorite_circles: &[String],
         favorite_authors: &[String],
     ) -> AnyElement {
-        let target = item.book.id.clone();
+        // チップ / ハートの要素 id にも出現キーを前置する（同じ本が複数出ても重複させない）。
+        let target = format!("{key}-{}", item.book.id);
         div()
             .flex()
             .flex_row()
@@ -1245,16 +1291,19 @@ impl HistoryView {
     }
 
     /// 読了 / 未読 とお気に入りハート（リストの状態列）。
+    /// `key` は出現キー（`render_card` / `render_row` と同じ）。
     fn render_state_chips(
         theme: &gpui_kit::component::Theme,
         handle: &Entity<Self>,
         item: &HistoryItem,
+        key: &str,
     ) -> AnyElement {
-        let database_id = item.book.id.clone();
+        // 状態列 / 状態チップ / ハートの要素 id に前置する「この出現ぶん」の id。
+        let element_id = format!("{key}-{}", item.book.id);
         div()
-            .id(SharedString::from(format!("history-status-{database_id}")))
+            .id(SharedString::from(format!("history-status-{element_id}")))
             .debug_selector({
-                let selector = format!("history-status-{database_id}");
+                let selector = format!("history-status-{element_id}");
                 move || selector.clone()
             })
             .flex()
@@ -1265,7 +1314,7 @@ impl HistoryView {
                 div()
                     .debug_selector({
                         let selector = format!(
-                            "history-state-{}-{database_id}",
+                            "history-state-{}-{element_id}",
                             match item.reading_state {
                                 progress::ReadingState::Read => "read",
                                 progress::ReadingState::Reading => "reading",
@@ -1300,7 +1349,7 @@ impl HistoryView {
                         },
                     ),
             )
-            .child(Self::render_heart(theme, handle, item, 24.0))
+            .child(Self::render_heart(theme, handle, item, key, 24.0))
             .into_any_element()
     }
 
@@ -1310,16 +1359,19 @@ impl HistoryView {
         theme: &gpui_kit::component::Theme,
         handle: &Entity<Self>,
         item: &HistoryItem,
+        key: &str,
         size: f32,
     ) -> AnyElement {
         let database_id = item.book.id.clone();
+        // カードのハートと同じ id を使うが、出現キーを前置する（同じ本が複数出ても重複しない）。
+        let element_id = format!("{key}-{database_id}");
         let is_favorite = item.book.is_favorite == 1;
         // 行の背景の上なので、本棚の行の状態アイコンと同じ配色（テーマで変わる）
         let (circle, heart) = row_heart_colors(theme, is_favorite);
         div()
-            .id(SharedString::from(format!("history-heart-{database_id}")))
+            .id(SharedString::from(format!("history-heart-{element_id}")))
             .debug_selector({
-                let selector = format!("history-heart-{database_id}");
+                let selector = format!("history-heart-{element_id}");
                 move || selector.clone()
             })
             .flex()
@@ -1445,34 +1497,41 @@ impl Render for HistoryView {
         let card_width =
             ((content_width - (columns as f32 - 1.0) * 12.0) / columns as f32).max(160.0);
 
+        // 選択中の出現（何日目の何冊目か）。同じ本が複数の日に出ても、選択枠はその出現だけ。
+        let selected = selected_occurrence(self.selected_index, &self.days);
         let days: Vec<AnyElement> = self
             .days
             .iter()
             .enumerate()
-            .map(|(index, day)| {
-                let selected_id = self
-                    .selected_index
-                    .and_then(|index| self.flat_book_ids().get(index).cloned());
+            .map(|(day_index, day)| {
+                // 出現キー（`{日付}-{その日の連番}`）。同じ本が複数の日に出ても
+                // 要素 id が重複しないように、カード / 行が描く id へ前置する。
+                let item_state = |item_index: usize, item: &HistoryItem| {
+                    // 展開状態も出現ごと（`render_tag_row` と同じ要素 id の組み立て）
+                    let element_id = format!("{}-{item_index}-{}", day.date, item.book.id);
+                    ItemState {
+                        tag_order: &tag_order,
+                        tags_expanded: self.expanded_tag_rows.contains(&element_id),
+                        selected: selected == Some((day_index, item_index)),
+                        favorite_circles: &self.favorite_circles,
+                        favorite_authors: &self.favorite_authors,
+                    }
+                };
                 let body: AnyElement = match view_mode {
                     ViewMode::Card => div()
                         .flex()
                         .flex_row()
                         .flex_wrap()
                         .gap_3()
-                        .children(day.items.iter().map(|item| {
+                        .children(day.items.iter().enumerate().map(|(item_index, item)| {
                             HistoryView::render_card(
                                 window,
                                 &theme,
                                 &handle,
                                 item,
+                                &format!("{}-{item_index}", day.date),
                                 card_width,
-                                &ItemState {
-                                    tag_order: &tag_order,
-                                    tags_expanded: self.expanded_tag_rows.contains(&item.book.id),
-                                    selected: selected_id.as_deref() == Some(item.book.id.as_str()),
-                                    favorite_circles: &self.favorite_circles,
-                                    favorite_authors: &self.favorite_authors,
-                                },
+                                &item_state(item_index, item),
                             )
                         }))
                         .into_any_element(),
@@ -1480,19 +1539,14 @@ impl Render for HistoryView {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .children(day.items.iter().map(|item| {
+                        .children(day.items.iter().enumerate().map(|(item_index, item)| {
                             HistoryView::render_row(
                                 window,
                                 &theme,
                                 &handle,
                                 item,
-                                &ItemState {
-                                    tag_order: &tag_order,
-                                    tags_expanded: self.expanded_tag_rows.contains(&item.book.id),
-                                    selected: selected_id.as_deref() == Some(item.book.id.as_str()),
-                                    favorite_circles: &self.favorite_circles,
-                                    favorite_authors: &self.favorite_authors,
-                                },
+                                &format!("{}-{item_index}", day.date),
+                                &item_state(item_index, item),
                             )
                         }))
                         .into_any_element(),
@@ -1508,7 +1562,7 @@ impl Render for HistoryView {
                             // デバッグ用の id は「何番目の日か」で固定する（テストが
                             // 日付に依存せずに検証できるように）
                             .debug_selector({
-                                let selector = format!("history-day-{index}");
+                                let selector = format!("history-day-{day_index}");
                                 move || selector.clone()
                             })
                             .w_full()
@@ -1661,7 +1715,7 @@ mod tests {
     /// 途中まで読んだ本が「未読」に丸められないことを確かめる。
     #[gpui_kit::test]
     async fn history_shows_reading_state(cx: &mut gpui_kit::TestAppContext) {
-        use chrono::{Duration, Utc};
+        use chrono::Duration;
         cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
         for (id, title) in [("b1", "未読の本"), ("b2", "途中の本"), ("b3", "読了の本")]
@@ -1688,7 +1742,8 @@ mod tests {
             progress("b2", 8, Some(10), false);
             progress("b3", 10, Some(10), true);
         });
-        let now = Utc::now() - Duration::hours(1);
+        // ローカルの正午を基準にする（実行時刻で日付がずれないように）。新しい順に b1 → b2 → b3
+        let now = local_noon() - Duration::hours(1);
         add_session(cx, "s1", "b1", now, 10);
         add_session(cx, "s2", "b2", now - Duration::minutes(10), 10);
         add_session(cx, "s3", "b3", now - Duration::minutes(20), 10);
@@ -1714,9 +1769,27 @@ mod tests {
             });
         }
         for (selector, expected) in [
-            ("history-state-unread-b1", "未読"),
-            ("history-state-reading-b2", "読んでいる途中"),
-            ("history-state-read-b3", "読了"),
+            (
+                interned(format!(
+                    "history-state-unread-{}-b1",
+                    occurrence_key(now, 0)
+                )),
+                "未読",
+            ),
+            (
+                interned(format!(
+                    "history-state-reading-{}-b2",
+                    occurrence_key(now - Duration::minutes(10), 1)
+                )),
+                "読んでいる途中",
+            ),
+            (
+                interned(format!(
+                    "history-state-read-{}-b3",
+                    occurrence_key(now - Duration::minutes(20), 2)
+                )),
+                "読了",
+            ),
         ] {
             assert!(
                 visual.debug_bounds(selector).is_some(),
@@ -1759,7 +1832,8 @@ mod tests {
             let img = image::RgbaImage::from_pixel(160, 40, image::Rgba([10, 20, 30, 255]));
             img.save(&path).unwrap();
         });
-        add_session(cx, "s1", "b1", Utc::now() - Duration::hours(1), 10);
+        let started = Utc::now() - Duration::hours(1);
+        add_session(cx, "s1", "b1", started, 10);
 
         let view = cx.new(HistoryView::new);
         let window = cx.open_window(
@@ -1776,8 +1850,9 @@ mod tests {
                 arena_clear.clear(cx);
             });
         }
+        let key = occurrence_key(started, 0);
         let cover = visual
-            .debug_bounds("history-card-cover-img-b1")
+            .debug_bounds(interned(format!("history-card-cover-img-{key}-b1")))
             .expect("カードの表紙画像が出ていない");
         let ratio = cover.size.width.as_f32() / cover.size.height.as_f32();
         assert!(
@@ -1787,7 +1862,7 @@ mod tests {
         // ダウンロード済みバッジ（本棚のカードと同じ）
         assert!(
             visual
-                .debug_bounds("history-card-cover-downloaded-b1")
+                .debug_bounds(interned(format!("history-card-cover-downloaded-{key}-b1")))
                 .is_some(),
             "ダウンロード済みバッジが出ていない"
         );
@@ -1855,7 +1930,8 @@ mod tests {
             let image = image::RgbImage::from_pixel(300, 400, image::Rgb([10, 20, 30]));
             image::DynamicImage::ImageRgb8(image).save(&path).unwrap();
         });
-        add_session(cx, "s1", "b1", Utc::now() - Duration::hours(1), 10);
+        let started = Utc::now() - Duration::hours(1);
+        add_session(cx, "s1", "b1", started, 10);
 
         let view = cx.new(HistoryView::new);
         let window = cx.open_window(
@@ -1872,10 +1948,14 @@ mod tests {
                 arena_clear.clear(cx);
             });
         }
+        let key = occurrence_key(started, 0);
         let cover = visual
-            .debug_bounds("history-card-cover-img-b1")
+            .debug_bounds(interned(format!("history-card-cover-img-{key}-b1")))
             .expect("カードの表紙画像が出ていない");
-        for selector in ["history-heart-b1", "history-card-cover-downloaded-b1"] {
+        for selector in [
+            interned(format!("history-heart-{key}-b1")),
+            interned(format!("history-card-cover-downloaded-{key}-b1")),
+        ] {
             let badge = visual
                 .debug_bounds(selector)
                 .unwrap_or_else(|| panic!("{selector} が出ていない"));
@@ -2054,7 +2134,7 @@ mod tests {
     /// タグ列は本棚と同じ見た目で出て、クリックで絞り込み・ハートでお気に入り・「+n」で展開。
     #[gpui_kit::test]
     async fn history_tag_column_filters_favorites_and_expands(cx: &mut gpui_kit::TestAppContext) {
-        use chrono::{Duration, Utc};
+        use chrono::Duration;
         cx.update(gpui_kit::component::init);
         cx.update(crate::app_state::AppState::init_test);
         seed_book(cx, "b1", "本1", "techbookfest");
@@ -2070,7 +2150,8 @@ mod tests {
             db::tags::set_for_book(pool, "b1", &pairs).unwrap();
             db::tags::set_for_book(pool, "b2", &[("べつのタグ", "manual")]).unwrap();
         });
-        let now = Utc::now() - Duration::hours(1);
+        // ローカルの正午を基準にする（実行時刻で日付がずれないように）。b1 → b2 の順
+        let now = local_noon() - Duration::hours(1);
         add_session(cx, "s1", "b1", now, 10);
         add_session(cx, "s2", "b2", now - Duration::minutes(5), 10);
 
@@ -2092,28 +2173,36 @@ mod tests {
             }
         };
         draw(visual);
+        // タグ行 / チップの要素 id には出現キー（日付 + その日の連番）が前置される
+        let key = occurrence_key(now, 0);
         // カード形式（既定）にタグ列が出る
         assert!(
-            visual.debug_bounds("history-tag-row-b1").is_some(),
+            visual
+                .debug_bounds(interned(format!("history-tag-row-{key}-b1")))
+                .is_some(),
             "タグ行が出ていない"
         );
         assert!(
-            visual.debug_bounds("tag-label-b1-しぼりこみ").is_some(),
+            visual
+                .debug_bounds(interned(format!("tag-label-{key}-b1-しぼりこみ")))
+                .is_some(),
             "タグチップが出ていない（集計数の多い順で先頭のはず）"
         );
         // 「+n」で展開できる（20 タグなので折りたたまれる）
         let toggle = visual
-            .debug_bounds("history-tag-toggle-b1")
+            .debug_bounds(interned(format!("history-tag-toggle-{key}-b1")))
             .expect("「+n」トグルが出ていない");
         visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
         draw(visual);
         assert!(
-            visual.debug_bounds("tag-label-b1-タグ19").is_some(),
+            visual
+                .debug_bounds(interned(format!("tag-label-{key}-b1-タグ19")))
+                .is_some(),
             "展開しても全タグが出ていない"
         );
         // タグのお気に入り（ハート）
         let heart = visual
-            .debug_bounds("tag-heart-b1-しぼりこみ")
+            .debug_bounds(interned(format!("tag-heart-{key}-b1-しぼりこみ")))
             .expect("タグのハートが出ていない");
         visual.simulate_click(heart.center(), gpui_kit::Modifiers::default());
         draw(visual);
@@ -2125,7 +2214,7 @@ mod tests {
         );
         // タグの文字クリックで絞り込み（b1 だけになる）
         let label = visual
-            .debug_bounds("tag-label-b1-しぼりこみ")
+            .debug_bounds(interned(format!("tag-label-{key}-b1-しぼりこみ")))
             .expect("タグの文字");
         visual.simulate_click(label.center(), gpui_kit::Modifiers::default());
         draw(visual);
@@ -2235,6 +2324,258 @@ mod tests {
         );
     }
 
+    /// 同じ本が複数の日に出ても、カード / 行は日ごとに別の要素として指せる。
+    /// 要素 id が本 id だけだと重複し、GPUI の要素 id は一意でなければならないため
+    /// 2 つ目以降をクリックできない（クリックしても本が開かない）。
+    #[gpui_kit::test]
+    async fn repeated_books_get_distinct_elements(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::Duration;
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book(cx, "b1", "何度も読む本", "techbookfest");
+        seed_book(cx, "b2", "同じ日の別の本", "techbookfest");
+        // ローカルの正午を基準にする（実行時刻で日付がずれないように）
+        let noon = local_noon();
+        // 今日は b1（同じ日のセッションは 1 冊に集約される）と b2、昨日は b1
+        add_session(cx, "s1", "b1", noon, 10);
+        add_session(cx, "s2", "b1", noon - Duration::minutes(15), 10);
+        add_session(cx, "s3", "b2", noon - Duration::minutes(30), 5);
+        add_session(cx, "s4", "b1", noon - Duration::days(1), 10);
+
+        let view = cx.new(HistoryView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(1200.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+
+        // 同じ本 b1 の今日 / 昨日（同じ日の中では連番 0）と、同じ日の 2 冊目 b2（連番 1）
+        let today = occurrence_key(noon, 0);
+        let today_second = occurrence_key(noon - Duration::minutes(30), 1);
+        let yesterday = occurrence_key(noon - Duration::days(1), 0);
+        // カード形式: 同じ本でも日ごとに別の要素として指せる（重複していると 2 つ目以降が取れない）
+        let today_card = visual
+            .debug_bounds(interned(format!("history-card-{today}-b1")))
+            .expect("今日のカードが指せない（要素 id が重複している）");
+        let yesterday_card = visual
+            .debug_bounds(interned(format!("history-card-{yesterday}-b1")))
+            .expect("昨日のカードが指せない（要素 id が重複している）");
+        assert!(
+            visual
+                .debug_bounds(interned(format!("history-card-{today_second}-b2")))
+                .is_some(),
+            "同じ日の 2 冊目のカードが指せない"
+        );
+        assert_ne!(
+            (today_card.origin.x.as_f32(), today_card.origin.y.as_f32()),
+            (
+                yesterday_card.origin.x.as_f32(),
+                yesterday_card.origin.y.as_f32()
+            ),
+            "同じ本のカードが日をまたいで同じ位置を指している"
+        );
+        // リスト形式も同じ（行の要素 id も本 id だけでは重複する）
+        view.update(cx, |this, cx| {
+            this.view_mode = ViewMode::List;
+            cx.notify();
+        });
+        draw(visual);
+        let today_row = visual
+            .debug_bounds(interned(format!("history-row-{today}-b1")))
+            .expect("今日の行が指せない（要素 id が重複している）");
+        let yesterday_row = visual
+            .debug_bounds(interned(format!("history-row-{yesterday}-b1")))
+            .expect("昨日の行が指せない（要素 id が重複している）");
+        assert_ne!(
+            (today_row.origin.x.as_f32(), today_row.origin.y.as_f32()),
+            (
+                yesterday_row.origin.x.as_f32(),
+                yesterday_row.origin.y.as_f32()
+            ),
+            "同じ本の行が日をまたいで同じ位置を指している"
+        );
+    }
+
+    /// 選択枠は「出現」に付く。`selected_index` は平坦化した位置なので、同じ本が複数の日に
+    /// 出ても選択中になるのはその 1 出現だけ（本 id で比べると全部が選択中になっていた）。
+    #[gpui_kit::test]
+    async fn selection_follows_the_occurrence_not_the_book(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::Duration;
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book(cx, "b1", "何度も読む本", "fanza");
+        // ローカルの正午を基準にする（実行時刻で日付がずれないように）
+        let noon = local_noon();
+        // 同じ本を 2 日（今日 = 連番 0 / 昨日 = 連番 0）
+        add_session(cx, "s1", "b1", noon, 10);
+        add_session(cx, "s2", "b1", noon - Duration::days(1), 10);
+
+        let view = cx.new(HistoryView::new);
+        let (books, first, second) = view.read_with(cx, |this, _| {
+            (
+                this.flat_book_ids(),
+                selected_occurrence(Some(0), &this.days),
+                selected_occurrence(Some(1), &this.days),
+            )
+        });
+        assert_eq!(
+            books,
+            vec!["b1".to_string(), "b1".to_string()],
+            "同じ本が 2 日分になっていない"
+        );
+        assert_eq!(
+            first,
+            Some((0, 0)),
+            "1 つ目の出現が選べていない（今日の 1 冊目）"
+        );
+        assert_eq!(
+            second,
+            Some((1, 0)),
+            "2 つ目の出現が選べていない（昨日の 1 冊目）"
+        );
+        assert_ne!(
+            first, second,
+            "同じ本の 2 つの出現が同じ選択になっている（両方選択枠になる）"
+        );
+    }
+
+    /// タグ列の展開（「+n」）は出現ごと。同じ本が複数の日に出ても、開いた 1 枚だけが展開される。
+    #[gpui_kit::test]
+    async fn tag_expansion_is_per_occurrence(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::Duration;
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        seed_book(cx, "b1", "同じ本", "techbookfest");
+        cx.update(|cx| {
+            let pool = &crate::app_state::AppState::global(cx).db_pool;
+            // 折りたたまれる数 + 1（最後の 1 つが「+1」で隠れる）
+            let tags: Vec<(String, &str)> = (1..=CARD_TAGS_COLLAPSED_MAX + 1)
+                .map(|i| (format!("タグ{i:02}"), "manual"))
+                .collect();
+            let pairs: Vec<(&str, &str)> = tags.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+            db::tags::set_for_book(pool, "b1", &pairs).unwrap();
+        });
+        // ローカルの正午を基準にする（実行時刻で日付がずれないように）
+        let noon = local_noon();
+        add_session(cx, "s1", "b1", noon, 10);
+        add_session(cx, "s2", "b1", noon - Duration::days(1), 10);
+
+        let view = cx.new(HistoryView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(1200.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            for _ in 0..4 {
+                visual.update(|window, cx| {
+                    let arena_clear = window.draw(cx);
+                    arena_clear.clear(cx);
+                });
+            }
+        };
+        draw(visual);
+        let today = occurrence_key(noon, 0);
+        let yesterday = occurrence_key(noon - Duration::days(1), 0);
+        let hidden = format!("タグ{:02}", CARD_TAGS_COLLAPSED_MAX + 1);
+        // 折りたたみ中は、隠れたタグがどちらの出現にも出ない
+        for key in [&today, &yesterday] {
+            assert!(
+                visual
+                    .debug_bounds(interned(format!("tag-label-{key}-b1-{hidden}")))
+                    .is_none(),
+                "折りたたみ中なのに {key} の隠れたタグが出ている"
+            );
+        }
+        // 今日の出現の「+n」だけを押す
+        let toggle = visual
+            .debug_bounds(interned(format!("history-tag-toggle-{today}-b1")))
+            .expect("「+n」トグルが出ていない");
+        visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        draw(visual);
+        assert!(
+            visual
+                .debug_bounds(interned(format!("tag-label-{today}-b1-{hidden}")))
+                .is_some(),
+            "開いた出現のタグが展開されていない"
+        );
+        assert!(
+            visual
+                .debug_bounds(interned(format!("tag-label-{yesterday}-b1-{hidden}")))
+                .is_none(),
+            "別の日の同じ本まで展開されている（展開が本 id で共有されている）"
+        );
+    }
+
+    /// ローカルの正午（実行時刻が深夜でも「今日」がぶれない基準）。
+    fn local_noon() -> chrono::DateTime<chrono::Utc> {
+        chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("正午")
+            .and_local_timezone(chrono::Local)
+            .single()
+            .expect("ローカル時刻")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// セッション開始時刻（UTC）が入る履歴の日付（ローカル `YYYY-MM-DD`）。
+    /// `view_history::list_daily` と同じく、保存されている UTC 時刻をローカルに直して日を切る。
+    fn local_day(started_utc: chrono::DateTime<chrono::Utc>) -> String {
+        started_utc
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    /// 要素 id に前置する出現キー（`{ローカル日付}-{その日の連番}`）。
+    /// `started_utc` は `add_session` に渡した開始時刻、`index` はその日の何冊目か。
+    fn occurrence_key(started_utc: chrono::DateTime<chrono::Utc>, index: usize) -> String {
+        format!("{}-{index}", local_day(started_utc))
+    }
+
+    /// `VisualTestContext::debug_bounds` は `&'static str` しか取らないので、
+    /// テストが組み立てたセレクタを static なスロットへ置いてから渡す
+    /// （`Box::leak` と違って増え続けない。同じ文字列は同じスロットを共有する）。
+    ///
+    /// 値（セレクタ）は実行時にしか決まらず、`LazyLock` は初期化後に入れ替えられないため
+    /// スロットは `OnceLock` にする（固定長の置き場。宣言時に初期化式が決まる値ではない）。
+    fn interned(selector: String) -> &'static str {
+        /// このテストバイナリで使うセレクタの数（並列実行の重複を見込んで余裕を持たせる）。
+        const SLOTS: usize = 64;
+        static POOL: [std::sync::OnceLock<String>; SLOTS] =
+            [const { std::sync::OnceLock::new() }; SLOTS];
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        for slot in &POOL {
+            if let Some(existing) = slot.get()
+                && *existing == selector
+            {
+                return existing.as_str();
+            }
+        }
+        let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let slot = POOL.get(index).expect("セレクタの置き場（POOL）が足りない");
+        if slot.set(selector).is_err() {
+            panic!("セレクタのスロットを 2 回使った");
+        }
+        slot.get().expect("直前に置いた").as_str()
+    }
+
     fn add_session(
         cx: &mut gpui_kit::TestAppContext,
         id: &str,
@@ -2322,10 +2663,10 @@ mod tests {
         };
         draw(visual);
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let yesterday = (chrono::Local::now() - Duration::days(1))
-            .format("%Y-%m-%d")
-            .to_string();
+        // 要素 id の出現キー（日付 + その日の連番）。今日は b1 の 1 冊だけ、昨日は b2
+        let today = local_day(now);
+        let today_key = occurrence_key(now, 0);
+        let yesterday_key = occurrence_key(now - Duration::days(1), 0);
         // 日付ごとに見出しが出て、1 日 1 本に集約される
         assert!(
             visual.debug_bounds("history-day-0").is_some(),
@@ -2358,7 +2699,9 @@ mod tests {
         );
         // 既定はカード形式
         assert!(
-            visual.debug_bounds("history-card-b1").is_some(),
+            visual
+                .debug_bounds(interned(format!("history-card-{today_key}-b1")))
+                .is_some(),
             "カード形式で描画されていない"
         );
         // リスト形式に切り替え
@@ -2368,13 +2711,21 @@ mod tests {
         visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
         draw(visual);
         assert!(
-            visual.debug_bounds("history-row-b1").is_some(),
+            visual
+                .debug_bounds(interned(format!("history-row-{today_key}-b1")))
+                .is_some(),
             "リスト形式に切り替わっていない"
         );
         // 本棚の行と同じ 4 列構成: 表紙 → 情報列（320px 固定） → タグ列
-        let cover = visual.debug_bounds("history-cover-b1").expect("表紙");
-        let info = visual.debug_bounds("history-info-b1").expect("情報列");
-        let tags_area = visual.debug_bounds("history-tag-area-b1").expect("タグ列");
+        let cover = visual
+            .debug_bounds(interned(format!("history-cover-{today_key}-b1")))
+            .expect("表紙");
+        let info = visual
+            .debug_bounds(interned(format!("history-info-{today_key}-b1")))
+            .expect("情報列");
+        let tags_area = visual
+            .debug_bounds(interned(format!("history-tag-area-{today_key}-b1")))
+            .expect("タグ列");
         assert!(
             (info.size.width.as_f32() - LIST_INFO_W).abs() < 1.5,
             "情報列が固定幅になっていない: {} (期待 {LIST_INFO_W})",
@@ -2394,11 +2745,13 @@ mod tests {
         );
         // サークル名のチップ（本棚と同じ: 値 + ハート）
         assert!(
-            visual.debug_bounds("history-circle-chip-b1").is_some(),
+            visual
+                .debug_bounds(interned(format!("history-circle-chip-{today_key}-b1")))
+                .is_some(),
             "サークルチップが出ていない"
         );
         let heart = visual
-            .debug_bounds("history-circle-heart-b1")
+            .debug_bounds(interned(format!("history-circle-heart-{today_key}-b1")))
             .expect("サークルのハート");
         visual.simulate_click(heart.center(), gpui_kit::Modifiers::default());
         draw(visual);
@@ -2409,7 +2762,9 @@ mod tests {
             "ハートでサークルがお気に入りになっていない"
         );
         assert!(
-            visual.debug_bounds("history-card-b1").is_none(),
+            visual
+                .debug_bounds(interned(format!("history-card-{today_key}-b1")))
+                .is_none(),
             "カード形式が残っている"
         );
         // 期間フィルタ: 今日 → 昨日の本は出ない
@@ -2442,7 +2797,13 @@ mod tests {
             2,
             "「全項目」で戻っていない"
         );
-        let _ = yesterday;
+        // 昨日の出現（b2）も別の要素として指せる（リスト形式のまま）
+        assert!(
+            visual
+                .debug_bounds(interned(format!("history-row-{yesterday_key}-b2")))
+                .is_some(),
+            "昨日の行が指せない"
+        );
     }
 
     /// サイトフィルタ: 履歴に含まれるサイトだけ選べて、選ぶとそのサイトの本だけになる。
