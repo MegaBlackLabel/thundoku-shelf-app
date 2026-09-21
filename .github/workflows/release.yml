@@ -254,9 +254,10 @@ jobs:
             exit 1
           fi
           echo "submission id: $NOTARY_ID"
-          # 最大 90 分待つ。時間切れは「却下」ではなく「処理中」なので、そう伝える
-          # （Apple 側が混んでいると数時間かかることがあり、その場合は再実行する）
-          DEADLINE=$(( $(date +%s) + 5400 ))
+          # 最大 4 時間待つ（ジョブ上限は 6 時間。公開リポジトリで Actions は無料なので、
+          # 待つこと自体にコストが無く、遅れて受理された分を無駄にしない方が得）。
+          # 時間切れは「却下」ではなく「処理中」なので、そう伝える。
+          DEADLINE=$(( $(date +%s) + 14400 ))
           NOTARY_STATUS=""
           while :; do
             INFO="$(xcrun notarytool info "$NOTARY_ID" "${NOTARY_ARGS[@]}" 2>&1 || true)"
