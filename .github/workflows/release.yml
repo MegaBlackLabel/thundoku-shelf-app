@@ -132,7 +132,15 @@ jobs:
             "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer"
           echo "${G2_SHA}  $RUNNER_TEMP/DeveloperIDG2CA.cer" | shasum -a 256 -c -
           security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KC"
+          # 保険として login キーチェーンにも入れておく。identity の探索は `--keychain` で
+          # 絞れるが、チェーンの構築（中間証明書の探索）は検索リストのキーチェーンを見るため、
+          # 中間が $KC にしか無い環境では `find-identity -v` が 0 件になりうる。
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+            -k "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          # 検索リストに $KC を加える（identity ではなくチェーン構築のため）
+          security list-keychains -d user -s "$KC" \
+            "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain
           # macOS 14 のランナーでは、これが無いと codesign が errSecInternalComponent で落ちる
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC"
           # 以降の署名は毎回 `--keychain "$KC"` を明示する（検索リストを汚さないため）。
