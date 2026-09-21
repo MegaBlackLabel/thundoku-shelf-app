@@ -31,11 +31,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 成果物名にバージョン（タグ）を入れる。例: タグ v1.2.3 -> 1.2.3
+      # 成果物名にバージョンを入れる。タグならタグの番号（v1.2.3 -> 1.2.3）、
+      # 手動実行などそれ以外は Cargo.toml の version を使う（"main" のような値が
+      # Info.plist や成果物名に入らないようにする）
       - name: Compute version
         id: ver
         shell: bash
-        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(sed -n 's/^version *= *"\(.*\)".*/\1/p' Cargo.toml | head -1)"
+          fi
+          test -n "$VERSION"
+          echo "v=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"
 
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
