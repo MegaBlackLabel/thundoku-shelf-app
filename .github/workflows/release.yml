@@ -28,9 +28,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             arch: x86_64
     runs-on: ${{ matrix.os }}
-    env:
-      # 署名用の一時キーチェーン（macOS）。`if: always()` の後始末でも同じパスを使う。
-      SIGNING_KEYCHAIN: ${{ runner.temp }}/build.keychain-db
     steps:
       - uses: actions/checkout@v4
 
@@ -114,7 +111,8 @@ jobs:
           CERT_PW: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
-          KC="$SIGNING_KEYCHAIN"
+          # 署名用の一時キーチェーン。Cleanup でも同じパスを使う（$RUNNER_TEMP は各ランナーで固有）
+          KC="$RUNNER_TEMP/build.keychain-db"
           KC_PW="$(openssl rand -hex 16)"
           echo "SIGNING_KEYCHAIN_PW=$KC_PW" >> "$GITHUB_ENV"
           security create-keychain -p "$KC_PW" "$KC"
@@ -159,6 +157,7 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
+          KC="$RUNNER_TEMP/build.keychain-db"
           APP="target/${{ matrix.target }}/release/ThundokuShelf.app"
           rm -rf "$APP"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -205,27 +204,27 @@ jobs:
           # 中身で確定する）。`--options runtime`（Hardened Runtime）は公証の要件で、これを
           # 付けると library validation が有効になり、同梱 dylib が別 Team の署名だと
           # ロード時に弾かれる（PDFium は実行時ロードなので特に効く）ので、同じ鍵で署名する。
-          IDENTITY="$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
+          IDENTITY="$(security find-identity -v -p codesigning "$KC" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
           test -n "$IDENTITY"
           echo "署名 ID: $IDENTITY"
           codesign --force --options runtime --timestamp \
-            --keychain "$SIGNING_KEYCHAIN" --sign "$IDENTITY" "$APP/Contents/Frameworks/libpdfium.dylib"
+            --keychain "$KC" --sign "$IDENTITY" "$APP/Contents/Frameworks/libpdfium.dylib"
           codesign --force --options runtime --timestamp \
-            --keychain "$SIGNING_KEYCHAIN" --sign "$IDENTITY" "$APP"
+            --keychain "$KC" --sign "$IDENTITY" "$APP"
           codesign --verify --strict --verbose=2 "$APP"
           # ── 公証 ──
           # 署名から公証までの間にロックされる可能性に備えて解錠し直す（-lut は 6 時間）
-          security unlock-keychain -p "$SIGNING_KEYCHAIN_PW" "$SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$SIGNING_KEYCHAIN_PW" "$KC"
           # zip には直接 staple できない（Apple のドキュメント）。notarytool に出すのは
           # 提出用の zip で、staple は .app に当て、配布用の zip は staple 後に作り直す。
           # パスワードはキーチェーンのプロファイルに入れて、以降のコマンドラインに残さない。
           xcrun notarytool store-credentials "thundoku-notary" \
-            --keychain "$SIGNING_KEYCHAIN" \
+            --keychain "$KC" \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
           ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
           set +e
           NOTARY_OUT="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --keychain-profile "thundoku-notary" --keychain "$SIGNING_KEYCHAIN" --wait 2>&1)"
+            --keychain-profile "thundoku-notary" --keychain "$KC" --wait 2>&1)"
           NOTARY_STATUS=$?
           set -e
           printf '%s\n' "$NOTARY_OUT"
@@ -233,7 +232,7 @@ jobs:
           NOTARY_ID="$(printf '%s' "$NOTARY_OUT" | sed -n 's/^ *id: *//p' | head -1)"
           if [ -n "$NOTARY_ID" ]; then
             xcrun notarytool log "$NOTARY_ID" \
-              --keychain-profile "thundoku-notary" --keychain "$SIGNING_KEYCHAIN" \
+              --keychain-profile "thundoku-notary" --keychain "$KC" \
               || echo "::warning::notarytool log の取得に失敗しました（キーチェーンのロックなど）"
           fi
           if [ "$NOTARY_STATUS" -ne 0 ]; then
@@ -288,7 +287,7 @@ jobs:
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |
-          security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP"/cert.p12 "$RUNNER_TEMP"/notarize.zip || true
 
   release:
