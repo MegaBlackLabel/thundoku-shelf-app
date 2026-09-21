@@ -241,21 +241,43 @@ jobs:
             --keychain "$KC" \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
           ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
-          set +e
-          NOTARY_OUT="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --keychain-profile "thundoku-notary" --keychain "$KC" --wait 2>&1)"
-          NOTARY_STATUS=$?
-          set -e
+          # --wait は使わない。提出後にランナーのネットワークが瞬断すると
+          # "The Internet connection appears to be offline" で即座に失敗し、処理中なのか
+          # 却下なのか分からなくなる（実際に 4 時間待った末にこれで落ちた）。
+          # ID だけ取って info でポーリングし、通信エラーはリトライする。
+          NOTARY_ARGS=(--keychain-profile "thundoku-notary" --keychain "$KC")
+          NOTARY_OUT="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" "${NOTARY_ARGS[@]}" 2>&1 || true)"
           printf '%s\n' "$NOTARY_OUT"
-          # 成功しても警告が入っていることがあるのでログは常に出す（Apple の推奨）
           NOTARY_ID="$(printf '%s' "$NOTARY_OUT" | sed -n 's/^ *id: *//p' | head -1)"
-          if [ -n "$NOTARY_ID" ]; then
-            xcrun notarytool log "$NOTARY_ID" \
-              --keychain-profile "thundoku-notary" --keychain "$KC" \
-              || echo "::warning::notarytool log の取得に失敗しました（キーチェーンのロックなど）"
+          if [ -z "$NOTARY_ID" ]; then
+            echo "::error::公証の提出に失敗しました（submission id を取得できませんでした）"
+            exit 1
           fi
-          if [ "$NOTARY_STATUS" -ne 0 ]; then
-            echo "::error::公証が通りませんでした。上のログを確認してください"
+          echo "submission id: $NOTARY_ID"
+          # 最大 90 分待つ。時間切れは「却下」ではなく「処理中」なので、そう伝える
+          # （Apple 側が混んでいると数時間かかることがあり、その場合は再実行する）
+          DEADLINE=$(( $(date +%s) + 5400 ))
+          NOTARY_STATUS=""
+          while :; do
+            INFO="$(xcrun notarytool info "$NOTARY_ID" "${NOTARY_ARGS[@]}" 2>&1 || true)"
+            NOTARY_STATUS="$(printf '%s' "$INFO" | sed -n 's/^ *status: *//p' | head -1)"
+            echo "status: ${NOTARY_STATUS:-unknown}"
+            case "$NOTARY_STATUS" in
+              Accepted|Invalid) break ;;
+              "") echo "  問い合わせに失敗（ネットワーク等）。60 秒後に再試行する" ;;
+            esac
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::公証が時間内に完了しませんでした（status=${NOTARY_STATUS:-unknown}）。Apple 側の処理が混んでいる可能性があるので、時間をおいて再実行してください"
+              xcrun notarytool log "$NOTARY_ID" "${NOTARY_ARGS[@]}" || true
+              exit 1
+            fi
+            sleep 60
+          done
+          # 成功しても警告が入っていることがあるのでログは常に出す（Apple の推奨）
+          xcrun notarytool log "$NOTARY_ID" "${NOTARY_ARGS[@]}" \
+            || echo "::warning::notarytool log の取得に失敗しました（キーチェーンのロックなど）"
+          if [ "$NOTARY_STATUS" != "Accepted" ]; then
+            echo "::error::公証が却下されました（status=$NOTARY_STATUS）。上のログを確認してください"
             exit 1
           fi
           xcrun stapler staple "$APP"
