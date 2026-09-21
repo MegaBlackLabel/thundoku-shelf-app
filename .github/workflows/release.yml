@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # 手動実行（署名・公証の動作確認用）。タグを切らずに試せる。
+  # Release の作成はタグのときだけ行う（release ジョブの if を参照）。
+  workflow_dispatch:
 
 jobs:
   build:
@@ -25,6 +28,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             arch: x86_64
     runs-on: ${{ matrix.os }}
+    env:
+      # 署名用の一時キーチェーン（macOS）。`if: always()` の後始末でも同じパスを使う。
+      SIGNING_KEYCHAIN: ${{ runner.temp }}/build.keychain-db
     steps:
       - uses: actions/checkout@v4
 
@@ -97,12 +103,60 @@ jobs:
           echo "${sha}  pdfium.tgz" | shasum -a 256 -c -
           tar -xzf pdfium.tgz lib/libpdfium.dylib
 
+      # Developer ID の証明書を一時キーチェーンに入れる（macOS のみ）。
+      # 秘密鍵は GitHub Secrets から環境変数で受け取る（コマンドライン引数に置くと
+      # ps から見える）。展開した .p12 はすぐ消し、キーチェーンは最後の Cleanup で必ず消す。
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PW: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KC="$SIGNING_KEYCHAIN"
+          KC_PW="$(openssl rand -hex 16)"
+          echo "SIGNING_KEYCHAIN_PW=$KC_PW" >> "$GITHUB_ENV"
+          security create-keychain -p "$KC_PW" "$KC"
+          # 公証の --wait は数十分〜数時間かかることがある。途中でロックされると、
+          # 時間のかかった submit の再認証や notarytool log が失敗するので長め（6 時間）にする。
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PW" "$KC"
+          printf '%s' "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PW" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Developer ID の中間証明書（Apple の G2 Sub-CA）を入れる。.p12 はリーフ 1 件しか
+          # 持たないため、ランナーに中間が無いと `find-identity -v` が 0 件になり、codesign は
+          # "unable to build chain to self-signed root" / errSecInternalComponent で落ちる。
+          # pdfium と同じく、供給網対策として SHA256 を固定して検証してから入れる。
+          G2_SHA="f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a"
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+            "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer"
+          echo "${G2_SHA}  $RUNNER_TEMP/DeveloperIDG2CA.cer" | shasum -a 256 -c -
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KC"
+          rm -f "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          # macOS 14 のランナーでは、これが無いと codesign が errSecInternalComponent で落ちる
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC"
+          # 以降の署名は毎回 `--keychain "$KC"` を明示する（検索リストを汚さないため）。
+          # 有効な identity が 1 件以上見えること = リーフ + 中間 + 秘密鍵が揃っていること。
+          IDS="$(security find-identity -v -p codesigning "$KC")"
+          printf '%s\n' "$IDS"
+          COUNT="$(printf '%s' "$IDS" | sed -n 's/.*\([0-9][0-9]*\) valid identities found.*/\1/p' | head -1)"
+          if [ "${COUNT:-0}" -lt 1 ]; then
+            echo "::error::有効な identity が 0 件（中間証明書か秘密鍵が欠けています）"
+            exit 1
+          fi
+
       # macOS は生バイナリではなく .app バンドルを配布する。
       # 生バイナリだと Info.plist もアイコンも無く、Finder からアプリとして扱えず、
       # Gatekeeper の扱いも厳しくなる（ローカルの scripts/make-app-bundle.sh と同じ構成）。
       - name: Package (macOS)
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           APP="target/${{ matrix.target }}/release/ThundokuShelf.app"
@@ -145,13 +199,52 @@ jobs:
           # この時点で中身が確定している必要がある。
           mkdir -p "$APP/Contents/Frameworks"
           cp lib/libpdfium.dylib "$APP/Contents/Frameworks/libpdfium.dylib"
-          codesign --force --sign - "$APP/Contents/Frameworks/libpdfium.dylib"
-          # .app として ad-hoc 署名し直す。実行ファイル単体の署名（リンカが付ける）だけだと
-          # _CodeSignature/CodeResources が無く、codesign --verify が失敗して Gatekeeper が
-          # 「壊れているため開けません」と判定しうる。Team ID は無いので ad-hoc（-）で署名する
-          codesign --force --sign - "$APP"
+          # ── 署名 ──
+          # Developer ID で署名する。ad-hoc だと Gatekeeper が「壊れているため開けません」側の
+          # 判定になり、公証も受けられない。順序は dylib → .app（.app の seal はこの時点の
+          # 中身で確定する）。`--options runtime`（Hardened Runtime）は公証の要件で、これを
+          # 付けると library validation が有効になり、同梱 dylib が別 Team の署名だと
+          # ロード時に弾かれる（PDFium は実行時ロードなので特に効く）ので、同じ鍵で署名する。
+          IDENTITY="$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
+          test -n "$IDENTITY"
+          echo "署名 ID: $IDENTITY"
+          codesign --force --options runtime --timestamp \
+            --keychain "$SIGNING_KEYCHAIN" --sign "$IDENTITY" "$APP/Contents/Frameworks/libpdfium.dylib"
+          codesign --force --options runtime --timestamp \
+            --keychain "$SIGNING_KEYCHAIN" --sign "$IDENTITY" "$APP"
           codesign --verify --strict --verbose=2 "$APP"
-          # 初回起動は Gatekeeper に止められるので、起動方法を書いた txt も同梱する
+          # ── 公証 ──
+          # 署名から公証までの間にロックされる可能性に備えて解錠し直す（-lut は 6 時間）
+          security unlock-keychain -p "$SIGNING_KEYCHAIN_PW" "$SIGNING_KEYCHAIN"
+          # zip には直接 staple できない（Apple のドキュメント）。notarytool に出すのは
+          # 提出用の zip で、staple は .app に当て、配布用の zip は staple 後に作り直す。
+          # パスワードはキーチェーンのプロファイルに入れて、以降のコマンドラインに残さない。
+          xcrun notarytool store-credentials "thundoku-notary" \
+            --keychain "$SIGNING_KEYCHAIN" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+          set +e
+          NOTARY_OUT="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --keychain-profile "thundoku-notary" --keychain "$SIGNING_KEYCHAIN" --wait 2>&1)"
+          NOTARY_STATUS=$?
+          set -e
+          printf '%s\n' "$NOTARY_OUT"
+          # 成功しても警告が入っていることがあるのでログは常に出す（Apple の推奨）
+          NOTARY_ID="$(printf '%s' "$NOTARY_OUT" | sed -n 's/^ *id: *//p' | head -1)"
+          if [ -n "$NOTARY_ID" ]; then
+            xcrun notarytool log "$NOTARY_ID" \
+              --keychain-profile "thundoku-notary" --keychain "$SIGNING_KEYCHAIN" \
+              || echo "::warning::notarytool log の取得に失敗しました（キーチェーンのロックなど）"
+          fi
+          if [ "$NOTARY_STATUS" -ne 0 ]; then
+            echo "::error::公証が通りませんでした。上のログを確認してください"
+            exit 1
+          fi
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl -a -vv -t exec "$APP"
+          # 公証済みなので初回起動の Gatekeeper 解除は不要。それでも環境によっては
+          # 止まることがあるため、起動方法を書いた txt は同梱しておく。
           STAGE="target/${{ matrix.target }}/release/dist"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
@@ -190,9 +283,19 @@ jobs:
           path: thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip
           if-no-files-found: error
 
+      # 一時キーチェーンと展開済み .p12 を必ず消す（失敗時も実行する）
+      - name: Cleanup signing keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP"/cert.p12 "$RUNNER_TEMP"/notarize.zip || true
+
   release:
     needs: build
     runs-on: ubuntu-latest
+    # 手動実行（workflow_dispatch）やブランチ ref では Release を作らない
+    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:

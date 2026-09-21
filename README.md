@@ -20,22 +20,24 @@
 
 - **Windows**: 展開したフォルダに `pdfium.dll`（PDF 表示用）が入っています。**exe と同じフォルダに置いたまま**使ってください。初回起動時に SmartScreen の警告が出たら「詳細情報」→「実行」で進めます。
 
-### macOS の初回起動（Important）
+### macOS での起動
+
+> [!NOTE]
+> **これから配布する版は Apple の公証（Notarization）済みです。** `ThundokuShelf.app` を Applications に移してダブルクリックすれば、そのまま起動できます。
 
 > [!IMPORTANT]
-> **macOS は初回だけ Gatekeeper の解除が必要です。** このアプリは Apple の公証を受けていないため、ダウンロードしたままだと起動できません（現在 Developer ID を申請中で、取得でき次第この手順は不要になります）。
+> **v0.2.5 以前をダウンロードした場合は、初回だけ Gatekeeper の解除が必要です。** 次の手順で起動してください（次回以降は普通のアプリと同じように起動できます）。
 
 macOS の zip を展開すると `ThundokuShelf.app` が出てきます。Applications に移してから、次の手順で起動してください。
 
 1. アプリをダブルクリック → 「開発元を検証できません」と表示されたら **「完了」** を押す
 2. **システム設定 →「プライバシーとセキュリティ」** を開き、「セキュリティ」の欄に出ている **「このまま開く」** を押す → 認証 → **「開く」**
    - 「このまま開く」は 1 の失敗から**約 1 時間以内**しか表示されません
-3. 次回以降は普通のアプリと同じように起動できます
 
 > [!NOTE]
 > **macOS 15 (Sequoia) 以降では、右クリック →「開く」は Gatekeeper の回避として機能しません**（メニューには出ますが効きません）。上の 1〜2 を使ってください。
 
-うまくいかない場合は、ターミナルで隔離属性を外してから開きます:
+隔離属性を外す方法（どちらの場合でも効きます）:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/ThundokuShelf.app
@@ -103,7 +105,7 @@ curl -s https://api.github.com/repos/MegaBlackLabel/thundoku-shelf-app/releases/
 - Google ログインはバックアップ用です。**書籍を読むのにログインは不要**です
 - 「レポート」の画像添付は、投稿先リポジトリへの書き込み権限が必要です。権限が無い場合は本文のみで送信できます
 - レポートの投稿先はこのアプリのリポジトリ（`MegaBlackLabel/thundoku-shelf-app`）に固定です
-- macOS 版は署名・公証を行っていません（**Developer ID を申請中**）。初回起動の手順は「[macOS の初回起動](#macos-の初回起動important)」を参照
+- macOS 版は Developer ID で署名し、Apple の公証（Notarization）を受けています。v0.2.5 以前の配布物は未署名・未公証なので「[macOS での起動](#macos-での起動)」を参照
 
 ## 開発者向け
 
