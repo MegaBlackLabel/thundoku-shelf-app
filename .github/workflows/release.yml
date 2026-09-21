@@ -323,6 +323,28 @@ jobs:
           path: thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip
           if-no-files-found: error
 
+      # 署名済み .app を退避する。公証の判定が遅れて時間切れになった場合でも、あとから
+      # stapler staple して配布 zip を作れるようにするため（チケットは cdhash に紐づくので
+      # 同じ .app が要る。stapler は公開チケットを取りに行くので手元でも実行できる）。
+      - name: Preserve signed app (macOS)
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP="target/${{ matrix.target }}/release/ThundokuShelf.app"
+          if [ ! -d "$APP" ]; then
+            echo "署名済み .app が無いので退避しない（署名より前で失敗した）"
+            exit 0
+          fi
+          ditto -c -k --keepParent "$APP" "signed-app-${{ steps.ver.outputs.v }}-${{ matrix.arch }}.zip"
+          ls -l signed-app-*.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'macOS'
+        with:
+          name: signed-app-${{ steps.ver.outputs.v }}-${{ matrix.arch }}
+          path: signed-app-${{ steps.ver.outputs.v }}-${{ matrix.arch }}.zip
+          if-no-files-found: ignore
+
       # 一時キーチェーンと展開済み .p12 を必ず消す（失敗時も実行する）
       - name: Cleanup signing keychain (macOS)
         if: always() && runner.os == 'macOS'
