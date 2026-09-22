@@ -3160,7 +3160,10 @@ impl BookshelfView {
         crate::app_state::set_toast_kind(
             cx,
             ToastKind::Success,
-            format!("{} サイトから {} 件取得しました", notice.label, notice.saved),
+            format!(
+                "{} サイトから {} 件取得しました",
+                notice.label, notice.saved
+            ),
         );
     }
 

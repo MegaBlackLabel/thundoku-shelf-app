@@ -816,11 +816,18 @@ mod tests {
         assert_eq!(session.cookie_header_for("evil.example.com"), "");
         // 収集元そのもの / その子ドメインには送る
         assert_eq!(session.cookie_header_for(SITE_HOST), "__DLsite_SID=shop");
-        assert!(session.cookie_header_for("sub.www.dlsite.com").contains("__DLsite_SID=shop"));
+        assert!(
+            session
+                .cookie_header_for("sub.www.dlsite.com")
+                .contains("__DLsite_SID=shop")
+        );
         assert_eq!(session.cookie_header_for(LOGIN_HOST), "login_ticket=t");
 
         // 収集元をまたいだ取り出し（認証判定用）
-        assert_eq!(session.cookie_value(SITE_HOST, "__DLsite_SID"), Some("shop"));
+        assert_eq!(
+            session.cookie_value(SITE_HOST, "__DLsite_SID"),
+            Some("shop")
+        );
         assert_eq!(session.cookie_value(LOGIN_HOST, "__DLsite_SID"), None);
         assert_eq!(session.cookies_count(), 2);
         assert!(session.logged_in());

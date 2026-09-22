@@ -131,8 +131,10 @@ impl FanzaLoginView {
         let _pumping = crate::app_state::WebviewPumpGuard::enter();
         // www と accounts の Cookie を**収集元ごとに分けて**持つ（1 つに潰すと、片方に
         // しか送るべきでない Cookie がもう片方や CDN へ飛ぶ）。
-        let mut origins: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
-            std::collections::BTreeMap::new();
+        let mut origins: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, String>,
+        > = std::collections::BTreeMap::new();
         for url in SESSION_ORIGINS {
             let cookies = webview
                 .read(cx)
