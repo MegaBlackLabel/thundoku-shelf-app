@@ -29,7 +29,7 @@ serde.workspace = true
  dirs = "6"
 rfd = "0.17"
  parking_lot = "0.12"
-ureq = { version = "2", features = ["rustls", "json"] }
+ureq = { version = "2", features = ["tls", "json"] }
 opfspack = { path = "../opfspack" }
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
 webp = "0.3"
