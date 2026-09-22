@@ -7,8 +7,18 @@ on:
   # Release の作成はタグのときだけ行う（release ジョブの if を参照）。
   workflow_dispatch:
 
+# 既定は読み取りのみ（署名鍵やリリース作成は release ジョブだけに与える）。
+permissions:
+  contents: read
+
 jobs:
   build:
+    # 署名つきの来歴（attestation）を作るために OIDC と証明の保存権限が要る。
+    # ジョブの `permissions` はワークフロー既定を**置き換える**ので `contents` も書く。
+    permissions:
+      contents: read
+      id-token: write # Sigstore の署名証明書（鍵レス）を取る
+      attestations: write # 生成した証明をリポジトリへ保存する
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +39,8 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      # Actions は**完全なコミット SHA** で固定する（タグは付け替え可能）。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # 成果物名にバージョンを入れる。タグならタグの番号（v1.2.3 -> 1.2.3）、
       # 手動実行などそれ以外は Cargo.toml の version を使う（"main" のような値が
@@ -48,17 +59,20 @@ jobs:
           echo "v=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}"
 
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       # cargo のビルドキャッシュを保存/復元。2 回目以降は依存のフルビルドを省略。
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: .
 
+      # `--locked`: 配布物が Cargo.lock のとおりにビルドされたことを保証する
+      # （手元と配布物で依存が違う事故を防ぐ）。
       - name: Build (release)
-        run: cargo build --release --target ${{ matrix.target }} -p thundoku-shelf
+        run: cargo build --release --locked --target ${{ matrix.target }} -p thundoku-shelf
 
       # PDFium (BSD-3-Clause / Apache-2.0) は mupdf (AGPL-3.0) の代替として
       # macOS でも使う。静的リンクはしない — 実行時に dylib をロードする方式なら
@@ -318,10 +332,65 @@ jobs:
             "target/${{ matrix.target }}/release/pdfium.dll"
           ) -DestinationPath "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
 
-      - uses: actions/upload-artifact@v4
+      # 配布物の部品表（CycloneDX JSON）を作る。`Cargo.lock` と `cargo metadata` の両方から
+      # 作るので、対象 triple と有効 feature に合った依存が入る（Rust の依存だけ。同梱する
+      # `pdfium.dll` 等のネイティブ部品は別途 SHA256 で固定している）。
+      - name: Generate SBOM (CycloneDX)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ツール自体もバージョン固定で入れる（`--locked` で依存も固定）。
+          if ! command -v cargo-cyclonedx > /dev/null 2>&1; then
+            cargo install cargo-cyclonedx --locked --version 0.5.9
+          fi
+          cargo cyclonedx --manifest-path crates/app/Cargo.toml -q \
+            --format json --target "${{ matrix.target }}"
+          sbom="thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.cdx.json"
+          # 生成物はワークスペースの各メンバーの隣に出る。配布物にはアプリの分だけ入れる。
+          mv crates/app/thundoku-shelf.cdx.json "$sbom"
+          rm -f crates/core/thundoku-core.cdx.json crates/opfspack/opfspack.cdx.json
+          test -s "$sbom"
+          echo "$sbom を作成した（$(wc -c < "$sbom") bytes）"
+
+      # 配布物のハッシュを併せて発行する（利用者が取得物を検証できるようにする）。
+      - name: Write artifact checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip="thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum "$zip" > "$zip.sha256"
+          else
+            shasum -a 256 "$zip" > "$zip.sha256"
+          fi
+          cat "$zip.sha256"
+
+      # 「どのワークフローが・どのコミットで・この zip を作ったか」を署名つきで証明する。
+      # 署名は Sigstore の鍵レス（OIDC の短期証明書）。利用者は次のように検証できる:
+      #   gh attestation verify <zip> --repo MegaBlackLabel/thundoku-shelf-app
+      # SHA256SUMS と違い、zip を差し替えてもハッシュも一緒に差し替えれば通ってしまう、
+      # という弱点が無い（証明はリポジトリ側に保存される）。
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: 'thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip'
+
+      # SBOM 自体も同じ配布物に結び付けて署名する。検証:
+      #   gh attestation verify <zip> --repo MegaBlackLabel/thundoku-shelf-app \
+      #     --predicate-type https://cyclonedx.org/bom
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: 'thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip'
+          sbom-path: 'thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.cdx.json'
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}
-          path: thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip
+          path: |
+            thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip
+            thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip.sha256
+            thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.cdx.json
           if-no-files-found: error
 
       # 署名済み .app を退避する。公証の判定が遅れて時間切れになった場合でも、あとから
@@ -362,15 +431,27 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           # 配布する zip だけを落とす。退避用の signed-app-* はリリースに添付しない
           # （files: artifacts/**/*.zip が両方にマッチしてしまうため）
           pattern: thundoku-shelf-*
 
+      # 全プラットフォーム分を 1 ファイルにまとめる（リリース本文から参照しやすくする）。
+      - name: Combine checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          find artifacts -name '*.zip.sha256' -exec cat {} + | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: artifacts/**/*.zip
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.zip.sha256
+            artifacts/**/*.cdx.json
+            SHA256SUMS.txt
           generate_release_notes: true

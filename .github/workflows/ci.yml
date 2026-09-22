@@ -5,6 +5,10 @@ on:
     tags: ["v*"]
   pull_request:
 
+# 既定の権限を最小化する（ジョブで必要な分だけ与える）。
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -13,18 +17,22 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      # Actions は**タグではなく完全なコミット SHA** で固定する（タグは付け替え可能で、
+      # 参照が変わると任意コードが走る）。更新するときは SHA とコメントの版を揃えて直す。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: .
 
-      # PDF レンダリングは PDFium を実行時ロードする。テストは crates/core を
-      # CWD としてライブラリを探すので、テストの前に取得しておく（SHA256 検証つき）。
+      # PDF レンダリングは PDFium を実行時ロードする。探索先はビルド時の
+      # `CARGO_MANIFEST_DIR`（= crates/core、テスト実行時の CWD ではない）と
+      # 実行ファイルの隣なので、テストの前に取得しておく（SHA256 検証つき）。
       - name: Fetch PDFium (runtime library for PDF rendering)
         shell: bash
         run: bash scripts/fetch-pdfium.sh
@@ -33,24 +41,43 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
 
+      # `--locked`: Cargo.lock のとおりに解決する（依存が黙って変わらない）。
       - name: Clippy (core crates) — Linux
         if: runner.os == 'Linux'
-        run: cargo clippy -p opfspack -p thundoku-core --all-targets -- -D warnings
+        run: cargo clippy -p opfspack -p thundoku-core --locked --all-targets -- -D warnings
       - name: Clippy (workspace) — macOS / Windows
         if: runner.os != 'Linux'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
 
       - name: Test (opfspack + core) — Linux
         if: runner.os == 'Linux'
-        run: cargo test -p opfspack -p thundoku-core
+        run: cargo test -p opfspack -p thundoku-core --locked
 
       - name: Test (workspace) — macOS
         if: runner.os == 'macOS'
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Test (opfspack + core) + build app — Windows
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          cargo test -p opfspack -p thundoku-core
-          cargo build -p thundoku-shelf
+          cargo test -p opfspack -p thundoku-core --locked
+          cargo build -p thundoku-shelf --locked
+
+  # 依存の既知脆弱性を継続的に確認する。例外（許容する勧告）は `.cargo/audit.toml` に
+  # 「理由」と「見直し時期」つきで列挙し、**それ以外は失敗させる**。
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          toolchain: 1.97.1
+
+      # 監査ツール自体もバージョン固定で入れる（`--locked` で依存も固定）。
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: cargo audit
+        run: cargo audit

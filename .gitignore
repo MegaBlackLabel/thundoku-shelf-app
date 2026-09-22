@@ -15,3 +15,5 @@ libpdfium.so
 *.cer
 *.certSigningRequest
 password.txt
+# cargo cyclonedx（SBOM）の生成物。リリース時に CI が作って配布物へ添付する
+*.cdx.json
