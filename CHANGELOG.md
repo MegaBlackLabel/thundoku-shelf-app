@@ -4,6 +4,36 @@
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-09-22
+
+### Changed
+
+- **macOS の配布物を Developer ID で署名し、Apple の公証（Notarization）を通すようにした**:
+  ad-hoc 署名だけだったため、ダウンロードした利用者は初回起動のたびに Gatekeeper の解除
+  （「開発元を検証できません」→「完了」→ システム設定 →「プライバシーとセキュリティ」→
+  「このまま開く」）が必要だった。CI で Developer ID 署名 + `notarytool` による公証 +
+  `stapler` でのチケット同梱まで行い、**ダウンロードしてそのまま起動できる**ようにした
+  （v0.2.5 以前の配布物は従来どおりの操作が必要）。
+  - 署名鍵は GitHub Secrets から環境変数で受け取り、一時キーチェーン（6 時間でロック）に
+    import する。展開した .p12 はすぐ消し、キーチェーンは `if: always()` の Cleanup で必ず
+    削除する。署名は dylib → .app の順に `--options runtime --timestamp` で行い、import 直後に
+    「有効な identity が 1 件以上」を確認する
+  - 一時キーチェーンには Apple の **Developer ID G2 中間証明書**も入れる。.p12 はリーフ 1 件
+    しか持たず、ランナーに中間が無いと `find-identity -v` が 0 件になり codesign が
+    `errSecInternalComponent` で落ちる
+  - 公証の待ちは `--wait` ではなく `notarytool info` のポーリングにした。`--wait` は提出後に
+    ランナーのネットワークが瞬断すると "The Internet connection appears to be offline" で
+    即座に失敗し、処理中なのか却下なのか分からなくなる（実際に 4 時間待った末にこれで落ちた）
+  - 署名済み .app を `if: always()` で artifact に退避する（公証の判定が遅れて時間切れに
+    なっても、チケットは cdhash 紐づきなので、あとから `stapler staple` して配布 zip を
+    組み立て直せる）
+  - `workflow_dispatch` で手動実行できるようにし、Release の作成は
+    `startsWith(github.ref, 'refs/tags/')` でガードした（手動実行で誤った Release を作らない）。
+    手動実行時はバージョンを Cargo.toml から取る（"main" が Info.plist に入らないように）
+  - 検証: x86_64 / aarch64 の両方で CI が完走し、成果物を実機で確認した（`codesign --verify
+    --deep --strict` が valid / `stapler validate` 成功 / **隔離属性を付けた状態でも Gatekeeper
+    が accepted** / Hardened Runtime 下で PDFium が遅延ロードされて PDF が表示できた）
+
 ### Fixed
 
 - **閲覧履歴で、同じ本が複数の日にあると 2 つ目以降のカードをクリックしても開かない**: 履歴は
