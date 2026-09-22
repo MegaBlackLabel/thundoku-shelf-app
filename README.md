@@ -1,6 +1,10 @@
 # Thundoku Shelf
 
-技術書典・BOOTH・FANZA同人・DLsite で購入した同人誌を、デスクトップで管理・閲覧するアプリです。
+各ストアで購入した同人誌を、デスクトップで管理・閲覧するアプリです。
+
+> **本アプリは非公式のアプリです。** 個人が開発しているもので、DMM.com、FANZA、DLsite、BOOTH、
+> 技術書典をはじめとする各サービスの運営会社とは提携・関連しておらず、各社による提供・承認・
+> 推奨・サポートを受けたものではありません。各サービスの名称は、それぞれの権利者に帰属します。
 
 > **これはアルファ版です。** 開発中で、予告なく仕様が変わったり、データの互換性が壊れたりすることがあります。大切なデータは Google Drive へのバックアップを併用してください。
 
@@ -25,41 +29,6 @@
 > [!NOTE]
 > **これから配布する版は Apple の公証（Notarization）済みです。** `ThundokuShelf.app` を Applications に移してダブルクリックすれば、そのまま起動できます。
 
-> [!IMPORTANT]
-> **v0.2.5 以前をダウンロードした場合は、初回だけ Gatekeeper の解除が必要です。** 次の手順で起動してください（次回以降は普通のアプリと同じように起動できます）。
-
-macOS の zip を展開すると `ThundokuShelf.app` が出てきます。Applications に移してから、次の手順で起動してください。
-
-1. アプリをダブルクリック → 「開発元を検証できません」と表示されたら **「完了」** を押す
-2. **システム設定 →「プライバシーとセキュリティ」** を開き、「セキュリティ」の欄に出ている **「このまま開く」** を押す → 認証 → **「開く」**
-   - 「このまま開く」は 1 の失敗から**約 1 時間以内**しか表示されません
-
-> [!NOTE]
-> **macOS 15 (Sequoia) 以降では、右クリック →「開く」は Gatekeeper の回避として機能しません**（メニューには出ますが効きません）。上の 1〜2 を使ってください。
-
-隔離属性を外す方法（どちらの場合でも効きます）:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/ThundokuShelf.app
-open /Applications/ThundokuShelf.app
-```
-
-最初から隔離させない方法もあります（ブラウザではなくターミナルで落とすと隔離属性が付かず、Gatekeeper の判定自体が走りません。`x.y.z` と `arch` は実際の値に置き換え。`~/Applications` なら管理者権限は不要、`/Applications` でも構いません）:
-
-```sh
-mkdir -p ~/Applications
-curl -fL -o /tmp/t.zip https://github.com/MegaBlackLabel/thundoku-shelf-app/releases/download/vx.y.z/thundoku-shelf-x.y.z-arch-macos.zip
-shasum -a 256 /tmp/t.zip   # 下のコマンドが出す digest と一致することを確認
-ditto -x -k /tmp/t.zip ~/Applications/
-open ~/Applications/ThundokuShelf.app
-```
-
-整合性の確認（`vx.y.z` は実際のタグ）:
-
-```sh
-curl -s https://api.github.com/repos/MegaBlackLabel/thundoku-shelf-app/releases/tags/vx.y.z | grep -o 'sha256:[0-9a-f]\{64\}'
-```
-
 ## 使い方
 
 1. 起動すると本棚が開きます（初回は空です）
@@ -75,7 +44,7 @@ curl -s https://api.github.com/repos/MegaBlackLabel/thundoku-shelf-app/releases/
 - **閲覧履歴・読書統計** — いつ・何回・どれだけ読んだかを記録します
 - **チェックリスト** — 技術書典のイベント・サークルの確認（技術書典ログイン中のみ利用可能）
 - **ダウンロード管理** — 未取得の本だけを取り込み、進捗を表示。進行中の転送は、右クリックメニューの「ダウンロード中止」または `Backspace` で中止できます
-- **ストアからの取り込み** — 技術書典 / BOOTH / FANZA同人 / DLsite に対応（ストアごとにログインして同期）
+- **ストアからの取り込み** — 各ストアにログインして購入本を取り込めます（同期でまとめて取得）
 - **自動タグ生成** — 取り込んだ本の情報からタグを生成（技術書典専用）
 - **Google Drive バックアップ** — Google でログインすると、本棚の DB と画像を Google Drive にバックアップ・同期できます（複数端末での共有も可）
 - **レポート（GitHub Issue）** — GitHub でログインすると、サイドバーの「設定」の上に「レポート」が出ます。不具合や要望をテンプレート付きの画面からそのまま Issue として送信できます（画像の添付もできます）
@@ -89,7 +58,7 @@ curl -s https://api.github.com/repos/MegaBlackLabel/thundoku-shelf-app/releases/
 | Windows | `%APPDATA%\thundoku-shelf\` |
 | macOS | `~/Library/Application Support/thundoku-shelf/` |
 
-- アプリが外部と通信するのは、**各ストアへのログイン・同期**（技術書典 / BOOTH / FANZA同人 / DLsite）、**Google Drive へのバックアップ**、**GitHub へのレポート送信**のときです（ほかに、タグ生成のために Zenn のタグ一覧を参照します）。アクセス解析・広告・利用状況の送信はありません
+- アプリが外部と通信するのは、**各ストアへのログイン・同期**、**Google Drive へのバックアップ**、**GitHub へのレポート送信**のときです（ほかに、タグ生成のために Zenn のタグ一覧を参照します）。アクセス解析・広告・利用状況の送信はありません
 - 保存先は設定画面から変更できます（バックアップの対象にもなります）
 
 ## 困ったときは
@@ -105,7 +74,7 @@ curl -s https://api.github.com/repos/MegaBlackLabel/thundoku-shelf-app/releases/
 - Google ログインはバックアップ用です。**書籍を読むのにログインは不要**です
 - 「レポート」の画像添付は、投稿先リポジトリへの書き込み権限が必要です。権限が無い場合は本文のみで送信できます
 - レポートの投稿先はこのアプリのリポジトリ（`MegaBlackLabel/thundoku-shelf-app`）に固定です
-- macOS 版は Developer ID で署名し、Apple の公証（Notarization）を受けています。v0.2.5 以前の配布物は未署名・未公証なので「[macOS での起動](#macos-での起動)」を参照
+- macOS 版は Developer ID で署名し、Apple の公証（Notarization）を受けています。v0.2.5 以前の配布物は未署名・未公証で、初回だけ Gatekeeper の解除が必要です（手順はその配布物に同梱の「はじめにお読みください」にあります）
 
 ## 開発者向け
 

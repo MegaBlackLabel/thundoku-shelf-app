@@ -26,6 +26,16 @@ use crate::views::licenses;
 const TARGET_NOTICE: &str = "本アプリが対象にするのは、購入済み・DRM の無い（非DRM）同人誌のみです。\
                              購入していないコンテンツや、DRM で保護されたコンテンツは取り込めません。";
 
+/// 各サービスとの関係の明示。
+///
+/// ストア名を挙げて「対応」と書くと、公式の連携アプリと受け取られうる。誤解は各サービスの
+/// 権利者との関係にも関わるので、対象コンテンツの注意と同じく説明画面の上部に出す。
+/// ストア名は**ここで「関係が無い」ことを示すため**に並べる（機能の説明では並べない）。
+const NON_AFFILIATION_NOTICE: &str = "本アプリは個人が開発している非公式のアプリです。\
+     DMM.com、FANZA、DLsite、BOOTH、技術書典をはじめとする各サービスの運営会社とは\
+     提携・関連しておらず、各社による提供・承認・推奨・サポートを受けたものではありません。\
+     各サービスの名称は、それぞれの権利者に帰属します。";
+
 /// ログイン手順の見出し（技術書典だけでなく各ストア共通の手順）。
 const LOGIN_SECTION_TITLE: &str = "ストアのログイン手順";
 
@@ -263,8 +273,7 @@ const FEATURES: [(&str, AppIcon, &str); 13] = [
     (
         "対応ストア",
         AppIcon::Cloud,
-        "技術書典・BOOTH・FANZA・DLsite の購入本を同期・管理。ストアごとにログインして本棚へ\
-         取り込めます。",
+        "各ストアの購入本を同期・管理。ストアごとにログインして本棚へ取り込めます。",
     ),
 ];
 
@@ -668,9 +677,27 @@ impl AboutView {
                                     ),
                             ),
                     )
+                    // 非公式のアプリであることの明示（権利者との関係。上部に出す）
+                    .child(
+                        div()
+                            .debug_selector(|| "about-non-affiliation".into())
+                            .rounded_xl()
+                            .border_1()
+                            .border_color(card_border)
+                            .bg(card_bg)
+                            .p_4()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted_fg)
+                                    .line_height(relative(1.7))
+                                    .child(NON_AFFILIATION_NOTICE),
+                            ),
+                    )
                     // 対象コンテンツの注意（最も誤解されやすい点。上部で強調する）
                     .child(
                         div()
+                            .debug_selector(|| "about-target-notice".into())
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -1428,6 +1455,38 @@ mod tests {
         assert!(
             TARGET_NOTICE.contains("DRM"),
             "DRM 付きが対象外である旨が無い: {TARGET_NOTICE}"
+        );
+    }
+
+    /// 非公式のアプリであること（名指しした各サービスと関係が無いこと）を画面に明示すること。
+    ///
+    /// ストア名を挙げて「対応」と書くと、公式の連携アプリと受け取られうる。誤解は各サービスの
+    /// 権利者との関係にも関わるので、対象コンテンツの注意と同じく画面上部で必ず出す。
+    #[gpui_kit::test]
+    async fn about_states_that_it_is_unofficial_and_unaffiliated(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        // 文面: 非公式であることと、名指しした各サービスとの関係が無いことを書く
+        for keyword in ["非公式", "提携", "承認"] {
+            assert!(
+                NON_AFFILIATION_NOTICE.contains(keyword),
+                "非公式・非提携の明示に「{keyword}」が無い: {NON_AFFILIATION_NOTICE}"
+            );
+        }
+        for service in ["DMM.com", "FANZA", "DLsite", "BOOTH", "技術書典"] {
+            assert!(
+                NON_AFFILIATION_NOTICE.contains(service),
+                "「{service}」と関係が無いことを書いていない: {NON_AFFILIATION_NOTICE}"
+            );
+        }
+
+        // 画面上部（対象コンテンツの注意より上）に出ていること
+        let visual = open_about(cx);
+        draw(visual);
+        assert!(
+            section_top(visual, "about-non-affiliation")
+                < section_top(visual, "about-target-notice"),
+            "非公式の注意が対象コンテンツの注意より下にある"
         );
     }
 
