@@ -98,6 +98,22 @@ fn main() {
     #[cfg(not(windows))]
     env_logger::init();
 
+    // 調査用の UA 差し替え（`thundoku_core::ua`）が効いている状態で起動したかを残す。
+    // ストアの同期が失敗したとき、「差し替えた状態で走らせたのか」をログだけで確定できる
+    // ようにする（実機確認のときに最初に見る行）。
+    for key in [
+        thundoku_core::ua::ENV_DLSITE,
+        thundoku_core::ua::ENV_FANZA,
+        thundoku_core::ua::ENV_BOOTH,
+        thundoku_core::ua::ENV_COVER,
+    ] {
+        if let Ok(value) = std::env::var(key)
+            && !value.trim().is_empty()
+        {
+            log::info!("UA override: {key}={value}");
+        }
+    }
+
     gpui_kit::application()
         .with_assets(AppAssets)
         .run(move |cx| {

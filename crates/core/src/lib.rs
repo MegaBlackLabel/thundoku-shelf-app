@@ -16,3 +16,4 @@ pub mod session_store;
 pub mod single_instance;
 pub mod tags;
 pub mod tbf;
+pub mod ua;

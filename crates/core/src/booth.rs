@@ -98,7 +98,15 @@ pub struct BoothClient {
     agent: ureq::Agent,
 }
 
+/// BOOTH もブラウザ UA を送ってきた（DLsite / FANZA と同じ流儀）。非ブラウザ UA が
+/// 弾かれるかは実測していないので現状のまま。`THUNDOKU_BOOTH_UA` に自認 UA を入れて
+/// 起動すれば実機で試せる（`crate::ua`）。
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// 送る UA。既定は上の定数（`THUNDOKU_BOOTH_UA` で差し替えられる → `crate::ua`）。
+fn user_agent() -> String {
+    crate::ua::for_store(USER_AGENT, crate::ua::ENV_BOOTH)
+}
 
 /// 診断用 HTML ダンプの有効化スイッチ。値が `1` のときだけ書き出す。
 const HTML_DUMP_ENV: &str = "THUNDOKU_BOOTH_HTML_DUMP";
@@ -175,7 +183,7 @@ impl BoothClient {
             let mut request = self
                 .agent
                 .post("https://accounts.booth.pm/users/sign_out")
-                .set("User-Agent", USER_AGENT)
+                .set("User-Agent", &user_agent())
                 .set("Accept", "*/*")
                 .set("X-CSRF-Token", &csrf)
                 .set("Referer", "https://accounts.booth.pm")
@@ -201,7 +209,7 @@ impl BoothClient {
         let mut request = self
             .agent
             .post("https://booth.pm/users/sign_out")
-            .set("User-Agent", USER_AGENT)
+            .set("User-Agent", &user_agent())
             .set("Accept", "*/*")
             .set("X-CSRF-Token", &csrf)
             .set("Referer", "https://booth.pm/ja")
@@ -232,7 +240,7 @@ impl BoothClient {
         let mut request = self
             .agent
             .get(url)
-            .set("User-Agent", USER_AGENT)
+            .set("User-Agent", &user_agent())
             .set("Accept", accept)
             .set("Accept-Language", "ja,en-US;q=0.9,en;q=0.8");
         if !self.cookie_header.is_empty() {
@@ -371,7 +379,7 @@ impl BoothClient {
         let mut request = self
             .agent
             .get(download_url)
-            .set("User-Agent", USER_AGENT)
+            .set("User-Agent", &user_agent())
             .set("Accept", "application/octet-stream, */*");
         if !self.cookie_header.is_empty() {
             request = request.set("Cookie", &self.cookie_header);

@@ -17,9 +17,17 @@ pub const LIBRARY_BASE: &str = "https://www.dmm.co.jp/dc/doujin/api/mylibraries/
 /// jar 等の参照メタ列は一覧 API では返さない（`details` / 商品ページで取得）。
 pub const PAGE_LIMIT: usize = 20;
 
-/// FANZA同人 は非ブラウザの User-Agent を 403 で弾くため、ブラウザ UA + Referer を送る
-///（BoothClient と同じ流儀）。
+/// FANZA同人 は**非ブラウザの User-Agent を 403 で弾く**ため、ブラウザ UA + Referer を
+/// 送る（BoothClient と同じ流儀）。DLsite は自認 UA でも購入履歴が取れることを実測して
+/// 切り替えたが、**FANZA はまだ実測できていない**ので現状のまま。
+/// `THUNDOKU_FANZA_UA` に自認 UA を入れて起動すれば、切り替えた場合の挙動を実機で試せる
+/// （`crate::ua`）。
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// 送る UA。既定は上の定数（`THUNDOKU_FANZA_UA` で差し替えられる → `crate::ua`）。
+fn user_agent() -> String {
+    crate::ua::for_store(USER_AGENT, crate::ua::ENV_FANZA)
+}
 
 /// ストア（`www.dmm.co.jp`）。Cookie を集める側のホスト。
 pub const SITE_HOST: &str = "www.dmm.co.jp";
@@ -211,7 +219,7 @@ impl FanzaClient {
         vec![
             ("Cookie".to_string(), self.session.cookie_header()),
             ("Accept".to_string(), "application/json".to_string()),
-            ("User-Agent".to_string(), USER_AGENT.to_string()),
+            ("User-Agent".to_string(), user_agent()),
         ]
     }
 
@@ -356,7 +364,7 @@ impl FanzaClient {
             .map_err(|error| FanzaError::BlockedUrl(format!("{download_url}: {error}")))?;
         let proxy_headers = vec![
             ("Cookie".to_string(), self.session.cookie_header()),
-            ("User-Agent".to_string(), USER_AGENT.to_string()),
+            ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
         ];
         let proxy_spec = RequestSpec {
@@ -404,7 +412,7 @@ impl FanzaClient {
             }
         }
         let mut headers = vec![
-            ("User-Agent".to_string(), USER_AGENT.to_string()),
+            ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
             (
                 "Accept".to_string(),

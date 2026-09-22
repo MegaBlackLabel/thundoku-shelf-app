@@ -8694,6 +8694,14 @@ pub(crate) fn write_cover_cache(
     }
 }
 
+/// 表紙取得の UA。**クライアントを名乗る**（実測で CDN は UA を見ていなかった）。
+/// 実機で問題が出たら `THUNDOKU_COVER_UA` でブラウザ UA に戻せる（`thundoku_core::ua`）。
+const COVER_USER_AGENT: &str = concat!(
+    "ThundokuShelf/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/MegaBlackLabel/thundoku-shelf-app)"
+);
+
 /// タイムアウト付きで画像をダウンロードする（ハング防止）。
 fn fetch_bytes(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
     use std::io::Read;
@@ -8701,7 +8709,7 @@ fn fetch_bytes(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
         .get(url)
         .set(
             "User-Agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            &thundoku_core::ua::for_store(COVER_USER_AGENT, thundoku_core::ua::ENV_COVER),
         )
         .call()
     {

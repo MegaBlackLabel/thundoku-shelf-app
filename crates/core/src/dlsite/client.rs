@@ -17,8 +17,26 @@ pub const STORES: [&str; 4] = ["maniax", "home", "books", "ai"];
 /// 購入履歴の 1 ページあたりの行数境界（実測は未確認だが、過剰アクセス防止の上限）。
 pub const MAX_PAGES_PER_STORE: usize = 200;
 
-/// DLsite は非ブラウザ UA を弾くため、ブラウザ UA + Referer を送る（BoothClient と同流儀）。
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+/// DLsite は以前「非ブラウザ UA を弾く」観測があったためブラウザ UA + Referer を送っていた。
+/// いまは **UA だけ自認に変えても購入履歴が 200 で返る**ことを実機で確認済み
+/// （Referer と `Sec-Fetch-*` / `Accept` は引き続き送る）。
+/// ストアへ送る UA。**クライアントを名乗る**（`ThundokuShelf/<version> (+リポジトリ URL)`）。
+///
+/// 以前は Chrome を名乗っていた（DLsite は非ブラウザ UA を弾くため）。購入履歴が
+/// この UA でも 200 で取れることを実測で確認したので、なりすましはやめた。
+///
+/// サイト側が弾くようになったら、環境変数 `THUNDOKU_DLSITE_UA` にブラウザ UA を入れて
+/// 起動すれば元の挙動に戻せる（`crate::ua`）。
+const USER_AGENT: &str = concat!(
+    "ThundokuShelf/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/MegaBlackLabel/thundoku-shelf-app)"
+);
+
+/// 送る UA。既定は上の定数（`THUNDOKU_DLSITE_UA` で差し替えられる → `crate::ua`）。
+fn user_agent() -> String {
+    crate::ua::for_store(USER_AGENT, crate::ua::ENV_DLSITE)
+}
 
 /// ダウンロード要求を送ってよいホスト。
 ///
@@ -181,7 +199,7 @@ impl DlsiteClient {
     fn cookie_headers(&self) -> Vec<(String, String)> {
         vec![
             ("Cookie".to_string(), self.session.cookie_header()),
-            ("User-Agent".to_string(), USER_AGENT.to_string()),
+            ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dlsite.com/".to_string()),
             // DLsite は non-browser リクエストをアプリ認証で弾く（Sec-Fetch / Accept が
             // 無いと購入履歴が regist/user へ 302 される）ため、ブラウザ相当のヘッダを送る。
@@ -319,7 +337,7 @@ impl DlsiteClient {
         }
         // 3) CDN（download.dlsite.com）へ直接取得
         let mut headers = vec![
-            ("User-Agent".to_string(), USER_AGENT.to_string()),
+            ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dlsite.com/".to_string()),
             (
                 "Accept".to_string(),
