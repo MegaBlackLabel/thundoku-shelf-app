@@ -2212,7 +2212,7 @@ impl Render for SettingsView {
                                         div()
                                             .text_xs()
                                             .text_color(muted_fg)
-                                            .child("ON にすると、本棚・進捗のデータを Google Drive に自動バックアップします。"),
+                                            .child("ON にすると、取り込んだ書籍ファイル本体（アプリの形式に変換したもの）と本棚・進捗のデータを Google Drive に自動バックアップします。"),
                                     ),
                             )
                              .child(
