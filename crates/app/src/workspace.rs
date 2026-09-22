@@ -340,6 +340,10 @@ impl Workspace {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(100))
                     .await;
+                // WebView2 がメッセージループを回している間は更新しない（次の tick に回す）。
+                if crate::app_state::webview_pumping() > 0 {
+                    continue;
+                }
                 // 認証モーダルを開く要求（SettingsView → 直接 update の RefCell 再入を回避）
                 if auth_open.load(std::sync::atomic::Ordering::SeqCst) {
                     auth_open.store(false, std::sync::atomic::Ordering::SeqCst);

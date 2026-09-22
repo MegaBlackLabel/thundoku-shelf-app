@@ -18,6 +18,9 @@ pub struct FanzaLoginDone;
 /// ログインキャンセルイベント（閉じるボタンでモーダルを閉じたときに発行）。
 pub struct FanzaLoginCancelled;
 
+/// セッション Cookie を集める起点（ストアとアカウント）。
+const SESSION_ORIGINS: [&str; 2] = ["https://www.dmm.co.jp", "https://accounts.dmm.co.jp"];
+
 pub struct FanzaLoginView {
     webview: Option<Entity<WebView>>,
     check_generation: u64,
@@ -47,6 +50,10 @@ impl FanzaLoginView {
                 return None;
             }
         };
+        // WebView2 の生成は内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
+        // その間に他の定期タスクが App を更新すると gpui の借用と衝突して落ちるため、
+        // ここでカウンタを立てて知らせる。
+        let _pumping = crate::app_state::WebviewPumpGuard::enter();
         let webview = match builder.build(&window_handle) {
             Ok(w) => w,
             Err(e) => {
@@ -75,6 +82,10 @@ impl FanzaLoginView {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
+                // WebView2 がメッセージループを回している間は更新しない（次の tick に回す）。
+                if crate::app_state::webview_pumping() > 0 {
+                    continue;
+                }
                 let Ok(done) = handle.update(cx, |this, cx| {
                     if this.check_generation != generation {
                         return true;
@@ -116,26 +127,34 @@ impl FanzaLoginView {
         if !host_ok || on_age_check || on_login {
             return false;
         }
-        let mut cookie_pairs: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for url in ["https://www.dmm.co.jp", "https://accounts.dmm.co.jp"] {
+        // Cookie 取得も内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
+        let _pumping = crate::app_state::WebviewPumpGuard::enter();
+        // www と accounts の Cookie を**収集元ごとに分けて**持つ（1 つに潰すと、片方に
+        // しか送るべきでない Cookie がもう片方や CDN へ飛ぶ）。
+        let mut origins: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+            std::collections::BTreeMap::new();
+        for url in SESSION_ORIGINS {
             let cookies = webview
                 .read(cx)
                 .raw()
                 .cookies_for_url(url)
                 .unwrap_or_default();
             log::debug!("fanza login: cookies_for_url({url}) -> {}", cookies.len());
+            let Ok(parsed) = thundoku_core::download_url::parse(url) else {
+                continue;
+            };
+            let entry = origins.entry(parsed.host.to_string()).or_default();
             for cookie in cookies {
-                let name = cookie.name().to_string();
-                let value = cookie.value().to_string();
-                cookie_pairs.entry(name).or_insert(value);
+                entry
+                    .entry(cookie.name().to_string())
+                    .or_insert_with(|| cookie.value().to_string());
             }
         }
-        if cookie_pairs.is_empty() {
+        let session = thundoku_core::fanza::client::FanzaSession::new(origins);
+        if !session.logged_in() {
             log::warn!("fanza login: セッション Cookie を取得できませんでした");
             return false;
         }
-        let session = thundoku_core::fanza::client::FanzaSession::new(cookie_pairs);
         log::info!("fanza login: {} cookies captured", session.cookies_count());
         crate::app_state::save_fanza_session(cx, &session);
         if let Some(webview) = &self.webview {

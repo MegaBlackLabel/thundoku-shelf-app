@@ -6,6 +6,8 @@
 //! ログイン後も `login.dlsite.com` のまま（初回ガイド等）なら、ストアへ遷移して
 //! ストア Cookie の発行を促す。
 
+use std::collections::BTreeMap;
+
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
@@ -13,6 +15,12 @@ use gpui_kit::{
 };
 use gpui_wry::WebView;
 use raw_window_handle::HasWindowHandle;
+use thundoku_core::dlsite::client::{DlsiteSession, LOGIN_HOST, SITE_HOST};
+
+use crate::app_state::WebviewPumpGuard;
+
+/// セッション Cookie を集める起点（ストアとログイン）。
+const SESSION_ORIGINS: [&str; 2] = ["https://www.dlsite.com", "https://login.dlsite.com"];
 
 /// ログイン完了イベント（Cookie を取得して永続化した後に発行）。
 pub struct DlsiteLoginDone;
@@ -49,6 +57,10 @@ impl DlsiteLoginView {
                 return None;
             }
         };
+        // WebView2 の生成は内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
+        // その間に他の定期タスクが App を更新すると gpui の借用と衝突して落ちるため、
+        // ここでカウンタを立てて知らせる。
+        let _pumping = WebviewPumpGuard::enter();
         let webview = match builder.build(&window_handle) {
             Ok(w) => w,
             Err(e) => {
@@ -84,6 +96,10 @@ impl DlsiteLoginView {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
+                // WebView2 がメッセージループを回している間は更新しない（次の tick に回す）。
+                if crate::app_state::webview_pumping() > 0 {
+                    continue;
+                }
                 let Ok(done) = handle.update(cx, |this, cx| {
                     if this.check_generation != generation {
                         return true;
@@ -115,39 +131,48 @@ impl DlsiteLoginView {
             "dlsite login check: url={}",
             url.split(['?', '#']).next().unwrap_or(&url)
         );
-        // www ストア + login の Cookie を収集する。www の認証セッション（__DLsite_SID に
-        // 加えて uid_jp / uhashjp）は「ログイン完了時の oauth2 コールバック」で確立される。
-        // ここでは一切 auto-navigation しない（SSO 連鎖を中断するとゲスト __DLsite_SID の
-        // ままになり、同期が regist/user へ 302 されて 0 件になる）。
-        let mut cookie_pairs: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for url in ["https://www.dlsite.com", "https://login.dlsite.com"] {
+        // www ストア + login の Cookie を**収集元ごとに分けて**持つ（1 つに潰すと、片方に
+        // しか送るべきでない Cookie がもう片方や CDN へ飛ぶ）。www の認証セッション
+        // （__DLsite_SID に加えて uid_jp / uhashjp）は「ログイン完了時の oauth2
+        // コールバック」で確立される。ここでは一切 auto-navigation しない（SSO 連鎖を
+        // 中断するとゲスト __DLsite_SID のままになり、同期が regist/user へ 302 されて
+        // 0 件になる）。
+        // Cookie 取得も内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
+        let _pumping = WebviewPumpGuard::enter();
+        let mut origins: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for url in SESSION_ORIGINS {
             let cookies = webview
                 .read(cx)
                 .raw()
                 .cookies_for_url(url)
                 .unwrap_or_default();
             log::debug!("dlsite login: cookies_for_url({url}) -> {}", cookies.len());
+            let Ok(parsed) = thundoku_core::download_url::parse(url) else {
+                continue;
+            };
+            let entry = origins.entry(parsed.host.to_string()).or_default();
             for cookie in cookies {
-                let name = cookie.name().to_string();
-                let value = cookie.value().to_string();
-                cookie_pairs.entry(name).or_insert(value);
+                entry
+                    .entry(cookie.name().to_string())
+                    .or_insert_with(|| cookie.value().to_string());
             }
         }
+        let session = DlsiteSession::new(origins);
         // 認証済み: __DLsite_SID に加えて uid_jp / uhashjp（ログイン中の認証 ID）が揃ったら完了。
         // 未ログインだと www 側はゲスト __DLsite_SID だけが付く（oauth2 コールバック未完了）。
-        if !cookie_pairs.contains_key("__DLsite_SID")
-            || (!cookie_pairs.contains_key("uhashjp") && !cookie_pairs.contains_key("uid_jp"))
-        {
+        let has = |name: &str| {
+            session.cookie_value(SITE_HOST, name).is_some()
+                || session.cookie_value(LOGIN_HOST, name).is_some()
+        };
+        if !has("__DLsite_SID") || !(has("uhashjp") || has("uid_jp")) {
             log::debug!(
                 "dlsite login: 未認証（__DLsite_SID={}, uhashjp={}, uid_jp={}）",
-                cookie_pairs.contains_key("__DLsite_SID"),
-                cookie_pairs.contains_key("uhashjp"),
-                cookie_pairs.contains_key("uid_jp")
+                has("__DLsite_SID"),
+                has("uhashjp"),
+                has("uid_jp")
             );
             return false;
         }
-        let session = thundoku_core::dlsite::client::DlsiteSession::new(cookie_pairs);
         log::info!("dlsite login: {} cookies captured", session.cookies_count());
         crate::app_state::save_dlsite_session(cx, &session);
         if let Some(webview) = &self.webview {

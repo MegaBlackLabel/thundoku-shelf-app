@@ -91,12 +91,22 @@
 3. listener 確保 `bind_loopback()`: `SO_REUSEADDR` を設定し `127.0.0.1:38387` に bind、`listen(128)`。失敗時は `127.0.0.1:0`（動的ポート）へフォールバック（Google Cloud Console 登録の redirect_uri と一致させるため固定ポート優先）`crates/core/src/google.rs:239-266`。
 4. PKCE 素材: verifier = 32 byte 乱数の base64url（パディング無し）、challenge = `base64url(SHA-256(verifier))`、state = 16 byte 乱数の base64url `crates/core/src/google.rs:67-86`。
 5. 認可 URL のクエリ: `client_id`, `redirect_uri`, `response_type=code`, `scope`, `access_type=offline`, `prompt=consent`, `state`, `code_challenge`, `code_challenge_method=S256` `crates/core/src/google.rs:90-104`。
-6. **OS の既定ブラウザ**で認可 URL を開く（`google::open_browser`）。アプリ内 WebView は使わない
+6. **OS の既定ブラウザ**で認可 URL を開く（`google::open_browser` → `browser_command`）。アプリ内 WebView は使わない
    （RFC 8252 はネイティブアプリに外部ユーザーエージェントを求め、Google も埋め込み UA を拒否する）。
    ブラウザを開けなかった場合は URL を画面に出して手動で開いてもらう `crates/app/src/views/google_login.rs`, `crates/core/src/google.rs`（`open_browser`）。
+   **Windows はコマンドライン経由（`cmd /C start`）も `explorer` も使わない**: `cmd` は `&` を
+   コマンド区切り、`%XX` を環境変数として解釈するため認可 URL が最初の `&` で切れて渡り
+   （実測: `cmd /C echo <URL>` は `?client_id=…` までしか出さない）、Google が 400
+   `invalid_request`（「アクセスをブロック: 認証エラー」）を返す。`explorer <URL>` は
+   エクスプローラーが開くだけで既定ブラウザが開かない（実測 2026-09-23）。**OS の API
+   （`ShellExecuteW`）**で URL をそのままシェルへ渡す（`crates/core/src/google.rs` の
+   `open_browser`、`windows-sys` 依存）。
    ※ `GoogleClient::authorize()` はブラウザを開いて最後まで実行する版で、アプリ経路は `begin_authorize`
-   （URL を作る）→ ブラウザで開く → `finish_authorize`（ループバック受信〜トークン交換）に分ける `crates/core/src/google.rs`。
-7. `finish_authorize()` が別スレッドで `receive_callback` を実行 `crates/app/src/views/google_login.rs`, `crates/core/src/google.rs:433-443`。
+   （URL を作る）→ ブラウザで開く → `wait_for_code`（ループバック受信）→ `complete_authorize`
+   （トークン交換〜プロフィール）に分ける `crates/core/src/google.rs`。
+7. `wait_for_code()` が別スレッドで `receive_callback` を実行する。**クライアントのロックは取らない**
+   （待ちは最大 300 秒あり、保持すると UI 側の `google.lock()` が止まり、ログインモーダルの ✕ も
+   効かなくなる）。ロックは `complete_authorize` のときだけ取る `crates/app/src/views/google_login.rs`, `crates/core/src/google.rs`。
 8. `receive_callback`: 非ブロッキング accept ループ。`cancel: AtomicBool` が立っていれば `GoogleError::Cancelled`、300 秒で `Auth("authorization timed out")`。1 接続のみ受けて HTTP リクエスト行の query を `percent_decode` し、`error` → `Auth`、`state` 不一致 → `Auth("state mismatch")`、`code` 無し → `Auth("missing code")`。応答は `HTTP/1.1 200 OK` + `text/html; charset=utf-8` の短文（成功時「認証完了。このタブを閉じてください。」）`crates/core/src/google.rs:142-237`。
 9. `exchange_code`: `POST https://oauth2.googleapis.com/token`、`Content-Type: application/x-www-form-urlencoded`、form は `grant_type=authorization_code&code&redirect_uri&client_id&code_verifier`（`client_secret` が設定されていれば `&client_secret=` を追加）。HTTP ステータスが 2xx 以外は `GoogleError::Token` `crates/core/src/google.rs:446-488`。
 10. `parse_token_response`: JSON の `error` を検査。`access_token` 必須（空文字不可）。`refresh_token` は任意。`expires_at = 現在時刻(Unix 秒) + expires_in` `crates/core/src/google.rs:105-140`。

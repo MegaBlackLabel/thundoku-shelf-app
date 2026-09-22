@@ -46,3 +46,14 @@ pdfium-render = { version = "0.9", default-features = false, features = ["pdfium
 
 [dev-dependencies]
 parking_lot = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+# システムブラウザで URL を開く（`google::open_browser`）。
+# コマンドライン経由（`cmd /C start`）は URL の `&` と `%XX` を壊すため、
+# OS の API（ShellExecuteW）を直接叩く。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    # `ShellExecuteW` の `nshowcmd`（`SHOW_WINDOW_CMD` / `SW_SHOWNORMAL`）用。
+    "Win32_UI_WindowsAndMessaging",
+] }

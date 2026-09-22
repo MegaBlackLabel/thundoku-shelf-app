@@ -100,10 +100,15 @@ impl GoogleLoginView {
             let result = cx.background_executor().spawn({
                 let google = google.clone();
                 async move {
+                    // コールバック待ち（最大 5 分）の間はクライアントのロックを取らない。
+                    // 取ると待っている間に UI 側の `google.lock()`（設定画面の表示・
+                    // Drive 同期）が止まり、モーダルの ✕ も効かなくなる（固まって見える）。
+                    // 交換とプロフィール取得のときだけロックする。
+                    let code = thundoku_core::google::wait_for_code(&pending)?;
                     let mut guard = google.lock();
                     guard
                         .as_mut()
-                        .map(|client| client.finish_authorize(pending))
+                        .map(|client| client.complete_authorize(&pending, &code))
                         .unwrap_or(Err(GoogleError::Auth(
                             "Google クライアントが未設定です".into(),
                         )))
@@ -252,7 +257,17 @@ impl Render for GoogleLoginView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(div().text_xs().child(url.clone()))
+                            // URL は長い（PKCE と state を含む）ので、カードからはみ出させず
+                            // 省略表示にする（全文は「URL をコピー」「ブラウザで開く」で使える）。
+                            // `min_w_0` が無いと flex 子の最小幅で押し広げられてあふれる。
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .child(url.clone()),
+                            )
                             .child(
                                 Button::new("google-login-copy-url")
                                     .cursor_pointer()

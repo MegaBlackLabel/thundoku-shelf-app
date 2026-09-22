@@ -6,8 +6,9 @@
 //! （`jwt` 署名 Cookie を 302 の Set-Cookie で捕捉して CDN へ送る）。`Transport` は
 //! `tbf::transport` を再利用（モック可能）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use crate::session_cookies::HostScopedCookies;
 use crate::tbf::TbfError;
 use crate::tbf::transport::{RequestSpec, Transport};
 
@@ -65,32 +66,69 @@ impl From<serde_json::Error> for DlsiteError {
     }
 }
 
+/// ストア（`www.dlsite.com`）。Cookie を集める側のホスト。
+pub const SITE_HOST: &str = "www.dlsite.com";
+/// ログイン（`login.dlsite.com`）。SSO の Cookie はここでも発行される。
+pub const LOGIN_HOST: &str = "login.dlsite.com";
+
 /// DLsite のセッション（`www.dlsite.com` / `login.dlsite.com` の Cookie 群）。
+///
+/// Cookie は**収集元ホストごと**に持つ。1 つに潰すと、片方にしか送るべきでない Cookie が
+/// もう片方や別システム（CDN）へ飛ぶ。送信先ごとに取り出せるようにホスト別で保つ。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DlsiteSession {
-    cookies: HashMap<String, String>,
+    /// 収集元ホスト →（Cookie 名 → 値）。宛先ごとに絞って送る（`cookie_header_for`）。
+    origins: HostScopedCookies,
 }
 
 impl DlsiteSession {
-    pub fn new(cookies: HashMap<String, String>) -> Self {
-        Self { cookies }
+    pub fn new(origins: BTreeMap<String, BTreeMap<String, String>>) -> Self {
+        Self {
+            origins: HostScopedCookies::new(origins),
+        }
+    }
+
+    /// `www.dlsite.com` の Cookie だけで作る。
+    pub fn from_site_cookies(cookies: BTreeMap<String, String>) -> Self {
+        Self {
+            origins: HostScopedCookies::from_origin(SITE_HOST, cookies),
+        }
     }
 
     pub fn logged_in(&self) -> bool {
-        !self.cookies.is_empty()
+        !self.origins.is_empty()
     }
 
+    /// 収集元ホストの Cookie 値（認証済み判定・ログ用）。収集元をまたがない。
+    pub fn cookie_value(&self, host: &str, name: &str) -> Option<&str> {
+        self.origins.value(host, name)
+    }
+
+    /// サイト内（`www.dlsite.com`）向けの Cookie ヘッダ。収集元すべてを 1 本にまとめる。
+    ///
+    /// **CDN など別システムへは使わない**（宛先ごとに絞る `cookie_header_for` を使う）。
     pub fn cookie_header(&self) -> String {
-        self.cookies
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ")
+        self.origins.header()
+    }
+
+    /// 宛先ホスト向けの Cookie ヘッダ。**そのホスト向けに収集したものだけ**を返す
+    /// （収集元と一致するか、その収集元の子ドメイン）。
+    pub fn cookie_header_for(&self, host: &str) -> String {
+        self.origins.header_for(host)
     }
 
     pub fn cookies_count(&self) -> usize {
-        self.cookies.len()
+        self.origins.count()
     }
+}
+
+/// 購入履歴の 1 ページ分（1 ストア）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DlsitePurchasesPage {
+    /// このページの作品。
+    pub items: Vec<DlsitePurchase>,
+    /// そのストアの最終ページ番号（ページャから。取れなければ `None`）。
+    pub last_page: Option<usize>,
 }
 
 /// 購入履歴ページの 1 作品（`#buy_history_this table.work_list_main tr` 由来）。
@@ -168,43 +206,21 @@ impl DlsiteClient {
         h
     }
 
-    /// 購入済み作品一覧を全ストア × 全ページから取得する。
-    /// 各ページは `parse_userbuy_page` で行 + `page_no` を解析し、
-    /// `page_no` 最大値 / `最後` リンクで終端、行 0 件でフォールバック打ち切り。
-    pub fn purchased(&mut self) -> Result<Vec<DlsitePurchase>, DlsiteError> {
-        let mut out = Vec::new();
-        // 同一作品は複数ストア（maniax/home/books/ai）の userbuy に重複して現れるため、
-        // content_id で初出のみ採る（site_id / work_type は同一なので初出で十分）。
-        let mut seen = std::collections::HashSet::new();
-        for store in STORES {
-            let mut page = 1usize;
-            loop {
-                if page > MAX_PAGES_PER_STORE {
-                    break;
-                }
-                let url = format!(
-                    "https://www.dlsite.com/{store}/mypage/userbuy/=/type/all/start/all/sort/1/order/1/page/{page}"
-                );
-                let html = self.get_html(&url)?;
-                let (rows, last) = parse_userbuy_page(&html);
-                let empty = rows.is_empty();
-                for row in rows {
-                    if seen.insert(row.content_id.clone()) {
-                        out.push(row);
-                    }
-                }
-                if empty {
-                    break;
-                }
-                if let Some(lp) = last
-                    && page >= lp
-                {
-                    break;
-                }
-                page += 1;
-            }
-        }
-        Ok(out)
+    /// 1 ストアの購入履歴 1 ページを取得する（1 始まり）。
+    ///
+    /// 分割同期はこれを 1 ページずつ呼ぶ（1 回で全ページ取ると、購入数の多い
+    /// アカウントでは 1 操作で大量のリクエストになる）。
+    pub fn purchased_page(
+        &mut self,
+        store: &str,
+        page: usize,
+    ) -> Result<DlsitePurchasesPage, DlsiteError> {
+        let url = format!(
+            "https://www.dlsite.com/{store}/mypage/userbuy/=/type/all/start/all/sort/1/order/1/page/{page}"
+        );
+        let html = self.get_html(&url)?;
+        let (items, last_page) = parse_userbuy_page(&html);
+        Ok(DlsitePurchasesPage { items, last_page })
     }
 
     /// 作品メタを取得する（`product/info/ajax`、複数 ID はカンマ区切り一括）。
@@ -287,10 +303,12 @@ impl DlsiteClient {
             return Err(DlsiteError::Http(proxy_resp.status));
         };
         // 転送先も検証する（任意ホストへ Cookie を転送させない）。
-        crate::download_url::check(&cd_url, DLSITE_CDN_RULES)
+        let cdn = crate::download_url::check(&cd_url, DLSITE_CDN_RULES)
             .map_err(|error| DlsiteError::BlockedUrl(format!("{cd_url}: {error}")))?;
-        // 2) 302 の Set-Cookie で `jwt`（署名付きダウンロード鍵）を捕捉して Cookie へ足す
-        let mut cookie = self.session.cookie_header();
+        // 2) CDN へ送る Cookie は**そのホスト向けに収集したもの + 署名 `jwt`** だけ。
+        //    www の認証セッションは別システム（CDN）には要らないので送らない。
+        //    `jwt` は 302 の Set-Cookie で渡される署名付きダウンロード鍵。
+        let mut cookie = self.session.cookie_header_for(cdn.host);
         for (k, v) in proxy_resp.set_cookies() {
             if k == "jwt" && !cookie.contains("jwt=") {
                 if !cookie.is_empty() {
@@ -299,9 +317,8 @@ impl DlsiteClient {
                 cookie.push_str(&format!("{k}={v}"));
             }
         }
-        // 3) CDN（download.dlsite.com）へ直接、`jwt` + セッション Cookie 付きで取得
-        let headers = vec![
-            ("Cookie".to_string(), cookie),
+        // 3) CDN（download.dlsite.com）へ直接取得
+        let mut headers = vec![
             ("User-Agent".to_string(), USER_AGENT.to_string()),
             ("Referer".to_string(), "https://www.dlsite.com/".to_string()),
             (
@@ -313,6 +330,10 @@ impl DlsiteClient {
             ("Sec-Fetch-Mode".to_string(), "navigate".to_string()),
             ("Sec-Fetch-Site".to_string(), "cross-site".to_string()),
         ];
+        // Cookie が 1 つも無ければヘッダを付けない（空の Cookie は送らない）。
+        if !cookie.is_empty() {
+            headers.insert(0, ("Cookie".to_string(), cookie));
+        }
         let spec = RequestSpec {
             method: "GET".into(),
             url: cd_url,
@@ -511,7 +532,19 @@ mod tests {
     use crate::tbf::transport::{RequestSpec, ResponseSpec, Transport};
 
     fn session() -> DlsiteSession {
-        DlsiteSession::new(HashMap::from([("__DLsite_SID".into(), "abc".into())]))
+        DlsiteSession::from_site_cookies(BTreeMap::from([(
+            "__DLsite_SID".to_string(),
+            "abc".to_string(),
+        )]))
+    }
+
+    /// リクエストの `Cookie` ヘッダ（無ければ空文字）。
+    fn cookie_of(spec: &RequestSpec) -> String {
+        spec.headers
+            .iter()
+            .find(|(k, _)| k == "Cookie")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
     }
 
     struct MockTransport {
@@ -639,9 +672,10 @@ mod tests {
         assert_eq!(m.title_name.as_deref(), Some("少年エルフ"));
     }
 
-    /// `purchased` が複数ストア × ページを走査し、Cookie ヘッダを送ることを検証する。
+    /// `purchased_page` が 1 ストア 1 ページ分（行 + 最終ページ番号）を返し、
+    /// Cookie ヘッダを送ることを検証する。
     #[test]
-    fn purchased_pages_all_stores_and_sends_cookie() {
+    fn purchased_page_returns_rows_last_page_and_sends_cookie() {
         use parking_lot::Mutex;
         use std::sync::Arc;
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -676,16 +710,25 @@ mod tests {
             }),
         };
         let mut client = DlsiteClient::with_transport(Box::new(transport), session());
-        let list = client.purchased().unwrap();
-        assert!(list.iter().any(|p| p.content_id == "RJ01234567"));
+        let first = client.purchased_page("maniax", 1).unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].content_id, "RJ01234567");
+        assert_eq!(first.last_page, Some(2));
+
+        let second = client.purchased_page("maniax", 2).unwrap();
+        assert!(second.items.is_empty());
+        assert_eq!(second.last_page, Some(1));
+
         let calls = calls.lock();
-        assert!(calls.len() >= 4); // maniax,home,books,ai × (page1..2)
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains("/maniax/mypage/userbuy/"), "{}", calls[0]);
         for c in calls.iter() {
             assert!(c.contains("Cookie="), "no cookie header: {c}");
         }
     }
 
     /// `down_url` 302 の `jwt` Set-Cookie を捕捉して CDN へ送り、ZIP を取得する。
+    /// **CDN へはセッション Cookie を送らない**（www の認証は CDN には要らない）。
     /// HTML レスポンスは拒否する。
     #[test]
     fn download_manually_follows_302_to_cdn_with_jwt() {
@@ -693,9 +736,12 @@ mod tests {
         use std::sync::Arc;
         let cdn_spec = Arc::new(Mutex::new(None::<RequestSpec>));
         let cdn_spec2 = cdn_spec.clone();
+        let proxy_spec = Arc::new(Mutex::new(None::<RequestSpec>));
+        let proxy_spec2 = proxy_spec.clone();
         let transport = MockTransport {
             handler: Box::new(move |spec: RequestSpec| {
                 if spec.url.contains("/download/") {
+                    *proxy_spec2.lock() = Some(spec);
                     Ok(ResponseSpec {
                         status: 302,
                         headers: vec![
@@ -716,7 +762,10 @@ mod tests {
         };
         let mut client = DlsiteClient::with_transport(
             Box::new(transport),
-            DlsiteSession::new(HashMap::from([("__DLsite_SID".into(), "abc".into())])),
+            DlsiteSession::from_site_cookies(BTreeMap::from([(
+                "__DLsite_SID".to_string(),
+                "abc".to_string(),
+            )])),
         );
         let mut on = |_: u64, _: u64| true;
         let bytes = client
@@ -728,20 +777,53 @@ mod tests {
         assert_eq!(bytes, b"PK\x03\x04zipdata");
         let spec = cdn_spec.lock().clone().expect("CDN request made");
         assert!(spec.url.starts_with("https://download.dlsite.com/"));
-        let cookie = spec
-            .headers
-            .iter()
-            .find(|(k, _)| k == "Cookie")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-        assert!(
-            cookie.contains("__DLsite_SID=abc"),
-            "session cookie missing: {cookie}"
+        // CDN へ送るのは 302 で受け取った署名 Cookie だけ。www の認証セッションは
+        // 別システム（CDN）には要らないので送らない。
+        assert_eq!(
+            cookie_of(&spec),
+            "jwt=eyJh.eyJwYXRoIjovY29udGVudC9kb3VqaW4vcmlwL3oifQ.sig",
+            "CDN へは署名 Cookie だけを送る"
         );
-        assert!(
-            cookie.contains("jwt=eyJh.eyJwYXRoIjovY29udGVudC9kb3VqaW4vcmlwL3oifQ.sig"),
-            "jwt cookie missing: {cookie}"
-        );
+        // サイト内（proxy）へは従来どおりセッション Cookie を送る
+        let proxy = proxy_spec.lock().clone().expect("proxy request made");
+        assert_eq!(cookie_of(&proxy), "__DLsite_SID=abc");
+    }
+
+    /// Cookie は収集元ホストごとに持ち、宛先が違う Cookie は送らない。
+    ///
+    /// 収集元（`www` / `login`）を潰すと、片方にしか送るべきでない Cookie がもう片方や
+    /// CDN へ飛ぶ。
+    #[test]
+    fn session_cookies_are_scoped_to_their_origin() {
+        let session = DlsiteSession::new(BTreeMap::from([
+            (
+                SITE_HOST.to_string(),
+                BTreeMap::from([("__DLsite_SID".to_string(), "shop".to_string())]),
+            ),
+            (
+                LOGIN_HOST.to_string(),
+                BTreeMap::from([("login_ticket".to_string(), "t".to_string())]),
+            ),
+        ]));
+
+        // サイト内のリクエストは従来どおり全収集元を 1 本にまとめる
+        let all = session.cookie_header();
+        assert!(all.contains("__DLsite_SID=shop"), "{all}");
+        assert!(all.contains("login_ticket=t"), "{all}");
+
+        // 宛先が収集元でなければ 1 つも送らない（CDN はこれに当たる）
+        assert_eq!(session.cookie_header_for("download.dlsite.com"), "");
+        assert_eq!(session.cookie_header_for("evil.example.com"), "");
+        // 収集元そのもの / その子ドメインには送る
+        assert_eq!(session.cookie_header_for(SITE_HOST), "__DLsite_SID=shop");
+        assert!(session.cookie_header_for("sub.www.dlsite.com").contains("__DLsite_SID=shop"));
+        assert_eq!(session.cookie_header_for(LOGIN_HOST), "login_ticket=t");
+
+        // 収集元をまたいだ取り出し（認証判定用）
+        assert_eq!(session.cookie_value(SITE_HOST, "__DLsite_SID"), Some("shop"));
+        assert_eq!(session.cookie_value(LOGIN_HOST, "__DLsite_SID"), None);
+        assert_eq!(session.cookies_count(), 2);
+        assert!(session.logged_in());
     }
 
     /// `parse_last_page` は数値リンクの最大値と `最後` リンクを検出する。

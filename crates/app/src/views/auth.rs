@@ -62,22 +62,24 @@ pub struct AuthDialog {
     /// BOOTH の WebView ログインモーダルを表示中か
     show_booth_login: bool,
     booth_login: Option<Entity<BoothLoginView>>,
-    /// BoothLoginView の完了イベント購読（保持して drop を防ぐ）
-    booth_subscription: Option<gpui_kit::Subscription>,
+    /// BoothLoginView のイベント購読（Done / Cancelled の 2 本）。束縛せずに捨てるとイベントが届かなくなる（✕ や完了でモーダルが閉じなくなる）
+    booth_subscriptions: Vec<gpui_kit::Subscription>,
     /// FANZA の WebView ログインモーダルを表示中か
     show_fanza_login: bool,
     fanza_login: Option<Entity<FanzaLoginView>>,
-    /// FanzaLoginView の完了イベント購読（保持して drop を防ぐ）
-    fanza_subscription: Option<gpui_kit::Subscription>,
+    /// FanzaLoginView のイベント購読（Done / Cancelled の 2 本）。束縛せずに捨てるとイベントが届かなくなる（✕ や完了でモーダルが閉じなくなる）
+    fanza_subscriptions: Vec<gpui_kit::Subscription>,
     /// DLsite の WebView ログインモーダルを表示中か
     show_dlsite_login: bool,
     dlsite_login: Option<Entity<DlsiteLoginView>>,
-    /// DlsiteLoginView の完了イベント購読（保持して drop を防ぐ）
-    dlsite_subscription: Option<gpui_kit::Subscription>,
+    /// DlsiteLoginView のイベント購読（Done / Cancelled の 2 本）。束縛せずに捨てるとイベントが届かなくなる（✕ や完了でモーダルが閉じなくなる）
+    dlsite_subscriptions: Vec<gpui_kit::Subscription>,
     /// Google の WebView ログインモーダルを表示中か
     show_google_login: bool,
     google_login: Option<Entity<GoogleLoginView>>,
-    google_subscription: Option<gpui_kit::Subscription>,
+    /// Google ログインの購読（Done / Failed / Cancelled の 3 本）。束縛せずに捨てると
+    /// イベントが届かなくなる（✕ やエラーでモーダルが閉じなくなる）。
+    google_subscriptions: Vec<gpui_kit::Subscription>,
     /// GitHub の Device Flow ログインモーダルを表示中か
     show_github_login: bool,
     github_login: Option<Entity<GithubLoginView>>,
@@ -89,7 +91,8 @@ pub struct AuthDialog {
     /// 技術書典の WebView ログインモーダルを表示中か
     show_tbf_login: bool,
     tbf_login: Option<Entity<TbfLoginView>>,
-    tbf_subscription: Option<gpui_kit::Subscription>,
+    /// TbfLoginView のイベント購読（Done / Cancelled の 2 本）。束縛せずに捨てるとイベントが届かなくなる（✕ や完了でモーダルが閉じなくなる）。
+    tbf_subscriptions: Vec<gpui_kit::Subscription>,
 }
 
 impl AuthDialog {
@@ -115,22 +118,22 @@ impl AuthDialog {
             google_profile: None,
             show_booth_login: false,
             booth_login: None,
-            booth_subscription: None,
+            booth_subscriptions: Vec::new(),
             show_fanza_login: false,
             fanza_login: None,
-            fanza_subscription: None,
+            fanza_subscriptions: Vec::new(),
             show_dlsite_login: false,
             dlsite_login: None,
-            dlsite_subscription: None,
+            dlsite_subscriptions: Vec::new(),
             show_google_login: false,
             google_login: None,
-            google_subscription: None,
+            google_subscriptions: Vec::new(),
             show_github_login: false,
             github_login: None,
             github_subscriptions: Vec::new(),
             show_tbf_login: false,
             tbf_login: None,
-            tbf_subscription: None,
+            tbf_subscriptions: Vec::new(),
         }
     }
 
@@ -204,7 +207,7 @@ impl AuthDialog {
                         this.show_booth_login = false;
                         // 次回は新しい WebView + 監視を開始する
                         this.booth_login = None;
-                        this.booth_subscription = None;
+                        this.booth_subscriptions.clear();
                         this.request_site_sync_after_login(AuthProvider::Booth, cx);
                         cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
                     },
@@ -215,10 +218,10 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<BoothLoginView>, _: &BoothLoginCancelled, _| {
                         this.show_booth_login = false;
                         this.booth_login = None;
-                        this.booth_subscription = None;
+                        this.booth_subscriptions.clear();
                     },
                 );
-                this.booth_subscription = Some(_done);
+                this.booth_subscriptions = vec![_done, _cancelled];
                 this.booth_login = Some(booth_login);
                 cx.notify();
             });
@@ -233,7 +236,7 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<FanzaLoginView>, _: &FanzaLoginDone, cx| {
                         this.show_fanza_login = false;
                         this.fanza_login = None;
-                        this.fanza_subscription = None;
+                        this.fanza_subscriptions.clear();
                         this.request_site_sync_after_login(AuthProvider::Fanza, cx);
                         cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
                     },
@@ -244,10 +247,10 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<FanzaLoginView>, _: &FanzaLoginCancelled, _| {
                         this.show_fanza_login = false;
                         this.fanza_login = None;
-                        this.fanza_subscription = None;
+                        this.fanza_subscriptions.clear();
                     },
                 );
-                this.fanza_subscription = Some(_done);
+                this.fanza_subscriptions = vec![_done, _cancelled];
                 this.fanza_login = Some(fanza_login);
                 cx.notify();
             });
@@ -262,7 +265,7 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<DlsiteLoginView>, _: &DlsiteLoginDone, cx| {
                         this.show_dlsite_login = false;
                         this.dlsite_login = None;
-                        this.dlsite_subscription = None;
+                        this.dlsite_subscriptions.clear();
                         this.request_site_sync_after_login(AuthProvider::Dlsite, cx);
                         cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
                     },
@@ -273,10 +276,10 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<DlsiteLoginView>, _: &DlsiteLoginCancelled, _| {
                         this.show_dlsite_login = false;
                         this.dlsite_login = None;
-                        this.dlsite_subscription = None;
+                        this.dlsite_subscriptions.clear();
                     },
                 );
-                this.dlsite_subscription = Some(_done);
+                this.dlsite_subscriptions = vec![_done, _cancelled];
                 this.dlsite_login = Some(dlsite_login);
                 cx.notify();
             });
@@ -297,7 +300,7 @@ impl AuthDialog {
                         crate::app_state::save_google_profile(cx, &profile);
                         // WebView は完了処理で隠される。次回は新しい認可フローを開始する
                         this.google_login = None;
-                        this.google_subscription = None;
+                        this.google_subscriptions.clear();
                         // Workspace の状態更新は、RefCell already borrowed でアプリが固まるため
                         // ここでは行わない。グローバルフラグを立て、Workspace の監視タスクが
                         // show_auth をリセットする（Workspace::new で開始）。
@@ -312,7 +315,7 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<GoogleLoginView>, event: &GoogleLoginFailed, cx| {
                         this.show_google_login = false;
                         this.google_login = None;
-                        this.google_subscription = None;
+                        this.google_subscriptions.clear();
                         let state = AppState::global(cx);
                         *state.google_login_error.lock() = Some(event.0.clone());
                         AppState::global(cx)
@@ -326,10 +329,10 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<GoogleLoginView>, _: &GoogleLoginCancelled, _| {
                         this.show_google_login = false;
                         this.google_login = None;
-                        this.google_subscription = None;
+                        this.google_subscriptions.clear();
                     },
                 );
-                this.google_subscription = Some(_done);
+                this.google_subscriptions = vec![_done, _failed, _cancelled];
                 this.google_login = Some(google_login);
                 cx.notify();
             });
@@ -387,7 +390,7 @@ impl AuthDialog {
                         this.show_tbf_login = false;
                         // 次回は新しい WebView + 監視を開始する
                         this.tbf_login = None;
-                        this.tbf_subscription = None;
+                        this.tbf_subscriptions.clear();
                         this.request_site_sync_after_login(AuthProvider::TechBookFest, cx);
                         cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
                     },
@@ -398,10 +401,10 @@ impl AuthDialog {
                     |this: &mut Self, _: Entity<TbfLoginView>, _: &TbfLoginCancelled, _| {
                         this.show_tbf_login = false;
                         this.tbf_login = None;
-                        this.tbf_subscription = None;
+                        this.tbf_subscriptions.clear();
                     },
                 );
-                this.tbf_subscription = Some(_done);
+                this.tbf_subscriptions = vec![_done, _cancelled];
                 this.tbf_login = Some(tbf_login);
                 cx.notify();
             });

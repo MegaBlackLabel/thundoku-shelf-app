@@ -1270,6 +1270,8 @@ pub struct BookshelfView {
     pending_download_confirm: Option<bookshelf::BookshelfItem>,
     /// ダウンロード中止の確認ダイアログ（表示中だけ Some）
     pending_cancel_download: Option<PendingCancelDownload>,
+    /// 分割同期の続き通知（表示中だけ Some）
+    pending_sync_notice: Option<SyncNotice>,
     /// ダウンロード完了後に開く本（リモート本棚の database_id）。
     /// 「はい」でダウンロードを始めた本・すでにダウンロード中の本を記録する。
     pending_open_after_download: Option<String>,
@@ -1516,6 +1518,35 @@ fn tag_fetch_notice(outcome: &thundoku_core::fanza::sync::TagFetchOutcome) -> Op
     })
 }
 
+/// 分割同期の「続きがある」通知（ダイアログで出す）。
+///
+/// 購入一覧を 1 回で全部取らず、あと何回で取り込みが終わるかをユーザーに伝える。
+struct SyncNotice {
+    /// 同期サイトの id（`sync_site` に渡す）。
+    site_id: &'static str,
+    /// 表示名（FANZA / DLsite）。
+    label: &'static str,
+    /// 今回取り込んだ件数。
+    saved: usize,
+    /// 一覧の総件数（0 = 分からない）。
+    total_items: usize,
+    /// 完了までにあと何回この操作が必要か。
+    remaining_runs: usize,
+}
+
+/// 分割同期の通知文（ダイアログ本文）。
+fn sync_notice_message(notice: &SyncNotice) -> String {
+    let total = if notice.total_items > 0 {
+        format!("（全体 {} 件）", notice.total_items)
+    } else {
+        String::new()
+    };
+    format!(
+        "{} の購入一覧から {} 件を取り込みました{}。あと {} 回で完了します。",
+        notice.label, notice.saved, total, notice.remaining_runs
+    )
+}
+
 impl BookshelfView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let handle = cx.weak_entity();
@@ -1638,6 +1669,7 @@ impl BookshelfView {
             sort_ascending: sort.1,
             last_search: String::new(),
             pending_download_confirm: None,
+            pending_sync_notice: None,
             pending_cancel_download: None,
             pending_open_after_download: None,
             auto_download_queue: Vec::new(),
@@ -2547,6 +2579,13 @@ impl BookshelfView {
                 });
             };
             loop {
+                // WebView2 がメッセージループを回している間は適用しない（次の周回に回す）。
+                if crate::app_state::webview_pumping() > 0 {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                    continue;
+                }
                 match rx.try_recv() {
                     Ok(update) => {
                         batch.push(update);
@@ -3112,6 +3151,36 @@ impl BookshelfView {
         }
     }
 
+    /// 分割同期の通知を出す（続きがあるときはダイアログ、無いときは完了トースト）。
+    fn show_sync_notice(&mut self, cx: &mut Context<Self>, notice: SyncNotice, more: bool) {
+        if more {
+            self.pending_sync_notice = Some(notice);
+            return;
+        }
+        crate::app_state::set_toast_kind(
+            cx,
+            ToastKind::Success,
+            format!("{} サイトから {} 件取得しました", notice.label, notice.saved),
+        );
+    }
+
+    /// 分割同期の続き通知を閉じる（「あとで」側）。
+    fn dismiss_sync_notice(&mut self, cx: &mut Context<Self>) {
+        self.pending_sync_notice = None;
+        cx.notify();
+    }
+
+    /// 分割同期の続きを取り込む（通知の「続きを取り込む」）。
+    ///
+    /// 続きの位置は `AppState` にあるので、同じサイトをもう一度同期するだけでよい。
+    fn continue_sync(&mut self, cx: &mut Context<Self>) {
+        let Some(notice) = self.pending_sync_notice.take() else {
+            return;
+        };
+        self.sync_site(notice.site_id, cx);
+        cx.notify();
+    }
+
     /// 指定したサイトだけを同期する（サイト id は本棚の絞り込み・サイドバーと同じ表記）。
     ///
     /// サイトのログイン完了直後の自動同期（`Workspace::handle_login_sync_request`）と、
@@ -3316,6 +3385,10 @@ impl BookshelfView {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(_) => {
+                        // WebView2 がメッセージループを回している間は更新しない。
+                        if crate::app_state::webview_pumping() > 0 {
+                            continue;
+                        }
                         handle.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(120))
@@ -3374,20 +3447,31 @@ impl BookshelfView {
         }
         log::info!("sync_fanza: 開始");
         self.sync_busy += 1;
+        // 前回の続き通知は新しい同期で置き換える
+        self.pending_sync_notice = None;
         crate::app_state::set_toast_kind(cx, ToastKind::Info, "FANZA サイトのデータを取得中です");
         let handle = cx.entity();
         let state = Self::app_state(cx);
         let session = state.fanza_session.lock().clone();
+        // 続きの位置（前回の続きがあればそこから取る）
+        let cursor = state.sync_cursors.lock().fanza.unwrap_or_default();
         let db = state.db_pool.clone();
         let owner = crate::app_state::owner_token(state);
-        let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<thundoku_core::fanza::sync::PurchaseBatch, String>>();
         std::thread::spawn(move || {
-            let result = (|| -> Result<usize, String> {
+            let result = (|| -> Result<thundoku_core::fanza::sync::PurchaseBatch, String> {
                 let session = session.ok_or_else(|| "FANZA セッションがありません".to_string())?;
                 let mut client =
                     FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
-                thundoku_core::fanza::sync::save_purchases(&db, &mut client, owner.as_deref())
-                    .map_err(|e| e.to_string())
+                thundoku_core::fanza::sync::save_purchases_batch(
+                    &db,
+                    &mut client,
+                    owner.as_deref(),
+                    cursor,
+                    thundoku_core::fanza::sync::PURCHASE_PAGES_PER_RUN,
+                )
+                .map_err(|e| e.to_string())
             })();
             let _ = tx.send(result);
         });
@@ -3396,6 +3480,10 @@ impl BookshelfView {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(_) => {
+                        // WebView2 がメッセージループを回している間は更新しない。
+                        if crate::app_state::webview_pumping() > 0 {
+                            continue;
+                        }
                         handle.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(120))
@@ -3406,14 +3494,26 @@ impl BookshelfView {
             handle.update(cx, |this, cx| {
                 this.sync_busy = this.sync_busy.saturating_sub(1);
                 match result {
-                    Ok(count) => {
-                        log::info!("sync_fanza: 完了（{count} 件）");
-                        crate::app_state::set_toast_kind(
-                            cx,
-                            ToastKind::Success,
-                            format!("FANZA サイトから {count} 件取得しました"),
+                    Ok(batch) => {
+                        let more = batch.next.is_some();
+                        log::info!(
+                            "sync_fanza: 完了（{} 件 / {} ページ、続きあり = {more}）",
+                            batch.saved,
+                            batch.fetched_pages
                         );
+                        Self::app_state(cx).sync_cursors.lock().fanza = batch.next;
                         this.reload(cx);
+                        this.show_sync_notice(
+                            cx,
+                            SyncNotice {
+                                site_id: "fanza",
+                                label: "FANZA",
+                                saved: batch.saved,
+                                total_items: batch.total_items,
+                                remaining_runs: batch.remaining_runs,
+                            },
+                            more,
+                        );
                         // 同期で入ってきた未ダウンロードのお気に入りを自動で落とす
                         this.auto_download_favorites(cx);
                         // 未ダウンロード本のタグを少しずつ取る（全件まとめて叩かない）
@@ -3537,20 +3637,32 @@ impl BookshelfView {
         }
         log::info!("sync_dlsite: 開始");
         self.sync_busy += 1;
+        // 前回の続き通知は新しい同期で置き換える
+        self.pending_sync_notice = None;
         crate::app_state::set_toast_kind(cx, ToastKind::Info, "DLsite サイトのデータを取得中です");
         let handle = cx.entity();
         let state = Self::app_state(cx);
         let session = state.dlsite_session.lock().clone();
+        // 続きの位置（前回の続きがあればそこから取る）
+        let cursor = state.sync_cursors.lock().dlsite.unwrap_or_default();
         let db = state.db_pool.clone();
         let owner = crate::app_state::owner_token(state);
-        let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<
+            Result<thundoku_core::dlsite::sync::PurchaseBatch, String>,
+        >();
         std::thread::spawn(move || {
-            let result = (|| -> Result<usize, String> {
+            let result = (|| -> Result<thundoku_core::dlsite::sync::PurchaseBatch, String> {
                 let session = session.ok_or_else(|| "DLsite セッションがありません".to_string())?;
                 let mut client =
                     DlsiteClient::with_transport(Box::new(UreqTransport::new()), session);
-                thundoku_core::dlsite::sync::save_purchases(&db, &mut client, owner.as_deref())
-                    .map_err(|e| e.to_string())
+                thundoku_core::dlsite::sync::save_purchases_batch(
+                    &db,
+                    &mut client,
+                    owner.as_deref(),
+                    cursor,
+                    thundoku_core::dlsite::sync::PURCHASE_PAGES_PER_RUN,
+                )
+                .map_err(|e| e.to_string())
             })();
             let _ = tx.send(result);
         });
@@ -3559,6 +3671,10 @@ impl BookshelfView {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(_) => {
+                        // WebView2 がメッセージループを回している間は更新しない。
+                        if crate::app_state::webview_pumping() > 0 {
+                            continue;
+                        }
                         handle.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(120))
@@ -3569,14 +3685,26 @@ impl BookshelfView {
             handle.update(cx, |this, cx| {
                 this.sync_busy = this.sync_busy.saturating_sub(1);
                 match result {
-                    Ok(count) => {
-                        log::info!("sync_dlsite: 完了（{count} 件）");
-                        crate::app_state::set_toast_kind(
-                            cx,
-                            ToastKind::Success,
-                            format!("DLsite サイトから {count} 件取得しました"),
+                    Ok(batch) => {
+                        let more = batch.next.is_some();
+                        log::info!(
+                            "sync_dlsite: 完了（{} 件 / {} ページ、続きあり = {more}）",
+                            batch.saved,
+                            batch.fetched_pages
                         );
+                        Self::app_state(cx).sync_cursors.lock().dlsite = batch.next;
                         this.reload(cx);
+                        this.show_sync_notice(
+                            cx,
+                            SyncNotice {
+                                site_id: "dlsite",
+                                label: "DLsite",
+                                saved: batch.saved,
+                                total_items: 0,
+                                remaining_runs: batch.remaining_runs,
+                            },
+                            more,
+                        );
                         // 同期で入ってきた未ダウンロードのお気に入りを自動で落とす
                         this.auto_download_favorites(cx);
                     }
@@ -3639,6 +3767,10 @@ impl BookshelfView {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(_) => {
+                        // WebView2 がメッセージループを回している間は更新しない。
+                        if crate::app_state::webview_pumping() > 0 {
+                            continue;
+                        }
                         handle.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(120))
@@ -4168,6 +4300,13 @@ impl BookshelfView {
             let mut last_label: Option<&'static str> = None;
             let mut disconnected = false;
             while !disconnected {
+                // WebView2 がメッセージループを回している間は更新しない（次の周回に回す）。
+                if crate::app_state::webview_pumping() > 0 {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(16))
+                        .await;
+                    continue;
+                }
                 // Drain the channel, keeping only the latest state per poll.
                 loop {
                     match progress_rx.try_recv() {
@@ -7084,6 +7223,8 @@ impl Render for BookshelfView {
         let busy = self.sync_busy > 0;
         // 未ダウンロード本のダウンロード確認（はい / いいえ）
         let pending_download_confirm = self.pending_download_confirm.clone();
+        // 分割同期の続き（あと何回で完了するかを伝える）
+        let pending_sync_notice = self.pending_sync_notice.as_ref().map(sync_notice_message);
         // ダウンロード中止の確認（表示中だけ）
         let pending_cancel_download = self
             .pending_cancel_download
@@ -8045,6 +8186,62 @@ impl Render for BookshelfView {
                                                     move |_, _window, cx| {
                                                         handle.update(cx, |this, cx| {
                                                             this.confirm_download(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .into_any_element()
+                        .into()
+                } else {
+                    None
+                },
+            )
+            // 分割同期の続き（あと何回で完了するかを伝える）
+            .children(
+                if let Some(message) = pending_sync_notice {
+                    let continue_handle = handle.clone();
+                    let close_handle = handle.clone();
+                    Dialog::new(cx)
+                        // 面は「浮いた面」に揃える（背景と同色だとダークで同化する）
+                        .bg(cx.theme().colors.popover)
+                        .title(div().child("購入一覧を取り込みました"))
+                        .content(move |content, _window, _cx| {
+                            content.child(div().text_sm().child(message.clone()))
+                        })
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "sync-notice-close".into())
+                                        .child(
+                                            dialog_button("sync-notice-close", "閉じる").on_click({
+                                                let handle = close_handle.clone();
+                                                move |_, _window, cx| {
+                                                    handle.update(cx, |this, cx| {
+                                                        this.dismiss_sync_notice(cx);
+                                                    });
+                                                }
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "sync-notice-continue".into())
+                                        .child(
+                                            Button::new("sync-notice-continue")
+                                                .cursor_pointer()
+                                                .primary()
+                                                .label("続きを取り込む")
+                                                .on_click({
+                                                    let handle = continue_handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.continue_sync(cx);
                                                         });
                                                     }
                                                 }),
@@ -11479,6 +11676,103 @@ mod tests {
             view.read_with(cx, |this, _| this.pending_open_after_download.clone()),
             Some("db-2".to_string()),
             "完了後に開く対象が記録されていない"
+        );
+    }
+
+    /// 分割同期の通知文は「あと何回」を出す（全体の件数が分からなければ省く）。
+    #[test]
+    fn sync_notice_message_shows_the_remaining_runs() {
+        let with_total = SyncNotice {
+            site_id: "fanza",
+            label: "FANZA",
+            saved: 100,
+            total_items: 2000,
+            remaining_runs: 19,
+        };
+        let message = sync_notice_message(&with_total);
+        assert!(message.contains("100 件を取り込みました"), "{message}");
+        assert!(message.contains("全体 2000 件"), "{message}");
+        assert!(message.contains("あと 19 回"), "{message}");
+
+        let without_total = SyncNotice {
+            site_id: "dlsite",
+            label: "DLsite",
+            saved: 30,
+            total_items: 0,
+            remaining_runs: 2,
+        };
+        let message = sync_notice_message(&without_total);
+        assert!(message.contains("あと 2 回"), "{message}");
+        assert!(!message.contains("全体"), "{message}");
+    }
+
+    /// 分割同期の続き通知: ダイアログが出て、「閉じる」で消え、
+    /// 「続きを取り込む」で次の同期に進む。
+    #[gpui_kit::test]
+    async fn sync_notice_dialog_closes_and_continues(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        let show_notice = |cx: &mut TestAppContext, view: &Entity<BookshelfView>| {
+            view.update(cx, |this, cx| {
+                this.pending_sync_notice = Some(SyncNotice {
+                    site_id: "fanza",
+                    label: "FANZA",
+                    saved: 20,
+                    total_items: 100,
+                    remaining_runs: 4,
+                });
+                cx.notify();
+            });
+        };
+        show_notice(cx, &view);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        // 「閉じる」で通知が消える
+        let close = visual
+            .debug_bounds("sync-notice-close")
+            .expect("続きの通知ダイアログが出ていない");
+        visual.simulate_click(close.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |this, _| this.pending_sync_notice.is_none()),
+            "「閉じる」で通知が消えていない"
+        );
+
+        // 「続きを取り込む」は同期を始める（未ログインなのでログイン導線が出る）
+        show_notice(cx, &view);
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let cont = visual
+            .debug_bounds("sync-notice-continue")
+            .expect("続きを取り込むボタンが出ていない");
+        visual.simulate_click(cont.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |this, _| this.pending_sync_notice.is_none()),
+            "「続きを取り込む」で通知が閉じていない"
+        );
+        assert_eq!(
+            cx.update(|cx| AppState::global(cx).toast_message.lock().clone()),
+            Some("FANZA にログインしてから同期してください".to_string()),
+            "続きの同期が始まっていない"
         );
     }
 

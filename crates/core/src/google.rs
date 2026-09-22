@@ -198,13 +198,22 @@ pub fn parse_token_response(body: &[u8]) -> Result<OAuthTokens, GoogleError> {
     })
 }
 
+/// ループバックのコールバック（`code`）を待つ。
+///
+/// **クライアントの状態を触らない**ので、待っている間 `GoogleClient` のロックを
+/// 保持しない。保持すると最大 5 分の待ちの間 UI 側の `google.lock()` が止まり、
+/// ログインモーダルの ✕ も効かなくなる（アプリが固まったように見える）。
+pub fn wait_for_code(pending: &PendingGoogleAuth) -> Result<String, GoogleError> {
+    receive_callback(&pending.listener, &pending.state, Some(&pending.cancel))
+}
+
 /// Accept exactly one connection on the loopback listener and return the
 /// authorization `code` (verifying `state`). Responds with a short HTML
 /// page telling the user to close the tab.
 /// Non-blocking accept with polling: returns `GoogleError::Cancelled` when
 /// `cancel` is set, and times out after 5 minutes.
 pub fn receive_callback(
-    listener: TcpListener,
+    listener: &TcpListener,
     expected_state: &str,
     cancel: Option<&AtomicBool>,
 ) -> Result<String, GoogleError> {
@@ -348,29 +357,61 @@ fn percent_encode(value: &str) -> String {
         .remove(b'~');
     percent_encoding::utf8_percent_encode(value, ENCODE_SET).to_string()
 }
-/// Open the authorize URL in the system browser.
+/// システムブラウザで URL を開く。
+///
+/// Windows は **`ShellExecuteW`（OS の API）**を使う。**コマンドライン経由にしない**:
+/// `cmd /C start "" <URL>` は `cmd` が `&` をコマンド区切り、`%XX` を環境変数として
+/// 解釈するため、認可 URL が最初の `&` で切れて渡る（実測: `cmd /C echo <URL>` の出力は
+/// `?client_id=…` まで）。必須パラメータが落ちると Google は 400 `invalid_request` を返す。
+/// `explorer <URL>` も不可（URL を渡すとエクスプローラーが開くだけで既定ブラウザが
+/// 開かない。実測 2026-09-23）。`ShellExecuteW` は URL をそのままシェルへ渡す。
 pub fn open_browser(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map(|_| ())
-    }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()
-            .map(|_| ())
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let operation = wide("open");
+        let target = wide(url);
+        // SAFETY: 3 つの文字列はこの関数の間だけ生きる NUL 終端 UTF-16 で、
+        // ポインタ引数は ShellExecuteW が呼び出し中しか読まない。
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecute の戻り値は「32 以下なら失敗」と決まっている。
+        if (result as isize) <= 32 {
+            return Err(std::io::Error::other(format!(
+                "ShellExecuteW failed ({})",
+                result as isize
+            )));
+        }
+        Ok(())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(target_os = "windows"))]
     {
-        std::process::Command::new("xdg-open")
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        std::process::Command::new(program)
             .arg(url)
             .spawn()
             .map(|_| ())
     }
+}
+
+/// NUL 終端の UTF-16（Windows の `*W` API 用）。
+#[cfg(target_os = "windows")]
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn percent_decode(input: &str) -> String {
@@ -538,9 +579,19 @@ impl GoogleClient {
         &mut self,
         pending: PendingGoogleAuth,
     ) -> Result<GoogleProfile, GoogleError> {
-        let code = receive_callback(pending.listener, &pending.state, Some(&pending.cancel))?;
+        let code = crate::google::wait_for_code(&pending)?;
+        self.complete_authorize(&pending, &code)
+    }
+
+    /// Exchange the received `code` for tokens and fetch the profile
+    /// (`&mut self` が要る側だけ。待つ側は `wait_for_code`）。
+    pub fn complete_authorize(
+        &mut self,
+        pending: &PendingGoogleAuth,
+        code: &str,
+    ) -> Result<GoogleProfile, GoogleError> {
         log::info!("google callback received, exchanging code");
-        let tokens = self.exchange_code(&code, &pending.verifier, &pending.redirect_uri)?;
+        let tokens = self.exchange_code(code, &pending.verifier, &pending.redirect_uri)?;
         self.tokens = Some(tokens);
         self.profile()
     }
@@ -788,6 +839,62 @@ mod tests {
             secret.map(String::from),
         );
         (client, captured)
+    }
+
+    /// ループバックのコールバック（`code`）を受け取る。
+    ///
+    /// ポートは動的（`127.0.0.1:0`）にする: `bind_loopback()` の固定ポート 38387 は
+    /// 起動中のアプリが握っていることがあり（`SO_REUSEADDR` で二重 bind できてしまう）、
+    /// テストがコールバックを取り合って固まる。
+    #[test]
+    fn callback_code_is_received_from_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .write_all(b"GET /?code=abc&state=S HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+        });
+        let code = receive_callback(&listener, "S", None).unwrap();
+        sender.join().unwrap();
+        assert_eq!(code, "abc");
+    }
+
+    /// キャンセル済みなら待たずに `Cancelled` を返す（✕ で即座に止まる）。
+    #[test]
+    fn cancelled_callback_returns_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cancel = AtomicBool::new(true);
+        let error = receive_callback(&listener, "S", Some(&cancel)).expect_err("cancelled");
+        assert!(matches!(error, GoogleError::Cancelled), "{error}");
+    }
+
+    /// `wait_for_code` はクライアントを要らない（＝コールバック待ちの間
+    /// `GoogleClient` のロックを保持しない）。ロックを保持すると、待っている間に
+    /// UI 側の `google.lock()` が止まり、モーダルの ✕ が効かなくなる。
+    #[test]
+    fn wait_for_code_receives_the_callback_without_a_client() {
+        // 固定ポート（`bind_loopback`）は使わない: 起動中のアプリと二重 bind し得る。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let pending = PendingGoogleAuth {
+            redirect_uri: "http://127.0.0.1:0".to_string(),
+            url: String::new(),
+            listener,
+            verifier: "verifier".to_string(),
+            state: "S".to_string(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let port = pending.listener.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .write_all(b"GET /?code=xyz&state=S HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+        });
+        let code = wait_for_code(&pending).unwrap();
+        sender.join().unwrap();
+        assert_eq!(code, "xyz");
     }
 
     #[test]

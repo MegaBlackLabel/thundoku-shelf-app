@@ -205,7 +205,7 @@ fn loopback_receives_code_and_rejects_state_mismatch() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let state = "expected-state".to_string();
-    let handle = std::thread::spawn(move || receive_callback(listener, &state, None));
+    let handle = std::thread::spawn(move || receive_callback(&listener, &state, None));
 
     let mut stream = std::net::TcpStream::connect(addr).unwrap();
     use std::io::Write;
@@ -223,7 +223,7 @@ fn loopback_receives_code_and_rejects_state_mismatch() {
     // state mismatch
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let handle = std::thread::spawn(move || receive_callback(listener, "other-state", None));
+    let handle = std::thread::spawn(move || receive_callback(&listener, "other-state", None));
     let mut stream = std::net::TcpStream::connect(addr).unwrap();
     write!(
         stream,
@@ -319,7 +319,7 @@ fn loopback_parses_request_split_across_writes() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let state = "split-state".to_string();
-    let handle = std::thread::spawn(move || receive_callback(listener, &state, None));
+    let handle = std::thread::spawn(move || receive_callback(&listener, &state, None));
 
     let mut stream = std::net::TcpStream::connect(addr).unwrap();
     // クエリの途中で 3 つに分割して送る

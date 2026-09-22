@@ -1868,6 +1868,10 @@ impl ImageViewer {
                 cx.background_executor()
                     .timer(Duration::from_millis(interval_ms))
                     .await;
+                // WebView2 がメッセージループを回している間は更新しない（次のフレームに回す）。
+                if crate::app_state::webview_pumping() > 0 {
+                    continue;
+                }
                 let done = handle.update(cx, |this, cx| {
                     if !this.autoplay || this.autoplay_generation != generation {
                         return true;
@@ -2021,6 +2025,10 @@ impl ImageViewer {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
+                // WebView2 がメッセージループを回している間は更新しない（次のフレームに回す）。
+                if crate::app_state::webview_pumping() > 0 {
+                    continue;
+                }
                 let stop = handle.update(cx, |this, cx| {
                     if this.inertia_generation != generation {
                         return true;

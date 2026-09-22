@@ -13,6 +13,77 @@
   旨を追加した（説明画面は上下の並びをテストで固定）。あわせて README と説明画面の機能説明から
   ストア名の列挙（「技術書典 / BOOTH / FANZA同人 / DLsite に対応」）を外し、「各ストア」と書く。
   ログイン手順のように**操作に必要な箇所**ではストア名を残している。
+- **DLsite の Cookie を収集元ホストごとに持ち、CDN へは署名 Cookie だけを送る**:
+  収集元（`www.dlsite.com` / `login.dlsite.com`）を 1 つの `HashMap` に潰していたため、
+  片方にしか送るべきでない Cookie がもう片方へ飛び、ダウンロードの CDN へは **www の
+  セッション Cookie を丸ごと**送っていた。`DlsiteSession` を収集元ホスト別
+  （`origins: BTreeMap<host, BTreeMap<name, value>>`）にして `cookie_header_for(host)` で
+  宛先ごとに絞り、CDN（`download.dlsite.com` は収集元ではない）へは 302 で受け取る署名
+  `jwt` だけが乗るようにした。サイト内向けは従来どおり全収集元をまとめる
+  （`cookie_header()`。`BTreeMap` 順で安定）。実アカウントでログイン → ダウンロードが
+  通ることを確認済み（CDN にセッション Cookie が無くても DL できる）。
+  保存済みセッションは JSON の形が変わるため、旧形式は「解釈できない」として未ログイン扱いに
+  なる（DLsite に再ログインが必要）。
+- **FANZA も CDN へセッション Cookie を送らない（DLsite と同じ形に揃える）**: 収集元
+  （`www.dmm.co.jp` / `accounts.dmm.co.jp`）を 1 つの `HashMap` に潰していたため、DMM の
+  ダウンロード CDN（`doujin.contents.doujin.dmm.co.jp`）へ **www のセッション Cookie を
+  丸ごと**送っていた（CDN リクエストで `cookie_header()` を使っていた）。Cookie の置き場を
+  収集元ホスト別に持つ共通型 `session_cookies::HostScopedCookies` へ寄せ（DLsite と共通化）、
+  CDN へは proxy の 302 で受け取る CloudFront 署名 Cookie だけが乗るようにした。サイト内
+  向け（一覧・詳細・proxy）は従来どおり全収集元をまとめる。保存済みセッションは JSON の形が
+  変わるため、**FANZA に再ログインが必要**（DLsite と同じ扱い）。実機でのダウンロード確認は
+  `live_download_probe`（`FANZA_TEST_COOKIE` を設定して `--ignored` で実行。本番の
+  `download_with_progress` を通す）で行う。
+- **購入一覧の同期を分割し、あと何回で終わるかをダイアログで知らせる**: 1 回の同期で全ページ
+  取り切っていた（FANZA は最大 2000 件、DLsite はストアごと最大 200 ページ）ため、購入数の
+  多いアカウントでは 1 操作で大量のリクエストになっていた。1 回 = `PURCHASE_PAGES_PER_RUN`
+  （5）ページずつ取り込む `save_purchases_batch` に変え、続きの位置（カーソル）を持ち越す。
+  続きがあるときは「〈サイト〉の購入一覧から N 件を取り込みました（全体 M 件）。あと K 回で
+  完了します。」を**ダイアログ**で出し、「続きを取り込む」を押すたびに続きから進む
+  （「閉じる」で中断でき、次に同期したときに続きから再開する）。DLsite はストアをまたいで
+  **ページ優先**（全ストアの 1 ページ目 → 2 ページ目…）で進めるので、最初の 1 回で全ストアの
+  最終ページが分かり残り回数を出せる。カーソルはメモリ上に置き、ログイン・ログアウトで破棄する
+  （アプリを閉じると最初から取り直す。取り込みは upsert なので二重登録にはならない）。
+
+### Fixed
+
+- **Windows で Google ログインが「アクセスをブロック: 認証エラー」になる（ログイン不能）**:
+  認可 URL を `cmd /C start "" <URL>` で開いていたため、`cmd` が `&` をコマンド区切りとして
+  扱い（さらに `%XX` を環境変数として展開し）、URL が**最初の `&` で切れて**渡っていた
+  （実測: `cmd /C echo <URL>` の出力は
+  `https://accounts.google.com/o/oauth2/v2/auth?client_id=…` まで）。`redirect_uri` /
+  `response_type` / `scope` / `code_challenge` が落ちるので Google は 400 `invalid_request`
+  を返し、ブラウザに「アクセスをブロック: 認証エラー」が出る。`explorer <URL>` も不可
+  （URL を渡すとエクスプローラーが開くだけで既定ブラウザが開かない。実測 2026-09-23）。
+  **OS の API（`ShellExecuteW`）**で URL をそのままシェルへ渡すようにした
+  （`crates/core/src/google.rs` の `open_browser`。`windows-sys` を追加）。
+- **ログインモーダルが ✕ で閉じない（BOOTH / FANZA / DLsite / Google / 技術書典）**:
+  `cx.subscribe` の戻り値（`Subscription`）は **Drop で解除**されるため、束縛して保持しないと
+  イベントが届かない。`AuthDialog` は各プロバイダで完了（Done）の 1 本しか保持しておらず、
+  **キャンセル（✕）と失敗が無視されていた**（GitHub だけは 3 本保持していて正しかった）。
+  5 プロバイダとも `Vec<Subscription>` に全イベント（Done / Failed / Cancelled）を保持する
+  ようにした。
+- **Google ログインモーダルの URL がカードからはみ出す**: PKCE と `state` を含む長い URL を
+  flex 行の子にそのまま置いていたため、子の最小幅でカード（448px）を押し広げていた。
+  `min_w_0` + 省略表示にした（全文は「URL をコピー」「ブラウザで開く」で使える）。
+- **Google ログインのモーダルが閉じない／アプリが固まる**: コールバック待ち（最大 5 分）の
+  間 `GoogleClient` の Mutex を保持していたため、待っている間に UI 側の `google.lock()`
+  （設定画面の表示・Drive 同期など）が止まり、✕ を押しても反応しなかった。待つ処理
+  （`wait_for_code`）と交換・プロフィール取得（`complete_authorize`）を分け、ロックは交換の
+  ときだけ取るようにした。
+
+- **ストアのログインを開くとアプリが落ちる（`RefCell already borrowed` → abort）**:
+  WebView2 の生成（`WebViewBuilder::build`）と Cookie 取得（`cookies_for_url`）は内部で
+  `webview2_com::wait_with_pump` を呼び、**Windows のメッセージループを回す**。gpui は
+  メッセージを処理するたびに保留中の foreground タスクを実行するため、App を借用した
+  ままこれを呼ぶと、その間に走った定期タスクの `handle.update` が gpui の借用と衝突して
+  panic し、FFI 境界を越えて abort していた（実測: DLsite のログインを開くと
+  `Workspace::start_login_done_watcher` の update が衝突）。
+  WebView2 を触っている区間を `app_state::WebviewPumpGuard` で示し、定期タスク
+  （Workspace のログイン監視・4 ストアのログイン監視・本棚の同期/進捗ポーリング・
+  ビューアーのフレームループ）はその間 1 tick 待つようにした。パニックフックは
+  `RUST_BACKTRACE` を設定したときだけスタックも残す（今回の特定はこれで行った）。
+  実機で DLsite のログインが通ることを確認済み。
 
 ### Security（2026-09-22 の2回目）
 

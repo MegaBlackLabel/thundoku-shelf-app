@@ -84,7 +84,7 @@ fn dlsite_rejects_a_foreign_saved_url_without_sending() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let mut client = DlsiteClient::with_transport(
         Box::new(Recording::new(&log, None)),
-        DlsiteSession::new(session_cookies()),
+        DlsiteSession::from_site_cookies(session_cookies().into_iter().collect()),
     );
 
     let error = client
@@ -103,7 +103,7 @@ fn dlsite_rejects_a_redirect_to_an_unlisted_host() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let mut client = DlsiteClient::with_transport(
         Box::new(Recording::new(&log, Some("https://evil.example.com/zip"))),
-        DlsiteSession::new(session_cookies()),
+        DlsiteSession::from_site_cookies(session_cookies().into_iter().collect()),
     );
 
     let error = client
@@ -126,7 +126,7 @@ fn fanza_rejects_a_foreign_proxy_url_without_sending() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let mut client = FanzaClient::with_transport(
         Box::new(Recording::new(&log, None)),
-        FanzaSession::new(session_cookies()),
+        FanzaSession::from_site_cookies(session_cookies().into_iter().collect()),
     );
 
     let error = client
@@ -142,7 +142,7 @@ fn fanza_rejects_a_redirect_to_an_unlisted_host() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let mut client = FanzaClient::with_transport(
         Box::new(Recording::new(&log, Some("https://evil.example.com/zip"))),
-        FanzaSession::new(session_cookies()),
+        FanzaSession::from_site_cookies(session_cookies().into_iter().collect()),
     );
 
     let error = client

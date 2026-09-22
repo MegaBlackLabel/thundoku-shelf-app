@@ -48,6 +48,7 @@
 | 保存済み `download_url` / 302 の `Location` を外部ホストへ向けると**セッション Cookie が送られる** | 送信先の検証が無かった。`download_url` は Drive の JSON バックアップから復元でき、改変バックアップの復元で攻撃が成立する | **修正済み**: `download_url::check` を追加し、認証付き送信の直前と 302 の転送先で `https` + 許可ホスト（Cookie のスコープに合わせる）を検証（`crates/core/src/download_url.rs`）。回帰テスト `crates/core/tests/download_credentials.rs` |
 | Windows で**作業ディレクトリの `pdfium.dll` を優先ロード** | `library_candidates()` の先頭が `./`（テスト用のつもりが製品コードにも残っていた）。CWD を用意して起動させられると任意 DLL を読む（DLL 配置攻撃） | **修正済み**: CWD の候補を削除し、開発時の探索はビルド時 `CARGO_MANIFEST_DIR` の絶対パスに限定（`crates/core/src/import/pdf.rs`） |
 | 改変バックアップの `books.id` / `pack_id` で**保存領域の外**の pack を読み書き・削除できる | 復元した id を検証せず `packs_dir.join("{id}.opfspack")` へ渡していた | **修正済み**: `pack_path` モジュールに検証を集約し、復元時は不正 id を拒否、pack を触る全経路で同じ検証を通す（`crates/core/src/pack_path.rs`） |
+| **ストアのログインを開くとアプリが落ちる**（`RefCell already borrowed` → `panic in a function that cannot unwind` で abort） | WebView2 の生成（`WebViewBuilder::build`）と Cookie 取得（`cookies_for_url`）が内部で `webview2_com::wait_with_pump` を呼び、**メッセージループを回す**。gpui はメッセージ処理のたびに保留中の foreground タスクを実行するため、App を借用したまま呼ぶと、その間に走った定期タスクの `handle.update` が `app_mut` の `borrow_mut` で panic する（実測: DLsite のログインを開いた瞬間に `Workspace::start_login_done_watcher` が衝突） | **修正済み**: `crates/app/src/app_state.rs` の `WebviewPumpGuard` / `webview_pumping()`（static。判定で借用を取ると本末転倒なので AppState ではない）で WebView2 を触る区間を示し、定期タスク（Workspace のログイン監視・4 ストアのログイン監視・本棚の同期/進捗ポーリング・ビューアーのフレームループ）は 0 でなければ 1 tick 待つ。**残るリスク**: WebView2 の呼び出し中に**単発**のタスクが待っている場合は依然として衝突し得る（恒久策は生成を借用の外＝タスク本体へ出すこと。未着手） |
 
 ## 5. ストア同期・認証の意図
 
@@ -56,6 +57,7 @@
 | 認証情報は **技術書典 / Google / DB 鍵 / セッション鍵 = OS keyring**、**BOOTH / FANZA / DLsite のセッション = DB（keyring の鍵で AES-256-GCM）** | keyring の値長上限（2560 UTF-16 文字）にセッションが収まらないため DB に置くが、DB のコピーからセッションを復元されないよう鍵だけを keyring に置いて暗号化する（`crates/core/src/session_store.rs`） |
 | 同期は**全件 UPSERT**（技術書典 / DLsite / FANZA）、**Drive のみ md5 + 更新時刻で差分** | ストア側 API に差分が無い。Drive はファイル転送コストが高い |
 | ログインはストアごとに**専用 WebView** を開き、URL 遷移を監視してセッションを保存 | 各ストアのログイン方式（Cookie / メールログイン / OAuth）が異なる |
+| **Cookie は収集元ホストごとに持ち、宛先ごとに絞って送る**（`DlsiteSession::cookie_header_for`） | 収集元（`www` / `login`）を 1 つに潰すと、片方にしか送るべきでない Cookie がもう片方へ飛ぶ。とくにダウンロードの CDN は別システムなので、302 で受け取る署名 `jwt` だけを送る（www のセッション Cookie は送らない） |
 | WebView を監視するタスクは**弱参照**でビューを持つ | 監視タスクがアプリ寿命で動き続けるため、強参照だと閉じても WebView ごと残る |
 | 複数 Google アカウントを切替えてもデータが消えない | データを `owner_sub` で**属性付け**して保持し、ログイン切替では削除しない（`crates/core/src/owner.rs`。設計は `docs/account-switch.md`） |
 

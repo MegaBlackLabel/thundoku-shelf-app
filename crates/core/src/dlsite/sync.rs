@@ -7,7 +7,9 @@
 
 use crate::db::SqlitePool;
 use crate::db::bookshelf::{self, BookshelfItem};
-use crate::dlsite::client::{DlsiteClient, DlsiteError};
+use crate::dlsite::client::{
+    DlsiteClient, DlsiteError, DlsitePurchase, DlsiteWorkMeta, MAX_PAGES_PER_STORE, STORES,
+};
 use crate::dlsite::{ai_to_str, classify, is_viewable_included, media_to_str};
 
 pub const SITE_ID_DLSITE: &str = "dlsite";
@@ -16,94 +18,225 @@ fn now() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// 購入済み作品のうち画像系（comic / cg）だけを `bookshelf_items(site_id='dlsite')` に
-/// 保存し、保存件数を返す。除外カテゴリ（voice / game / novel / video）は upsert しない。
-/// リッチメタは `product_info` から取得して `release_date`/`maker_id`/`age_rating`/
-/// `series_name`/`tags_json` に反映する（取得失敗はベストエフォートで一覧の値のみ）。
+/// 1 回の分割同期で取り込むページ数（ユーザーの操作を挟んで少しずつ進める）。
+pub const PURCHASE_PAGES_PER_RUN: usize = 5;
+
+/// 分割同期の続き位置。
 ///
-/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。書き込んだ行に所有者を付ける。
-pub fn save_purchases(
+/// ストアをまたいで**ページ優先**で進む（全ストアの 1 ページ目 → 2 ページ目…）。
+/// こうすると最初の 1 回で全ストアの最終ページ番号が分かり、「あと何回か」を出せる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurchaseCursor {
+    /// 次に取るページ（1 始まり）。
+    pub page: usize,
+    /// `STORES` のうち次に取るストアの添字。
+    pub store_index: usize,
+    /// 各ストアの最終ページ番号（未取得は `None`）。
+    pub last_pages: [Option<usize>; STORES.len()],
+}
+
+impl Default for PurchaseCursor {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            store_index: 0,
+            last_pages: [None; STORES.len()],
+        }
+    }
+}
+
+impl PurchaseCursor {
+    /// まだ取っていないページ数（最終ページが分かっているストアだけ数える）。
+    fn pages_left(&self) -> usize {
+        self.last_pages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, last)| {
+                let last = (*last)?;
+                // 同じページ内では、既に取ったストアの次から始まる
+                let from = if index < self.store_index {
+                    self.page + 1
+                } else {
+                    self.page
+                };
+                (last >= from).then(|| last - from + 1)
+            })
+            .sum()
+    }
+
+    /// 全ストアの最終ページが分かっていて、残りが無いか。
+    fn is_finished(&self) -> bool {
+        self.last_pages.iter().all(Option::is_some) && self.pages_left() == 0
+    }
+}
+
+/// 1 回の分割同期の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurchaseBatch {
+    /// 取り込んだ件数（画像系のみ。upsert なので既存行の更新も含む）。
+    pub saved: usize,
+    /// 取得したページ数。
+    pub fetched_pages: usize,
+    /// 分かっている範囲の残りページ数（未取得のストアは数えない）。
+    pub pages_left: usize,
+    /// 続きの位置（`None` = 完了）。
+    pub next: Option<PurchaseCursor>,
+    /// 完了までにあと何回この操作が必要か（0 = 完了）。
+    pub remaining_runs: usize,
+}
+
+/// 購入一覧を `pages` ページ分だけ取り込み、続きの位置と残り回数を返す。
+///
+/// 1 回で全ページ取ると、購入数の多いアカウントでは 1 操作で大量のリクエストになる。
+/// ユーザーの操作を挟んで少しずつ進めるための分割版（続きは `next` を次の呼び出しに渡す）。
+/// 画像系（comic / cg）だけを upsert する（voice / game / novel / video は保存しない）。
+/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。
+pub fn save_purchases_batch(
     pool: &SqlitePool,
     client: &mut DlsiteClient,
     owner: Option<&str>,
-) -> Result<usize, DlsiteError> {
-    let items = client.purchased()?;
-    // リッチメタを一括取得（ベストエフォート。失敗時は一覧の値のみで続行）
-    let ids: Vec<&str> = items.iter().map(|p| p.content_id.as_str()).collect();
-    let metas = client.product_info(&ids).unwrap_or_default();
+    cursor: PurchaseCursor,
+    pages: usize,
+) -> Result<PurchaseBatch, DlsiteError> {
+    let pages = pages.max(1);
+    let mut cursor = cursor;
+    let mut fetched_pages = 0usize;
     let mut saved = 0usize;
-    for p in items {
-        let meta = metas.get(&p.content_id);
-        let site_id = meta
-            .map(|m| m.site_id.as_str())
-            .unwrap_or(p.site_id.as_str());
-        let age_category = meta.and_then(|m| m.age_category);
-        let cfg = classify(&p.work_type, &p.genre_icons, site_id, age_category);
-        if !is_viewable_included(&cfg, true) {
+    // 同一作品は複数ストアの一覧に重複して現れるため、初出のみ採る。
+    let mut seen = std::collections::HashSet::new();
+    while fetched_pages < pages {
+        if cursor.store_index >= STORES.len() {
+            cursor.page += 1;
+            cursor.store_index = 0;
+        }
+        // 全ストアの最終ページが分かっていて残りが無い / 上限に達したら終わり
+        if cursor.is_finished() || cursor.page > MAX_PAGES_PER_STORE {
+            break;
+        }
+        // 既に終端と分かっているストアは叩かない
+        if cursor.last_pages[cursor.store_index].is_some_and(|last| cursor.page > last) {
+            cursor.store_index += 1;
             continue;
         }
-        let ts = now();
-        let tags_json = meta.and_then(|m| {
-            if m.custom_genres.is_empty() {
-                None
-            } else {
-                serde_json::to_string(&m.custom_genres).ok()
+        let page = client.purchased_page(STORES[cursor.store_index], cursor.page)?;
+        fetched_pages += 1;
+        if let Some(last) = page.last_page {
+            cursor.last_pages[cursor.store_index] = Some(last);
+        } else if page.items.is_empty() {
+            // ページャが取れないときは空ページを終端とみなす（同じページを叩き続けない）
+            cursor.last_pages[cursor.store_index] = Some(cursor.page);
+        }
+        // リッチメタを一括取得（ベストエフォート。失敗時は一覧の値のみで続行）
+        let ids: Vec<&str> = page.items.iter().map(|p| p.content_id.as_str()).collect();
+        let metas = client.product_info(&ids).unwrap_or_default();
+        for p in page.items {
+            if !seen.insert(p.content_id.clone()) {
+                continue;
             }
-        });
-        // 表紙は「作品画像」（product/info/ajax の work_image、//img.dlsite.jp/...）を優先。
-        // ユーザーページの静的 HTML は data: プレースホルダしか持たないため。
-        let thumbnail_url = meta
-            .and_then(|m| m.work_image.clone())
-            .or_else(|| p.thumbnail_url.clone().filter(|u| !u.starts_with("data:")))
-            .map(|u| {
-                if u.starts_with("//") {
-                    format!("https:{u}")
-                } else {
-                    u
-                }
-            });
-        let item = BookshelfItem {
-            site_id: SITE_ID_DLSITE.into(),
-            database_id: p.content_id.clone(),
-            title: p.title,
-            circle_name: p.maker_name,
-            author: String::new(),
-            thumbnail_url,
-            format: "ZIP".into(),
-            caused_at: p.purchase_date,
-            event_name: None,
-            event_slug: None,
-            event_id: None,
-            file_name: None,
-            download_url: p.down_url,
-            is_downloadable: 1,
-            is_checked: 0,
-            is_purchased: 1,
-            is_new: 0,
-            is_active: 1,
-            is_favorite: 0,
-            is_hidden: 0,
-            hidden_at: None,
-            tags_json,
-            synced_at: ts.clone(),
-            created_at: ts.clone(),
-            updated_at: ts,
-            media_category: Some(media_to_str(cfg.media).into()),
-            ai_type: Some(ai_to_str(cfg.ai).into()),
-            is_drm: 0,
-            release_date: meta.and_then(|m| m.regist_date.clone()),
-            description: None,
-            theme: None,
-            maker_id: meta.and_then(|m| m.maker_id.clone()),
-            page_count: None,
-            age_rating: cfg.age.map(String::from),
-            series_name: meta.and_then(|m| m.title_name.clone()),
-        };
-        bookshelf::upsert(pool, &item)?;
-        saved += 1;
+            let meta = metas.get(&p.content_id);
+            if save_purchase(pool, p, meta)? {
+                saved += 1;
+            }
+        }
+        cursor.store_index += 1;
     }
     bookshelf::attribute_owner(pool, SITE_ID_DLSITE, owner)?;
-    Ok(saved)
+    let pages_left = cursor.pages_left();
+    // 全ストアを取り切った / 1 ストアの上限（`MAX_PAGES_PER_STORE`）に達したら続きを出さない
+    // （上限で止まったまま「続き」を出し続けると、押しても何も進まなくなる）。
+    let next = if cursor.is_finished() || cursor.page > MAX_PAGES_PER_STORE {
+        None
+    } else {
+        Some(cursor)
+    };
+    // 未取得のストアがあると残りページは過小評価になるので、最低 1 回は残す
+    let remaining_runs = if next.is_some() {
+        pages_left.div_ceil(pages).max(1)
+    } else {
+        0
+    };
+    Ok(PurchaseBatch {
+        saved,
+        fetched_pages,
+        pages_left,
+        next,
+        remaining_runs,
+    })
+}
+
+/// 購入 1 件を本棚へ upsert する（画像系以外は保存しない）。保存したら `true`。
+fn save_purchase(
+    pool: &SqlitePool,
+    p: DlsitePurchase,
+    meta: Option<&DlsiteWorkMeta>,
+) -> Result<bool, DlsiteError> {
+    let site_id = meta
+        .map(|m| m.site_id.as_str())
+        .unwrap_or(p.site_id.as_str());
+    let age_category = meta.and_then(|m| m.age_category);
+    let cfg = classify(&p.work_type, &p.genre_icons, site_id, age_category);
+    if !is_viewable_included(&cfg, true) {
+        return Ok(false);
+    }
+    let ts = now();
+    let tags_json = meta.and_then(|m| {
+        if m.custom_genres.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&m.custom_genres).ok()
+        }
+    });
+    // 表紙は「作品画像」（product/info/ajax の work_image、//img.dlsite.jp/...）を優先。
+    // ユーザーページの静的 HTML は data: プレースホルダしか持たないため。
+    let thumbnail_url = meta
+        .and_then(|m| m.work_image.clone())
+        .or_else(|| p.thumbnail_url.clone().filter(|u| !u.starts_with("data:")))
+        .map(|u| {
+            if u.starts_with("//") {
+                format!("https:{u}")
+            } else {
+                u
+            }
+        });
+    let item = BookshelfItem {
+        site_id: SITE_ID_DLSITE.into(),
+        database_id: p.content_id.clone(),
+        title: p.title,
+        circle_name: p.maker_name,
+        author: String::new(),
+        thumbnail_url,
+        format: "ZIP".into(),
+        caused_at: p.purchase_date,
+        event_name: None,
+        event_slug: None,
+        event_id: None,
+        file_name: None,
+        download_url: p.down_url,
+        is_downloadable: 1,
+        is_checked: 0,
+        is_purchased: 1,
+        is_new: 0,
+        is_active: 1,
+        is_favorite: 0,
+        is_hidden: 0,
+        hidden_at: None,
+        tags_json,
+        synced_at: ts.clone(),
+        created_at: ts.clone(),
+        updated_at: ts,
+        media_category: Some(media_to_str(cfg.media).into()),
+        ai_type: Some(ai_to_str(cfg.ai).into()),
+        is_drm: 0,
+        release_date: meta.and_then(|m| m.regist_date.clone()),
+        description: None,
+        theme: None,
+        maker_id: meta.and_then(|m| m.maker_id.clone()),
+        page_count: None,
+        age_rating: cfg.age.map(String::from),
+        series_name: meta.and_then(|m| m.title_name.clone()),
+    };
+    bookshelf::upsert(pool, &item)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -114,7 +247,7 @@ mod tests {
     use crate::tbf::TbfError;
     use crate::tbf::transport::{RequestSpec, ResponseSpec};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     struct MockTransport {
         handler: Box<dyn FnMut(RequestSpec) -> Result<ResponseSpec, TbfError> + Send>,
@@ -324,11 +457,15 @@ mod tests {
                 }
             }),
         };
-        let session = DlsiteSession::new(HashMap::from([("__DLsite_SID".into(), "abc".into())]));
+        let session = DlsiteSession::from_site_cookies(BTreeMap::from([(
+            "__DLsite_SID".to_string(),
+            "abc".to_string(),
+        )]));
         let mut client = DlsiteClient::with_transport(Box::new(transport), session);
 
-        let saved = save_purchases(&pool, &mut client, None).unwrap();
-        assert_eq!(saved, 4);
+        let batch =
+            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 20).unwrap();
+        assert_eq!(batch.saved, 4);
 
         let rows = bookshelf::list(&pool, SITE_ID_DLSITE).unwrap();
         assert_eq!(rows.len(), 4);
@@ -360,5 +497,119 @@ mod tests {
         let d4 = rows.iter().find(|r| r.database_id == "RJ00000004").unwrap();
         assert_eq!(d4.media_category.as_deref(), Some("cg"));
         assert_eq!(d4.ai_type.as_deref(), Some("full"));
+    }
+
+    // ---- 分割同期（1 回で少しずつ取り込む） ---------------------------------------
+
+    /// 購入履歴 1 件分の行 HTML（画像系 = マンガ）。
+    fn manga_row(store: &str, content_id: &str) -> String {
+        row_html(
+            store,
+            content_id,
+            "タイトル",
+            r#"<span class="icon_MNG" title="マンガ">マンガ</span>"#,
+            "C1",
+            "RG1",
+        )
+    }
+
+    /// ストア × ページごとの一覧モック。各ストアは `last_page` ページまである。
+    /// 叩いた一覧 URL を記録する（メタ取得は数えない）。
+    fn paged_transport(
+        calls: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        last_page: usize,
+    ) -> MockTransport {
+        const STORE_NAMES: [&str; 4] = ["maniax", "home", "books", "ai"];
+        MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                let url = spec.url;
+                if url.contains("/product/info/ajax") {
+                    return Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![],
+                        body: b"{}".to_vec(),
+                    });
+                }
+                calls.lock().push(url.clone());
+                let store = STORE_NAMES
+                    .into_iter()
+                    .find(|s| url.contains(&format!("/{s}/mypage/userbuy/")))
+                    .unwrap_or("maniax");
+                let page: usize = url
+                    .split("/page/")
+                    .nth(1)
+                    .and_then(|p| p.trim_end_matches('/').parse().ok())
+                    .unwrap_or(1);
+                let index = STORE_NAMES.iter().position(|s| *s == store).unwrap_or(0);
+                let content_id = format!("RJ{index:02}{page:04}00");
+                let links: String = (1..=last_page)
+                    .map(|p| format!(r#"<a href="/{store}/mypage/userbuy/.../page/{p}">{p}</a>"#))
+                    .collect();
+                let html = format!(
+                    r#"<div id="buy_history_this"><table class="work_list_main"><tr class="item_name"><td>..</td></tr>{}</table><table class="global_pagination"><td class="page_no">{links}</td></table></div>"#,
+                    manga_row(store, &content_id)
+                );
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: html.into_bytes(),
+                })
+            }),
+        }
+    }
+
+    fn session() -> DlsiteSession {
+        DlsiteSession::from_site_cookies(BTreeMap::from([(
+            "__DLsite_SID".to_string(),
+            "abc".to_string(),
+        )]))
+    }
+
+    /// 分割同期: 1 回で `pages` ページだけ取り込み、続きの位置と「あと何回か」を返す。
+    /// ストアをまたいでページ優先で進むので、最初の 1 回で全ストアの最終ページが分かる。
+    #[test]
+    fn batch_takes_only_the_given_pages_and_reports_the_remaining_runs() {
+        let pool = crate::db::test_pool();
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        // 全ストア 2 ページ
+        let transport = paged_transport(calls.clone(), 2);
+        let mut client = DlsiteClient::with_transport(Box::new(transport), session());
+
+        let batch =
+            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 5).unwrap();
+        // 4 ストアの 1 ページ目 + maniax の 2 ページ目 = 5 ページ
+        assert_eq!(batch.fetched_pages, 5);
+        assert_eq!(calls.lock().len(), 5, "5 ページだけ叩く");
+        assert_eq!(batch.saved, 5);
+        let next = batch.next.expect("続きがある");
+        assert_eq!(next.page, 2);
+        assert_eq!(next.store_index, 1);
+        assert_eq!(next.last_pages, [Some(2), Some(2), Some(2), Some(2)]);
+        assert_eq!(batch.pages_left, 3);
+        assert_eq!(batch.remaining_runs, 1, "残り 3 ページ = あと 1 回");
+
+        // 続きから再開すると各ストアの 2 ページ目を取って完了する
+        let rest = save_purchases_batch(&pool, &mut client, None, next, 5).unwrap();
+        assert_eq!(rest.fetched_pages, 3);
+        assert_eq!(rest.pages_left, 0);
+        assert_eq!(rest.next, None);
+        assert_eq!(rest.remaining_runs, 0);
+        assert_eq!(calls.lock().len(), 8);
+    }
+
+    /// 各ストア 1 ページなら 1 回で完了する（続きなし・残り 0）。
+    #[test]
+    fn batch_finishes_in_one_run_when_every_store_has_a_single_page() {
+        let pool = crate::db::test_pool();
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let transport = paged_transport(calls.clone(), 1);
+        let mut client = DlsiteClient::with_transport(Box::new(transport), session());
+
+        let batch =
+            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 5).unwrap();
+        assert_eq!(batch.fetched_pages, 4, "4 ストア × 1 ページ");
+        assert_eq!(batch.pages_left, 0);
+        assert_eq!(batch.next, None);
+        assert_eq!(batch.remaining_runs, 0);
     }
 }

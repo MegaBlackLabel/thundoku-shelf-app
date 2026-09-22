@@ -54,6 +54,10 @@ impl TbfLoginView {
                 return None;
             }
         };
+        // WebView2 の生成は内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
+        // その間に他の定期タスクが App を更新すると gpui の借用と衝突して落ちるため、
+        // ここでカウンタを立てて知らせる。
+        let _pumping = crate::app_state::WebviewPumpGuard::enter();
         let webview = match builder.build(&window_handle) {
             Ok(w) => w,
             Err(e) => {
@@ -96,6 +100,10 @@ impl TbfLoginView {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
+                // WebView2 がメッセージループを回している間は更新しない（次の tick に回す）。
+                if crate::app_state::webview_pumping() > 0 {
+                    continue;
+                }
                 let Ok(done) = handle.update(cx, |this, cx| {
                     if this.check_generation != generation {
                         return true; // 新しい監視が始まっている
@@ -135,6 +143,8 @@ impl TbfLoginView {
         if !is_tbf || on_login_page {
             return false;
         }
+        // Cookie 取得も内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
+        let _pumping = crate::app_state::WebviewPumpGuard::enter();
         // セッション Cookie（XSRF-TOKEN 以外）が入っていれば成功
         let cookies = webview
             .read(cx)

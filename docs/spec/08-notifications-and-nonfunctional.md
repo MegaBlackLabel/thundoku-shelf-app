@@ -220,13 +220,12 @@
 - `receive_callback` の 300 秒タイムアウト後の見え方は、`GoogleError::Auth` が `google_login_error` に入り `google_login_done` が立つ（Workspace が認証モーダルを閉じる）ところまで。ブラウザ側のタブはアプリから閉じられない。
 - **[DLsite]** 購入履歴 1 ページあたりの実件数（コードに定数なし。`MAX_PAGES_PER_STORE` のコメントは「1 ページあたりの行数境界（実測は未確認）」だが実装は最大ページ数）。`crates/core/src/dlsite/client.rs:16-17`
 - **[DLsite]** `age_category` の実測値の全パターン（コメントは「2 以上（R18 想定）」で、2 以上を実測確認した記述はない）。`crates/core/src/dlsite/mod.rs:78-80`
-- **[DLsite]** `login.dlsite.com` 側に年齢確認・2 段階認証があるか（コードに分岐・文言が存在しないため判断不能）。`crates/app/src/views/dlsite_login.rs:106-154`
-- **[DLsite]** セッション Cookie の有効期限、および `jwt` を永続化すべきか（実装は「その 1 リクエストのみ」）。`crates/core/src/dlsite/client.rs:262-271`
+- **[DLsite]** `login.dlsite.com` 側に年齢確認・2 段階認証があるか（コードに分岐・文言が存在しないため判断不能）。`crates/app/src/views/dlsite_login.rs:112-171`
+- **[DLsite]** セッション Cookie の有効期限、および `jwt` を永続化すべきか（実装は「その 1 リクエストのみ」）。`crates/core/src/dlsite/client.rs:336-361`
 - **[DLsite]** 同期の途中キャンセル手段（実装なし）。
-- **[DLsite]** `books` フロア（`STORES` に含まれる）に `RJ` 以外の ID 接頭辞の作品が並ぶ場合の挙動（コードは `RJ\d+` 以外の行を破棄するため、行があっても採用されない）。`crates/core/src/dlsite/client.rs:359`
-- **[DLsite]** `product/info/ajax` を maniax 固定で叩いた場合に他フロア（`books` / `home` / `ai`）の ID が返る範囲（コメントは「store を跨いでも解決される」と主張するがテストは maniax/ai の ID のみ）。`crates/core/src/dlsite/client.rs:222-224`, `:196`
-- **[DLsite]** 401/403 以外でセッション切れを表す実レスポンス（302 で `regist/user` へ飛ぶケースがコメントにあるが、実装は 302 を `Http(302)` として失敗させる）。`crates/app/src/views/dlsite_login.rs:114-117`, `crates/core/src/dlsite/client.rs:326-327`
-- **[DLsite]** `dlsite.session` を平文 DB 保存としている仕様判断の根拠（`docs/account-switch.md` は pack の `owner_sub` 暗号化方針のみ記載。DLsite の記載はない）。`docs/account-switch.md:30-37`
+- **[DLsite]** `books` フロア（`STORES` に含まれる）に `RJ` 以外の ID 接頭辞の作品が並ぶ場合の挙動（コードは `RJ\d+` 以外の行を破棄するため、行があっても採用されない）。`crates/core/src/dlsite/client.rs:405`
+- **[DLsite]** `product/info/ajax` を maniax 固定で叩いた場合に他フロア（`books` / `home` / `ai`）の ID が返る範囲（コメントは「store を跨いでも解決される」と主張するがテストは maniax/ai の ID のみ）。`crates/core/src/dlsite/client.rs:263-265`, `:196`
+- **[DLsite]** 401/403 以外でセッション切れを表す実レスポンス（302 で `regist/user` へ飛ぶケースがコメントにあるが、実装は 302 を `Http(302)` として失敗させる）。`crates/app/src/views/dlsite_login.rs:124-129`, `crates/core/src/dlsite/client.rs:376-383`
 - **[DLsite]** docs（`features.md` / `import-patterns.md` / `database.md` / `account-switch.md`）に **DLsite の同期手順・ログインフロー・Cookie 名の記述は存在しない**（`DLsite`/`dlsite`/`__DLsite_SID` で grep 済み。`docs/features.md:209` の release_date、`docs/features.md:206` の日付形式、`docs/features.md:570` の実装済み項目のみ）。
 - **[DLsite]** 同期完了後に `synced_at` を用いた鮮度表示・差分スキップを将来入れる予定があるか（コード上は未使用の値を書くだけ）。
 - **[FANZA]** **セッション Cookie の実名**（`session_id` 等）。コードは全 Cookie を無差別に保存し特定名に依存しないため、コードからは列挙不能。`login_id` はテスト用モック値（`crates/core/src/fanza/client.rs:479-484`、`crates/core/src/fanza/sync.rs:194`）。
@@ -270,12 +269,12 @@
 - Drive のダウンロード方向は `HashMap` 反復順に依存するため、同一実行内では同名 pack の先勝ち（`or_insert`）だが、実行ごとの処理順は不定 [根拠: `crates/core/src/drive/sync.rs:225-231`]（推測）。
 - 復号不能な `owner_sub` を持つ行は非表示のまま残り続ける（クリーンアップ処理が存在しない） [根拠: `crates/core/src/db/books.rs:293-311` に該当行を削除する処理がなく、`crates/core/src/drive/sync.rs` にも削除処理がない]（推測）。
 - **[DLsite]** `author` の DO UPDATE 二重代入（`crates/core/src/db/bookshelf.rs:70`, `:87-90`）は SQLite の重複 SET 許容により **後勝ち**（空文字のとき既存値を残す CASE 側が有効）になる（根拠: 同ファイルのコメントが「値が無いときは既存値を保持する」と明記。SQLite の評価順を実行確認はしていない）。
-- **[DLsite]** `MAX_PAGES_PER_STORE` のコメント（「1 ページあたりの行数境界」）は古い設計の名残で、実装はページ上限（根拠: `crates/core/src/dlsite/client.rs:160` の比較が `page` に対する `>` 判定）。
-- **[DLsite]** `books` フロアを `STORES` に入れているが `RJ\d+` 正規表現しか許容しないため、`BJ` 等の接頭辞の作品は取り込まれない（根拠: `crates/core/src/dlsite/client.rs:359` の必須キャプチャ。DLsite の書店フロアの ID 形式は外部知識で、リポジトリ内に裏付けはない）。
+- **[DLsite]** `MAX_PAGES_PER_STORE` のコメント（「1 ページあたりの行数境界」）は古い設計の名残で、実装はページ上限（根拠: `crates/core/src/dlsite/client.rs:201` の比較が `page` に対する `>` 判定）。
+- **[DLsite]** `books` フロアを `STORES` に入れているが `RJ\d+` 正規表現しか許容しないため、`BJ` 等の接頭辞の作品は取り込まれない（根拠: `crates/core/src/dlsite/client.rs:405` の必須キャプチャ。DLsite の書店フロアの ID 形式は外部知識で、リポジトリ内に裏付けはない）。
 - **[DLsite]** `synced_at` は「最終同期時刻」用途で書かれており、同期間引き（差分判定）を将来入れる前提の布石（根拠: 毎回必ず上書きされ、他に DLsite の最終同期時刻を記録する箇所が無い）。
-- **[DLsite]** ログイン完了判定に `uid_jp`/`uhashjp` を要求するのは、`__DLsite_SID` が未ログインでも発行されるゲスト ID であるため（根拠: `crates/app/src/views/dlsite_login.rs:133-134` のコメント）。
+- **[DLsite]** ログイン完了判定に `uid_jp`/`uhashjp` を要求するのは、`__DLsite_SID` が未ログインでも発行されるゲスト ID であるため（根拠: `crates/app/src/views/dlsite_login.rs:149-154` のコメント）。
 - **[DLsite]** `DlsiteError::SessionExpired` は未使用のため、実際のセッション切れ通知は `Unauthorized(401/403)`（文言「不正アクセス（401）」）と app 側の `"セッション"` 文字列（`"DLsite セッションがありません"`）に依存している（根拠: `crates/core/src/dlsite/client.rs:24-25` に構築箇所なし、`crates/app/src/views/bookshelf.rs:2618` の文字列一致）。
-- **[DLsite]** `save_purchases` は `product_info` を後段でまとめて叩くため、一覧の `work_type` が空でもメタ取得に成功すれば救済される設計（根拠: `crates/core/src/dlsite/client.rs:385-393` の導出失敗＝空文字＋`crates/core/src/dlsite/sync.rs:36` の meta 優先 site_id）。
+- **[DLsite]** `save_purchases` は `product_info` を後段でまとめて叩くため、一覧の `work_type` が空でもメタ取得に成功すれば救済される設計（根拠: `crates/core/src/dlsite/client.rs:431-439` の導出失敗＝空文字＋`crates/core/src/dlsite/sync.rs:36` の meta 優先 site_id）。
 - **[FANZA]** 同期が「全件取得 → 全件 UPSERT」で削除を伴わないのは、**購入履歴が減らない前提**の設計と推測（根拠: `save_purchases` に削除処理が一切なく、`docs/database.md:77-79` が `bookshelf_items` を「同期データのスナップショット」と説明している）。
 - **[FANZA]** `is_streaming` / `is_unavailable` は**ストリーミング作品や配信終了作品を後からフィルタするための先行パース**と推測（根拠: フィールドはパースされるが使用箇所がない。`crates/core/src/fanza/client.rs:84-85`）。
 - **[FANZA]** `FanzaError::DrmProtected` は DRM 判定をコア層へ移す想定の名残で、現状は UI 側が `detail.is_drm` を見て `ImportFailure::Message("DRM 付き作品は取り込めません")` を返すと推測（根拠: `crates/app/src/views/bookshelf.rs:2804-2808` にメッセージがある）。

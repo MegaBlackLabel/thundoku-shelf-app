@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use gpui_kit::ReadGlobal as _;
 use gpui_kit::{App, Bounds, Global, Point, Size, Window, WindowBounds, px};
@@ -54,6 +54,17 @@ pub fn purge_marker(state: &AppState) -> PurgeMarker {
     PurgeMarker::new(&state.data_dir)
 }
 
+/// 購入一覧の分割同期の続き位置（ストアごと）。
+///
+/// 1 回の同期で全ページ取らず、ユーザーの操作ごとに少しずつ進める。アプリを閉じると
+/// 失われるが、取り込みは upsert なので取り直しても二重登録にはならない。
+/// ログイン・ログアウト（アカウントの切り替え）でそのストアの位置は捨てる。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncCursors {
+    pub fanza: Option<thundoku_core::fanza::sync::PurchaseCursor>,
+    pub dlsite: Option<thundoku_core::dlsite::sync::PurchaseCursor>,
+}
+
 pub struct AppState {
     pub data_dir: PathBuf,
     pub packs_dir: PathBuf,
@@ -90,6 +101,8 @@ pub struct AppState {
     pub dlsite_logged_in: Arc<Mutex<bool>>,
     /// ストアのセッション Cookie の暗号化保存（keyring の鍵が使えない環境では `None`）。
     pub session_vault: Option<SessionVault>,
+    /// 購入一覧の分割同期の続き位置（ストアごと。`SyncCursors` の説明を参照）。
+    pub sync_cursors: Arc<Mutex<SyncCursors>>,
     /// サイトのログイン完了で立てる同期要求（サイト id。`Workspace` が消費する）。
     ///
     /// ログイン直後の本棚は購入済みの一覧が空なので、手動で「同期」を押させずに
@@ -131,6 +144,44 @@ pub struct AppState {
     pub auth_open_requested: Arc<AtomicBool>,
     /// auth_open_requested 時の認証プロバイダ。
     pub auth_open_provider: Arc<Mutex<Option<crate::views::auth::AuthProvider>>>,
+}
+
+/// WebView2（メッセージループを回す API）を呼んでいる最中の数。
+///
+/// WebView2 の生成（`WebViewBuilder::build`）と Cookie 取得（`cookies_for_url`）は
+/// 内部で `webview2_com::wait_with_pump` を呼び、**Windows のメッセージループを回す**。
+/// gpui はメッセージを処理するたびに保留中の foreground タスクを実行するので、App を
+/// 借用したままこれを呼ぶと、その間に走った他タスクの `handle.update` が
+/// `RefCell already borrowed` で panic する（実測: DLsite のログインを開いた瞬間に
+/// `Workspace::start_login_done_watcher` の update が衝突して abort した）。
+///
+/// 定期タスクは tick の先頭で [`webview_pumping`] を見て、0 でなければ次の tick に回す。
+/// AppState ではなく static なのは、**借用せずに読める**ようにするため（判定のために
+/// 借用を取ること自体がこの問題の引き金なので、それでは意味がない）。
+static WEBVIEW_PUMPING: AtomicUsize = AtomicUsize::new(0);
+
+/// WebView2 を触っている最中か（カウンタ値。0 なら触っていない）。
+pub fn webview_pumping() -> usize {
+    WEBVIEW_PUMPING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// WebView2（メッセージループを回す API）を呼んでいる間だけカウンタを立てるガード。
+///
+/// 理由は [`webview_pumping`] を参照。WebView2 を触る区間の先頭で作る。
+pub struct WebviewPumpGuard;
+
+impl WebviewPumpGuard {
+    /// カウンタを立てる（Drop で戻す）。
+    pub fn enter() -> Self {
+        WEBVIEW_PUMPING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for WebviewPumpGuard {
+    fn drop(&mut self) {
+        WEBVIEW_PUMPING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Global for AppState {}
@@ -356,6 +407,7 @@ impl AppState {
             dlsite_session: Arc::new(Mutex::new(dlsite_session)),
             dlsite_logged_in: Arc::new(Mutex::new(dlsite_logged_in)),
             session_vault,
+            sync_cursors: Arc::new(Mutex::new(SyncCursors::default())),
             login_sync_requested: Arc::new(Mutex::new(None)),
             toast_message: Arc::new(Mutex::new(None)),
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
@@ -437,6 +489,7 @@ impl AppState {
             fanza_logged_in: Arc::new(Mutex::new(false)),
             dlsite_session: Arc::new(Mutex::new(None)),
             dlsite_logged_in: Arc::new(Mutex::new(false)),
+            sync_cursors: Arc::new(Mutex::new(SyncCursors::default())),
             login_sync_requested: Arc::new(Mutex::new(None)),
             toast_message: Arc::new(Mutex::new(None)),
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
@@ -797,6 +850,8 @@ pub fn save_fanza_session(cx: &App, session: &FanzaSession) {
     save_store_session(state, StoreSession::Fanza, session);
     *state.fanza_session.lock() = Some(session.clone());
     *state.fanza_logged_in.lock() = logged_in;
+    // アカウントが変わると続き位置は無意味（別アカウントの一覧を途中から取らない）
+    state.sync_cursors.lock().fanza = None;
 }
 
 /// FANZA同人 のセッションを破棄する（ログアウト）。削除に失敗したら `Err`。
@@ -804,6 +859,7 @@ pub fn clear_fanza_session(cx: &App) -> Result<(), String> {
     let state = AppState::global(cx);
     *state.fanza_session.lock() = None;
     *state.fanza_logged_in.lock() = false;
+    state.sync_cursors.lock().fanza = None;
     clear_store_session(state, StoreSession::Fanza)
 }
 
@@ -814,6 +870,8 @@ pub fn save_dlsite_session(cx: &App, session: &DlsiteSession) {
     save_store_session(state, StoreSession::Dlsite, session);
     *state.dlsite_session.lock() = Some(session.clone());
     *state.dlsite_logged_in.lock() = logged_in;
+    // アカウントが変わると続き位置は無意味（別アカウントの一覧を途中から取らない）
+    state.sync_cursors.lock().dlsite = None;
 }
 
 /// DLsite のセッションを破棄する（ログアウト）。削除に失敗したら `Err`。
@@ -821,6 +879,7 @@ pub fn clear_dlsite_session(cx: &App) -> Result<(), String> {
     let state = AppState::global(cx);
     *state.dlsite_session.lock() = None;
     *state.dlsite_logged_in.lock() = false;
+    state.sync_cursors.lock().dlsite = None;
     clear_store_session(state, StoreSession::Dlsite)
 }
 
@@ -879,6 +938,28 @@ pub fn load_window_bounds(cx: &App) -> Option<WindowBounds> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `WebviewPumpGuard` は生存中だけカウンタを立て、drop で必ず戻す。
+    ///
+    /// 戻し忘れると `webview_pumping()` が 0 に戻らず、定期タスクが**永久に**更新を
+    /// 止める（画面が固まる）。逆に立て忘れると、WebView2 がメッセージループを回して
+    /// いる間に他タスクの `update` が走って gpui の RefCell panic で落ちる
+    /// （実測: DLsite ログインを開くと `Workspace` の監視タスクが衝突した）。
+    /// 入れ子（生成中に Cookie 取得が走る）でも正しく数えることを見る。
+    #[test]
+    fn webview_pump_guard_counts_nesting_and_always_resets() {
+        assert_eq!(webview_pumping(), 0, "初期状態は 0");
+        {
+            let _outer = WebviewPumpGuard::enter();
+            assert_eq!(webview_pumping(), 1);
+            {
+                let _inner = WebviewPumpGuard::enter();
+                assert_eq!(webview_pumping(), 2, "入れ子でも数える");
+            }
+            assert_eq!(webview_pumping(), 1, "内側を落としたら 1 に戻る");
+        }
+        assert_eq!(webview_pumping(), 0, "外側を落としたら 0 に戻る");
+    }
 
     /// メモリバックエンドはプロセス内で共有されるため、`USER_GITHUB` スロットを使う
     /// テストはこの Mutex で直列化する（並列だと保存と削除が競合する）。

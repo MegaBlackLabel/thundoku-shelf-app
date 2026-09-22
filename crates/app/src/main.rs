@@ -63,6 +63,11 @@ fn main() {
                 .open(&hook_log)
             {
                 let _ = writeln!(f, "PANIC: {info}");
+                // スタックは `RUST_BACKTRACE=1` のときだけ残す（release は
+                // `strip = true` で関数名が出ないため、常用では情報が増えない）。
+                // 調査時は `CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1`
+                // でビルドしてから再現させる。
+                let _ = writeln!(f, "BACKTRACE:\n{}", std::backtrace::Backtrace::capture());
             }
         }));
         // ログファイルが開けなくてもアプリは起動を続ける（best-effort）。

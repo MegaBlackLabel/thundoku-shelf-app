@@ -7,7 +7,7 @@
 
 use crate::db::SqlitePool;
 use crate::db::bookshelf::{self, BookshelfItem};
-use crate::fanza::client::{FanzaClient, FanzaError};
+use crate::fanza::client::{FanzaClient, FanzaError, FanzaPurchase, PAGE_LIMIT};
 use crate::fanza::{ai_to_str, classify, is_viewable_included, media_to_str};
 
 pub const SITE_ID_FANZA: &str = "fanza";
@@ -46,65 +46,160 @@ pub fn full_size_thumb(url: &str) -> String {
     }
 }
 
-/// 購入済み作品のうち画像系（comic / cg）だけを `bookshelf_items(site_id='fanza')` に
-/// 保存し、保存件数を返す。除外カテゴリ（voice / game / video）は upsert しない。
+/// 1 回の分割同期で取り込むページ数（ユーザーの操作を挟んで少しずつ進める）。
+pub const PURCHASE_PAGES_PER_RUN: usize = 5;
+
+/// 分割同期の続き位置（1 始まりのページ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurchaseCursor {
+    pub page: usize,
+}
+
+impl Default for PurchaseCursor {
+    fn default() -> Self {
+        Self { page: 1 }
+    }
+}
+
+/// 1 回の分割同期の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurchaseBatch {
+    /// 取り込んだ件数（画像系のみ。upsert なので既存行の更新も含む）。
+    pub saved: usize,
+    /// 取得したページ数。
+    pub fetched_pages: usize,
+    /// 一覧の総件数（API の `total`。0 = 不明）。
+    pub total_items: usize,
+    /// 続きの位置（`None` = 完了）。
+    pub next: Option<PurchaseCursor>,
+    /// 完了までにあと何回この操作が必要か（0 = 完了）。
+    pub remaining_runs: usize,
+}
+
+/// 購入一覧を `pages` ページ分だけ取り込み、続きの位置と残り回数を返す。
 ///
-/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。書き込んだ行に所有者を付ける。
-pub fn save_purchases(
+/// 1 回で全ページ取ると、件数が多いアカウントでは 1 操作で大量のリクエストになる。
+/// ユーザーの操作を挟んで少しずつ進めるための分割版（続きは `next` を次の呼び出しに渡す）。
+/// 画像系（comic / cg）だけを upsert する（voice / game / video は保存しない）。
+/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。
+pub fn save_purchases_batch(
     pool: &SqlitePool,
     client: &mut FanzaClient,
     owner: Option<&str>,
-) -> Result<usize, FanzaError> {
-    let items = client.purchased()?;
+    cursor: PurchaseCursor,
+    pages: usize,
+) -> Result<PurchaseBatch, FanzaError> {
+    let pages = pages.max(1);
+    let mut page = cursor.page.max(1);
+    // 最後に取得したページ（続きの位置と残り回数はここから出す）
+    let mut last_fetched = page.saturating_sub(1);
+    let mut fetched_pages = 0usize;
     let mut saved = 0usize;
-    for p in items {
-        let meta = classify(&p.image_src, &p.genre);
-        if !is_viewable_included(&meta, true) {
-            continue;
+    let mut total_items = 0usize;
+    let mut has_next = false;
+    while fetched_pages < pages {
+        let purchases = client.purchased_page(page)?;
+        last_fetched = page;
+        fetched_pages += 1;
+        total_items = purchases.total;
+        has_next = purchases.has_next;
+        for p in purchases.items {
+            if save_purchase(pool, p)? {
+                saved += 1;
+            }
         }
-        let ts = now();
-        let item = BookshelfItem {
-            site_id: SITE_ID_FANZA.into(),
-            database_id: p.content_id.clone(),
-            title: p.title,
-            circle_name: p.maker_name,
-            author: String::new(),
-            thumbnail_url: Some(widen_thumb(&p.image_src)),
-            format: "ZIP".into(),
-            caused_at: p.purchase_date,
-            event_name: None,
-            event_slug: None,
-            event_id: None,
-            file_name: None,
-            download_url: None,
-            is_downloadable: 1,
-            is_checked: 0,
-            is_purchased: 1,
-            is_new: 0,
-            is_active: 1,
-            is_favorite: 0,
-            is_hidden: 0,
-            hidden_at: None,
-            tags_json: None,
-            synced_at: ts.clone(),
-            created_at: ts.clone(),
-            updated_at: ts,
-            media_category: Some(media_to_str(meta.media).into()),
-            ai_type: Some(ai_to_str(meta.ai).into()),
-            is_drm: 0,
-            release_date: None,
-            description: None,
-            theme: None,
-            maker_id: None,
-            page_count: None,
-            age_rating: None,
-            series_name: None,
-        };
-        bookshelf::upsert(pool, &item)?;
-        saved += 1;
+        // 次が無い / このページで総件数に届いたら終わり（次を叩かない）
+        if !has_next || page * PAGE_LIMIT >= total_items {
+            has_next = false;
+            break;
+        }
+        page += 1;
     }
     bookshelf::attribute_owner(pool, SITE_ID_FANZA, owner)?;
-    Ok(saved)
+    Ok(finish_batch(
+        pages,
+        last_fetched,
+        fetched_pages,
+        saved,
+        total_items,
+        has_next,
+    ))
+}
+
+/// 分割同期の結果を組み立てる（続きの位置と「あと何回か」）。
+fn finish_batch(
+    pages: usize,
+    last_page: usize,
+    fetched_pages: usize,
+    saved: usize,
+    total_items: usize,
+    has_next: bool,
+) -> PurchaseBatch {
+    let next = has_next.then(|| PurchaseCursor {
+        page: last_page + 1,
+    });
+    // 残りページ数は総件数から割り出す（API が `total` を返す）。
+    let remaining_runs = match next {
+        Some(_) => (total_items.div_ceil(PAGE_LIMIT).saturating_sub(last_page))
+            .div_ceil(pages)
+            .max(1),
+        None => 0,
+    };
+    PurchaseBatch {
+        saved,
+        fetched_pages,
+        total_items,
+        next,
+        remaining_runs,
+    }
+}
+
+/// 購入 1 件を本棚へ upsert する（画像系以外は保存しない）。保存したら `true`。
+fn save_purchase(pool: &SqlitePool, p: FanzaPurchase) -> Result<bool, FanzaError> {
+    let meta = classify(&p.image_src, &p.genre);
+    if !is_viewable_included(&meta, true) {
+        return Ok(false);
+    }
+    let ts = now();
+    let item = BookshelfItem {
+        site_id: SITE_ID_FANZA.into(),
+        database_id: p.content_id.clone(),
+        title: p.title,
+        circle_name: p.maker_name,
+        author: String::new(),
+        thumbnail_url: Some(widen_thumb(&p.image_src)),
+        format: "ZIP".into(),
+        caused_at: p.purchase_date,
+        event_name: None,
+        event_slug: None,
+        event_id: None,
+        file_name: None,
+        download_url: None,
+        is_downloadable: 1,
+        is_checked: 0,
+        is_purchased: 1,
+        is_new: 0,
+        is_active: 1,
+        is_favorite: 0,
+        is_hidden: 0,
+        hidden_at: None,
+        tags_json: None,
+        synced_at: ts.clone(),
+        created_at: ts.clone(),
+        updated_at: ts,
+        media_category: Some(media_to_str(meta.media).into()),
+        ai_type: Some(ai_to_str(meta.ai).into()),
+        is_drm: 0,
+        release_date: None,
+        description: None,
+        theme: None,
+        maker_id: None,
+        page_count: None,
+        age_rating: None,
+        series_name: None,
+    };
+    bookshelf::upsert(pool, &item)?;
+    Ok(true)
 }
 
 /// 1 回の実行で取る未取得タグの件数（同期のたびに少しずつ進める）。
@@ -175,7 +270,7 @@ mod tests {
     use crate::tbf::TbfError;
     use crate::tbf::transport::{RequestSpec, ResponseSpec};
     use serde_json::Value;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     #[test]
     fn widen_thumb_uses_the_larger_listing_variant() {
@@ -222,10 +317,18 @@ mod tests {
         serde_json::to_vec(&v).unwrap()
     }
 
-    fn page_json(items: Vec<Value>) -> Value {
+    /// 1 ページ分の一覧応答（`total` / `hasNext` を指定できる）。
+    fn page_json_with(items: Vec<Value>, total: usize, has_next: bool) -> Value {
         let mut m = serde_json::Map::new();
         m.insert("2026年09月03日".into(), Value::Array(items));
-        serde_json::json!({ "error_code": 0, "data": { "items": m, "total": 6, "hasNext": false } })
+        serde_json::json!({
+            "error_code": 0,
+            "data": { "items": m, "total": total, "hasNext": has_next }
+        })
+    }
+
+    fn page_json(items: Vec<Value>) -> Value {
+        page_json_with(items, 6, false)
     }
 
     fn purchase(content: &str, genre: &str, image_path: &str) -> Value {
@@ -259,11 +362,15 @@ mod tests {
                 })
             }),
         };
-        let session = FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]));
+        let session = FanzaSession::from_site_cookies(BTreeMap::from([(
+            "login_id".to_string(),
+            "abc".to_string(),
+        )]));
         let mut client = FanzaClient::with_transport(Box::new(transport), session);
 
-        let saved = save_purchases(&pool, &mut client, None).unwrap();
-        assert_eq!(saved, 3);
+        let batch =
+            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 20).unwrap();
+        assert_eq!(batch.saved, 3);
 
         let rows = bookshelf::list(&pool, SITE_ID_FANZA).unwrap();
         assert_eq!(rows.len(), 3);
@@ -284,6 +391,80 @@ mod tests {
         let d1 = rows.iter().find(|r| r.database_id == "d_1").unwrap();
         assert_eq!(d1.media_category.as_deref(), Some("comic"));
         assert_eq!(d1.ai_type.as_deref(), Some("none"));
+    }
+
+    // ---- 分割同期（1 回で少しずつ取り込む） ---------------------------------------
+
+    /// ページ番号で応答が変わる一覧モック。叩いた URL を記録する。
+    fn paged_transport(
+        calls: Arc<parking_lot::Mutex<Vec<String>>>,
+        total: usize,
+        last_page: usize,
+    ) -> MockTransport {
+        MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                calls.lock().push(spec.url.clone());
+                let page: usize = spec
+                    .url
+                    .split("page=")
+                    .nth(1)
+                    .and_then(|rest| rest.split('&').next())
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(1);
+                let items = vec![purchase(&format!("d_{page}"), "コミック", "comic")];
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: json_body(page_json_with(items, total, page < last_page)),
+                })
+            }),
+        }
+    }
+
+    /// 分割同期: 1 回で `pages` ページだけ取り込み、続きの位置と「あと何回か」を返す。
+    #[test]
+    fn batch_takes_only_the_given_pages_and_reports_the_remaining_runs() {
+        let pool = crate::db::test_pool();
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        // 50 件 / 1 ページ 20 件 = 3 ページ
+        let transport = paged_transport(calls.clone(), 50, 3);
+        let mut client = FanzaClient::with_transport(Box::new(transport), session());
+
+        let batch =
+            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 2).unwrap();
+        assert_eq!(batch.fetched_pages, 2, "指定した 2 ページだけ取る");
+        assert_eq!(batch.saved, 2);
+        assert_eq!(batch.total_items, 50);
+        assert_eq!(batch.next, Some(PurchaseCursor { page: 3 }));
+        assert_eq!(batch.remaining_runs, 1, "残り 1 ページ = あと 1 回");
+        assert_eq!(calls.lock().len(), 2);
+
+        // 続きから再開すると 3 ページ目から取り、最後のページで打ち切る
+        let rest = save_purchases_batch(&pool, &mut client, None, batch.next.unwrap(), 2).unwrap();
+        assert_eq!(rest.fetched_pages, 1);
+        assert_eq!(rest.next, None);
+        assert_eq!(rest.remaining_runs, 0);
+        let urls = calls.lock().clone();
+        assert!(
+            urls[2].contains("page=3"),
+            "続きは 3 ページ目から: {}",
+            urls[2]
+        );
+    }
+
+    /// 最後のページまで来たら続きは無い（残り回数 0）。
+    #[test]
+    fn batch_stops_at_the_last_page_without_remaining_runs() {
+        let pool = crate::db::test_pool();
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let transport = paged_transport(calls.clone(), 20, 1);
+        let mut client = FanzaClient::with_transport(Box::new(transport), session());
+
+        let batch =
+            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 5).unwrap();
+        assert_eq!(batch.fetched_pages, 1);
+        assert_eq!(batch.next, None);
+        assert_eq!(batch.remaining_runs, 0);
     }
 
     // ---- 未取得タグの遅延取得（1 回の同期で少しずつ） ----------------------------
@@ -307,9 +488,19 @@ mod tests {
                 })
             }),
         };
-        let session = FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]));
+        let session = FanzaSession::from_site_cookies(BTreeMap::from([(
+            "login_id".to_string(),
+            "abc".to_string(),
+        )]));
         let mut client = FanzaClient::with_transport(Box::new(transport), session);
-        save_purchases(pool, &mut client, None).unwrap();
+        save_purchases_batch(
+            pool,
+            &mut client,
+            None,
+            PurchaseCursor::default(),
+            PURCHASE_PAGES_PER_RUN,
+        )
+        .unwrap();
     }
 
     /// 商品ページ（`genreTag__txt` 入り HTML）を返す。叩かれた回数を数える。
@@ -348,7 +539,10 @@ mod tests {
     }
 
     fn session() -> FanzaSession {
-        FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]))
+        FanzaSession::from_site_cookies(BTreeMap::from([(
+            "login_id".to_string(),
+            "abc".to_string(),
+        )]))
     }
 
     /// 保存済みのタグと取得済みフラグ。

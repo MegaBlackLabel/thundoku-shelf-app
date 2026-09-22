@@ -30,10 +30,27 @@ JSON バックアップから復元でき、改変したバックアップを復
 
 | ストア | site_id | 同期エントリポイント | 取得対象 | ログイン方式 | セッション保存先 / 保護 | 差分判定 |
 |---|---|---|---|---|---|---|
-| DLsite | `"dlsite"` `crates/core/src/dlsite/sync.rs:13` | `dlsite::sync::save_purchases` `crates/core/src/dlsite/sync.rs:23`（アプリ側は `BookshelfView::sync_dlsite` `crates/app/src/views/bookshelf.rs:2557`） | 購入済み一覧。走査フロア `["maniax","home","books","ai"]` `crates/core/src/dlsite/client.rs:15`、`RJ\d+` のみ採用 | アプリ内 WebView（DLsite ログイン → `www` + `login` の Cookie 収集）`crates/app/src/views/dlsite_login.rs:114-146` | `app_settings["dlsite.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:439-441` | なし（毎回 全ストア × 全ページ + 全件 UPSERT、削除なし）`crates/core/src/dlsite/sync.rs:23-100` |
-| FANZA同人 | `"fanza"` `crates/core/src/fanza/sync.rs:13` | `fanza::sync::save_purchases` `crates/core/src/fanza/sync.rs:51` | mylibrary API。`PAGE_LIMIT = 20` 件/ページ `crates/core/src/fanza/client.rs:17`、安全弁 2000 件 `:212` | アプリ内 WebView（購入済み作品ページ → 年齢確認）`crates/app/src/views/fanza_login.rs:3` | `app_settings["fanza.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:419-421` | なし（全件 UPSERT）`crates/core/src/fanza/sync.rs:52-100` |
+| DLsite | `"dlsite"` `crates/core/src/dlsite/sync.rs:13` | `dlsite::sync::save_purchases_batch` `crates/core/src/dlsite/sync.rs:94`（アプリ側は `BookshelfView::sync_dlsite` `crates/app/src/views/bookshelf.rs`） | 購入済み一覧。走査フロア `["maniax","home","books","ai"]` `crates/core/src/dlsite/client.rs:15`、`RJ\d+` のみ採用。1 ページ = `purchased_page(store, page)` `crates/core/src/dlsite/client.rs:213` | アプリ内 WebView（DLsite ログイン → `www` + `login` の Cookie 収集）`crates/app/src/views/dlsite_login.rs:114-146` | `app_settings["dlsite.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:439-441` | なし（1 回 = 5 ページずつ取り込み、続きはカーソルに持ち越す。全件 UPSERT、削除なし）`crates/core/src/dlsite/sync.rs:94-163` |
+| FANZA同人 | `"fanza"` `crates/core/src/fanza/sync.rs:13` | `fanza::sync::save_purchases_batch` `crates/core/src/fanza/sync.rs:85` | mylibrary API。`PAGE_LIMIT = 20` 件/ページ `crates/core/src/fanza/client.rs:17`。1 ページ = `purchased_page(page)` `crates/core/src/fanza/client.rs:249`（安全弁だった 2000 件の一括取得は廃止） | アプリ内 WebView（購入済み作品ページ → 年齢確認）`crates/app/src/views/fanza_login.rs:3` | `app_settings["fanza.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:419-421` | なし（1 回 = 5 ページずつ取り込み、続きはカーソルに持ち越す。全件 UPSERT）`crates/core/src/fanza/sync.rs:85-150` |
 | BOOTH | `"booth"` 固定 `crates/app/src/views/bookshelf.rs:2341` | **core に同期エンジンが無くアプリ層** `BookshelfView::sync_booth` `crates/app/src/views/bookshelf.rs:2253` | `BoothClient::library()`（`accounts.booth.pm/library`）と `BoothClient::orders()`（`accounts.booth.pm/orders`）`crates/core/src/booth.rs:200`, `:266` | アプリ内 WebView（incognito）+ 1 秒間隔の URL 監視 `crates/app/src/views/booth_login.rs:46`, `:83` | `app_settings["booth.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:394-396` | 全件 UPSERT + 集合差 DELETE 3 種 `crates/app/src/views/bookshelf.rs:2383-2430` |
 | 技術書典 | `"techbookfest"` `crates/core/src/tbf/mod.rs:22` | `tbf::sync::save_bookshelf` `crates/core/src/tbf/sync.rs:70` / `save_events` `:130` / `refresh_checklist` `:244` | GraphQL。本棚・チェックリスト・イベント。`first: 100` + `endCursor` カーソル `crates/core/src/tbf/mod.rs:289-327` | アプリ内 WebView（`techbookfest.org/user/signin`）+ 1 秒間隔の URL 監視 | **OS keyring**（`techbookfest`）に `TbfSession` JSON `crates/core/src/secrets.rs:10` | `refresh_checklist` が `SyncPollOutcome.changed` を返す `crates/core/src/tbf/sync.rs:211-244` |
+
+### 7.0.1 購入一覧の分割同期（FANZA / DLsite 共通）
+
+購入一覧は**1 回の同期で全ページ取り切らない**。1 回 = `PURCHASE_PAGES_PER_RUN`（= 5）ページ
+だけ取り込み、続きの位置（カーソル）を返す（`crates/core/src/fanza/sync.rs:50`、
+`crates/core/src/dlsite/sync.rs:22`）。
+
+| 項目 | 事実 | アンカー |
+|---|---|---|
+| コア API（FANZA） | `save_purchases_batch(pool, client, owner, cursor, pages) -> Result<PurchaseBatch, FanzaError>`。`PurchaseBatch` = `saved` / `fetched_pages` / `total_items` / `next` / `remaining_runs` | `crates/core/src/fanza/sync.rs:85`, `:66` |
+| コア API（DLsite） | `save_purchases_batch(pool, client, owner, cursor, pages) -> Result<PurchaseBatch, DlsiteError>`。`PurchaseBatch` = `saved` / `fetched_pages` / `pages_left` / `next` / `remaining_runs` | `crates/core/src/dlsite/sync.rs:94`, `:75` |
+| ページ取得 | FANZA `purchased_page(page) -> PurchasesPage{items,total,has_next}` `crates/core/src/fanza/client.rs:249`、DLsite `purchased_page(store, page) -> DlsitePurchasesPage{items,last_page}` `crates/core/src/dlsite/client.rs:213`。**全ページ版 `purchased()` は廃止** | 左記 |
+| 残り回数の算出 | FANZA = 一覧 API の `total` から総ページ数を出して割る。DLsite = 各ストアの最終ページ番号（ページャ由来）から残りページを出して割る（未取得のストアは数えないので最低 1 回に丸める） | `crates/core/src/fanza/sync.rs:119-147`, `crates/core/src/dlsite/sync.rs:49-72` |
+| DLsite の走査順 | ストアをまたいで**ページ優先**（全ストアの 1 ページ目 → 2 ページ目…）。最初の 1 回で全ストアの最終ページが分かるので、その時点で残り回数を出せる | `crates/core/src/dlsite/sync.rs:100-140` |
+| カーソル | app の `AppState.sync_cursors`（`SyncCursors`）にメモリ上で持つ。ログイン・ログアウト（`save_*_session` / `clear_*_session`）でそのストアの位置を破棄する。アプリを閉じると失われるが、取り込みは upsert なので二重登録にはならない | `crates/app/src/app_state.rs:63`, `:105` |
+| UI（続きの通知） | 続きがあるときはダイアログ（見出し「購入一覧を取り込みました」、本文 `sync_notice_message`）で「あと何回で完了するか」を知らせる。「続きを取り込む」（`continue_sync`、debug selector `sync-notice-continue`）で同じサイトをもう一度同期し、「閉じる」（`dismiss_sync_notice`、`sync-notice-close`）で中断する。全部取り切ったら従来どおりトースト「〈サイト〉 サイトから N 件取得しました」 | `crates/app/src/views/bookshelf.rs:1524`, `:1538`, `:3155`, `:3176`, `:8236`, `:8222` |
+| テスト | コア: 1 回で指定ページだけ取り込み続きと残り回数を返す / 最後のページで完了する / 続きは前回の位置から。app: 通知文とダイアログの「閉じる」「続きを取り込む」 | `crates/core/src/fanza/sync.rs:347-415`, `crates/core/src/dlsite/sync.rs:452-564`, `crates/app/src/views/bookshelf.rs:11682-11777` |
 
 ### 7.1 DLsite
 
@@ -57,16 +74,16 @@ JSON バックアップから復元でき、改変したバックアップを復
 | 項目 | 事実 | アンカー |
 |---|---|---|
 | 公開定数 | `pub const SITE_ID_DLSITE: &str = "dlsite";` | `crates/core/src/dlsite/sync.rs:13` |
-| エントリ関数 | `pub fn save_purchases(pool: &SqlitePool, client: &mut DlsiteClient) -> Result<usize, DlsiteError>` | `crates/core/src/dlsite/sync.rs:23` |
-| 戻り値 | upsert に成功した **保存件数**（`usize`）。除外カテゴリは含まない | `crates/core/src/dlsite/sync.rs:97-99` |
+| エントリ関数 | `pub fn save_purchases_batch(pool: &SqlitePool, client: &mut DlsiteClient, owner: Option<&str>, cursor: PurchaseCursor, pages: usize) -> Result<PurchaseBatch, DlsiteError>`（1 回 = `PURCHASE_PAGES_PER_RUN` ページ。§7.0.1） | `crates/core/src/dlsite/sync.rs:94` |
+| 戻り値 | `PurchaseBatch`（`saved` / `fetched_pages` / `pages_left` / `next` / `remaining_runs`）。`saved` は upsert した件数で、除外カテゴリは含まない | `crates/core/src/dlsite/sync.rs:75`, `:157-162` |
 | 時刻ヘルパ | `fn now() -> String` = `chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")`（**UTC**、ローカル時刻ではない） | `crates/core/src/dlsite/sync.rs:15-17` |
-| クライアント生成 | `DlsiteClient::with_transport(Box<dyn Transport>, DlsiteSession)` | `crates/core/src/dlsite/client.rs:117-119` |
-| app 側の呼び出し元 | `BookshelfView::sync_dlsite`（`pub fn sync_dlsite(&mut self, cx: &mut Context<Self>)`）→ `std::thread::spawn` → `thundoku_core::dlsite::sync::save_purchases(&db, &mut client)` | `crates/app/src/views/bookshelf.rs:2557`, `:2581`, `:2586` |
-| 実行スレッド | 専用 `std::thread` 1 本（UI 非ブロック）。結果は `std::sync::mpsc::channel::<Result<usize, String>>()` で返す | `crates/app/src/views/bookshelf.rs:2580-2589` |
+| クライアント生成 | `DlsiteClient::with_transport(Box<dyn Transport>, DlsiteSession)` | `crates/core/src/dlsite/client.rs:158-160` |
+| app 側の呼び出し元 | `BookshelfView::sync_dlsite`（`pub fn sync_dlsite(&mut self, cx: &mut Context<Self>)`）→ `std::thread::spawn` → `thundoku_core::dlsite::sync::save_purchases_batch(&db, &mut client, owner, cursor, PURCHASE_PAGES_PER_RUN)` | `crates/app/src/views/bookshelf.rs:3622`, `:3658` |
+| 実行スレッド | 専用 `std::thread` 1 本（UI 非ブロック）。結果は `std::sync::mpsc::channel::<Result<PurchaseBatch, String>>()` で返す。続きの位置は同期の開始時に `AppState.sync_cursors` から読む | `crates/app/src/views/bookshelf.rs:3647`, `:3650-3652` |
 
-#### 1.2 番号付き処理手順（`save_purchases` 本体）
+#### 1.2 番号付き処理手順（`save_purchases_batch` 本体）
 
-1. `client.purchased()?` で購入済み一覧を **全ストア・全ページ** 取得（`?` なので失敗＝即 `Err`、部分結果は返らない）。`crates/core/src/dlsite/sync.rs:24`
+1. `client.purchased_page(store, page)?` を、ストアをまたいでページ優先で最大 `pages`（= `PURCHASE_PAGES_PER_RUN`）回呼ぶ（`?` なので失敗＝即 `Err`、部分結果は返らない）。各ページの `last_page`（ページャ由来）を控え、全ストアの最終ページが分かった時点で残りページから `remaining_runs` を出す。`crates/core/src/dlsite/sync.rs:100-140`
 2. 一覧の `content_id` を `Vec<&str>` に集める。`crates/core/src/dlsite/sync.rs:26`
 3. `client.product_info(&ids).unwrap_or_default()` でリッチメタを **一括取得**。エラーは空 `HashMap` に潰して続行（ベストエフォート）。`crates/core/src/dlsite/sync.rs:27`
 4. 各作品 `p` について `meta = metas.get(&p.content_id)`（`Option`）。`crates/core/src/dlsite/sync.rs:29-30`
@@ -85,31 +102,31 @@ JSON バックアップから復元でき、改変したバックアップを復
 #### 1.3 `purchased()`（一覧取得）の詳細
 
 - 走査対象ストアフロア: `pub const STORES: [&str; 4] = ["maniax", "home", "books", "ai"];`（`soft` / `app` は対象外とコメント）。`crates/core/src/dlsite/client.rs:15`
-- リクエスト: `GET https://www.dlsite.com/{store}/mypage/userbuy/=/type/all/start/all/sort/1/order/1/page/{page}`（`type/all` / `start/all` / `sort/1` / `order/1`、ページは 1 始まり）。`crates/core/src/dlsite/client.rs:163-165`
-- `page` は 1 から開始、ストアごとにリセット。`crates/core/src/dlsite/client.rs:158`
+- リクエスト: `GET https://www.dlsite.com/{store}/mypage/userbuy/=/type/all/start/all/sort/1/order/1/page/{page}`（`type/all` / `start/all` / `sort/1` / `order/1`、ページは 1 始まり）。`crates/core/src/dlsite/client.rs:204-206`
+- `page` は 1 から開始、ストアごとにリセット。`crates/core/src/dlsite/client.rs:199`
 - 終了条件（この順に評価）:
-  1. `page > MAX_PAGES_PER_STORE`（= 200）→ break（**取得前**チェック）。`crates/core/src/dlsite/client.rs:160-162`
-  2. そのページの行が 0 件 → break（フォールバック打ち切り）。`crates/core/src/dlsite/client.rs:174-176`
-  3. `parse_last_page` が返した最大ページ番号 `last` に対し `page >= lp` → break。`crates/core/src/dlsite/client.rs:177-181`
-  4. それ以外は `page += 1` で継続（上限なしの無限ページングは 1. が抑止）。`crates/core/src/dlsite/client.rs:182`
-- 総件数取得: **専用 API なし**。終端は「HTML 内の `/page/(\d+)` の最大値」と「行 0 件」で判定。`crates/core/src/dlsite/client.rs:445-451`
-- 重複排除: 全ストア横断で `HashSet<String>` に `content_id` を入れ、**初出のみ**採用（`STORES` の並び順＝ maniax が優先）。`crates/core/src/dlsite/client.rs:156`, `:169-173`
-- 取得失敗時: `get_html` の `?` で即 `Err`（1 ページでも失敗すると全体失敗、部分結果は返らない）。`crates/core/src/dlsite/client.rs:166`
+  1. `page > MAX_PAGES_PER_STORE`（= 200）→ break（**取得前**チェック）。`crates/core/src/dlsite/client.rs:201-203`
+  2. そのページの行が 0 件 → break（フォールバック打ち切り）。`crates/core/src/dlsite/client.rs:215-217`
+  3. `parse_last_page` が返した最大ページ番号 `last` に対し `page >= lp` → break。`crates/core/src/dlsite/client.rs:218-222`
+  4. それ以外は `page += 1` で継続（上限なしの無限ページングは 1. が抑止）。`crates/core/src/dlsite/client.rs:223`
+- 総件数取得: **専用 API なし**。終端は「HTML 内の `/page/(\d+)` の最大値」と「行 0 件」で判定。`crates/core/src/dlsite/client.rs:491-497`
+- 重複排除: 全ストア横断で `HashSet<String>` に `content_id` を入れ、**初出のみ**採用（`STORES` の並び順＝ maniax が優先）。`crates/core/src/dlsite/client.rs:197`, `:169-173`
+- 取得失敗時: `get_html` の `?` で即 `Err`（1 ページでも失敗すると全体失敗、部分結果は返らない）。`crates/core/src/dlsite/client.rs:207`
 - 1 ページあたりの件数: コード上の明示定数 **なし**（`MAX_PAGES_PER_STORE` のコメントは「1 ページあたりの行数境界」だが実際は最大ページ数として使用）。`crates/core/src/dlsite/client.rs:16-17`
-- HTTP ヘッダ（HTML 取得 = `cookie_headers()`）: `Cookie` / `User-Agent` / `Referer: https://www.dlsite.com/` / `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: same-origin` / `Upgrade-Insecure-Requests: 1`。`crates/core/src/dlsite/client.rs:121-138`
+- HTTP ヘッダ（HTML 取得 = `cookie_headers()`）: `Cookie` / `User-Agent` / `Referer: https://www.dlsite.com/` / `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: same-origin` / `Upgrade-Insecure-Requests: 1`。`crates/core/src/dlsite/client.rs:162-179`
 - User-Agent 実値（1 行定数）: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36`。`crates/core/src/dlsite/client.rs:20`
-- メソッドは GET、ボディは `None`、`redirects: 3`。`crates/core/src/dlsite/client.rs:313-321`
+- メソッドは GET、ボディは `None`、`redirects: 3`。`crates/core/src/dlsite/client.rs:355-367`
 
 #### 1.4 `product_info()`（作品メタ）の詳細
 
-- シグネチャ: `pub fn product_info(&mut self, ids: &[&str]) -> Result<HashMap<String, DlsiteWorkMeta>, DlsiteError>`。`crates/core/src/dlsite/client.rs:189-192`
-- チャンク: `ids.chunks(20)` = **20 件/リクエスト**、`product_id` クエリにカンマ区切りで連結。`crates/core/src/dlsite/client.rs:194-197`
-- URL: `GET https://www.dlsite.com/maniax/product/info/ajax?product_id={joined}`（**ストアは maniax 固定**。作品 ID はフロアを跨いで解決されるとのコメント）。`crates/core/src/dlsite/client.rs:196-197`
-- ヘッダ: `ajax_headers()` = `cookie_headers()` の `Accept` を `application/json` に置換し `X-Requested-With: XMLHttpRequest` を追加。`crates/core/src/dlsite/client.rs:140-147`
-- メソッド GET / body `None` / `redirects: 3`。`crates/core/src/dlsite/client.rs:200-205`
-- ステータス判定: `401|403` → `DlsiteError::Unauthorized(status)`、`200` 以外 → `DlsiteError::Http(status)`、200 → `String::from_utf8_lossy` で JSON 化。`crates/core/src/dlsite/client.rs:208-215`
-- レスポンス JSON のキー = 作品 ID、値オブジェクトのフィールド: `site_id` / `work_type` / `maker_id` / `work_name` / `regist_date` / `price`(i64) / `down_url` / `custom_genres`(文字列配列) / `options` / `age_category`(i64) / `title_name` / `work_image`。`crates/core/src/dlsite/client.rs:419-441`
-- JSON パース失敗時は `Value::Null` 扱い＝ **空マップ**（エラーにしない）。`crates/core/src/dlsite/client.rs:420-421`
+- シグネチャ: `pub fn product_info(&mut self, ids: &[&str]) -> Result<HashMap<String, DlsiteWorkMeta>, DlsiteError>`。`crates/core/src/dlsite/client.rs:230-233`
+- チャンク: `ids.chunks(20)` = **20 件/リクエスト**、`product_id` クエリにカンマ区切りで連結。`crates/core/src/dlsite/client.rs:235-238`
+- URL: `GET https://www.dlsite.com/maniax/product/info/ajax?product_id={joined}`（**ストアは maniax 固定**。作品 ID はフロアを跨いで解決されるとのコメント）。`crates/core/src/dlsite/client.rs:237-238`
+- ヘッダ: `ajax_headers()` = `cookie_headers()` の `Accept` を `application/json` に置換し `X-Requested-With: XMLHttpRequest` を追加。`crates/core/src/dlsite/client.rs:181-188`
+- メソッド GET / body `None` / `redirects: 3`。`crates/core/src/dlsite/client.rs:241-246`
+- ステータス判定: `401|403` → `DlsiteError::Unauthorized(status)`、`200` 以外 → `DlsiteError::Http(status)`、200 → `String::from_utf8_lossy` で JSON 化。`crates/core/src/dlsite/client.rs:249-256`
+- レスポンス JSON のキー = 作品 ID、値オブジェクトのフィールド: `site_id` / `work_type` / `maker_id` / `work_name` / `regist_date` / `price`(i64) / `down_url` / `custom_genres`(文字列配列) / `options` / `age_category`(i64) / `title_name` / `work_image`。`crates/core/src/dlsite/client.rs:465-487`
+- JSON パース失敗時は `Value::Null` 扱い＝ **空マップ**（エラーにしない）。`crates/core/src/dlsite/client.rs:466-467`
 
 #### 1.5 `bookshelf::upsert` へ渡す値（DLsite 固定値つき）
 
@@ -159,22 +176,22 @@ JSON バックアップから復元でき、改変したバックアップを復
 
 #### 1.7 差分判定・ハッシュ・更新日時
 
-- **差分判定は存在しない**。毎回「全ストア × 全ページ取得 → 画像系全件 upsert」のフル同期（比較キー・ハッシュ・`If-Modified-Since` 等の実装なし）。`crates/core/src/dlsite/client.rs:152-185`, `crates/core/src/dlsite/sync.rs:23-100`
+- **差分判定は存在しない**。毎回「全ストア × 全ページ取得 → 画像系全件 upsert」のフル同期（比較キー・ハッシュ・`If-Modified-Since` 等の実装なし）。`crates/core/src/dlsite/client.rs:193-226`, `crates/core/src/dlsite/sync.rs:23-100`
 - 結果として毎回 `synced_at` と `updated_at` が現在 UTC 時刻で書き換わる。`crates/core/src/dlsite/sync.rs:83-85`
-- 購入履歴の HTML には 1 行ごとに購入日時（`class="buy_date"`、例 `2026/05/04 17:03`）があり、`causedAt` にそのまま入る（DLsite の日付形式は `YYYY/MM/DD` と docs に記載）。`crates/core/src/dlsite/client.rs:365`, `docs/features.md:206`
+- 購入履歴の HTML には 1 行ごとに購入日時（`class="buy_date"`、例 `2026/05/04 17:03`）があり、`causedAt` にそのまま入る（DLsite の日付形式は `YYYY/MM/DD` と docs に記載）。`crates/core/src/dlsite/client.rs:411`, `docs/features.md:206`
 
 #### 1.8 エラー時の挙動 / キャンセル
 
 | 事象 | 挙動 | アンカー |
 |---|---|---|
-| HTTP 401 / 403（一覧・メタ・DL・CDN） | `DlsiteError::Unauthorized(u16)`（表示文言 `不正アクセス（{status}）`） | `crates/core/src/dlsite/client.rs:208-209`, `:255-256`, `:297-298`, `:323-324` |
-| HTTP 200 以外 | `DlsiteError::Http(u16)`（表示 `HTTP {status}`） | `crates/core/src/dlsite/client.rs:211-212`, `:300-301`, `:326-327` |
-| 302 応答に `location` なし | `DlsiteError::Parse("302 応答に location がありません")` | `crates/core/src/dlsite/client.rs:250-254` |
-| DL で 404 / 410 | `DlsiteError::NotDownloadable`（販売終了・未購入等） | `crates/core/src/dlsite/client.rs:257-258` |
+| HTTP 401 / 403（一覧・メタ・DL・CDN） | `DlsiteError::Unauthorized(u16)`（表示文言 `不正アクセス（{status}）`） | `crates/core/src/dlsite/client.rs:249-250`, `:255-256`, `:297-298`, `:323-324` |
+| HTTP 200 以外 | `DlsiteError::Http(u16)`（表示 `HTTP {status}`） | `crates/core/src/dlsite/client.rs:252-253`, `:300-301`, `:326-327` |
+| 302 応答に `location` なし | `DlsiteError::Parse("302 応答に location がありません")` | `crates/core/src/dlsite/client.rs:291-295` |
+| DL で 404 / 410 | `DlsiteError::NotDownloadable`（販売終了・未購入等） | `crates/core/src/dlsite/client.rs:298-299` |
 | DL 応答が `<!doctype` / `<html` 始まり | `DlsiteError::Parse("HTML レスポンス（ファイルではない）")` | `crates/core/src/dlsite/client.rs:303-306` |
-| JSON パース失敗（メタ） | エラーにしない（空マップ） | `crates/core/src/dlsite/client.rs:420-421` |
+| JSON パース失敗（メタ） | エラーにしない（空マップ） | `crates/core/src/dlsite/client.rs:466-467` |
 | `serde_json::Error` | `DlsiteError::Parse(msg)` へ変換 | `crates/core/src/dlsite/client.rs:40-43` |
-| ネットワーク | `TbfError` → `DlsiteError::Transport` | `crates/core/src/dlsite/client.rs:207`, `:249`, `:295`, `:322` |
+| ネットワーク | `TbfError` → `DlsiteError::Transport` | `crates/core/src/dlsite/client.rs:248`, `:249`, `:295`, `:322` |
 | DB | `sqlx::Error` → `DlsiteError::Database` | `crates/core/src/dlsite/client.rs:34-35` |
 | `DlsiteError::SessionExpired` | **宣言のみで未使用**（構築箇所なし。401/403 は `Unauthorized` になる） | `crates/core/src/dlsite/client.rs:24-25` |
 | app 側の失敗表示 | `Err(String)` をトースト（`ToastKind::Error`）に表示し、メッセージに `"not logged in"` か `"セッション"` を含むときだけログインモーダルを開く | `crates/app/src/views/bookshelf.rs:2615-2624` |
@@ -193,49 +210,49 @@ JSON バックアップから復元でき、改変したバックアップを復
 | 関数 / 要素 | 役割 | アンカー |
 |---|---|---|
 | `AuthProvider::Dlsite` | 設定／本棚からログインモーダルを開くアクション | `crates/app/src/views/auth.rs:104` |
-| `DlsiteLoginView::new(window, cx)` | WebView 生成 → 監視タスク開始 | `crates/app/src/views/dlsite_login.rs:29-37` |
-| `try_create_webview(window, cx) -> Option<Entity<WebView>>` | `lb_wry::WebViewBuilder` で WebView を作り、初期 URL を読み込む | `crates/app/src/views/dlsite_login.rs:39-74` |
-| `start_url_check(&mut self, cx)` | 1 秒間隔の URL 監視ループを `cx.spawn`（`detach`） | `crates/app/src/views/dlsite_login.rs:76-103` |
-| `check_login(&mut self, cx) -> bool` | Cookie 収集・認証判定・永続化・`DlsiteLoginDone` 発行 | `crates/app/src/views/dlsite_login.rs:106-154` |
-| `show` / `close` | モーダル表示／非表示（`check_generation` を増やして旧監視ループを無効化）、`close` は `DlsiteLoginCancelled` を発行 | `crates/app/src/views/dlsite_login.rs:164-169`, `:238-239` |
+| `DlsiteLoginView::new(window, cx)` | WebView 生成 → 監視タスク開始 | `crates/app/src/views/dlsite_login.rs:35-43` |
+| `try_create_webview(window, cx) -> Option<Entity<WebView>>` | `lb_wry::WebViewBuilder` で WebView を作り、初期 URL を読み込む | `crates/app/src/views/dlsite_login.rs:45-80` |
+| `start_url_check(&mut self, cx)` | 1 秒間隔の URL 監視ループを `cx.spawn`（`detach`） | `crates/app/src/views/dlsite_login.rs:82-109` |
+| `check_login(&mut self, cx) -> bool` | Cookie 収集（収集元ホスト別）・認証判定・永続化・`DlsiteLoginDone` 発行 | `crates/app/src/views/dlsite_login.rs:112-171` |
+| `show` / `close` | モーダル表示／非表示（`check_generation` を増やして旧監視ループを無効化）、`close` は `DlsiteLoginCancelled` を発行 | `crates/app/src/views/dlsite_login.rs:177-182`, `:238-239` |
 | `save_dlsite_session(cx, &session)` | DB 永続化＋グローバル状態更新 | `crates/app/src/app_state.rs:434-442` |
 
 #### 2.2 番号付きログイン手順
 
-1. モーダル生成時（`new`）に WebView を作成。ビルダは `lb_wry::WebViewBuilder::new().with_incognito(true)`（**非永続 = メモリのみ**。永続ストアだと SSO で自動再ログインされるため使わない旨コメント）。`#[cfg(debug_assertions)]` のときだけ `with_devtools(true)`。`crates/app/src/views/dlsite_login.rs:42-43`
-2. `window.window_handle()` 取得失敗／`build()` 失敗時は `log::error!` して `None`（WebView なし＝監視は常に false）。`crates/app/src/views/dlsite_login.rs:47-60`
-3. 初期 URL を読み込む（**ストアのログインルート**）: `https://www.dlsite.com/home/login/=/skip_register/1/_query/https://www.dlsite.com/home/mypage`。直後に `hide()`。`crates/app/src/views/dlsite_login.rs:62-73`
-4. `start_url_check` が `check_generation` をインクリメントし、`cx.entity().downgrade()`（WeakEntity）でループを起動。`background_executor().timer(Duration::from_secs(1))` = **1 秒周期**。`crates/app/src/views/dlsite_login.rs:76-84`, `:87-91`
-5. ループ先頭で `check_generation != generation` なら `true`（＝終了）。`handle.update` が `Err`（ビュー drop 済み）なら break。`done == true` で break。`crates/app/src/views/dlsite_login.rs:86-99`
-6. `check_login` は `webview.read(cx).raw().url()` を取得（失敗は `false` 継続、`log::debug!("dlsite login check: url={url}")`）。`crates/app/src/views/dlsite_login.rs:107-113`
-7. Cookie 収集: `cookies_for_url("https://www.dlsite.com")` と `cookies_for_url("https://login.dlsite.com")` の 2 origin を順に読み、`HashMap<String,String>` に `entry(name).or_insert(value)`（**同名は www 側を優先**＝先勝ち）。`crates/app/src/views/dlsite_login.rs:118-131`
-8. 認証判定（両方を満たせば完了）: `__DLsite_SID` が存在し、かつ `uhashjp` **または** `uid_jp` が存在する。欠ける場合は `log::debug!` で未認証理由を出して `false`。`crates/app/src/views/dlsite_login.rs:133-145`
-9. 完了時: `DlsiteSession::new(cookie_pairs)` を作り、`log::info!("dlsite login: {n} cookies captured")`、`save_dlsite_session(cx, &session)`、WebView を `hide()`、`cx.emit(DlsiteLoginDone)`、`true` 返却。`crates/app/src/views/dlsite_login.rs:146-154`
+1. モーダル生成時（`new`）に WebView を作成。ビルダは `lb_wry::WebViewBuilder::new().with_incognito(true)`（**非永続 = メモリのみ**。永続ストアだと SSO で自動再ログインされるため使わない旨コメント）。`#[cfg(debug_assertions)]` のときだけ `with_devtools(true)`。`crates/app/src/views/dlsite_login.rs:48-49`
+2. `window.window_handle()` 取得失敗／`build()` 失敗時は `log::error!` して `None`（WebView なし＝監視は常に false）。`crates/app/src/views/dlsite_login.rs:53-66`
+3. 初期 URL を読み込む（**ストアのログインルート**）: `https://www.dlsite.com/home/login/=/skip_register/1/_query/https://www.dlsite.com/home/mypage`。直後に `hide()`。`crates/app/src/views/dlsite_login.rs:68-79`
+4. `start_url_check` が `check_generation` をインクリメントし、`cx.entity().downgrade()`（WeakEntity）でループを起動。`background_executor().timer(Duration::from_secs(1))` = **1 秒周期**。`crates/app/src/views/dlsite_login.rs:82-90`, `:87-91`
+5. ループ先頭で `check_generation != generation` なら `true`（＝終了）。`handle.update` が `Err`（ビュー drop 済み）なら break。`done == true` で break。`crates/app/src/views/dlsite_login.rs:92-105`
+6. `check_login` は `webview.read(cx).raw().url()` を取得（失敗は `false` 継続、`log::debug!("dlsite login check: url={url}")`）。`crates/app/src/views/dlsite_login.rs:113-119`
+7. Cookie 収集: `cookies_for_url("https://www.dlsite.com")` と `cookies_for_url("https://login.dlsite.com")` の 2 origin を順に読み、**収集元ホストごとの `BTreeMap<String, BTreeMap<String,String>>`** に入れる（同じホスト内は先勝ち）。1 つに潰さないのは、片方にしか送るべきでない Cookie を CDN（別システム）へ流さないため。`crates/app/src/views/dlsite_login.rs:130-147`
+8. 認証判定（両方を満たせば完了）: `__DLsite_SID` が存在し、かつ `uhashjp` **または** `uid_jp` が存在する（`www` と `login` の両方を照合）。欠ける場合は `log::debug!` で未認証理由を出して `false`。`crates/app/src/views/dlsite_login.rs:151-163`
+9. 完了時: `DlsiteSession::new(origins)` を作り、`log::info!("dlsite login: {n} cookies captured")`、`save_dlsite_session(cx, &session)`、WebView を `hide()`、`cx.emit(DlsiteLoginDone)`、`true` 返却。`crates/app/src/views/dlsite_login.rs:148-170`
 10. `auth.rs` 側は `DlsiteLoginDone` でモーダルを閉じる（`show_dlsite_login = false` など）。`DlsiteLoginCancelled` でも閉じる。`crates/app/src/views/auth.rs:203-219`
-11. 自動ナビゲーションは **一切しない**（SSO 連鎖を中断するとゲスト `__DLsite_SID` のままになり、同期が `regist/user` へ 302 されて 0 件になる旨のコメント）。`crates/app/src/views/dlsite_login.rs:114-117`
+11. 自動ナビゲーションは **一切しない**（SSO 連鎖を中断するとゲスト `__DLsite_SID` のままになり、同期が `regist/user` へ 302 されて 0 件になる旨のコメント）。`crates/app/src/views/dlsite_login.rs:120-123`
 
 #### 2.3 Cookie 名・取得方法・成否判定
 
 | 項目 | 事実 | アンカー |
 |---|---|---|
 | 取得方法 | **アプリ内 WebView（gpui-wry / lb_wry）**。HTTP ログイン（フォーム POST）は行わない | `crates/app/src/views/dlsite_login.rs:1-2`, `:39-74` |
-| セッション Cookie 名（必須） | `__DLsite_SID` | `crates/app/src/views/dlsite_login.rs:135` |
-| 認証 ID Cookie（どちらか必須） | `uhashjp` または `uid_jp` | `crates/app/src/views/dlsite_login.rs:135-136` |
-| ダウンロード用 Cookie | `jwt`（DL の 302 `Set-Cookie` から捕捉。セッションには保存せず、その 1 回のリクエストヘッダにのみ付与） | `crates/core/src/dlsite/client.rs:262-271` |
-| ログイン成否判定 | WebView の Cookie 有無のみ。**API 叩き直し・トークン検証は行わない** | `crates/app/src/views/dlsite_login.rs:133-145` |
-| `DlsiteSession::logged_in()` | `!self.cookies.is_empty()`（Cookie が 1 つでもあれば true） | `crates/core/src/dlsite/client.rs:57-59` |
+| セッション Cookie 名（必須） | `__DLsite_SID` | `crates/app/src/views/dlsite_login.rs:155` |
+| 認証 ID Cookie（どちらか必須） | `uhashjp` または `uid_jp` | `crates/app/src/views/dlsite_login.rs:155-161` |
+| ダウンロード用 Cookie | `jwt`（DL の 302 `Set-Cookie` から捕捉。セッションには保存せず、その 1 回のリクエストヘッダにのみ付与）。**CDN へはこの `jwt` と「CDN 向けに収集した Cookie」だけを送り、www のセッション Cookie は送らない** | `crates/core/src/dlsite/client.rs:336-361` |
+| ログイン成否判定 | WebView の Cookie 有無のみ。**API 叩き直し・トークン検証は行わない** | `crates/app/src/views/dlsite_login.rs:151-163` |
+| `DlsiteSession::logged_in()` | `self.cookies_count() > 0`（収集元を問わず Cookie が 1 つでもあれば true） | `crates/core/src/dlsite/client.rs:95-97` |
 | 起動時復元の判定 | `app_settings["dlsite.session"]` の JSON を `DlsiteSession` に復元し `logged_in()` でフィルタ | `crates/app/src/app_state.rs:222-227` |
-| 年齢確認の分岐 | **DLsite ログインでの明示処理なし**（コード上に `age_check` 相当の分岐・文言なし。比較: FANZA は `age_check` を監視） | `crates/app/src/views/dlsite_login.rs:106-154`（対比: `crates/app/src/views/fanza_login.rs:109-113`） |
-| 2 段階認証の分岐 | **なし**（WebView 内の viviON ID フローに委譲。コードに TOTP / 追加確認の分岐は存在しない） | `crates/app/src/views/dlsite_login.rs:62-73` |
-| セッション切れの検知 | 同期・DL 時の HTTP 401/403（`Unauthorized`）と、app 側の文字列一致（`"セッション"` を含む `Err` メッセージ）でのみ | `crates/core/src/dlsite/client.rs:208-209`, `crates/app/src/views/bookshelf.rs:2618-2624` |
+| 年齢確認の分岐 | **DLsite ログインでの明示処理なし**（コード上に `age_check` 相当の分岐・文言なし。比較: FANZA は `age_check` を監視） | `crates/app/src/views/dlsite_login.rs:112-171`（対比: `crates/app/src/views/fanza_login.rs:109-113`） |
+| 2 段階認証の分岐 | **なし**（WebView 内の viviON ID フローに委譲。コードに TOTP / 追加確認の分岐は存在しない） | `crates/app/src/views/dlsite_login.rs:68-79` |
+| セッション切れの検知 | 同期・DL 時の HTTP 401/403（`Unauthorized`）と、app 側の文字列一致（`"セッション"` を含む `Err` メッセージ）でのみ | `crates/core/src/dlsite/client.rs:249-250`, `crates/app/src/views/bookshelf.rs:2618-2624` |
 
 #### 2.4 モーダル UI の数値
 
 | 項目 | 値 | アンカー |
 |---|---|---|
-| WebView サイズ | 640.0 × 480.0 px（ウィンドウ中央配置、位置は `(window_w - 640)/2`, `(window_h - 480)/2`） | `crates/app/src/views/dlsite_login.rs:179-196` |
-| 背景 | `hsla(0.0, 0.0, 0.0, 0.45)`（全面 absolute） | `crates/app/src/views/dlsite_login.rs:216` |
-| 閉じるボタン | 36.0 × 36.0 px、`top_3` / `right_3`、背景 `rgba(0xffffff26)` → hover `rgba(0xffffff40)`、アイコン `IconName::Close` 18.0 px | `crates/app/src/views/dlsite_login.rs:218-244` |
+| WebView サイズ | 640.0 × 480.0 px（ウィンドウ中央配置、位置は `(window_w - 640)/2`, `(window_h - 480)/2`） | `crates/app/src/views/dlsite_login.rs:192-209` |
+| 背景 | `hsla(0.0, 0.0, 0.0, 0.45)`（全面 absolute） | `crates/app/src/views/dlsite_login.rs:229` |
+| 閉じるボタン | 36.0 × 36.0 px、`top_3` / `right_3`、背景 `rgba(0xffffff26)` → hover `rgba(0xffffff40)`、アイコン `IconName::Close` 18.0 px | `crates/app/src/views/dlsite_login.rs:231-257` |
 
 ---
 
@@ -245,15 +262,16 @@ JSON バックアップから復元でき、改変したバックアップを復
 |---|---|---|
 | 保存先 | `app_settings` テーブル（key-value） | `crates/core/src/db/schema.sql:25-30`, `crates/core/src/db/settings.rs:11-28` |
 | 保存キー | `"dlsite.session"` | `crates/app/src/app_state.rs:222`, `:438`, `:447` |
-| 保存値の形式 | `serde_json::to_string(&DlsiteSession)` の JSON 文字列。`DlsiteSession` は `cookies: HashMap<String,String>` 1 フィールドなので実体は `{"cookies":{"<name>":"<value>", …}}` | `crates/app/src/app_state.rs:437-439`, `crates/core/src/dlsite/client.rs:47-50` |
-| 保護 | **平文**（暗号化・難読化なし。`app_settings.value` は TEXT そのまま） | `crates/app/src/app_state.rs:437-439`, `crates/core/src/db/settings.rs:16-26` |
-| keyring を使わない理由（コメント） | 「Cookie が巨大で keyring 上限を超えるため DB 保存」（BOOTH / FANZA と同流儀） | `crates/app/src/app_state.rs:433-434`, `:218-222` |
-| 書き込みタイミング | ログイン完了直後（`save_dlsite_session`）のみ | `crates/app/src/views/dlsite_login.rs:148` |
+| 保存値の形式 | `serde_json::to_string(&DlsiteSession)` の JSON 文字列。`DlsiteSession` は `origins: BTreeMap<String, BTreeMap<String,String>>` 1 フィールドなので実体は `{"origins":{"www.dlsite.com":{"<name>":"<value>", …},"login.dlsite.com":{…}}}`（**収集元ホストごと**） | `crates/app/src/app_state.rs:437-439`, `crates/core/src/dlsite/client.rs:77-81` |
+| 保護 | **AES-256-GCM で暗号化**（SEC-01）。値は `enc:v1:` + base64 で `app_settings.value` に入る。鍵は keyring の専用スロット（`thundoku-shelf.session-key`）にあり、**DB のコピーだけでは復元できない**。復号できない値（旧平文・改ざん）は未ログインとして破棄する | `crates/core/src/session_store.rs`, `crates/app/src/app_state.rs:764-775` |
+| keyring に Cookie を直接置かない理由 | Cookie が巨大で keyring の値長上限（2560 UTF-16 文字）を超えるため、**鍵だけ**を keyring に置いて DB 側を暗号化する（BOOTH / FANZA と同流儀） | `crates/core/src/session_store.rs`, `crates/app/src/app_state.rs:433-434` |
+| 書き込みタイミング | ログイン完了直後（`save_dlsite_session`）のみ | `crates/app/src/views/dlsite_login.rs:165` |
 | メモリ側 | `AppState.dlsite_session: Arc<Mutex<Option<DlsiteSession>>>` と `dlsite_logged_in: Arc<Mutex<bool>>` を同時更新 | `crates/app/src/app_state.rs:57-59`, `:440-441` |
 | 削除タイミング 1 | 設定画面のログアウト `SettingsView::logout_dlsite`（`background_spawn` で `db::settings::delete`） | `crates/app/src/views/settings.rs:737-752` |
 | 削除タイミング 2 | `clear_dlsite_session(cx)`（同期側の破棄 API。呼び出し箇所は `logout_dlsite` が直接 delete する実装） | `crates/app/src/app_state.rs:445-450` |
-| Cookie ヘッダ生成 | `cookie_header()` = `{k}={v}` を `"; "` で連結。`HashMap` 反復なので **順序は不定** | `crates/core/src/dlsite/client.rs:61-67` |
-| `jwt` の扱い | 302 応答の `Set-Cookie` から `jwt` のみ拾い、既存ヘッダに `jwt=` が無いときだけ追記。`self.session` には書き戻さない（＝永続化されない） | `crates/core/src/dlsite/client.rs:262-271` |
+| Cookie ヘッダ生成（サイト内） | `cookie_header()` = 全収集元を `{k}={v}` の `"; "` で連結。`BTreeMap` 順なので**安定** | `crates/core/src/dlsite/client.rs:105-109` |
+| Cookie ヘッダ生成（宛先指定） | `cookie_header_for(host)` = **そのホスト向けに収集した Cookie だけ**を連結（収集元と一致 or その子ドメイン）。CDN のような別システムへセッション Cookie を流さないために使う | `crates/core/src/dlsite/client.rs:111-122` |
+| `jwt` の扱い | 302 応答の `Set-Cookie` から `jwt` のみ拾い、既存ヘッダに `jwt=` が無いときだけ追記。`self.session` には書き戻さない（＝永続化されない）。CDN へは `cookie_header_for(cdn.host)` + `jwt` を送るので、**通常は Cookie ヘッダが `jwt=…` だけ**になる（**実アカウントでログイン → ダウンロードできることを確認済み**: 2026-09-22） | `crates/core/src/dlsite/client.rs:336-361` |
 
 ---
 
@@ -262,19 +280,19 @@ JSON バックアップから復元でき、改変したバックアップを復
 | 項目 | 実値 | アンカー |
 |---|---|---|
 | `sleep` / `tokio::time::sleep` | **DLsite コード内に 0 箇所**（`dlsite/` 配下に sleep なし） | `crates/core/src/dlsite/client.rs`・`sync.rs`（全文） |
-| リトライ | **なし**（1 リクエスト失敗で即 `Err`） | `crates/core/src/dlsite/client.rs:207`, `:166`, `:322` |
+| リトライ | **なし**（1 リクエスト失敗で即 `Err`） | `crates/core/src/dlsite/client.rs:248`, `:166`, `:322` |
 | バックオフ | **なし** | 同上 |
-| レート制限ヘッダ / 429 対応 | **なし**（`429` は `Http(429)` として失敗するだけ） | `crates/core/src/dlsite/client.rs:211-212` |
+| レート制限ヘッダ / 429 対応 | **なし**（`429` は `Http(429)` として失敗するだけ） | `crates/core/src/dlsite/client.rs:252-253` |
 | 最大ページ数/ストア | `MAX_PAGES_PER_STORE = 200`（過剰アクセス防止の上限。コメントは「1 ページあたりの行数境界」だが実装は最大ページ数） | `crates/core/src/dlsite/client.rs:16-17`, `:160` |
-| メタ一括チャンク | 20 件/リクエスト（`ids.chunks(20)`） | `crates/core/src/dlsite/client.rs:194` |
-| 並列度 | **1**（`purchased` はストア × ページを直列、`product_info` はチャンクを直列。`Semaphore` / `buffer_unordered` / `spawn` は不使用） | `crates/core/src/dlsite/client.rs:157-184`, `:194-218` |
+| メタ一括チャンク | 20 件/リクエスト（`ids.chunks(20)`） | `crates/core/src/dlsite/client.rs:235` |
+| 並列度 | **1**（`purchased` はストア × ページを直列、`product_info` はチャンクを直列。`Semaphore` / `buffer_unordered` / `spawn` は不使用） | `crates/core/src/dlsite/client.rs:198-225`, `:194-218` |
 | app 側スレッド | 同期 1 本のみ（`std::thread::spawn`） | `crates/app/src/views/bookshelf.rs:2581` |
 | UI ポーリング間隔 | 120 ms（`background_executor().timer(Duration::from_millis(120))`） | `crates/app/src/views/bookshelf.rs:2597-2598` |
 | connect タイムアウト | 5 秒（`UreqTransport` の production 実装。DLsite 同期・DL は `UreqTransport::new()` を使用） | `crates/core/src/tbf/transport.rs:94-106`, `crates/app/src/views/bookshelf.rs:2584-2585` |
 | read タイムアウト | 15 秒（同上。手動リダイレクト用エージェントも 5 秒 / 15 秒） | `crates/core/src/tbf/transport.rs:94-106` |
-| リダイレクト | `RequestSpec.redirects` で指定: HTML・JSON・CDN = `3`、302 手動検査 = `0`（ureq の agent は redirects 無効版を別に保持） | `crates/core/src/dlsite/client.rs:205`, `:244`, `:291`, `:320`, `crates/core/src/tbf/transport.rs:100-107` |
+| リダイレクト | `RequestSpec.redirects` で指定: HTML・JSON・CDN = `3`、302 手動検査 = `0`（ureq の agent は redirects 無効版を別に保持） | `crates/core/src/dlsite/client.rs:246`, `:244`, `:291`, `:320`, `crates/core/src/tbf/transport.rs:100-107` |
 | DL 進捗コールバック | 1 % 単位で `on_progress(downloaded, total)`（read バッファ 64 KiB） | `crates/core/src/tbf/transport.rs:181-198` |
-| 一覧ページの `sleep` 相当 | なし（連続リクエスト） | `crates/core/src/dlsite/client.rs:157-184` |
+| 一覧ページの `sleep` 相当 | なし（連続リクエスト） | `crates/core/src/dlsite/client.rs:198-225` |
 
 ---
 
@@ -299,21 +317,21 @@ JSON バックアップから復元でき、改変したバックアップを復
 
 | 種別 | 形式・規則 | アンカー |
 |---|---|---|
-| 作品 ID（= `bookshelf_items.database_id`） | 正規表現 `(?i)product_id\/(RJ\d+)\.html`（大文字小文字無視、`.html` 必須）。**RJ + 数字のみ**。マッチしない行は行ごと破棄 | `crates/core/src/dlsite/client.rs:359` |
-| サークル ID | 正規表現 `(?i)maker_id\/(RG\d+)\.html` → `maker_id`（`RG\d+`） | `crates/core/src/dlsite/client.rs:363` |
-| ストアフロア ID（`site_id`） | 行内で最初に現れる `https?://www\.dlsite\.com/([a-z0-9]+)/` のキャプチャ（例 `maniax` / `home` / `books` / `ai`）。取得失敗は空文字 | `crates/core/src/dlsite/client.rs:371` |
+| 作品 ID（= `bookshelf_items.database_id`） | 正規表現 `(?i)product_id\/(RJ\d+)\.html`（大文字小文字無視、`.html` 必須）。**RJ + 数字のみ**。マッチしない行は行ごと破棄 | `crates/core/src/dlsite/client.rs:405` |
+| サークル ID | 正規表現 `(?i)maker_id\/(RG\d+)\.html` → `maker_id`（`RG\d+`） | `crates/core/src/dlsite/client.rs:409` |
+| ストアフロア ID（`site_id`） | 行内で最初に現れる `https?://www\.dlsite\.com/([a-z0-9]+)/` のキャプチャ（例 `maniax` / `home` / `books` / `ai`）。取得失敗は空文字 | `crates/core/src/dlsite/client.rs:417` |
 | 作品ページ URL | `https://www.dlsite.com/{store}/work/=/product_id/{id}.html` | `crates/core/src/dlsite/sync.rs:135`, `:142`（テスト HTML） |
-| ダウンロードページ URL（`download_url` に保存） | `https://www.dlsite.com/{store}/download/=/product_id/{id}.html` | `crates/core/src/dlsite/sync.rs:139`, `crates/core/src/dlsite/client.rs:370` |
+| ダウンロードページ URL（`download_url` に保存） | `https://www.dlsite.com/{store}/download/=/product_id/{id}.html` | `crates/core/src/dlsite/sync.rs:139`, `crates/core/src/dlsite/client.rs:416` |
 | サークルページ URL | `https://www.dlsite.com/{store}/circle/profile/=/maker_id/{maker_id}.html` | `crates/core/src/dlsite/sync.rs:136` |
-| メタ API URL | `https://www.dlsite.com/maniax/product/info/ajax?product_id={id[,id…]}`（最大 20 件/回） | `crates/core/src/dlsite/client.rs:196-197` |
-| 作者ページ URL | `https://www.dlsite.com/maniax/work/=/product_id/{id}.html` | `crates/core/src/dlsite/client.rs:226` |
-| CDN 実ファイル URL（302 `location`） | `https://download.dlsite.com/get/=/type/work/domain/doujin/dir/{RJxxxx}/file/{id}.zip/_/{yyyymmdd}?update_date={yyyymmdd}`（テストフィクスチャ実値） | `crates/core/src/dlsite/client.rs:672` |
-| サムネイル URL（一覧 HTML） | `<source srcset>` の先頭トークン → `<img data-src>` → `<img src>`（`data:` 始まり除外）。例 `//img.dlsite.jp/resize/images2/work/doujin/RJ{first8}/{content_id}_img_main_240x240.webp` | `crates/core/src/dlsite/client.rs:366-369`, `crates/core/src/dlsite/sync.rs:132` |
-| サムネイル URL（`product_info`） | `work_image`（例 `//img.dlsite.jp/...img_main.jpg`）を優先。`//` 始まりは `https:` 前置 | `crates/core/src/dlsite/sync.rs:48-58`, `crates/core/src/dlsite/client.rs:105-107` |
+| メタ API URL | `https://www.dlsite.com/maniax/product/info/ajax?product_id={id[,id…]}`（最大 20 件/回） | `crates/core/src/dlsite/client.rs:237-238` |
+| 作者ページ URL | `https://www.dlsite.com/maniax/work/=/product_id/{id}.html` | `crates/core/src/dlsite/client.rs:267` |
+| CDN 実ファイル URL（302 `location`） | `https://download.dlsite.com/get/=/type/work/domain/doujin/dir/{RJxxxx}/file/{id}.zip/_/{yyyymmdd}?update_date={yyyymmdd}`（テストフィクスチャ実値） | `crates/core/src/dlsite/client.rs:730` |
+| サムネイル URL（一覧 HTML） | `<source srcset>` の先頭トークン → `<img data-src>` → `<img src>`（`data:` 始まり除外）。例 `//img.dlsite.jp/resize/images2/work/doujin/RJ{first8}/{content_id}_img_main_240x240.webp` | `crates/core/src/dlsite/client.rs:412-415`, `crates/core/src/dlsite/sync.rs:132` |
+| サムネイル URL（`product_info`） | `work_image`（例 `//img.dlsite.jp/...img_main.jpg`）を優先。`//` 始まりは `https:` 前置 | `crates/core/src/dlsite/sync.rs:48-58`, `crates/core/src/dlsite/client.rs:146-148` |
 | ブック側の紐づけ | ダウンロード後に `books.tbf_product_id = product_id`（= RJ ID）＋ `books.site_id = "dlsite"` として保存され、`find_by_source(site_id, tbf_product_id)` で重複抑止に使う | `crates/app/src/views/bookshelf.rs:2988`, `crates/core/src/db/books.rs:314-329` |
 | 抽出に使う `work_type` コード | `MNG`→Comic / `ICG`→Cg / `SOU`→Voice / `NRE`,`DNV`→Novel / `VCM`,`WBT`→Video / `ACN`,`ADV`,`QIZ`,`RPG`,`STG`,`SLN`,`TBL`,`TYP`,`PZL`,`ETC`→Game / それ以外→`None` | `crates/core/src/dlsite/mod.rs:40-50` |
-| ジャンルアイコン | `class="work_genre"...>` 〜 `</dd>` 内の `class="icon_([A-Za-z0-9]+)"` を `icon_` 前置で再構成。`icon_AIG`→AI 生成（full）、`icon_AIP`→AI 一部利用（partial） | `crates/core/src/dlsite/client.rs:373-384`, `crates/core/src/dlsite/mod.rs:67-78` |
-| `work_type` の導出 | ジャンルアイコンのうち `media_from_work_type` が解釈できる最初のコード。無ければ空文字 | `crates/core/src/dlsite/client.rs:385-393` |
+| ジャンルアイコン | `class="work_genre"...>` 〜 `</dd>` 内の `class="icon_([A-Za-z0-9]+)"` を `icon_` 前置で再構成。`icon_AIG`→AI 生成（full）、`icon_AIP`→AI 一部利用（partial） | `crates/core/src/dlsite/client.rs:419-430`, `crates/core/src/dlsite/mod.rs:67-78` |
+| `work_type` の導出 | ジャンルアイコンのうち `media_from_work_type` が解釈できる最初のコード。無ければ空文字 | `crates/core/src/dlsite/client.rs:431-439` |
 | 分類の優先順位 | `media` = `work_type` → ジャンルアイコン → `Other`（安全側＝除外）。`ai` = `site_id == "ai"` なら `FullAi`、そうでなければアイコン判定 | `crates/core/src/dlsite/mod.rs:93-113` |
 | 年齢区分 | `age_category == Some(1)`→`"all"` / `Some(n) n>1`→`"r18"` / `Some(その他)`→`"all"` / `None` かつ `site_id == "maniax"`→`"r18"` / それ以外→`None` | `crates/core/src/dlsite/mod.rs:81-89` |
 | DB 保存値 | `media_category`: `comic`/`cg`/`voice`/`game`/`novel`/`video`/`other`、`ai_type`: `none`/`partial`/`full` | `crates/core/src/dlsite/mod.rs:124-135`, `:138-147` |
@@ -342,12 +360,12 @@ JSON バックアップから復元でき、改変したバックアップを復
 
 | 関数 | シグネチャ | アンカー |
 |---|---|---|
-| コア同期本体 | `pub fn save_purchases(pool: &SqlitePool, client: &mut FanzaClient) -> Result<usize, FanzaError>` | `crates/core/src/fanza/sync.rs:51` |
-| 一覧取得 | `pub fn purchased(&mut self) -> Result<Vec<FanzaPurchase>, FanzaError>` | `crates/core/src/fanza/client.rs:187` |
+| コア同期本体 | `pub fn save_purchases_batch(pool: &SqlitePool, client: &mut FanzaClient, owner: Option<&str>, cursor: PurchaseCursor, pages: usize) -> Result<PurchaseBatch, FanzaError>`（1 回 = `PURCHASE_PAGES_PER_RUN` ページ。§7.0.1） | `crates/core/src/fanza/sync.rs:85` |
+| 一覧取得（1 ページ） | `pub fn purchased_page(&mut self, page: usize) -> Result<PurchasesPage, FanzaError>`（`items` / `total` / `hasNext` を返す）。全ページ版 `purchased()` は**廃止** | `crates/core/src/fanza/client.rs:249` |
 | 詳細取得 | `pub fn detail(&mut self, content_id: &str) -> Result<FanzaDetail, FanzaError>` | `crates/core/src/fanza/client.rs:222` |
 | 作品ページ取得 | `pub fn product_page(&mut self, cid: &str) -> Result<FanzaProductPage, FanzaError>` | `crates/core/src/fanza/client.rs:267` |
 | ダウンロード | `pub fn download_with_progress(&mut self, download_url: &str, on_progress: &mut dyn FnMut(u64, u64)) -> Result<Vec<u8>, FanzaError>` | `crates/core/src/fanza/client.rs:288` |
-| UI 側起動 | `pub fn sync_fanza(&mut self, cx: &mut Context<Self>)` | `crates/app/src/views/bookshelf.rs:2479` |
+| UI 側起動 | `pub fn sync_fanza(&mut self, cx: &mut Context<Self>)` | `crates/app/src/views/bookshelf.rs:3432` |
 
 - 同期は **UI からの手動操作のみ**で起動する（自動同期・ポーリングなし）: `crates/app/src/views/bookshelf.rs:2237`（サイト絞り込み `"fanza"` 選択時）、`:2242`（全サイト同期時）。
 - UI はセッションを clone してから `std::thread::spawn` で同期を実行し、`std::sync::mpsc` で結果を返す: `crates/app/src/views/bookshelf.rs:2500-2511`。受け取りは 120 ms 間隔の `try_recv` ポーリング: `crates/app/src/views/bookshelf.rs:2520-2523`。
@@ -355,8 +373,8 @@ JSON バックアップから復元でき、改変したバックアップを復
 
 #### 1.2 処理手順（番号付き）
 
-1. `client.purchased()` で購入済み一覧を**全ページ**取得する（`crates/core/src/fanza/sync.rs:52`）。
-2. 取得した `Vec<FanzaPurchase>` を先頭から順に処理する（`crates/core/src/fanza/sync.rs:54`）。**並列度 1**。
+1. `client.purchased_page(page)?` を最大 `pages`（= `PURCHASE_PAGES_PER_RUN`）回呼ぶ。`hasNext` が false、または そのページまでで `total` に届いたら打ち切る（`crates/core/src/fanza/sync.rs:100-117`）。
+2. 各ページの `Vec<FanzaPurchase>` を先頭から順に処理する（**並列度 1**）。`crates/core/src/fanza/sync.rs:105-110`
 3. 各作品を `classify(&p.image_src, &p.genre)` で 2 軸分類（media / ai）する（`crates/core/src/fanza/sync.rs:55`、`crates/core/src/fanza/mod.rs:79`）。
 4. `is_viewable_included(&meta, true)` が `false` なら **upsert せず次へ**（`crates/core/src/fanza/sync.rs:56-58`）。第 2 引数 `drm_ok` は**常に `true` 固定**（同期時は DRM を見ない。`crates/core/src/fanza/mod.rs:91-93` の定義上、media が `Comic`/`Cg` のときだけ保存される）。
 5. `now()` でタイムスタンプ文字列を 1 件ごとに生成: UTC `"%Y-%m-%d %H:%M:%S"`（`crates/core/src/fanza/sync.rs:15-17`、呼び出し `:59`）。

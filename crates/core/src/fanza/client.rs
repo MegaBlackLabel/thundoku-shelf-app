@@ -4,9 +4,10 @@
 //! GET に CSRF 不要）を叩く。ダウンロードは詳細で得た proxy URL を 302 追跡して
 //! CDN の実 ZIP を取得する。`Transport` は `tbf::transport` を再利用（モック可能）。
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::fanza::classify;
+use crate::session_cookies::HostScopedCookies;
 use crate::tbf::TbfError;
 use crate::tbf::transport::{RequestSpec, ResponseSpec, Transport};
 use serde::Deserialize;
@@ -19,6 +20,11 @@ pub const PAGE_LIMIT: usize = 20;
 /// FANZA同人 は非ブラウザの User-Agent を 403 で弾くため、ブラウザ UA + Referer を送る
 ///（BoothClient と同じ流儀）。
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// ストア（`www.dmm.co.jp`）。Cookie を集める側のホスト。
+pub const SITE_HOST: &str = "www.dmm.co.jp";
+/// アカウント（`accounts.dmm.co.jp`）。ログインの Cookie はここでも発行される。
+pub const ACCOUNT_HOST: &str = "accounts.dmm.co.jp";
 
 /// ダウンロード proxy（詳細 API の `downloadLinks`）を叩いてよいホスト。
 /// Cookie は `domain=.dmm.co.jp` で発行されるため、その範囲だけを許可する。
@@ -64,30 +70,53 @@ impl From<serde_json::Error> for FanzaError {
 }
 
 /// FANZA のセッション（`www.dmm.co.jp` / `accounts.dmm.co.jp` の Cookie 群）。
+///
+/// Cookie は**収集元ホストごと**に持つ。1 つに潰すと、片方にしか送るべきでない Cookie が
+/// もう片方や別システム（ダウンロード CDN）へ飛ぶ。送信先ごとに取り出せるように保つ。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct FanzaSession {
-    cookies: HashMap<String, String>,
+    /// 収集元ホスト →（Cookie 名 → 値）。宛先ごとに絞って送る（`cookie_header_for`）。
+    origins: HostScopedCookies,
 }
 
 impl FanzaSession {
-    pub fn new(cookies: HashMap<String, String>) -> Self {
-        Self { cookies }
+    pub fn new(origins: BTreeMap<String, BTreeMap<String, String>>) -> Self {
+        Self {
+            origins: HostScopedCookies::new(origins),
+        }
+    }
+
+    /// `www.dmm.co.jp` の Cookie だけで作る。
+    pub fn from_site_cookies(cookies: BTreeMap<String, String>) -> Self {
+        Self {
+            origins: HostScopedCookies::from_origin(SITE_HOST, cookies),
+        }
     }
 
     pub fn logged_in(&self) -> bool {
-        !self.cookies.is_empty()
+        !self.origins.is_empty()
     }
 
+    /// 収集元ホストの Cookie 値（認証済み判定・ログ用）。収集元をまたがない。
+    pub fn cookie_value(&self, host: &str, name: &str) -> Option<&str> {
+        self.origins.value(host, name)
+    }
+
+    /// サイト内（`www.dmm.co.jp`）向けの Cookie ヘッダ。収集元すべてを 1 本にまとめる。
+    ///
+    /// **CDN など別システムへは使わない**（宛先ごとに絞る `cookie_header_for` を使う）。
     pub fn cookie_header(&self) -> String {
-        self.cookies
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ")
+        self.origins.header()
+    }
+
+    /// 宛先ホスト向けの Cookie ヘッダ。**そのホスト向けに収集したものだけ**を返す
+    /// （収集元と一致するか、その収集元の子ドメイン）。
+    pub fn cookie_header_for(&self, host: &str) -> String {
+        self.origins.header_for(host)
     }
 
     pub fn cookies_count(&self) -> usize {
-        self.cookies.len()
+        self.origins.count()
     }
 }
 
@@ -162,6 +191,17 @@ pub struct FanzaClient {
     session: FanzaSession,
 }
 
+/// 購入一覧の 1 ページ分（分割同期の 1 ステップ）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PurchasesPage {
+    /// このページの作品。
+    pub items: Vec<FanzaPurchase>,
+    /// 一覧の総件数（API の `total`）。
+    pub total: usize,
+    /// 次のページがあるか（API の `hasNext`）。
+    pub has_next: bool,
+}
+
 impl FanzaClient {
     pub fn with_transport(transport: Box<dyn Transport>, session: FanzaSession) -> Self {
         Self { transport, session }
@@ -202,39 +242,38 @@ impl FanzaClient {
         Ok(json)
     }
 
-    /// 購入済み作品一覧を全ページ取得する（`hasNext` でページを回し、`total` で打ち切り）。
-    pub fn purchased(&mut self) -> Result<Vec<FanzaPurchase>, FanzaError> {
-        let mut out = Vec::new();
-        let mut page = 1usize;
-        loop {
-            let url = format!(
-                "{LIBRARY_BASE}?page={page}&sort=purchasedate_desc&genre=all&limit={PAGE_LIMIT}"
-            );
-            let json = self.get_json(&url)?;
-            let data = json
-                .get("data")
-                .ok_or_else(|| FanzaError::Parse("no data".into()))?;
-            let items = data.get("items").cloned().unwrap_or(Value::Null);
-            if let Value::Object(map) = &items {
-                for (date, list) in map {
-                    if let Value::Array(arr) = list {
-                        for v in arr {
-                            out.push(parse_purchase(v, Some(date.clone())));
-                        }
+    /// 購入一覧の 1 ページを取得する（1 始まり）。
+    ///
+    /// 分割同期はこれを `pages` 回ぶん呼ぶ（1 回で全部取ると、件数が多いアカウントで
+    /// まとめて叩くことになる）。ページングの情報（`hasNext` / `total`）も返す。
+    pub fn purchased_page(&mut self, page: usize) -> Result<PurchasesPage, FanzaError> {
+        let url = format!(
+            "{LIBRARY_BASE}?page={page}&sort=purchasedate_desc&genre=all&limit={PAGE_LIMIT}"
+        );
+        let json = self.get_json(&url)?;
+        let data = json
+            .get("data")
+            .ok_or_else(|| FanzaError::Parse("no data".into()))?;
+        let mut items = Vec::new();
+        if let Some(Value::Object(map)) = data.get("items") {
+            for (date, list) in map {
+                if let Value::Array(arr) = list {
+                    for v in arr {
+                        items.push(parse_purchase(v, Some(date.clone())));
                     }
                 }
             }
-            let has_next = data
-                .get("hasNext")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let total = data.get("total").and_then(Value::as_i64).unwrap_or(0) as usize;
-            if !has_next || out.len() >= total || out.len() >= PAGE_LIMIT * 100 {
-                break;
-            }
-            page += 1;
         }
-        Ok(out)
+        let total = data.get("total").and_then(Value::as_i64).unwrap_or(0) as usize;
+        let has_next = data
+            .get("hasNext")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(PurchasesPage {
+            items,
+            total,
+            has_next,
+        })
     }
 
     /// 作品詳細（download link / DRM / メタ）を取得する。
@@ -346,13 +385,16 @@ impl FanzaClient {
             return Err(FanzaError::Http(proxy_resp.status));
         };
         // 転送先も検証する（任意ホストへ Cookie を転送させない）。
-        crate::download_url::check(&cd_url, FANZA_CDN_RULES)
+        let cdn = crate::download_url::check(&cd_url, FANZA_CDN_RULES)
             .map_err(|error| FanzaError::BlockedUrl(format!("{cd_url}: {error}")))?;
-        // 2) CDN へ直接（署名 Cookie 込みのフルブラウザヘッダ付き）
+        // 2) CDN へ直接（署名 Cookie のみのフルブラウザヘッダ付き）
         //    署名 Cookie（CloudFront-*）はログイン時ではなく、このダウンロード proxy の
         //    応答（Set-Cookie）で lazy に発行されるため、ここで取って CDN へ送る。
         //    （ureq をリダイレクトに任せるとクロスホストで Cookie が落ちるので手動追跡）
-        let mut cookie = self.session.cookie_header();
+        //
+        //    www / accounts の**セッション Cookie は CDN へ送らない**（別システムなので
+        //    要らない）。宛先ホスト向けに収集した Cookie だけを載せる。
+        let mut cookie = self.session.cookie_header_for(cdn.host);
         for (k, v) in proxy_resp.set_cookies() {
             if k.starts_with("CloudFront-") && !cookie.contains(&format!("{k}=")) {
                 if !cookie.is_empty() {
@@ -361,8 +403,7 @@ impl FanzaClient {
                 cookie.push_str(&format!("{k}={v}"));
             }
         }
-        let headers = vec![
-            ("Cookie".to_string(), cookie),
+        let mut headers = vec![
             ("User-Agent".to_string(), USER_AGENT.to_string()),
             ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
             (
@@ -375,6 +416,10 @@ impl FanzaClient {
             ("Sec-Fetch-Site".to_string(), "cross-site".to_string()),
             ("Upgrade-Insecure-Requests".to_string(), "1".to_string()),
         ];
+        // Cookie が 1 つも無ければヘッダを付けない（空の Cookie は送らない）。
+        if !cookie.is_empty() {
+            headers.insert(0, ("Cookie".to_string(), cookie));
+        }
         let spec = RequestSpec {
             method: "GET".into(),
             url: cd_url,
@@ -472,8 +517,20 @@ mod tests {
         })
     }
 
+    /// リクエストの `Cookie` ヘッダ（無ければ空文字）。
+    fn cookie_of(spec: &RequestSpec) -> String {
+        spec.headers
+            .iter()
+            .find(|(k, _)| k == "Cookie")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
     fn session() -> FanzaSession {
-        FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]))
+        FanzaSession::from_site_cookies(BTreeMap::from([(
+            "login_id".to_string(),
+            "abc".to_string(),
+        )]))
     }
 
     /// スクリプト化されたトランスポート。URL で応答を分岐する（tbf::sync の MockTransport と同流儀）。
@@ -487,9 +544,10 @@ mod tests {
         }
     }
 
-    /// GET リクエストに Cookie ヘッダが付くこと、`hasNext` でページングし `total` で打ち切ることを検証。
+    /// GET リクエストに Cookie ヘッダが付くこと、1 ページ分の作品と
+    /// ページング情報（`total` / `hasNext`）が返ることを検証。
     #[test]
-    fn purchased_pages_until_hasnext_false_and_sends_cookie() {
+    fn purchased_page_returns_items_total_and_next_flag() {
         use parking_lot::Mutex;
         use std::sync::Arc;
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -505,7 +563,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join("&")
                 ));
-                let page1 = if spec.url.contains("page=1") {
+                let page = if spec.url.contains("page=1") {
                     page_json(vec![purchase("d_1", "コミック", "comic")], true, 3)
                 } else {
                     page_json(
@@ -520,17 +578,28 @@ mod tests {
                 Ok(ResponseSpec {
                     status: 200,
                     headers: vec![],
-                    body: json_body(page1),
+                    body: json_body(page),
                 })
             }),
         };
         let mut client = FanzaClient::with_transport(Box::new(transport), session());
-        let list = client.purchased().unwrap();
-        assert_eq!(list.len(), 3);
-        assert_eq!(list[0].content_id, "d_1");
-        assert_eq!(list[0].purchase_date.as_deref(), Some("2026年09月03日"));
+        let first = client.purchased_page(1).unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].content_id, "d_1");
+        assert_eq!(
+            first.items[0].purchase_date.as_deref(),
+            Some("2026年09月03日")
+        );
+        assert_eq!(first.total, 3);
+        assert!(first.has_next);
+
+        let second = client.purchased_page(2).unwrap();
+        assert_eq!(second.items.len(), 2);
+        assert_eq!(second.total, 3);
+        assert!(!second.has_next);
+
         let calls = calls.lock();
-        assert!(calls.len() >= 2);
+        assert_eq!(calls.len(), 2);
         // Cookie ヘッダが全リクエストに付く
         for c in calls.iter() {
             assert!(c.contains("Cookie="), "no cookie header: {c}");
@@ -622,15 +691,19 @@ mod tests {
 
     /// ダウンロード: proxy の 302 Location を手動で取得し、CDN へ直接（署名 Cookie 付き）
     /// 取得すること。ureq がクロスホストリダイレクトで Cookie を落とす問題の回帰テスト。
+    /// **CDN へはセッション Cookie を送らない**（302 で受け取った署名 Cookie だけ）。
     #[test]
-    fn download_manually_follows_proxy_302_to_cdn_with_cookie() {
+    fn download_manually_follows_proxy_302_to_cdn_with_signed_cookie_only() {
         use parking_lot::Mutex;
         use std::sync::Arc;
         let cdn_spec = Arc::new(Mutex::new(None::<RequestSpec>));
         let cdn_spec2 = cdn_spec.clone();
+        let proxy_spec = Arc::new(Mutex::new(None::<RequestSpec>));
+        let proxy_spec2 = proxy_spec.clone();
         let transport = MockTransport {
             handler: Box::new(move |spec: RequestSpec| {
                 if spec.url.contains("/dc/-/proxy/") {
+                    *proxy_spec2.lock() = Some(spec);
                     Ok(ResponseSpec {
                         status: 302,
                         headers: vec![
@@ -661,7 +734,10 @@ mod tests {
         };
         let mut client = FanzaClient::with_transport(
             Box::new(transport),
-            FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())])),
+            FanzaSession::from_site_cookies(BTreeMap::from([(
+                "login_id".to_string(),
+                "abc".to_string(),
+            )])),
         );
         let mut on = |_: u64, _: u64| true;
         let bytes = client
@@ -671,29 +747,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes, b"PK\x03\x04zipdata");
-        // CDN リクエストには Cookie（CloudFront 署名含む）が送られ、proxy URL ではなく CDN URL 宛。
+        // CDN リクエストは署名 Cookie 付きで、proxy URL ではなく CDN URL 宛。
         let spec = cdn_spec.lock().clone().expect("CDN request made");
         assert!(
             spec.url
                 .starts_with("https://doujin.contents.doujin.dmm.co.jp/")
         );
-        assert!(
-            spec.headers
-                .iter()
-                .any(|(k, v)| k == "Cookie" && v.contains("login_id=abc"))
+        // サイト内（proxy）へは従来どおりセッション Cookie を送る
+        let proxy = proxy_spec.lock().clone().expect("proxy request made");
+        assert_eq!(cookie_of(&proxy), "login_id=abc");
+        // CDN へ送るのは 302 で受け取った署名 Cookie だけ。www の認証セッションは
+        // 別システム（CDN）には要らないので送らない。
+        assert_eq!(
+            cookie_of(&spec),
+            "CloudFront-Signature=abc; CloudFront-Key-Pair-Id=K123",
+            "CDN へは署名 Cookie だけを送る"
         );
-        // proxy 応答で発行された署名 Cookie（CloudFront-*）が CDN へ届く
-        let cf = spec
-            .headers
-            .iter()
-            .find(|(k, _)| k == "Cookie")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-        assert!(
-            cf.contains("CloudFront-Signature=abc"),
-            "CloudFront signature cookie missing: {cf}"
-        );
-        assert!(cf.contains("CloudFront-Key-Pair-Id=K123"));
         assert!(spec.redirects == 3);
     }
 
@@ -731,53 +800,42 @@ mod tests {
         assert_eq!(parse_product_page(empty).author, None);
     }
 
-    /// 実機プローブ: `UreqTransport` 経由で CDN ダウンロードが 200 になるか確認する。
-    /// `FANZA_TEST_COOKIE` に Cookie（`name=value; ...`）を設定して実行する。
+    /// 実機プローブ: **本番の経路**（`FanzaClient::download_with_progress`）で proxy → 302 →
+    /// CDN を通し、CDN がセッション Cookie 無し（署名 Cookie だけ）で受け付けるかを確認する。
+    ///
+    /// `FANZA_TEST_COOKIE` に Cookie（`name=value; ...`）を設定して実行する:
+    /// `FANZA_TEST_COOKIE='...' mise exec -- cargo test -p thundoku-core --lib live_download_probe -- --ignored --nocapture`
+    /// 403 になる場合は、CDN が www のセッション Cookie を要求している（送る必要がある）。
     #[test]
     #[ignore]
     fn live_download_probe() {
         let cookie = std::env::var("FANZA_TEST_COOKIE").expect("FANZA_TEST_COOKIE not set");
-        let mut t = crate::tbf::UreqTransport::new();
-        let base = vec![
-            ("Cookie".into(), cookie),
-            ("User-Agent".into(), USER_AGENT.into()),
-            ("Referer".into(), "https://www.dmm.co.jp/".into()),
-        ];
-        // 1) proxy を manual (redirects=0) で叩いて 302 Location を取得
-        let p_spec = RequestSpec {
-            method: "GET".into(),
-            url: "https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=d_815503/".into(),
-            headers: base.clone(),
-            body: None,
-            redirects: 0,
+        let product_id =
+            std::env::var("FANZA_TEST_PRODUCT_ID").unwrap_or_else(|_| "d_815503".to_string());
+        let cookies = cookie
+            .split(';')
+            .filter_map(|pair| pair.trim().split_once('='))
+            .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let session = FanzaSession::from_site_cookies(cookies);
+        eprintln!("session cookies={}", session.cookies_count());
+        let mut client =
+            FanzaClient::with_transport(Box::new(crate::tbf::UreqTransport::new()), session);
+        let url = format!(
+            "https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id={product_id}/"
+        );
+        let mut on = |downloaded: u64, total: u64| {
+            eprintln!("progress {downloaded}/{total}");
+            true
         };
-        let p = t.send(p_spec).unwrap();
-        eprintln!("PROXY status={}", p.status);
-        let loc = p.header("location").unwrap_or("").to_string();
-        eprintln!("LOC={loc}");
-        // 2) CDN へ直接（Cookie 含む Sec-Fetch ヘッダ付き）
-        let mut c_headers = base;
-        c_headers.push(("Sec-Fetch-Dest".into(), "document".into()));
-        c_headers.push(("Sec-Fetch-Mode".into(), "navigate".into()));
-        c_headers.push(("Sec-Fetch-Site".into(), "cross-site".into()));
-        c_headers.push((
-            "Accept".into(),
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into(),
-        ));
-        let c_spec = RequestSpec {
-            method: "GET".into(),
-            url: loc,
-            headers: c_headers,
-            body: None,
-            redirects: 3,
-        };
-        let mut on = |_: u64, _: u64| true;
-        let r = t.send_download(c_spec, &mut on).unwrap();
-        eprintln!(
-            "CDN status={} len={} ct={:?}",
-            r.status,
-            r.body.len(),
-            r.header("content-type")
+        let body = client
+            .download_with_progress(&url, &mut on)
+            .expect("CDN がセッション Cookie 無しで受け付けるか（403 なら送る必要がある）");
+        eprintln!("download ok: {} bytes", body.len());
+        assert!(
+            body.starts_with(b"PK"),
+            "ZIP ではない: {:?}",
+            &body[..8.min(body.len())]
         );
     }
 }
