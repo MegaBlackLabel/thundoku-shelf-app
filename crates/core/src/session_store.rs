@@ -5,9 +5,10 @@
 //! DB のコピー・バックアップ・サポートへのファイル添付からセッションを再利用される。
 //!
 //! そこで鍵だけを keyring の専用スロット（`thundoku-shelf.session-key`）に置き、値は
-//! AES-256-GCM（AAD に用途名 = サービス + 形式版）で暗号化して `enc:v1:` を前置して
-//! 保存する。**復号できない値（旧平文・改ざん・別鍵）は未ログインとして扱い、行を
-//! 削除する**（平文へのフォールバックは禁止）。
+//! AES-256-GCM（AAD に用途名 = サービス + 形式版）で暗号化し、**保存時刻を暗号文の中に
+//! 包んで** `enc:v2:` を前置して保存する。**復号できない値（旧平文・改ざん・別鍵）と
+//! 保存から 7 日を過ぎた値は未ログインとして扱い、行を削除する**（平文へのフォールバックは
+//! 禁止）。
 //!
 //! 併せて「ログアウトしたのに DB の削除に失敗した」セッションを次回起動で復元しない
 //! ための印を、DB とは別の場所（データディレクトリのファイル）に残す。
@@ -24,9 +25,31 @@ use crate::db::{SqlitePool, settings};
 use crate::secrets::{SecretError, SecretStore};
 
 /// 保存値の形式版。AAD に混ぜるので、形式を変えたら別物として扱われる。
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 /// 暗号化された値の接頭辞。**これが無い値は旧平文として拒否する**。
-const PREFIX: &str = "enc:v1:";
+///
+/// v1 → v2 で「保存時刻」を暗号文の中に入れた（DB を書き換えても期限を延ばせない）。
+/// v1 の値は接頭辞が違うため復号できず、未ログイン扱いで破棄される（＝再ログイン）。
+const PREFIX: &str = "enc:v2:";
+
+/// 保存したセッションの有効期限（秒）。これより古い値は復元せず、行ごと破棄する
+/// （＝再ログイン）。長く持つほど、端末の共有・売却やバックアップ流出時の影響が伸びる。
+/// 7 日 = 週 1 回の再ログインで済む線（README にも記載）。
+pub const SESSION_MAX_AGE_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// 現在時刻（Unix 秒）。期限判定に使う。
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// 保存する値の包み。**保存時刻を暗号文の中に入れる**ので、DB を書き換えても
+/// 期限を延ばせない（改ざんは GCM のタグで検出される）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Envelope<T> {
+    /// 保存した時刻（Unix 秒）。
+    saved_at: i64,
+    session: T,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -91,14 +114,30 @@ impl SessionVault {
         })
     }
 
-    /// 暗号化して `app_settings` に保存する。
+    /// 暗号化して `app_settings` に保存する（保存時刻を包んで期限判定に使う）。
     pub fn save<T: serde::Serialize>(
         &self,
         pool: &SqlitePool,
         store: StoreSession,
         value: &T,
     ) -> Result<(), SessionError> {
-        let json = serde_json::to_vec(value).map_err(|e| SessionError::Encoding(e.to_string()))?;
+        self.save_at(pool, store, value, now_unix())
+    }
+
+    /// 保存時刻を指定して保存する（テスト用の入口。`save` は現在時刻を渡す）。
+    fn save_at<T: serde::Serialize>(
+        &self,
+        pool: &SqlitePool,
+        store: StoreSession,
+        value: &T,
+        saved_at: i64,
+    ) -> Result<(), SessionError> {
+        let envelope = Envelope {
+            saved_at,
+            session: value,
+        };
+        let json =
+            serde_json::to_vec(&envelope).map_err(|e| SessionError::Encoding(e.to_string()))?;
         let blob = self.encrypt(store, &json)?;
         settings::set(pool, store.settings_key(), &blob)?;
         // 保存できた = もう「削除できなかった」状態ではない。
@@ -130,8 +169,21 @@ impl SessionVault {
         }
         let raw = settings::get(pool, store.settings_key()).ok().flatten()?;
         match self.decrypt(store, &raw) {
-            Ok(bytes) => match serde_json::from_slice::<T>(&bytes) {
-                Ok(value) => Some(value),
+            Ok(bytes) => match serde_json::from_slice::<Envelope<T>>(&bytes) {
+                Ok(envelope) => {
+                    // 期限は暗号文の中の保存時刻で判定する（DB を書き換えても延ばせない）。
+                    let age = now_unix() - envelope.saved_at;
+                    if !(0..=SESSION_MAX_AGE_SECONDS).contains(&age) {
+                        log::info!(
+                            "{} session: 保存から {age} 秒たっているため破棄します（期限 {} 秒・再ログインが必要）",
+                            store.label(),
+                            SESSION_MAX_AGE_SECONDS
+                        );
+                        let _ = settings::delete(pool, store.settings_key());
+                        return None;
+                    }
+                    Some(envelope.session)
+                }
                 Err(error) => {
                     log::warn!(
                         "{} session: 復号はできたが内容を解釈できないため破棄します: {error}",
@@ -347,6 +399,68 @@ mod tests {
 
         let loaded: FakeSession = vault.load(&pool, StoreSession::Booth).expect("復元できる");
         assert_eq!(loaded, fake_session());
+    }
+
+    /// 期限（`SESSION_MAX_AGE_SECONDS`）を過ぎたセッションは復元せず、行も残さない。
+    #[test]
+    fn expired_session_is_refused_and_removed() {
+        let dir = temp_dir("expired");
+        let pool = test_pool();
+        let vault = vault(&dir);
+
+        let saved_at = now_unix() - SESSION_MAX_AGE_SECONDS - 1;
+        vault
+            .save_at(&pool, StoreSession::Fanza, &fake_session(), saved_at)
+            .unwrap();
+
+        let loaded: Option<FakeSession> = vault.load(&pool, StoreSession::Fanza);
+        assert!(loaded.is_none(), "期限切れを復元してはいけない");
+        assert!(
+            stored(&pool, StoreSession::Fanza).is_none(),
+            "期限切れの行が残っている"
+        );
+    }
+
+    /// 期限内なら復元できる（境界: ちょうど期限はまだ有効）。
+    #[test]
+    fn session_within_the_retention_period_is_restored() {
+        let dir = temp_dir("within");
+        let pool = test_pool();
+        let vault = vault(&dir);
+
+        vault
+            .save_at(
+                &pool,
+                StoreSession::Fanza,
+                &fake_session(),
+                now_unix() - SESSION_MAX_AGE_SECONDS,
+            )
+            .unwrap();
+
+        let loaded: FakeSession = vault
+            .load(&pool, StoreSession::Fanza)
+            .expect("期限内は復元できる");
+        assert_eq!(loaded, fake_session());
+    }
+
+    /// 未来の保存時刻（改ざん・時計ずれ）は復元しない。
+    #[test]
+    fn session_saved_in_the_future_is_refused() {
+        let dir = temp_dir("future");
+        let pool = test_pool();
+        let vault = vault(&dir);
+
+        vault
+            .save_at(
+                &pool,
+                StoreSession::Dlsite,
+                &fake_session(),
+                now_unix() + 3600,
+            )
+            .unwrap();
+
+        let loaded: Option<FakeSession> = vault.load(&pool, StoreSession::Dlsite);
+        assert!(loaded.is_none(), "未来の保存時刻を復元してはいけない");
     }
 
     /// 旧バージョンが保存した平文は復元せず、行ごと削除する（平文へ戻らない）。

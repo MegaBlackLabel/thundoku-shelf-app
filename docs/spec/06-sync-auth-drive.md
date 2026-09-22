@@ -31,7 +31,8 @@
 | DLsite | アプリ DB（`app_settings`） | `dlsite.session` | `DlsiteSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）** |
 
 - keyring の service 名と user 名の定数: `crates/core/src/secrets.rs`（`SERVICE` / `USER_TECHBOOKFEST` / `USER_GOOGLE` / `USER_BOOTH` / `USER_DB_KEY` / `USER_SESSION_KEY`）。
-- **DB 保存の 3 ストアは keyring の鍵で暗号化する**: 鍵は `thundoku-shelf.session-key`（`USER_DB_KEY` とは別スロット＝別鍵）、値は AES-256-GCM（AAD に用途名と形式版）で `enc:v1:` + base64 として `app_settings` に入る。**復号できない値は未ログインとして破棄**し、平文へはフォールバックしない `crates/core/src/session_store.rs`。
+- **DB 保存の 3 ストアは keyring の鍵で暗号化する**: 鍵は `thundoku-shelf.session-key`（`USER_DB_KEY` とは別スロット＝別鍵）、値は AES-256-GCM（AAD に用途名と形式版）で `enc:v2:` + base64 として `app_settings` に入る。**復号できない値は未ログインとして破棄**し、平文へはフォールバックしない `crates/core/src/session_store.rs`。
+- **保存期限は 7 日（`SESSION_MAX_AGE_SECONDS`）**: 保存時刻を**暗号文の中**（`Envelope { saved_at, session }`）に入れて復元時に判定し、期限切れ・未来の時刻（改ざん/時計ずれ）は行ごと破棄して再ログインを求める（DB を書き換えても期限は延ばせない）。形式版は v2 で、**v1 の値は接頭辞が違うため復号できず破棄**される `crates/core/src/session_store.rs`。
 - keyring の鍵が取得できない環境では**セッションを保存しない**（平文で保存しない）。その場合、次回起動では再ログインが必要。
 - モジュール冒頭の宣言: 「OS keyring-backed secret storage (sessions, OAuth tokens). Passwords are never stored — only session cookies / tokens.」`crates/core/src/secrets.rs:1-2`。
 - keyring 操作は `keyring::Entry::new(service, user)` の `set_password` / `get_password` / `delete_credential`。`NoEntry` は `None`（load）／成功扱い（delete）`crates/core/src/secrets.rs:37-66`。
