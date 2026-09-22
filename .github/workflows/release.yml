@@ -365,6 +365,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          # 配布する zip だけを落とす。退避用の signed-app-* はリリースに添付しない
+          # （files: artifacts/**/*.zip が両方にマッチしてしまうため）
+          pattern: thundoku-shelf-*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
