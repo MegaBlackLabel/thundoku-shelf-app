@@ -1,6 +1,6 @@
 //! Google Drive API client (files list/download, multipart upload, folder
 //! create, delete) — the Rust equivalent of the Web `drive-client.ts`.
-//! Scope: `drive.readonly` + `drive.file` (no appdata).
+//! Scope: `drive.file` only (files the app created or the user picked; no appdata).
 
 pub mod sync;
 

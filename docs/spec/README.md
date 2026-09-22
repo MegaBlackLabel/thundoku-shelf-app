@@ -126,6 +126,11 @@ flowchart LR
 | 実装（未対応） | `ReadFilter::Unread` がローカル本のみ一致（未ダウンロード本は「未読」表示なのに未読フィルタに出ない） |
 | 実装（未対応） | 履歴一覧が非仮想化（全行描画） |
 | 実装（既知の制約） | Drive の保存先フォルダはアカウント別ではない（単一キー。`docs/account-switch.md` に明記済み） |
+| 実装（設計判断の残件） | pack の master key は `sub` 由来のまま（Web 版とのバイト互換を優先）。`sub` をログ・平文 DB に残さない対策のみ実施。ランダム鍵 + 端末間の鍵配送への移行は未着手（`docs/spec/03-import-and-pack.md` §4.5 の残るリスク） |
+| 運用（公開前の確認） | Google Cloud のクライアント種別・Web 版との secret 共用・同意画面の設定は**コードからは確認できない**。公開前に `docs/spec/06-sync-auth-drive.md` §2.5 の表で確認する |
+| 運用（継続） | macOS 配布物は **Developer ID で署名し、Apple の公証（Notarization）を受ける**（v0.2.6 以降。`release.yml` の Import signing certificate / Package (macOS)。鍵は GitHub Secrets から一時キーチェーンへ入れ、`if: always()` で必ず削除する）。**Windows の Authenticode 署名は証明書が要るため未実施**。配布物のハッシュは `release.yml` が発行する |
+| 運用（継続） | 依存の脆弱性は CI の `cargo audit` ジョブで確認する（2026-09-22 時点で**脆弱性 0 件**）。無視する例外は `.cargo/audit.toml` に理由と見直し時期つきで列挙（現在は `rsa` の 1 件のみ）。**脆弱性ではない警告 13 件**（未保守 11・unsound 2）は `docs/spec/07-decisions.md` §6.1 で「配布物に入るか」つきで分類済み。Actions はコミット SHA 固定、ビルド・テストは `--locked` |
+| 運用（継続） | リリースごとに **SBOM（CycloneDX JSON）** を生成して配布物へ添付し、**zip と SBOM の両方に署名つきビルド来歴（attestation）** を付ける（`release.yml`。Sigstore の鍵レス署名。公開リポジトリは全プランで利用可）。検証は `gh attestation verify <zip> --repo MegaBlackLabel/thundoku-shelf-app`（SBOM は `--predicate-type https://cyclonedx.org/bom`）。SBOM は Rust の依存のみで、同梱する `pdfium.dll` 等のネイティブ部品は `release.yml` の SHA256 固定で追跡する |
 | `docs/features.md` | 解消済み（検索対象を著者込みに更新。「書籍のバックアップ」ON/OFF は未実装の残件として明記し、実装は `drive.sync.enabled` に連動して pack を常時同期する） |
 | コード内コメント | 解消済み（通知の 3 秒 → 5 秒、`pdf.rs` の 800px → 1000px） |
 | 説明画面 | 解消済み（`docs/spec/04-ui.md` に現行文言） |

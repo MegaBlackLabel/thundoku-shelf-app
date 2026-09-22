@@ -66,6 +66,9 @@ pub const USER_GITHUB: &str = "github";
 pub const USER_BOOTH: &str = "booth";
 /// `books.owner_sub` 暗号化用のローカル鍵（keyring）。
 pub const USER_DB_KEY: &str = "thundoku-shelf.db-key";
+/// ストアのセッション Cookie 暗号化用のローカル鍵（keyring）。
+/// `USER_DB_KEY` とは**別の鍵**にする（用途ごとに分離する）。
+pub const USER_SESSION_KEY: &str = "thundoku-shelf.session-key";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
@@ -152,11 +155,12 @@ impl SecretStore {
         result
     }
 
-    /// `books.owner_sub` の暗号化用ローカル鍵（32 byte）。無ければ新規生成して保存する。
-    /// P1: 起動時に無い場合は新規生成（既存の `owner_sub` は復号不能になるが許容）。
-    /// 鍵の BASE64 を keyring に保存する。
-    pub fn db_key(&self) -> Result<[u8; 32], SecretError> {
-        if let Some(encoded) = self.load(USER_DB_KEY)?
+    /// keyring のスロットに保存された 32 byte 鍵を返す。無ければ新規生成して保存する。
+    ///
+    /// 用途ごとに **別のスロット**（＝別の鍵）を使う。1 つの鍵を複数の用途で
+    /// 使い回すと、片方の漏洩が他方へ波及する。
+    fn random_key(&self, slot: &str) -> Result<[u8; 32], SecretError> {
+        if let Some(encoded) = self.load(slot)?
             && let Ok(decoded) = B64.decode(encoded.trim())
             && decoded.len() == 32
         {
@@ -166,8 +170,21 @@ impl SecretStore {
         }
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
-        self.save(USER_DB_KEY, &B64.encode(key))?;
+        self.save(slot, &B64.encode(key))?;
         Ok(key)
+    }
+
+    /// `books.owner_sub` の暗号化用ローカル鍵（32 byte）。無ければ新規生成して保存する。
+    /// P1: 起動時に無い場合は新規生成（既存の `owner_sub` は復号不能になるが許容）。
+    /// 鍵の BASE64 を keyring に保存する。
+    pub fn db_key(&self) -> Result<[u8; 32], SecretError> {
+        self.random_key(USER_DB_KEY)
+    }
+
+    /// ストアのセッション Cookie の暗号化用ローカル鍵（32 byte）。
+    /// `db_key` とは別スロット＝別鍵（用途ごとに分離する）。
+    pub fn session_key(&self) -> Result<[u8; 32], SecretError> {
+        self.random_key(USER_SESSION_KEY)
     }
 }
 

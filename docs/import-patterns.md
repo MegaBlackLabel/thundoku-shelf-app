@@ -527,9 +527,10 @@ DB に入る**（実 DB に `âMâUÄòé┼é⌐éφéóéóùtÄqé│é±.pdf
     すでに取り込み済みの本は何もしない（ローカルの取り込みを壊さない）。
     ページ画像の寸法はエントリのヘッダから読む（画素デコードはしない）
     - **復元されないもの（pack だけでは戻せない）**:
-      - 本文テキスト（`document_images.extracted_text` / `document_text`）と
-        `token_analysis` — `rebuild_from_pack` は復元しない。ページ画像からは取り出せず、
-        EPUB の生エントリは pack にあるが再抽出はしていない
+      - 本文テキスト（`document_text`）と `token_analysis` — `rebuild_from_pack` は復元しない。
+        ページ画像からは取り出せず、EPUB の生エントリは pack にあるが再抽出はしていない
+        （`document_images.extracted_text` は 2026-09-22 に廃止。読み出し側が無いまま
+        暗号化 pack の本文を平文で複製していたため、書き込みをやめた）
       - `books.site_id` / `books.tbf_product_id` — `import_book` が `None` で作るため。
         復元本は source 紐付けを失い、`find_by_source` の重複抑止や site 絞り込みに乗らない
   - 進捗（`reading_progress`）・タグ（`book_tags`）は DB バックアップ（`thundoku-backup.json`）から復元される

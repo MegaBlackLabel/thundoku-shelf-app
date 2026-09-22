@@ -100,6 +100,9 @@ CREATE TABLE IF NOT EXISTS bookshelf_items (
   synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- 所有者（`books.owner_sub` と同じ暗号文）の列。db/mod.rs の
+  -- プログラム的マイグレーションで追加される。
+  owner_sub TEXT,
   PRIMARY KEY (site_id, database_id)
 );
 
@@ -133,6 +136,7 @@ CREATE TABLE IF NOT EXISTS checked_items (
   price INTEGER,
   is_purchased INTEGER NOT NULL DEFAULT 0,
   sample_fetch_attempted_at TEXT,
+  owner_sub TEXT,
   createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -243,6 +247,7 @@ CREATE TABLE IF NOT EXISTS zenn_tag_metadata (
 
 CREATE TABLE IF NOT EXISTS favorite_tags (
   tag_name TEXT PRIMARY KEY,
+  owner_sub TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -250,6 +255,7 @@ CREATE TABLE IF NOT EXISTS favorite_tags (
 CREATE TABLE IF NOT EXISTS favorite_entities (
   entity_kind TEXT NOT NULL,
   entity_name TEXT NOT NULL,
+  owner_sub TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (entity_kind, entity_name)
 );
@@ -259,6 +265,7 @@ CREATE TABLE IF NOT EXISTS book_first_events (
   database_id TEXT NOT NULL,
   first_event_name TEXT,
   first_event_slug TEXT,
+  owner_sub TEXT,
   fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (site_id, database_id),
   FOREIGN KEY (site_id, database_id) REFERENCES bookshelf_items(site_id, database_id)

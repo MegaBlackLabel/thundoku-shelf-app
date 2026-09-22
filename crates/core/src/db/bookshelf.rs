@@ -142,6 +142,34 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
     })
 }
 
+/// 未所属（`owner_sub IS NULL`）の行に所有者（暗号化済み sub）を与える。
+///
+/// 本棚の行はストアのセッションで同期したデータなので、帰属は「そのとき
+/// ログインしていた Google アカウント」で決める。**既に所有者が付いている行は
+/// 書き換えない**（A の購入一覧が B の同期で B のものに化けて、B の
+/// バックアップに混ざるのを防ぐ）。戻り値は更新した行数。
+pub fn attribute_owner(
+    pool: &SqlitePool,
+    site_id: &str,
+    owner: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let Some(owner) = owner else {
+        // 未ログイン: 未所属のままにする。
+        return Ok(0);
+    };
+    crate::db::block_on(async {
+        let result = sqlx::query(
+            "UPDATE bookshelf_items SET owner_sub = ?1 \
+             WHERE site_id = ?2 AND owner_sub IS NULL",
+        )
+        .bind(owner)
+        .bind(site_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    })
+}
+
 /// bookshelf_items の event_name を更新する（同期で空になったイベント名を
 /// tbf_events から補完するときに使う）。
 pub fn set_event_name(

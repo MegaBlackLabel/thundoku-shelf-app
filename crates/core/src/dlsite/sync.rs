@@ -20,7 +20,13 @@ fn now() -> String {
 /// 保存し、保存件数を返す。除外カテゴリ（voice / game / novel / video）は upsert しない。
 /// リッチメタは `product_info` から取得して `release_date`/`maker_id`/`age_rating`/
 /// `series_name`/`tags_json` に反映する（取得失敗はベストエフォートで一覧の値のみ）。
-pub fn save_purchases(pool: &SqlitePool, client: &mut DlsiteClient) -> Result<usize, DlsiteError> {
+///
+/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。書き込んだ行に所有者を付ける。
+pub fn save_purchases(
+    pool: &SqlitePool,
+    client: &mut DlsiteClient,
+    owner: Option<&str>,
+) -> Result<usize, DlsiteError> {
     let items = client.purchased()?;
     // リッチメタを一括取得（ベストエフォート。失敗時は一覧の値のみで続行）
     let ids: Vec<&str> = items.iter().map(|p| p.content_id.as_str()).collect();
@@ -96,6 +102,7 @@ pub fn save_purchases(pool: &SqlitePool, client: &mut DlsiteClient) -> Result<us
         bookshelf::upsert(pool, &item)?;
         saved += 1;
     }
+    bookshelf::attribute_owner(pool, SITE_ID_DLSITE, owner)?;
     Ok(saved)
 }
 
@@ -320,7 +327,7 @@ mod tests {
         let session = DlsiteSession::new(HashMap::from([("__DLsite_SID".into(), "abc".into())]));
         let mut client = DlsiteClient::with_transport(Box::new(transport), session);
 
-        let saved = save_purchases(&pool, &mut client).unwrap();
+        let saved = save_purchases(&pool, &mut client, None).unwrap();
         assert_eq!(saved, 4);
 
         let rows = bookshelf::list(&pool, SITE_ID_DLSITE).unwrap();

@@ -108,6 +108,17 @@ pub(crate) const WHEEL_DIRECTION_UP: &str = "up-to-next";
 const GOOGLE_AUTH_EXPIRED_NOTICE: &str = "Google のログインが無効になりました（トークンが失効または取り消されています）。\
      もう一度ログインしてください";
 
+/// ログアウト時に**永続値の削除に失敗した**ときの通知文。
+///
+/// 「ログアウトしました」とだけ出すと、共有端末などで「消えた」と誤解させる
+/// （実際には次回起動で復元され得る）。
+fn logout_purge_failed_message(service: &str) -> String {
+    format!(
+        "{service} からログアウトしました（端末に保存したセッション情報を削除できませんでした。\
+         再起動すると復元される可能性があります）"
+    )
+}
+
 /// Google の認証が失効したことを示すメッセージか。
 ///
 /// 同期のエラーは `String` に畳まれて渡ってくるため、core の `GoogleError` の文言で判定する
@@ -736,26 +747,66 @@ impl SettingsView {
 
     pub fn logout_google(&mut self, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
-        {
+        // ローカルの利用状態は即時に落とす（メモリ上のトークンは破棄する）。
+        // 永続値（keyring）の削除は結果を待ってから知らせる（SEC-09）。
+        let store = {
             let state = AppState::global(cx);
             if let Some(client) = state.google.lock().as_mut() {
                 client.logout();
                 log::info!("logout_google: client logout ({:?})", t.elapsed());
-                crate::app_state::clear_google_profile(cx);
-                // ログアウトで未ログインに戻るため、本棚を再フィルタするフラグを立てる。
-                AppState::global(cx)
-                    .google_logout_done
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                // keyring の削除はバックグラウンドで行う（プロフィールの控えも消す）
-                let store = state.secrets.clone();
-                cx.background_spawn(async move {
-                    let _ = store.delete(secrets::USER_GOOGLE);
-                    thundoku_core::google::delete_saved_profile(&store);
-                })
-                .detach();
             }
-        }
-        self.show_toast("Google からログアウトしました", cx);
+            crate::app_state::clear_google_profile(cx);
+            // ログアウトで未ログインに戻るため、本棚を再フィルタするフラグを立てる。
+            state
+                .google_logout_done
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            state.secrets.clone()
+        };
+        // keyring の削除は OS の応答待ち（許可ダイアログ等）で止まり得るので背景で行い、
+        // **結果を待ってから**知らせる。失敗したまま「ログアウトしました」と出すと、
+        // 次回起動で勝手にログインし直って見える。
+        let handle = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let deleted = store.delete(secrets::USER_GOOGLE);
+                    // プロフィール（sub）の控えも消す（残ると所有者判定だけ生き残る）。
+                    thundoku_core::google::delete_saved_profile(&store);
+                    deleted
+                })
+                .await;
+            let _ = handle.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        log::info!("logout_google: credentials cleared ({:?})", t.elapsed());
+                        this.show_toast("Google からログアウトしました", cx);
+                    }
+                    Err(error) => {
+                        log::error!("logout_google: 資格情報を削除できません: {error}");
+                        // 次回起動で復元しないよう印を残す（keyring が使えなくても
+                        // データディレクトリのファイルには書けることが多い）。
+                        let state = AppState::global(cx);
+                        if let Err(mark_error) = crate::app_state::purge_marker(state)
+                            .mark(crate::app_state::GOOGLE_LOGOUT_SLOT)
+                        {
+                            log::error!("logout_google: 印の記録にも失敗: {mark_error}");
+                        }
+                        // サイドバーから呼ばれると設定画面は見えていないのでトーストでも出す。
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            crate::app_state::ToastKind::Error,
+                            "Google からログアウトしました（端末に保存した資格情報を削除できませんでした。\
+                             再起動すると復元される可能性があります）"
+                                .to_string(),
+                        );
+                        this.error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         log::info!("logout_google: done ({:?})", t.elapsed());
         cx.notify();
     }
@@ -813,64 +864,56 @@ impl SettingsView {
             if server_ok.is_ok() { "ok" } else { "failed" },
             t.elapsed()
         );
-        {
-            let state = AppState::global(cx);
-            *state.booth_session.lock() = None;
-            *state.booth_logged_in.lock() = false;
-            // DB（app_settings）からの削除はバックグラウンドで行う
-            let db = state.db_pool.clone();
-            cx.background_spawn(async move {
-                let _ = db::settings::delete(&db, "booth.session");
-            })
-            .detach();
-        }
+        // ローカルは即時に利用停止し、**永続値の削除結果を待って**知らせる
+        // （削除に失敗したまま「ログアウトしました」と出すと、次回起動で復元される）。
+        let purge = crate::app_state::clear_booth_session(cx);
         log::info!("logout_booth: cleared ({:?})", t.elapsed());
-        if server_ok.is_ok() {
-            self.show_toast(
-                "BOOTH からログアウトしました（サイト側のセッションも破棄しました）",
-                cx,
-            );
+        let message = if let Some(error) = purge.as_ref().err() {
+            log::error!("logout_booth: {error}");
+            logout_purge_failed_message("BOOTH")
+        } else if server_ok.is_ok() {
+            "BOOTH からログアウトしました（サイト側のセッションも破棄しました）".to_string()
         } else {
-            self.show_toast(
-                "BOOTH からログアウトしました（サイト側のセッションは残っています）",
-                cx,
-            );
+            "BOOTH からログアウトしました（サイト側のセッションは残っています）".to_string()
+        };
+        if purge.is_err() {
+            crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Error, message);
+        } else {
+            self.show_toast(message, cx);
         }
         cx.notify();
     }
 
     pub fn logout_fanza(&mut self, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
-        {
-            let state = AppState::global(cx);
-            *state.fanza_session.lock() = None;
-            *state.fanza_logged_in.lock() = false;
-            let db = state.db_pool.clone();
-            cx.background_spawn(async move {
-                let _ = db::settings::delete(&db, "fanza.session");
-            })
-            .detach();
-        }
+        let purge = crate::app_state::clear_fanza_session(cx);
         log::info!("logout_fanza: cleared ({:?})", t.elapsed());
-        self.show_toast("FANZA からログアウトしました", cx);
+        self.report_logout("FANZA", purge, cx);
         cx.notify();
     }
 
     pub fn logout_dlsite(&mut self, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
-        {
-            let state = AppState::global(cx);
-            *state.dlsite_session.lock() = None;
-            *state.dlsite_logged_in.lock() = false;
-            let db = state.db_pool.clone();
-            cx.background_spawn(async move {
-                let _ = db::settings::delete(&db, "dlsite.session");
-            })
-            .detach();
-        }
+        let purge = crate::app_state::clear_dlsite_session(cx);
         log::info!("logout_dlsite: cleared ({:?})", t.elapsed());
-        self.show_toast("DLsite からログアウトしました", cx);
+        self.report_logout("DLsite", purge, cx);
         cx.notify();
+    }
+
+    /// ログアウトの結果を知らせる。永続値の削除に失敗したら**成功として見せない**
+    /// （共有端末で「消えた」と誤解させないため）。
+    fn report_logout(&mut self, service: &str, purge: Result<(), String>, cx: &mut Context<Self>) {
+        match purge {
+            Ok(()) => self.show_toast(format!("{service} からログアウトしました"), cx),
+            Err(error) => {
+                log::error!("logout({service}): {error}");
+                crate::app_state::set_toast_kind(
+                    cx,
+                    crate::app_state::ToastKind::Error,
+                    logout_purge_failed_message(service),
+                );
+            }
+        }
     }
 
     pub fn toggle_drive_sync(&mut self, cx: &mut Context<Self>, enabled: bool) {
@@ -2871,6 +2914,44 @@ mod tests {
     use thundoku_core::db;
 
     use super::*;
+
+    /// ログアウトは**永続値の削除に成功したときだけ**「ログアウトしました」と出す。
+    ///
+    /// 失敗を成功として見せると、共有端末などで「消えた」と誤解させる
+    /// （実際には次回起動で復元され得る。`crates/core/src/session_store.rs` の
+    /// `failed_purge_is_not_restored_on_the_next_start` と対になる表示側の契約）。
+    #[gpui_kit::test]
+    async fn logout_reports_purge_failure_instead_of_success(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(SettingsView::new);
+
+        // 失敗: 成功として見せず、再起動で復元され得ることを伝える
+        view.update(cx, |this, cx| {
+            this.report_logout("FANZA", Err("database is locked".to_string()), cx);
+        });
+        let (kind, message) = cx.update(|cx| {
+            let state = AppState::global(cx);
+            (*state.toast_kind.lock(), state.toast_message.lock().clone())
+        });
+        assert_eq!(kind, crate::app_state::ToastKind::Error);
+        let message = message.unwrap_or_default();
+        assert!(
+            message.contains("削除できませんでした"),
+            "失敗を伝えていない: {message}"
+        );
+
+        // 成功: 通常の完了メッセージ
+        view.update(cx, |this, cx| {
+            this.report_logout("FANZA", Ok(()), cx);
+        });
+        let (kind, message) = cx.update(|cx| {
+            let state = AppState::global(cx);
+            (*state.toast_kind.lock(), state.toast_message.lock().clone())
+        });
+        assert_eq!(kind, crate::app_state::ToastKind::Info);
+        assert_eq!(message.unwrap_or_default(), "FANZA からログアウトしました");
+    }
 
     /// Google のトークン失効（`invalid_grant`）を見逃さないこと。
     ///

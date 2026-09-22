@@ -36,11 +36,17 @@ pub struct PageImage {
 
 /// PDFium のライブラリを探す候補（プラットフォームごとのファイル名は
 /// `pdfium_platform_library_name_at_path` が解決する）。
+///
+/// **カレントディレクトリ（`./`）は候補にしない。** Windows では CWD からも DLL を
+/// 探索するため、攻撃者が用意したディレクトリを作業ディレクトリにして起動させられると、
+/// 正規 DLL が同梱されていても先に任意の DLL をロードさせられる（DLL 配置攻撃）。
+/// 開発時（`cargo test` / `cargo run`）の探索は、ビルド時に確定する
+/// `CARGO_MANIFEST_DIR` の**絶対パス**で満たす（`scripts/fetch-pdfium.sh` が
+/// `crates/core/` にライブラリを置く）。
 fn library_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![
-        // テスト実行時（cargo test）は CWD が crate ルート。
-        Pdfium::pdfium_platform_library_name_at_path("./"),
-    ];
+    let mut candidates = vec![Pdfium::pdfium_platform_library_name_at_path(env!(
+        "CARGO_MANIFEST_DIR"
+    ))];
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
@@ -87,6 +93,17 @@ pub fn pdfium_library_path() -> Option<PathBuf> {
 
 static PDFIUM_LOCK: Mutex<()> = Mutex::new(());
 
+/// ページ画像の目標幅（px）。`set_target_width` と上限計算の両方で使う。
+const PDF_TARGET_WIDTH: f32 = 1000.0;
+
+/// 1 ページの描画で許す最大画素数。
+///
+/// `set_maximum_height` は縦長ページの幅を縮めて画質を落とすため使わず、
+/// 幅 1000px へ縮めたときの高さから画素数を見積もって、常識的な範囲を超える
+/// ページを描画前に失敗させる。1000 × 16000 px（= 16 MPix、生 RGB で約 48 MB）を
+/// 上限に置く（実本の見開きは数 MPix）。
+const MAX_PDF_PAGE_PIXELS: f64 = 16_000_000.0;
+
 /// Render every page of a PDF to webp (q80) at a target width of 1000px
 /// and extract the page text. `progress` receives 0..=1.
 pub fn render_pdf_pages(
@@ -112,7 +129,7 @@ pub fn render_pdf_pages(
     // ページ幅を 1000px に（アスペクト比維持）。高さの上限は設けない
     // （縦長ページでも幅 1000px を維持する。`set_maximum_height` を入れると
     // 縦長ページで幅が縮み画質が落ちる）。
-    let render_config = PdfRenderConfig::new().set_target_width(1000);
+    let render_config = PdfRenderConfig::new().set_target_width(PDF_TARGET_WIDTH as i32);
     // 8 ページずつ「描画（直列）→ 並列エンコード」を回す。全ページの生 RGB を
     // 溜めてから一括でエンコードすると 1 ページ約 4MB × ページ数になり、
     // 200 ページ級の本で 1GB を超える（旧 mupdf 経路はページごとにエンコードして
@@ -136,6 +153,22 @@ pub fn render_pdf_pages(
             let page = pages
                 .get(index as _)
                 .map_err(|e| ImportError::Pdf(e.to_string()))?;
+            // 描画前に「幅 1000px へ縮めたときの画素数」を見積もる。極端な
+            // アスペクト比のページ（例: 1pt × 100000pt）は描画後のビットマップが
+            // 数 GB になり得るため、確保する前に弾く（生 RGB は窓 8 ページ分が
+            // 同時に載る）。実本の見開きでも数 MPix なので上限は十分余裕がある。
+            let page_width = f64::from(page.width().value).max(1.0);
+            let page_height = f64::from(page.height().value);
+            let target_width = f64::from(PDF_TARGET_WIDTH);
+            let projected_pixels = target_width * page_height * target_width / page_width;
+            if projected_pixels > MAX_PDF_PAGE_PIXELS {
+                return Err(ImportError::Pdf(format!(
+                    "ページ {} の描画サイズが上限を超えています（幅 {PDF_TARGET_WIDTH}px 換算で {:.0} 画素 > {:.0}）",
+                    index + 1,
+                    projected_pixels,
+                    MAX_PDF_PAGE_PIXELS
+                )));
+            }
             let bitmap = page
                 .render_with_config(&render_config)
                 .map_err(|e| ImportError::Pdf(e.to_string()))?;
@@ -208,4 +241,21 @@ pub fn render_pdf_pages(
         render_start.elapsed()
     );
     Ok(rendered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 探索候補はすべて絶対パス（CWD 相対の候補が混ざると DLL 配置攻撃が成立する）。
+    #[test]
+    fn library_candidates_are_absolute() {
+        for candidate in library_candidates() {
+            assert!(
+                candidate.is_absolute(),
+                "カレントディレクトリ依存の候補が残っている: {}",
+                candidate.display()
+            );
+        }
+    }
 }

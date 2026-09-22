@@ -1,21 +1,24 @@
-//! Google OAuth ログインをアプリ内 WebView（gpui-wry）で行うビュー。
+//! Google OAuth ログインを**システムブラウザ**で行うモーダル。
 //!
-//! BOOTH と同じく、Google の認可ページを WebView で開き、ユーザーが
-//! WebView 内で Google アカウントにログインしてリダイレクトがループバック
-//! アドレス（127.0.0.1）に戻ったら、code をループバック受信 → トークン交換
-//! → プロフィール取得まで自動で行う（システムブラウザは開かない）。
+//! RFC 8252（ネイティブアプリは外部ユーザーエージェントを使う）と、Google が
+//! 埋め込みユーザーエージェントを拒否する方針（`disallowed_useragent`）に従い、
+//! 認可ページはアプリ内 WebView ではなく OS の既定ブラウザで開く。認証情報の入力面を
+//! アプリのプロセスから分離でき、WebView に残る認証状態も持たない。
+//!
+//! ループバック受信（`127.0.0.1`）・PKCE S256・`state` 検証は従来のまま
+//! （`GoogleClient::begin_authorize` / `finish_authorize`）。ブラウザが開けなかった
+//! 場合に備えて認可 URL を画面に出し、手で開いてもらう経路を残す。
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement, ReadGlobal as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
-    div, px,
+    ClipboardItem, Context, EventEmitter, InteractiveElement as _, IntoElement, ParentElement,
+    ReadGlobal as _, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_wry::WebView;
-use raw_window_handle::HasWindowHandle;
 use thundoku_core::google::{GoogleError, GoogleProfile, PendingGoogleAuth};
 
 use crate::app_state::AppState;
@@ -30,38 +33,47 @@ pub struct GoogleLoginFailed(pub String);
 pub struct GoogleLoginCancelled;
 
 pub struct GoogleLoginView {
-    webview: Option<Entity<WebView>>,
     /// 認可フローのキャンセルフラグ（✕ ボタンで立てる）
     cancel: Option<Arc<AtomicBool>>,
-    /// WebView を開けなかった場合のエラー（表示用）
+    /// 認可 URL（ブラウザを開けなかったときに手で開いてもらう）
+    url: Option<String>,
+    /// 表示用のエラー（開始できなかった・ブラウザを開けなかった）
     error: Option<String>,
 }
 
 impl GoogleLoginView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // AppState の GoogleClient から認可フローを開始（ブラウザは開かない）
-        // バックグラウンドタスクからも使うため Arc を保持する
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        // AppState の GoogleClient から認可フローを開始し、認可 URL を既定ブラウザで開く。
         let google = AppState::global(cx).google.clone();
         let pending = google
             .lock()
             .as_ref()
             .and_then(|client| client.begin_authorize().ok());
         let mut this = Self {
-            webview: None,
             cancel: None,
+            url: None,
             error: None,
         };
         match pending {
             Some(pending) => {
-                let cancel = pending.cancel_handle();
-                let url = pending.url.clone();
-                this.cancel = Some(cancel);
-                this.webview = Self::try_create_webview(window, cx);
-                if let Some(webview) = &this.webview {
-                    webview.update(cx, |view, _| {
-                        view.load_url(&url);
-                        view.show();
-                    });
+                this.cancel = Some(pending.cancel_handle());
+                this.url = Some(pending.url.clone());
+                // `authorize()` と同じく、URL には state と code_challenge が入るため
+                // ログにはホストと path だけを残す。
+                log::info!(
+                    "google login: ブラウザで認可を開始 {}",
+                    pending
+                        .url
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or("https://accounts.google.com/o/oauth2/v2/auth")
+                );
+                if let Err(error) = thundoku_core::google::open_browser(&pending.url) {
+                    // 自動で開けなくても、URL を出せば手で続行できる。
+                    log::warn!("google login: ブラウザを開けません: {error}");
+                    this.error = Some(
+                        "ブラウザを自動で開けませんでした。下の URL を開いてください。".to_string(),
+                    );
                 }
                 this.start_finish(pending, google, cx);
             }
@@ -74,29 +86,6 @@ impl GoogleLoginView {
         this
     }
 
-    fn try_create_webview(window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<WebView>> {
-        let builder = lb_wry::WebViewBuilder::new();
-        #[cfg(debug_assertions)]
-        let builder = builder.with_devtools(true);
-        let window_handle = match window.window_handle() {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!("google login: window_handle() failed: {e:?}");
-                return None;
-            }
-        };
-        let webview = match builder.build(&window_handle) {
-            Ok(w) => w,
-            Err(e) => {
-                log::error!("google login: wry build() failed: {e:?} | {e}");
-                return None;
-            }
-        };
-        let entity = cx.new(|cx| WebView::new(webview, window, cx));
-        entity.update(cx, |view, _| view.hide());
-        Some(entity)
-    }
-
     /// ループバック受信 → トークン交換 → プロフィール取得をバックグラウンドで実行する。
     fn start_finish(
         &mut self,
@@ -105,7 +94,7 @@ impl GoogleLoginView {
         cx: &mut Context<Self>,
     ) {
         // 弱参照にする: 監視タスクはアプリ寿命で動き続けるため、強参照を持つと
-        // ログイン画面を閉じてもビュー（と WebView）が解放されない。
+        // ログイン画面を閉じてもビューが解放されない。
         let handle = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let result = cx.background_executor().spawn({
@@ -124,11 +113,6 @@ impl GoogleLoginView {
             // ビューが閉じられていたら（弱参照が切れていたら）何もしない
             let _ = handle.update(cx, |this, cx| {
                 this.cancel = None;
-                // wry の WebView は GPUI のレイヤーとは別にウィンドウに重なっているため、
-                // 完了時（成功・失敗・キャンセル）に必ず隠す
-                if let Some(webview) = this.webview.take() {
-                    webview.update(cx, |view, _| view.hide());
-                }
                 match result {
                     Ok(profile) => {
                         // トークンを keyring に永続化する（再起動時の復元用）。
@@ -169,21 +153,12 @@ impl GoogleLoginView {
         .detach();
     }
 
-    /// WebView を表示する（ログインモーダルを開く）。
-    pub fn show(&mut self, cx: &mut Context<Self>) {
-        if let Some(webview) = &self.webview {
-            webview.update(cx, |view, _| view.show());
-        }
-    }
-
     /// キャンセル/閉じる。
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        if let Some(webview) = self.webview.take() {
-            webview.update(cx, |view, _| view.hide());
-        }
+        cx.notify();
     }
 }
 
@@ -192,100 +167,134 @@ impl EventEmitter<GoogleLoginFailed> for GoogleLoginView {}
 impl EventEmitter<GoogleLoginCancelled> for GoogleLoginView {}
 
 impl Render for GoogleLoginView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // モーダル領域（中央 480x640）に WebView を配置する
-        let window_bounds = window.bounds();
-        let window_w = window_bounds.size.width.as_f32();
-        let window_h = window_bounds.size.height.as_f32();
-        let width = 480.0_f32;
-        let height = 640.0_f32;
-        let left = (window_w - width) / 2.0;
-        let top = (window_h - height) / 2.0;
-        let bounds = gpui_kit::bounds(
-            gpui_kit::Point {
-                x: px(left),
-                y: px(top),
-            },
-            gpui_kit::Size {
-                width: px(width),
-                height: px(height),
-            },
-        );
-        if let Some(webview) = &self.webview {
-            webview.update(cx, |view, _| {
-                let _ = view.raw().set_bounds(lb_wry::Rect {
-                    position: lb_wry::dpi::Position::Physical(lb_wry::dpi::PhysicalPosition::new(
-                        bounds.origin.x.as_f32() as i32,
-                        bounds.origin.y.as_f32() as i32,
-                    )),
-                    size: lb_wry::dpi::Size::Physical(lb_wry::dpi::PhysicalSize::new(
-                        bounds.size.width.as_f32() as u32,
-                        bounds.size.height.as_f32() as u32,
-                    )),
-                });
-            });
-        }
-        // 閉じるボタンは WebView の右上・すぐ外側に置く。技術書典ログインと同じ配置
-        // （WebView はネイティブ子ウィンドウで GPUI 要素より常に最前面。領域内だと隠れる）。
-        let close_size = 36.0_f32;
-        let close_gap = 10.0_f32;
-        let mut close_left = left + width + close_gap;
-        let close_top = top + close_gap;
-        if close_left + close_size > window_w {
-            close_left = left - close_gap - close_size;
-        }
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let border = theme.border;
+        let url = self.url.clone();
+        let handle = cx.weak_entity();
+
         div()
-            .id("google-login-backdrop")
-            .absolute()
-            .top_0()
-            .right_0()
-            .bottom_0()
-            .left_0()
-            .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.45))
+            .id("google-login-card")
+            .debug_selector(|| "google-login-card".into())
+            // 下のレイヤ（workspace の dim オーバーレイ）へクリックを伝播させない
+            // （伝播すると CloseAuth が走ってモーダルが閉じてしまう）。
+            .occlude()
+            .on_click(|_, _window, cx| cx.stop_propagation())
+            .w(px(448.0))
+            .rounded_xl()
+            .border_1()
+            .border_color(border)
+            .bg(theme.popover)
+            .shadow_lg()
+            .p_6()
             .flex()
-            .items_center()
-            .justify_center()
+            .flex_col()
+            .gap_4()
             .child(
                 div()
-                    .id("google-login-cancel")
-                    .absolute()
-                    .left(px(close_left))
-                    .top(px(close_top))
-                    .w(px(close_size))
-                    .h(px(close_size))
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .bg(gpui_kit::rgba(0xffffff26))
-                    .text_color(gpui_kit::white())
-                    .hover(|style| style.bg(gpui_kit::rgba(0xffffff40)))
-                    .cursor_pointer()
-                    .on_click({
-                        let handle = cx.weak_entity();
-                        move |_, _window, cx| {
-                            if let Some(handle) = handle.upgrade() {
-                                handle.update(cx, |this, cx| {
-                                    this.close(cx);
-                                    cx.emit(GoogleLoginCancelled);
-                                });
-                            }
-                        }
-                    })
-                    .child(Icon::new(IconName::Close).size(px(18.0))),
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child("Google でログイン"),
+                    )
+                    .child(
+                        div()
+                            .id("google-login-cancel")
+                            .debug_selector(|| "google-login-cancel".into())
+                            .cursor_pointer()
+                            .child(Icon::new(IconName::Close).size(px(18.0)))
+                            .on_click(move |_, _window, cx| {
+                                if let Some(handle) = handle.upgrade() {
+                                    handle.update(cx, |this, cx| {
+                                        this.close(cx);
+                                        cx.emit(GoogleLoginCancelled);
+                                    });
+                                }
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("ブラウザで Google アカウントにログインしてください。認証が終わると自動で続行します。"),
             )
             .child(if let Some(message) = self.error.clone() {
                 div()
-                    .max_w(px(420.0))
-                    .p_4()
-                    .rounded_lg()
-                    .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.75))
-                    .text_color(gpui_kit::white())
-                    .text_sm()
+                    .debug_selector(|| "google-login-error".into())
+                    .text_xs()
+                    .text_color(gpui_kit::rgb(0xdc2626))
                     .child(message)
                     .into_any_element()
             } else {
                 div().into_any_element()
             })
+            .child(if let Some(url) = url {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("ブラウザが開かないときは、この URL を開いてください。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().child(url.clone()))
+                            .child(
+                                Button::new("google-login-copy-url")
+                                    .cursor_pointer()
+                                    .outline()
+                                    .label("URL をコピー")
+                                    .on_click({
+                                        let url = url.clone();
+                                        move |_, _window, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                url.clone(),
+                                            ));
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("google-login-open-browser")
+                                    .cursor_pointer()
+                                    .outline()
+                                    .label("ブラウザで開く")
+                                    .on_click({
+                                        let url = url.clone();
+                                        move |_, _window, _cx| {
+                                            if let Err(error) =
+                                                thundoku_core::google::open_browser(&url)
+                                            {
+                                                log::warn!(
+                                                    "google login: ブラウザを開けません: {error}"
+                                                );
+                                            }
+                                        }
+                                    }),
+                            ),
+                    )
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("この画面の ✕ でいつでも中止できます。"),
+            )
     }
 }

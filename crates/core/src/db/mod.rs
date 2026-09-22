@@ -406,6 +406,20 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         )
         .execute(&mut *conn)
         .await?;
+        // 複数アカウント対応: `books.owner_sub` と同じ所有者列を、アカウントに
+        // 紐づく他テーブルにも持たせる。DB バックアップを現在 sub の行だけに
+        // 絞るために使う（値は `books.owner_sub` と同じ keyring 鍵による暗号文）。
+        // `favorite_entities` 等はこの関数の中で後から CREATE されるため、
+        // **テーブル作成がすべて終わったここで**冪等に追加する。
+        for table in [
+            "bookshelf_items",
+            "checked_items",
+            "book_first_events",
+            "favorite_tags",
+            "favorite_entities",
+        ] {
+            ensure_column(&mut conn, table, "owner_sub", "owner_sub TEXT").await?;
+        }
         Ok(())
     })
 }

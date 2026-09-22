@@ -125,24 +125,58 @@ fn collect_headers(resp: &ureq::Response) -> Vec<(String, String)> {
     headers
 }
 
-fn read_body(reader: &mut impl std::io::Read) -> Vec<u8> {
-    let mut body = Vec::new();
-    let _ = reader.read_to_end(&mut body);
-    body
+/// API 応答（JSON / HTML）本文の上限。同期の応答がこれを超えることはない。
+pub(crate) const MAX_API_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// ダウンロード本文の上限。取り込み対象は最大でも数百 MB（ZIP の展開後は 1.3GB 級）。
+/// 無制限に積むと、細工した Content-Length や無限ストリームでメモリを使い切られる。
+pub(crate) const MAX_DOWNLOAD_BODY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 本文読み出しの結末。
+pub(crate) enum BodyOutcome {
+    /// 上限内で読み切った。
+    Read(Vec<u8>),
+    /// 進捗コールバックが中止を要求した。
+    Cancelled,
+    /// 上限（バイト）を超えた。
+    TooLarge(u64),
+    /// 読み出しが途中で失敗した（切れた本文を成功として返さない）。
+    Io(String),
+}
+
+fn with_limit(outcome: BodyOutcome) -> Result<Vec<u8>, TbfError> {
+    match outcome {
+        BodyOutcome::Read(body) => Ok(body),
+        BodyOutcome::Cancelled => Err(TbfError::Cancelled),
+        BodyOutcome::TooLarge(limit) => Err(TbfError::Upstream(format!(
+            "応答本文が上限（{limit} バイト）を超えました"
+        ))),
+        BodyOutcome::Io(message) => Err(TbfError::Network(format!(
+            "応答本文の読み出しに失敗しました: {message}"
+        ))),
+    }
+}
+
+/// 本文を上限つきで読む（進捗通知なし）。
+fn read_body_capped(reader: &mut impl std::io::Read, limit: u64) -> BodyOutcome {
+    read_body_with_progress(reader, 0, limit, &mut |_, _| true)
 }
 
 /// 本文を読みながら `on_progress(downloaded, total)` を通知する。
 ///
 /// - 進捗は**1% 刻み**で間引く（チャンクごとに通知すると受信側の UI を詰まらせ、
 ///   ダウンロード自体がストールする）
-/// - コールバックが `false` を返すと読み込みを中断し、`None` を返す
-///   （途中まで読んだバイト列は呼び出し側に渡さない。部分的な本文を取り込まない）
+/// - コールバックが `false` を返すと読み込みを中断する（途中まで読んだバイト列は
+///   呼び出し側に渡さない。部分的な本文を取り込まない）
 /// - `total` が 0（Content-Length 無し）のときは進捗を通知しない
+/// - 読み出しが `limit` を超えたら `TooLarge`（**宣言サイズではなく実際に読めた
+///   バイト数**で判定する）
 pub(crate) fn read_body_with_progress(
     reader: &mut impl std::io::Read,
     total: u64,
+    limit: u64,
     on_progress: &mut dyn FnMut(u64, u64) -> bool,
-) -> Option<Vec<u8>> {
+) -> BodyOutcome {
     let mut out = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut downloaded = 0u64;
@@ -152,22 +186,27 @@ pub(crate) fn read_body_with_progress(
             Ok(0) => break,
             Ok(n) => {
                 downloaded += n as u64;
+                if downloaded > limit {
+                    return BodyOutcome::TooLarge(limit);
+                }
                 out.extend_from_slice(&buf[..n]);
                 if total > 0 {
                     let pct = (downloaded * 100).checked_div(total).unwrap_or(0) as u32;
                     if pct != last_pct {
                         last_pct = pct;
                         if !on_progress(downloaded, total) {
-                            return None;
+                            return BodyOutcome::Cancelled;
                         }
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            // 途中で切れた本文を成功として返さない（壊れた JSON / 途中までの
+            // ファイルを取り込まない）。
+            Err(e) => return BodyOutcome::Io(e.to_string()),
         }
     }
-    Some(out)
+    BodyOutcome::Read(out)
 }
 
 impl Transport for UreqTransport {
@@ -188,12 +227,18 @@ impl Transport for UreqTransport {
             Ok(resp) => Ok(ResponseSpec {
                 status: resp.status(),
                 headers: collect_headers(&resp),
-                body: read_body(&mut resp.into_reader()),
+                body: with_limit(read_body_capped(
+                    &mut resp.into_reader(),
+                    MAX_API_BODY_BYTES,
+                ))?,
             }),
             Err(ureq::Error::Status(status, resp)) => Ok(ResponseSpec {
                 status,
                 headers: collect_headers(&resp),
-                body: read_body(&mut resp.into_reader()),
+                body: with_limit(read_body_capped(
+                    &mut resp.into_reader(),
+                    MAX_API_BODY_BYTES,
+                ))?,
             }),
             Err(other) => Err(TbfError::Network(other.to_string())),
         }
@@ -223,8 +268,24 @@ impl Transport for UreqTransport {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(0);
                 let mut reader = resp.into_reader();
-                let Some(body) = read_body_with_progress(&mut reader, total, on_progress) else {
-                    return Err(TbfError::Cancelled);
+                let body = match read_body_with_progress(
+                    &mut reader,
+                    total,
+                    MAX_DOWNLOAD_BODY_BYTES,
+                    on_progress,
+                ) {
+                    BodyOutcome::Read(body) => body,
+                    BodyOutcome::Cancelled => return Err(TbfError::Cancelled),
+                    BodyOutcome::TooLarge(limit) => {
+                        return Err(TbfError::Upstream(format!(
+                            "ダウンロードが上限（{limit} バイト）を超えました"
+                        )));
+                    }
+                    BodyOutcome::Io(message) => {
+                        return Err(TbfError::Network(format!(
+                            "ダウンロードの読み出しに失敗しました: {message}"
+                        )));
+                    }
                 };
                 Ok(ResponseSpec {
                     status,
@@ -235,7 +296,10 @@ impl Transport for UreqTransport {
             Err(ureq::Error::Status(status, resp)) => Ok(ResponseSpec {
                 status,
                 headers: collect_headers(&resp),
-                body: read_body(&mut resp.into_reader()),
+                body: with_limit(read_body_capped(
+                    &mut resp.into_reader(),
+                    MAX_API_BODY_BYTES,
+                ))?,
             }),
             Err(other) => Err(TbfError::Network(other.to_string())),
         }
@@ -304,11 +368,18 @@ mod tests {
         let total = 64 * 1024 * 2;
         let mut reader = std::io::Cursor::new(vec![0u8; total as usize]);
         let mut calls: Vec<u64> = Vec::new();
-        let body = read_body_with_progress(&mut reader, total as u64, &mut |downloaded, _| {
-            calls.push(downloaded);
-            true
-        })
-        .expect("中止していないのに本文が無い");
+        let outcome = read_body_with_progress(
+            &mut reader,
+            total as u64,
+            MAX_DOWNLOAD_BODY_BYTES,
+            &mut |downloaded, _| {
+                calls.push(downloaded);
+                true
+            },
+        );
+        let BodyOutcome::Read(body) = outcome else {
+            panic!("上限内なのに本文が読めていない");
+        };
         assert_eq!(body.len(), total as usize);
         assert_eq!(calls, vec![64 * 1024, total as u64], "通知が 1% 刻みでない");
     }
@@ -319,16 +390,35 @@ mod tests {
         let total = 64 * 1024 * 4;
         let mut reader = std::io::Cursor::new(vec![7u8; total as usize]);
         let mut seen: Vec<u64> = Vec::new();
-        let body = read_body_with_progress(&mut reader, total as u64, &mut |downloaded, _| {
-            seen.push(downloaded);
-            false
-        });
-        assert!(body.is_none(), "中止したのに途中のデータが返っている");
+        let outcome = read_body_with_progress(
+            &mut reader,
+            total as u64,
+            MAX_DOWNLOAD_BODY_BYTES,
+            &mut |downloaded, _| {
+                seen.push(downloaded);
+                false
+            },
+        );
+        assert!(
+            matches!(outcome, BodyOutcome::Cancelled),
+            "中止したのに途中のデータが返っている"
+        );
         assert_eq!(seen, vec![64 * 1024], "最初のチャンクで通知していない");
         assert_eq!(
             reader.position(),
             64 * 1024,
             "中止後も読み進めている（転送が止まっていない）"
+        );
+    }
+
+    /// 上限を超えた本文は成功として返さない（宣言サイズではなく実バイト数で判定）。
+    #[test]
+    fn read_body_with_progress_stops_at_the_limit() {
+        let mut reader = std::io::Cursor::new(vec![0u8; 200 * 1024]);
+        let outcome = read_body_with_progress(&mut reader, 0, 64 * 1024, &mut |_, _| true);
+        assert!(
+            matches!(outcome, BodyOutcome::TooLarge(limit) if limit == 64 * 1024),
+            "上限超過が失敗として伝わっていない"
         );
     }
 }

@@ -755,11 +755,16 @@ fn db_backup_upload_records_the_baseline_for_the_next_check() {
     )
     .unwrap();
     let owned = thundoku_core::db::books::owned_book_ids(&env.pool, &key, Some("sub-1")).unwrap();
+    let owner_filter = thundoku_core::db::backup::OwnerFilter {
+        key: &key,
+        sub: Some("sub-1"),
+    };
     let status = thundoku_core::drive::sync::inspect_drive_backup(
         &env.pool,
         &mut drive,
         "folder-1",
         Some(&owned),
+        Some(&owner_filter),
         baseline.as_deref(),
     )
     .unwrap()

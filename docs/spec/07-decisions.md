@@ -44,12 +44,16 @@
 | 表紙のプレースホルダが**常に空枠** | SVG を `image` クレートで復号しようとして常に `None` | `usvg` + `resvg` + `tiny-skia` でラスタライズ（`rasterize_svg`）。BGRA 入れ替えが必要 |
 | 履歴の表紙が日ごとに再デコード | 同じ本が複数の日に出る | `reload` 内で `book_id` ごとに**1 回だけデコードして共有** |
 | 通知の自動消滅時間のコメントが「3 秒」 | 実装は gpui-kit の既定 **5 秒** | **修正済み**: コード内コメント（`app_state.rs` / `settings.rs` / `workspace.rs`）を実装に合わせて「既定 5 秒」に統一した |
+| pack の `entry_count` で **377 GB の確保**を試みてプロセスが異常終了（`memory allocation of 377957121960 bytes failed` → `STATUS_STACK_BUFFER_OVERRUN`） | `entry_count` を index 長と突き合わせずに `Vec::with_capacity` に渡していた。ヘッダ CRC は攻撃者も計算できるため、68 バイトの細工データで再現する | **修正済み**: index 長から導ける件数上限（1 エントリ ≧ 48 バイト）を確保の前に検査（`crates/opfspack/src/reader.rs`）。回帰テスト `crates/opfspack/tests/hardening.rs` |
+| 保存済み `download_url` / 302 の `Location` を外部ホストへ向けると**セッション Cookie が送られる** | 送信先の検証が無かった。`download_url` は Drive の JSON バックアップから復元でき、改変バックアップの復元で攻撃が成立する | **修正済み**: `download_url::check` を追加し、認証付き送信の直前と 302 の転送先で `https` + 許可ホスト（Cookie のスコープに合わせる）を検証（`crates/core/src/download_url.rs`）。回帰テスト `crates/core/tests/download_credentials.rs` |
+| Windows で**作業ディレクトリの `pdfium.dll` を優先ロード** | `library_candidates()` の先頭が `./`（テスト用のつもりが製品コードにも残っていた）。CWD を用意して起動させられると任意 DLL を読む（DLL 配置攻撃） | **修正済み**: CWD の候補を削除し、開発時の探索はビルド時 `CARGO_MANIFEST_DIR` の絶対パスに限定（`crates/core/src/import/pdf.rs`） |
+| 改変バックアップの `books.id` / `pack_id` で**保存領域の外**の pack を読み書き・削除できる | 復元した id を検証せず `packs_dir.join("{id}.opfspack")` へ渡していた | **修正済み**: `pack_path` モジュールに検証を集約し、復元時は不正 id を拒否、pack を触る全経路で同じ検証を通す（`crates/core/src/pack_path.rs`） |
 
 ## 5. ストア同期・認証の意図
 
 | 決定 | 理由 |
 |---|---|
-| 認証情報は **技術書典 / Google / DB 鍵 = OS keyring**、**BOOTH / FANZA / DLsite = DB（平文 JSON）** | keyring の値長上限（2560 UTF-16 文字）にセッションが収まらないため（`crates/core/src/secrets.rs`） |
+| 認証情報は **技術書典 / Google / DB 鍵 / セッション鍵 = OS keyring**、**BOOTH / FANZA / DLsite のセッション = DB（keyring の鍵で AES-256-GCM）** | keyring の値長上限（2560 UTF-16 文字）にセッションが収まらないため DB に置くが、DB のコピーからセッションを復元されないよう鍵だけを keyring に置いて暗号化する（`crates/core/src/session_store.rs`） |
 | 同期は**全件 UPSERT**（技術書典 / DLsite / FANZA）、**Drive のみ md5 + 更新時刻で差分** | ストア側 API に差分が無い。Drive はファイル転送コストが高い |
 | ログインはストアごとに**専用 WebView** を開き、URL 遷移を監視してセッションを保存 | 各ストアのログイン方式（Cookie / メールログイン / OAuth）が異なる |
 | WebView を監視するタスクは**弱参照**でビューを持つ | 監視タスクがアプリ寿命で動き続けるため、強参照だと閉じても WebView ごと残る |
@@ -70,3 +74,32 @@
 | Drive のフォルダ | **既知の制約**: 実装は単一キー `drive.sync.folder_id`（アカウント別ではない）。データ本体は `owner_sub` で属性付けされるため混ざらないが、フォルダは分かれない |
 | 未読フィルタ | **未対応**: `ReadFilter::Unread` はローカル本のみ一致（未ダウンロード本はカード上「未読」表示だが未読フィルタに出ない） |
 | 履歴一覧 | **未対応（見送り）**: 非仮想化（全行描画）。表紙は 1 冊 1 回に共有済みで、残る効果は約 15MiB |
+
+### 6.1 依存の警告（脆弱性ではないもの）
+
+`cargo audit` は**脆弱性（vulnerability）と警告（warning）を分けて**報告する。2026-09-22 時点で
+**脆弱性 0 件 / 警告 13 件**（未保守 11・unsound 2）。警告はいずれも**修正版が無い**種類の勧告
+（`patched_versions` が空）なので、版を上げても消えない。したがって「**実際に配布物へ入るか**」で
+切って判断する（判定は `cargo tree -i <crate> --target <triple> -e all`。Windows は
+`x86_64-pc-windows-msvc`、macOS は `aarch64-apple-darwin` / `x86_64-apple-darwin`）。
+
+| crate | 勧告 | 種別 | 配布物（Win / macOS） | 由来 | 判断 |
+|---|---|---|---|---|---|
+| `ttf-parser` 0.24.1 / 0.25.1 | RUSTSEC-2026-0192 | 未保守 | **入る** | `usvg` / `resvg`（SVG のラスタライズ。gpui-component のアイコン描画） | 修正版なし。上流の更新待ち |
+| `rustybuzz` 0.18.0 / 0.20.1 | RUSTSEC-2026-0206 | 未保守 | **入る** | 同上 | 同上 |
+| `bincode` 2.0.1 | RUSTSEC-2025-0141 | 未保守 | **入る** | `lindera`（形態素解析の辞書読み込み。`crates/core/src/tags.rs`） | 修正版なし。`lindera` の更新待ち |
+| `instant` 0.1.13 | RUSTSEC-2024-0384 | 未保守 | **入る** | `gpui-base` / `notify-types` | 上流待ち（後継は `web-time`） |
+| `paste` 1.0.15 | RUSTSEC-2024-0436 | 未保守 | ビルド時のみ（proc-macro） | `gpui-component` / `pulp` | 上流待ち（後継は `pastey`） |
+| `encoding` 0.2.33 | RUSTSEC-2021-0153 | 未保守 | ビルド時のみ | `lindera-dictionary` の `[build-dependencies]` | 上流待ち |
+| `glib` 0.18.5 | RUSTSEC-2024-0429 | unsound | **入らない** | `gtk` ← `lb-wry`（Linux の WebView のみ） | 配布対象外なので許容 |
+| `proc-macro-error` 1.0.4 | RUSTSEC-2024-0370 | 未保守 | **入らない** | `glib-macros` ← `glib`（同上） | 同上 |
+| `rand` 0.7.3 | RUSTSEC-2026-0097 | unsound | **入らない** | `phf_codegen` ← `selectors` ← `kuchikiki` ← `lb-wry` | 同上 |
+| `fxhash` 0.2.1 | RUSTSEC-2025-0057 | 未保守 | **入らない** | 同上 | 同上 |
+| `rustls-pemfile` 2.2.0 | RUSTSEC-2025-0134 | 未保守 | **入らない** | `gpui-pre-reqwest` ← `gpui-kit-assets` | 同上 |
+
+「入らない」は**配布ターゲットの依存グラフに現れない**という実測（`cargo tree -i … --target … -e all`
+が空）。「入る」ものは上流（gpui / lindera / resvg 系）が置換・更新するまで解消できない。
+
+見直し: CI の `cargo audit` は毎回これを警告として出す（消えれば上流が直った合図）。依存を更新する
+たび、または四半期ごとにこの表を引き直す。**新しい勧告（とくに unsound）が出たら、まず配布物へ
+入るかを確認する。**

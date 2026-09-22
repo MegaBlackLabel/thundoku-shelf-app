@@ -19,6 +19,25 @@ pub const MAX_PAGES_PER_STORE: usize = 200;
 /// DLsite は非ブラウザ UA を弾くため、ブラウザ UA + Referer を送る（BoothClient と同流儀）。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
+/// ダウンロード要求を送ってよいホスト。
+///
+/// `bookshelf_items.download_url`（= `down_url`）は Drive の JSON バックアップから
+/// 復元でき、改変したバックアップを復元させると外部ホストへセッション Cookie が
+/// 送られる。自サイトだけを許可する。
+const DLSITE_DOWNLOAD_RULES: &[crate::download_url::HostRule] =
+    &[crate::download_url::HostRule::with_subdomains(
+        "dlsite.com",
+        None,
+    )];
+
+/// 302 の転送先（署名 `jwt` + セッション Cookie を送る先）。Cookie は
+/// `domain=.dlsite.com` で発行されるため、その範囲（本体 + CDN）だけを許可する。
+const DLSITE_CDN_RULES: &[crate::download_url::HostRule] =
+    &[crate::download_url::HostRule::with_subdomains(
+        "dlsite.com",
+        None,
+    )];
+
 #[derive(Debug, thiserror::Error)]
 pub enum DlsiteError {
     #[error("セッション切れ・未ログイン")]
@@ -31,6 +50,9 @@ pub enum DlsiteError {
     Http(u16),
     #[error("parsing failed: {0}")]
     Parse(String),
+    /// 送信先が許可リストに無い（資格情報を送らない）。
+    #[error("blocked download url: {0}")]
+    BlockedUrl(String),
     #[error("db: {0}")]
     Database(#[from] sqlx::Error),
     #[error("transport: {0}")]
@@ -236,6 +258,11 @@ impl DlsiteClient {
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, DlsiteError> {
         // 1) down_url を manual（redirects=0）で叩いて 302 Location を取得
+        //
+        // 送信先は `bookshelf_items.download_url`（改変バックアップ由来もあり得る）と
+        // その 302 の `Location`。Cookie を付ける前に双方を検証する。
+        crate::download_url::check(down_url, DLSITE_DOWNLOAD_RULES)
+            .map_err(|error| DlsiteError::BlockedUrl(format!("{down_url}: {error}")))?;
         let proxy_spec = RequestSpec {
             method: "GET".into(),
             url: down_url.into(),
@@ -259,6 +286,9 @@ impl DlsiteClient {
         } else {
             return Err(DlsiteError::Http(proxy_resp.status));
         };
+        // 転送先も検証する（任意ホストへ Cookie を転送させない）。
+        crate::download_url::check(&cd_url, DLSITE_CDN_RULES)
+            .map_err(|error| DlsiteError::BlockedUrl(format!("{cd_url}: {error}")))?;
         // 2) 302 の Set-Cookie で `jwt`（署名付きダウンロード鍵）を捕捉して Cookie へ足す
         let mut cookie = self.session.cookie_header();
         for (k, v) in proxy_resp.set_cookies() {

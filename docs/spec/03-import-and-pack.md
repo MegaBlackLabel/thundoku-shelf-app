@@ -57,6 +57,7 @@
 | 合流エントリ数上限 | `MAX_NESTED_ENTRIES = 2000` | `import/mod.rs:197`, `:357-363` |
 | 合流規則 | 入れ子 ZIP のパス（拡張子除去）+ `/` + 内側エントリ名。外側の分類・グルーピングがそのまま効く | `import/mod.rs:336`, `:351-355` |
 | 上限超過時 | 半分だけ取り込まず**その入れ子全体をスキップ**し、`warnings` に 1 行積む（取り込み全体は失敗させない） | `import/mod.rs:357-364` |
+| 通常エントリの上限 | `MAX_ZIP_ENTRY_BYTES = 512 MiB`（非圧縮。**宣言サイズではなく実際に読めたバイト数**で判定）。超過は `ImportError::Zip`（部分的なデータで先へ進めない） | `import/mod.rs`（`read_zip_entry_capped`） |
 | 壊れた入れ子 | `warnings` に `"{name}: {error}"` を積んでスキップ | `import/mod.rs:326-333` |
 | 警告文言（実装値） | `"{name}: nested zip is larger than the size limit (536870912 bytes)"` / `"{name}: nested zip inside a nested zip is not expanded (depth limit 1)"` / `"{name}: nested zip exceeds the entry/size limit and was skipped"` | `import/mod.rs:314-317`, `:347-349`, `:358-361` |
 
@@ -108,7 +109,7 @@
 
 | 環境 | 実装 | 解像度 / 品質 | 並列 | アンカー |
 |---|---|---|---|---|
-| 全プラットフォーム | `pdfium-render` 0.9（`pdfium_7881` / `image_latest` / `thread_safe`）を**実行時ロード**。探索順は ① `./`（テスト実行時の CWD） ② 実行ファイルと同じディレクトリ ③ macOS は `../Frameworks`（`.app` の `Contents/Frameworks`） | `set_target_width(1000)`、WebP 品質 **80**（高さ制限なし） | PDFium の呼び出し（初期化を含む）は **`PDFIUM_LOCK: Mutex<()>` で直列**（`thread_safe` feature はロックしないため自前で排他）。描画後の WebP エンコードは PDFium を触らないので **8 スレッドで並列**（`chunk_size = total.div_ceil(8)`） | `pdf.rs:80-95`, `:107`, `:122-131` |
+| 全プラットフォーム | `pdfium-render` 0.9（`pdfium_7881` / `image_latest` / `thread_safe`）を**実行時ロード**。探索順は ① ビルド時の `CARGO_MANIFEST_DIR`（= `crates/core`）② 実行ファイルと同じディレクトリ ③ macOS は `../Frameworks`（`.app` の `Contents/Frameworks`）。**CWD は探索しない**（DLL 配置攻撃対策） | `set_target_width(1000)`、WebP 品質 **80**。描画前に「幅 1000px 換算の画素数」を見積もり、`MAX_PDF_PAGE_PIXELS = 16 MPix` を超えるページは描画せずエラー（極端なアスペクト比のページでビットマップが巨大化するのを防ぐ） | PDFium の呼び出し（初期化を含む）は **`PDFIUM_LOCK: Mutex<()>` で直列**（`thread_safe` feature はロックしないため自前で排他）。描画後の WebP エンコードは PDFium を触らないので **8 スレッドで並列**（`chunk_size = total.div_ceil(8)`） | `pdf.rs` |
 | テキスト抽出 | `page.text()` の文字列。取れない場合は空文字 | — | — | `pdf.rs:118` |
 | 進捗 | `progress(finished / total)`（0.0〜1.0）。**エンコードが終わったページ数**を `AtomicUsize` で数えてページごとに通知 | — | — | `pdf.rs:157-160` |
 | 失敗時 | 1 ページでも失敗したら `ImportError::Pdf`（失敗したページ番号はログに残す） | — | — | `pdf.rs:166-183` |
@@ -235,6 +236,14 @@
 | 鍵のキャッシュ用 API | `derived_pack_key(&Identity) -> [u8; 32]`（ページごとの PBKDF2 再計算を避ける） | `lib.rs:22-26`, `reader.rs:90-93` |
 | 所有者 ID | `SHA-256("opfspack:v1:{sub}")` の小文字 hex（TS `deriveOwnerId` と一致）。テストベクタ: `derive_owner_id("test-sub") == "6366bfc3b6ab37feaf2adb385aeaa515c4aa52cf09e70cac890d888e4409f3b0"` | `lib.rs:117-124`, `tests/interop.rs:361-367` |
 
+> **残るリスク（設計判断）**: `sub` は Google のアカウント識別子であって秘密ではない。
+> `sub` を入手した相手は pack を復号できる。アプリ側でできる対策は「`sub` をログ・
+> 平文 DB に書かない」（`books.owner_sub` は keyring 鍵で暗号化、ログは
+> `google::profile_log_label` で有無のみ）までで、**鍵そのものを `sub` から導出しない
+> 設計（アカウントごとのランダム鍵 + 端末間の鍵配送）は pack 形式の変更**（Web 版との
+> バイト互換が切れる）と既存 pack の再暗号化・復旧手段の設計を伴うため未着手。
+
+
 ### 4.6 検証順序（`PackReader::open`）
 
 | 順 | 検証 | 失敗時 | アンカー |
@@ -246,8 +255,9 @@
 | 5 | `index_offset + index_size` がバッファ内（オーバーフロー検査付き） | `Corrupted("index offset overflow")` / `Corrupted("index extends beyond buffer")` | `reader.rs:25-34` |
 | 6 | `index_size >= 4` | `Corrupted("index too small for CRC")` | `reader.rs:35-37` |
 | 7 | index CRC-32 | `Corrupted("index CRC mismatch: …")` | `reader.rs:38-45` |
-| 8 | 各エントリが `entry_count` 件読める | `Corrupted("index truncated: expected N entries")` | `reader.rs:51-57` |
-| 9 | 各エントリの `offset >= 64` かつ `offset + compressed_size <= index_offset` | `Corrupted("entry extends beyond body: {path}")` / `Corrupted("entry offset overflow: {path}")` | `reader.rs:60-76` |
+| 8 | `entry_count` が index 長から導ける上限以内（1 エントリ ≧ 48 バイト） | `Corrupted("entry_count N exceeds index capacity M")` | `reader.rs`（`MIN_INDEX_ENTRY_SIZE`） |
+| 9 | 各エントリが `entry_count` 件読める | `Corrupted("index truncated: expected N entries")` | `reader.rs:51-57` |
+| 10 | 各エントリの `offset >= 64` かつ `offset + compressed_size <= index_offset` | `Corrupted("entry extends beyond body: {path}")` / `Corrupted("entry offset overflow: {path}")` | `reader.rs:60-76` |
 
 読み出し時: `NotFound(path)` → LZ4 判定 → `IDENTITY_BOUND` なら鍵必須（無ければ `IdentityRequired(path)`、タグ不一致は `Corrupted("decryption failed: {path}")`）→ `COMPRESSED` なら RAW DEFLATE 展開（失敗は `Corrupted("decompression failed: …")`）。`read_entry_range` は `start >= end || end > entry.size` で `InvalidRange`（`reader.rs:98-149`）。
 
@@ -345,7 +355,7 @@
 | PDF ページ WebP 品質 | `80` | 0-100 | `pdf.rs:147` |
 | PDFium の直列化 | プロセス全体で `Mutex` 1 本（初期化を含む。`thread_safe` feature はロックしないため自前で排他） | — | `pdf.rs:80`, `:91-95` |
 | PDFium の WebP エンコード並列度 | `8`（`chunk_size = total.div_ceil(8)`。PDFium を触らないので並列可） | スレッド | `pdf.rs:122-131` |
-| PDFium ライブラリ探索順 | ① `./`（テスト実行時の CWD = crate ルート） ② 実行ファイルと同じディレクトリ ③ macOS は実行ファイルの `../Frameworks`（`.app` の `Contents/Frameworks`） | — | `pdf.rs:37-55` |
+| PDFium ライブラリ探索順 | ① ビルド時の `CARGO_MANIFEST_DIR`（= `crates/core`） ② 実行ファイルと同じディレクトリ ③ macOS は実行ファイルの `../Frameworks`（`.app` の `Contents/Frameworks`）。**CWD は探索しない**（DLL 配置攻撃対策） | — | `pdf.rs` |
 
 ### 5.3 DB（接続・バッチ）
 
@@ -453,7 +463,7 @@
 | 4 | `books.page_count` / `bookshelf_items.page_count` に入る値の定義（何ページを指すか） | 本担当範囲（FANZA/DLsite 同期）にその代入コードが無い |
 | 5 | import が `entry_flags::COMPRESSED` を一切立てない理由 | 呼び出し側は全エントリ `compress=false` 固定（`import/mod.rs:918`, `:1549`, `:1592`, `:1642`, `:1674-1683`）。判断根拠のコメントは無い |
 | 6 | DEFLATE レベル `6` の根拠（TS の fflate 既定と一致するか） | `builder.rs:135` の値のみ。TS 側ソースは本リポジトリに無い |
-| 7 | pack・エントリ単位のサイズ上限（1 pack 最大バイト数等） | `opfspack` に上限チェックが無い（上限は入れ子 ZIP の 512 MiB / 2000 件のみ）。仕様として「無制限」なのか未実装なのか不明 |
+| 7 | pack・エントリ単位のサイズ上限（1 pack 最大バイト数等） | `opfspack` 側に pack 全体の上限は無い（読み出しは index 長から導ける件数で `entry_count` を検査する）。取り込み側は通常エントリ 512 MiB / 入れ子 ZIP 512 MiB / 2000 件、HTTP 応答 2 GiB の上限を持つ |
 | 8 | `books.cover_thumbnail` を埋める経路 | 取り込みは常に `None`（`import/mod.rs:933`）。Drive 取り込みも `None`（`drive/sync.rs:149`） |
 | 9 | `view_history.started_at` / `ended_at` をローカル時刻へ直す責務の所在（コメントは「表示側でローカルに直す」） | `db/view_history.rs:142-160` は `chrono::Local` で日付集計するが、どの層が正かは本担当範囲外（詳細は `local://spec-core.md` を参照） |
 | 10 | PDFium ライブラリ（`pdfium.dll` / `libpdfium.dylib`）の配布手順・バージョン整合（feature `pdfium_7881`） | 依存宣言のみで、取得の手順は本担当範囲のファイルに無い（配布物は `.github/workflows/release.yml`、開発/テスト用は `scripts/fetch-pdfium.sh` = `mise run pdfium` が `crates/core/` へ取得する） |

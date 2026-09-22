@@ -4,6 +4,110 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **非公式のアプリであることを README と「このアプリについて」画面に明示**: ストア名を挙げて
+  「〜に対応」と書くと、各サービスの公式な連携アプリと受け取られうる。README と説明画面の上部に、
+  「個人が開発している非公式のアプリで、DMM.com、FANZA、DLsite、BOOTH、技術書典をはじめとする
+  各サービスの運営会社とは提携・関連が無く、各社による提供・承認・推奨・サポートを受けていない」
+  旨を追加した（説明画面は上下の並びをテストで固定）。あわせて README と説明画面の機能説明から
+  ストア名の列挙（「技術書典 / BOOTH / FANZA同人 / DLsite に対応」）を外し、「各ストア」と書く。
+  ログイン手順のように**操作に必要な箇所**ではストア名を残している。
+
+### Security（2026-09-22 の2回目）
+
+セキュリティ評価（2026-09-22）で指摘された項目のうち、未着手だったものに対応した。
+
+- **BOOTH / FANZA / DLsite のセッション Cookie を暗号化して保存**（SEC-01）: DB（`app_settings`）に
+  平文 JSON で置いていたため、DB のコピー・バックアップ・サポートへのファイル添付からセッションを
+  再利用できた。鍵は keyring の専用スロット（`thundoku-shelf.session-key`。`db-key` とは**別鍵**）に置き、
+  値は AES-256-GCM（AAD にサービス名と形式版）で `enc:v1:` + base64 として保存する。
+  **復号できない値（旧平文・改ざん・別鍵）は未ログインとして破棄**し、平文へはフォールバックしない。
+  鍵が取れない環境では保存しない（次回起動で再ログインが必要）。`crates/core/src/session_store.rs`
+- **Google の認証画面を外部ブラウザへ移動**（SEC-07）: アプリ内 WebView は RFC 8252 が求める外部
+  ユーザーエージェントではなく、Google も埋め込み UA を拒否する。認可 URL を OS の既定ブラウザで開き、
+  ループバック受信・PKCE・`state` 検証は従来のまま。ブラウザを開けなかった場合は URL を画面に出して
+  手動で続行できる。`crates/app/src/views/google_login.rs`
+- **Google Drive の要求スコープを `drive.file` に縮小**（SEC-08）: `drive.readonly`（Drive 全体の
+  閲覧・ダウンロード）を外した。本アプリが触るのは自分で作った `thundoku-shelf/` フォルダとその中の
+  バックアップだけなので `drive.file` で足りる。`crates/core/src/google.rs`
+- **ログアウトの「成功」表示を正確に**（SEC-09）: 永続値の削除を待たずに「ログアウトしました」と
+  出していたため、削除に失敗すると次回起動で勝手に復元され得た。削除の成否を待って表示し、失敗時は
+  「端末に保存したセッション情報を削除できませんでした」と明示したうえで、次回起動で復元しない印
+  （`<data_dir>/session-purge.pending`）を残す（DB / keyring とは別の障害領域に書く）。
+  `crates/app/src/views/settings.rs`, `crates/core/src/session_store.rs`
+- **CI / リリースの強化**（SEC-11）: Actions をタグ参照から**完全なコミット SHA** に固定し、
+  ビルド・テスト・Clippy を `--locked` にした。`cargo audit` のジョブを追加し、例外は
+  `.cargo/audit.toml` に理由と見直し時期つきで列挙する。配布物に SHA-256 を併せて発行する。
+- **配布物に SBOM と署名つきビルド来歴を付ける**（SEC-11）: リリースごとに CycloneDX JSON の
+  部品表（`thundoku-shelf-x.y.z-<arch>-<os>.cdx.json`）を生成して添付し、zip と SBOM の両方に
+  Sigstore の鍵レス署名による来歴（`actions/attest`）を付ける。`SHA256SUMS.txt` は zip と同居して
+  いるため zip ごと差し替えられると無力だが、来歴はリポジトリ側に保存されるので検証できる。
+  利用者側の確認は `gh attestation verify <zip> --repo MegaBlackLabel/thundoku-shelf-app`
+  （SBOM は `--predicate-type https://cyclonedx.org/bom`）。運用手順は `docs/spec/README.md` §4 に記載。
+- **README から macOS の初回起動手順を削除**: 配布物が Developer ID 署名 + 公証になったため、
+  通常の利用者には不要になった。v0.2.5 以前の手順は、その配布物に同梱の「はじめにお読みください」
+  に残っている（README は要点だけを「既知の制約」に残す）。
+- **依存更新（監査で検出した実際の脆弱性を解消）**: `cargo audit` を導入して確認したところ、
+  次の勧告が出ていたので更新した。更新後は **脆弱性 0 件**。残る警告 13 件は**修正版の無い**
+  勧告（未保守 11・unsound 2）で、**配布物（Windows / macOS）に入るか**を `cargo tree` で
+  切り分けて `docs/spec/07-decisions.md` §6.1 に記録した。
+  - `sqlx` 0.8.0 → 0.8.6（RUSTSEC-2024-0363。同梱 SQLite も `libsqlite3-sys` 0.30.1 へ更新）
+  - `ureq` 2.8.0 → 2.12.1（`rustls` 0.21 → 0.23 になり、古い `rustls-webpki` 0.101.7 の
+    RUSTSEC-2026-0098 / -0099 / -0104 が解消）。ureq 2.9 で `rustls` feature が廃止されたため
+    宣言を `tls` に変更（`crates/core/Cargo.toml`, `crates/app/Cargo.toml`）
+  - `rustls` 0.23.43 → 0.23.45（RUSTSEC-2026-0285）
+  - `chacha20` 0.10.1 → 0.10.2（yank された版を置き換え。lock に残るだけで配布物には入らない）
+  - 例外は `.cargo/audit.toml` に理由・見直し時期つきで列挙（現在は `rsa` の 1 件のみ。到達しない）
+  - ライセンス一覧（`crates/app/assets/third-party/licenses.json`）は `mise run licenses` で作り直した
+    （版が変わった crate を検出するテストがあるため、更新を忘れると CI が落ちる）
+
+### Security（2026-09-22 の1回目）
+
+セキュリティ評価（2026-09-22）で指摘された 8 件に対応した。
+
+- **`sub`（Google アカウント ID）をログに書かないようにした**（SEC-01 / SEC-03 の一部）: pack の master key は
+  `sub` から導出される（`PBKDF2(sub + salt) → HKDF(pack_id)`）ため、`sub` は実質の
+  復号秘密。Windows は既定 debug レベルで `%TEMP%/thundoku-shelf/thundoku.log` に
+  残るため、起動時の復元ログとプロフィール更新ログから `sub` を除いた
+  （`google::profile_log_label` は有無だけを返す）。pack 形式は変えていない。
+- **認証付きリクエストの送信先を許可リストで検証**（SEC-02）: `bookshelf_items.download_url` は
+  Drive の JSON バックアップから復元でき、改変したバックアップを復元させると外部
+  ホストへセッション Cookie が送られていた。`download_url` モジュールを追加し、
+  BOOTH / DLsite / FANZA / 技術書典 の**認証付き送信の直前**と**302 の転送先**で
+  `https` + 許可ホスト（+ 必要なパス）を検証する。DLsite / FANZA の CDN は Cookie の
+  スコープ（`*.dlsite.com` / `*.dmm.co.jp`）に合わせた。
+- **PDFium をカレントディレクトリから読み込まない**（SEC-04）: 探索候補の先頭が `./pdfium.dll`
+  だったため、攻撃者が用意したディレクトリを作業ディレクトリにして起動させられると
+  任意の DLL をロードさせられた（DLL 配置攻撃）。CWD の候補を削除し、開発時の探索は
+  ビルド時の `CARGO_MANIFEST_DIR`（絶対パス）に限定した。
+- **資源上限を追加**（SEC-06）: pack の `entry_count` を index 長と突き合わせずに
+  `Vec::with_capacity` へ渡していたため、68 バイトの細工データで数百 GB の確保を
+  試みさせられた（実測: 377 GB の確保失敗でプロセス異常終了）。宣言数を index 長から
+  導ける上限で検査する。あわせて通常 ZIP エントリ（512 MiB）、API 応答本文（16 MiB）、
+  ダウンロード本文（2 GiB）、PDF ページの描画画素数（16 MPix）に上限を設け、本文の
+  読み出しエラーも失敗として伝播させるようにした。
+- **バックアップの所有者フィルタを本棚・チェックリスト・お気に入りへ拡張**（SEC-10）:
+  `bookshelf_items` / `checked_items` / `book_first_events` / `favorite_tags` /
+  `favorite_entities` に `owner_sub` を持たせ、同期・お気に入り登録時の現在の
+  アカウントで属性付けし、Drive のバックアップは現在のアカウントの行だけを出す
+  （他アカウント・未所属のメタを混ぜない）。既に所有者が付いた行は書き換えない。
+- **暗号化 pack の抽出本文をバックアップに載せない**（SEC-10）: `document_images.extracted_text`
+  は平文のページ本文で、Drive のバックアップ JSON に含まれていた（読み出し側が
+  存在しない未使用列だったため、書き込みと列自体を削除）。除外列にも追加した。
+- **BOOTH の取得 HTML を通常動作でダンプしない**（追加の是正。ログ・一時領域の最小化）: ライブラリ / 購入履歴の HTML を
+  無条件に一時領域へ書き出していた。`THUNDOKU_BOOTH_HTML_DUMP=1` を明示したときだけ
+  専用ディレクトリへ保存し、ログアウト時に既存のダンプを削除する。
+- **復元した id のパス検証**（SEC-05）: Drive の JSON バックアップから取り込む `books.id` /
+  `books.pack_id` を検証せずに `packs/{id}.opfspack` へ渡していたため、改変
+  バックアップで保存領域の外のファイルを読み書き・削除できた。`pack_path` モジュールに
+  検証を集約し、復元時は不正な id を拒否、pack を触るすべての経路（取り込み・閲覧・
+  改名・削除・Drive 同期・表紙）で同じ検証を通す。
+
+- **pack の鍵導出そのもの（SEC-03）は変更していない**: `sub` から鍵を導出する現行方式は
+  Web 版とのバイト互換を持ち、変更には pack 形式の改版・既存 pack の再暗号化・鍵紛失時の
+  復旧手段の設計が必要（`docs/spec/03-import-and-pack.md` §4.5 に設計判断として記載）。
+
 ## [0.2.6] - 2026-09-22
 
 ### Changed
@@ -33,6 +137,7 @@
   - 検証: x86_64 / aarch64 の両方で CI が完走し、成果物を実機で確認した（`codesign --verify
     --deep --strict` が valid / `stapler validate` 成功 / **隔離属性を付けた状態でも Gatekeeper
     が accepted** / Hardened Runtime 下で PDFium が遅延ロードされて PDF が表示できた）
+
 
 ### Fixed
 

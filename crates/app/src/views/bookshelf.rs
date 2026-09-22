@@ -2075,7 +2075,7 @@ impl BookshelfView {
                 // `CoverSlot::Remote` が「未取得＝fetch_remote_covers の取得対象」の印。
                 // ここで placeholder を表紙として入れてはいけない（取得対象の判定が
                 // 成立しなくなる）。プレースホルダは描画側でフォールバックしている。
-                let pack_path = local.map(|entry| cover_pack_path(&packs_dir, &entry.book));
+                let pack_path = local.and_then(|entry| cover_pack_path(&packs_dir, &entry.book));
                 let cover = self.cover_slot(
                     &shelf.site_id,
                     &shelf.database_id,
@@ -2123,7 +2123,7 @@ impl BookshelfView {
                     let cover = self.cover_slot(
                         entry.book.site_id.as_deref().unwrap_or_default(),
                         &entry.book.id,
-                        Some(&pack_path),
+                        pack_path.as_deref(),
                         &thumbnails_dir,
                     );
                     shelf_cards.push(ShelfCard {
@@ -3379,13 +3379,14 @@ impl BookshelfView {
         let state = Self::app_state(cx);
         let session = state.fanza_session.lock().clone();
         let db = state.db_pool.clone();
+        let owner = crate::app_state::owner_token(state);
         let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
         std::thread::spawn(move || {
             let result = (|| -> Result<usize, String> {
                 let session = session.ok_or_else(|| "FANZA セッションがありません".to_string())?;
                 let mut client =
                     FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
-                thundoku_core::fanza::sync::save_purchases(&db, &mut client)
+                thundoku_core::fanza::sync::save_purchases(&db, &mut client, owner.as_deref())
                     .map_err(|e| e.to_string())
             })();
             let _ = tx.send(result);
@@ -3541,13 +3542,14 @@ impl BookshelfView {
         let state = Self::app_state(cx);
         let session = state.dlsite_session.lock().clone();
         let db = state.db_pool.clone();
+        let owner = crate::app_state::owner_token(state);
         let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
         std::thread::spawn(move || {
             let result = (|| -> Result<usize, String> {
                 let session = session.ok_or_else(|| "DLsite セッションがありません".to_string())?;
                 let mut client =
                     DlsiteClient::with_transport(Box::new(UreqTransport::new()), session);
-                thundoku_core::dlsite::sync::save_purchases(&db, &mut client)
+                thundoku_core::dlsite::sync::save_purchases(&db, &mut client, owner.as_deref())
                     .map_err(|e| e.to_string())
             })();
             let _ = tx.send(result);
@@ -3617,6 +3619,7 @@ impl BookshelfView {
         let state = Self::app_state(cx);
         let tbf_client = state.tbf.clone();
         let db = state.db_pool.clone();
+        let owner = crate::app_state::owner_token(state);
         let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
         // 同期のネットワーク処理は GPUI のワーカーをブロックしないよう専用スレッドで実行する
         std::thread::spawn(move || {
@@ -3624,7 +3627,7 @@ impl BookshelfView {
                 let mut client = tbf_client.lock();
                 let items = client.bookshelf().map_err(|e| e.to_string())?;
 
-                tbf::sync::save_bookshelf(&db, &items)
+                tbf::sync::save_bookshelf(&db, &items, owner.as_deref())
                     .map(|_| items.len())
                     .map_err(|e| e.to_string())
             })();
@@ -4379,8 +4382,10 @@ impl BookshelfView {
         }
         {
             let state = Self::app_state(cx);
-            let path = state.packs_dir.join(format!("{book_id}.opfspack"));
-            let _ = std::fs::remove_file(path);
+            // 保存領域の外を指す id では削除しない。
+            if let Ok(path) = thundoku_core::pack_path::pack_path(&state.packs_dir, book_id) {
+                let _ = std::fs::remove_file(path);
+            }
         }
         // デコード済みの表紙も捨てる（同じ id が再利用されても古い表紙を出さない）
         for card_index in 0..self.shelf_cards.len() {
@@ -4600,7 +4605,12 @@ impl BookshelfView {
         {
             let state = Self::app_state(cx);
             let db = &state.db_pool;
-            let _ = db::tags::set_favorite(db, tag, !is_favorite);
+            let _ = db::tags::set_favorite(
+                db,
+                tag,
+                !is_favorite,
+                crate::app_state::owner_token(state).as_deref(),
+            );
         }
         if is_favorite {
             self.favorite_tags.retain(|t| t != tag);
@@ -4619,7 +4629,13 @@ impl BookshelfView {
         {
             let state = Self::app_state(cx);
             let db = &state.db_pool;
-            let _ = db::favorites::set_favorite(db, kind.db_kind(), value, !is_favorite);
+            let _ = db::favorites::set_favorite(
+                db,
+                kind.db_kind(),
+                value,
+                !is_favorite,
+                crate::app_state::owner_token(state).as_deref(),
+            );
         }
         let favorites = match kind {
             EntityLink::Circle => &mut self.favorite_circles,
@@ -8705,9 +8721,10 @@ pub(crate) fn format_event_label(event_name: &str) -> String {
 }
 
 /// ローカル本の pack のパス（表紙の読み込み元）。
-fn cover_pack_path(packs_dir: &std::path::Path, book: &books::Book) -> std::path::PathBuf {
+/// 保存領域の外を指す id（改変バックアップ由来）では `None`。
+fn cover_pack_path(packs_dir: &std::path::Path, book: &books::Book) -> Option<std::path::PathBuf> {
     let pack_id = book.pack_id.as_deref().unwrap_or(&book.id);
-    packs_dir.join(format!("{pack_id}.opfspack"))
+    thundoku_core::pack_path::pack_path(packs_dir, pack_id).ok()
 }
 
 /// 表紙をディスクから読んで 448px へ縮小する（キャッシュファイル → pack の順）。
@@ -8730,7 +8747,8 @@ pub(crate) fn load_cover_image(
     book: &books::Book,
 ) -> Option<Arc<RenderImage>> {
     let pack_id = book.pack_id.as_deref().unwrap_or(&book.id);
-    let path = packs_dir.join(format!("{pack_id}.opfspack"));
+    // 保存領域の外を指す id（改変バックアップ由来）では読まない。
+    let path = thundoku_core::pack_path::pack_path(packs_dir, pack_id).ok()?;
     // pack 全体（この環境には 354 MB のものがある）を読まずに、ヘッダ + インデックス +
     // 表紙エントリだけを読む。表紙は表示サイズ（448px）へ縮小してから保持する
     // （リモート表紙と同じ経路・同じ解像度に揃える）。
@@ -9526,8 +9544,8 @@ mod tests {
             db::tags::set_for_book(db, "booth-1", &[("既存タグ", "manual")]).unwrap();
             db::tags::set_for_book(db, "booth-2", &[("別のタグ", "manual")]).unwrap();
             // お気に入りタグ: サイト内のものと、よそのサイトのもの
-            db::tags::set_favorite(db, "既存タグ", true).unwrap();
-            db::tags::set_favorite(db, "よそのタグ", true).unwrap();
+            db::tags::set_favorite(db, "既存タグ", true, None).unwrap();
+            db::tags::set_favorite(db, "よそのタグ", true, None).unwrap();
         });
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(
@@ -13982,7 +14000,7 @@ mod tests {
         // お気に入りタグと本を seed
         cx.update(|cx| {
             let db = &AppState::global(cx).db_pool;
-            db::tags::set_favorite(db, "react", true).unwrap();
+            db::tags::set_favorite(db, "react", true, None).unwrap();
         });
         seed_book(cx, "b1", "本1", "サークルA");
         cx.update(|cx| {
@@ -14048,8 +14066,8 @@ mod tests {
         cx.update(AppState::init_test);
         cx.update(|cx| {
             let db = &AppState::global(cx).db_pool;
-            db::tags::set_favorite(db, "あか", true).unwrap();
-            db::tags::set_favorite(db, "いか", true).unwrap();
+            db::tags::set_favorite(db, "あか", true, None).unwrap();
+            db::tags::set_favorite(db, "いか", true, None).unwrap();
         });
         // 「いか」を 2 冊が持つので、名前順（あか → いか）ではなく集計数順で先頭になる
         for (book, shelf) in [("b1", "db-1"), ("b2", "db-2")] {
@@ -14219,7 +14237,7 @@ mod tests {
         cx.update(|cx| {
             let db = &AppState::global(cx).db_pool;
             db::tags::set_for_book(db, "b1", &[("react", "manual")]).unwrap();
-            db::tags::set_favorite(db, "react", true).unwrap();
+            db::tags::set_favorite(db, "react", true, None).unwrap();
         });
         let view = cx.new(BookshelfView::new);
         let window = cx.open_window(

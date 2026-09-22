@@ -230,29 +230,14 @@ fn collect_entry_metas<R: std::io::Read + std::io::Seek>(
     Ok(metas)
 }
 
-/// ZIP のエントリを 1 件読み出す。
-/// 全エントリを同時にメモリへ載せないよう、呼び出しごとに 1 件だけ伸長する。
-fn read_zip_entry<R: std::io::Read + std::io::Seek>(
-    archive: &mut zip::ZipArchive<R>,
-    index: usize,
-) -> Result<Vec<u8>, ImportError> {
-    let mut entry = archive
-        .by_index(index)
-        .map_err(|e| ImportError::Zip(e.to_string()))?;
-    let mut data = Vec::new();
-    entry
-        .read_to_end(&mut data)
-        .map_err(|e| ImportError::Zip(e.to_string()))?;
-    Ok(data)
-}
-
 /// 上限付きで ZIP エントリを読み出す（解凍爆弾対策）。
 /// 宣言サイズを信用せず、実際に読めたバイト数で上限を判定する。
+/// 上限超過は `Ok(None)`（呼び出し側が警告にしてスキップできるようにする）。
 fn read_zip_entry_capped<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: usize,
     limit: u64,
-) -> Result<Vec<u8>, ImportError> {
+) -> Result<Option<Vec<u8>>, ImportError> {
     let mut entry = archive
         .by_index(index)
         .map_err(|e| ImportError::Zip(e.to_string()))?;
@@ -262,20 +247,40 @@ fn read_zip_entry_capped<R: std::io::Read + std::io::Seek>(
         .take(limit + 1)
         .read_to_end(&mut data)
         .map_err(|e| ImportError::Zip(e.to_string()))?;
-    Ok(data)
+    if data.len() as u64 > limit {
+        return Ok(None);
+    }
+    Ok(Some(data))
 }
+
+/// 通常 ZIP エントリ 1 件の非圧縮サイズ上限（解凍爆弾対策）。
+///
+/// 入れ子 ZIP を合流させるときの上限（[`MAX_NESTED_BYTES`]）と揃える。1 冊に
+/// 含まれる 1 ファイルとしては十分大きく、数百 GB を展開させる細工を弾ける。
+/// 宣言サイズではなく**実際に読めたバイト数**で判定する。
+pub const MAX_ZIP_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// `EntryMeta` が指すエントリを 1 件読み出す（入れ子 ZIP の中身にも対応）。
 fn read_entry<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     meta: &EntryMeta,
 ) -> Result<Vec<u8>, ImportError> {
+    // 上限超過のエントリは取り込まない（部分的なデータで先へ進めない）。
+    let too_large = || {
+        ImportError::Zip(format!(
+            "エントリがサイズ上限（{MAX_ZIP_ENTRY_BYTES} バイト）を超えています: {}",
+            meta.name
+        ))
+    };
     match &meta.nested {
-        None => read_zip_entry(archive, meta.index),
+        None => {
+            read_zip_entry_capped(archive, meta.index, MAX_ZIP_ENTRY_BYTES)?.ok_or_else(too_large)
+        }
         Some(bytes) => {
             let mut nested = zip::ZipArchive::new(std::io::Cursor::new(Arc::clone(bytes)))
                 .map_err(|e| ImportError::Zip(e.to_string()))?;
-            read_zip_entry(&mut nested, meta.index)
+            read_zip_entry_capped(&mut nested, meta.index, MAX_ZIP_ENTRY_BYTES)?
+                .ok_or_else(too_large)
         }
     }
 }
@@ -330,14 +335,15 @@ fn expand_nested_archives<R: std::io::Read + std::io::Seek>(
             ));
             continue;
         }
-        let bytes: Arc<[u8]> =
-            Arc::from(read_zip_entry_capped(archive, index, MAX_NESTED_BYTES)?.into_boxed_slice());
-        if bytes.len() as u64 > MAX_NESTED_BYTES {
-            warnings.push(format!(
-                "{name}: nested zip is larger than the size limit ({MAX_NESTED_BYTES} bytes)"
-            ));
-            continue;
-        }
+        let bytes: Arc<[u8]> = match read_zip_entry_capped(archive, index, MAX_NESTED_BYTES)? {
+            Some(bytes) => Arc::from(bytes.into_boxed_slice()),
+            None => {
+                warnings.push(format!(
+                    "{name}: nested zip is larger than the size limit ({MAX_NESTED_BYTES} bytes)"
+                ));
+                continue;
+            }
+        };
         let mut nested = match zip::ZipArchive::new(std::io::Cursor::new(Arc::clone(&bytes))) {
             Ok(nested) => nested,
             Err(error) => {
@@ -855,7 +861,6 @@ struct PageRow {
     height: i64,
     entry_path: String,
     file_size: i64,
-    text: Option<String>,
 }
 
 fn finish_import(
@@ -921,7 +926,15 @@ fn finish_import(
     }
     let pack_bytes = builder.build(identity, true)?;
     std::fs::create_dir_all(packs_dir)?;
-    std::fs::write(packs_dir.join(format!("{book_id}.opfspack")), &pack_bytes)?;
+    // 書き出し先は保存領域内に収まることを検証する（`book_id` は再利用 id や
+    // 復元 id 由来でも同じ検査を通す）。
+    let pack_file = crate::pack_path::pack_path(packs_dir, &book_id).map_err(|error| {
+        ImportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            error.to_string(),
+        ))
+    })?;
+    std::fs::write(&pack_file, &pack_bytes)?;
     log::info!("finish_import: パック作成（{:?}）", save_start.elapsed());
 
     let book = books::Book {
@@ -1048,7 +1061,6 @@ fn finish_import(
             height: row.height,
             mime_type: "image/webp".to_string(),
             file_size: row.file_size,
-            extracted_text: row.text.clone(),
             pack_entry_path: Some(row.entry_path.clone()),
             created_at: timestamp.clone(),
         });
@@ -1091,7 +1103,6 @@ fn finish_import(
             height,
             mime_type: "image/webp".to_string(),
             file_size: data.len() as i64,
-            extracted_text: None,
             pack_entry_path: Some("thumbnail.webp".to_string()),
             created_at: timestamp.clone(),
         });
@@ -1245,7 +1256,6 @@ pub fn import_rendered_pdf_pages(
             height: page.height as i64,
             entry_path,
             file_size: page.data.len() as i64,
-            text: Some(page.text.clone()),
         });
         texts.push((index as i64 + 1, page.text.clone()));
     }
@@ -1559,7 +1569,6 @@ pub fn commit_zip(
                                 height: height as i64,
                                 entry_path,
                                 file_size: webp.len() as i64,
-                                text: None,
                             });
                         }
                     }
@@ -1592,7 +1601,6 @@ pub fn commit_zip(
                             height: page.height as i64,
                             entry_path,
                             file_size: page.data.len() as i64,
-                            text: Some(page.text.clone()),
                         });
                     }
                     if legacy {
@@ -2053,7 +2061,6 @@ fn document_image_row(
         height,
         mime_type: "image/webp".to_string(),
         file_size,
-        extracted_text: None,
         pack_entry_path: Some(entry_path.to_string()),
         created_at: timestamp,
     }
@@ -2107,7 +2114,6 @@ pub fn import_image_bytes(
                 height: height as i64,
                 entry_path: "pages/page_0001.webp".to_string(),
                 file_size: webp.len() as i64,
-                text: None,
             }],
             texts: Vec::new(),
             warnings: Vec::new(),

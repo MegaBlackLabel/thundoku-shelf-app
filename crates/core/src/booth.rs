@@ -31,6 +31,17 @@ impl BoothSession {
     }
 }
 
+/// BOOTH の商品ファイル取得先（`booth.pm/downloadables/{id}`）。
+///
+/// `bookshelf_items.download_url` は Drive の JSON バックアップから復元でき、
+/// 改変したバックアップを復元させると外部ホストへセッション Cookie が送られる。
+/// 取得先はここに列挙したホスト + パスだけを許可する。
+const BOOTH_DOWNLOAD_RULES: &[crate::download_url::HostRule] =
+    &[crate::download_url::HostRule::exact(
+        "booth.pm",
+        Some("/downloadables/"),
+    )];
+
 #[derive(Debug, thiserror::Error)]
 pub enum BoothError {
     #[error("network error: {0}")]
@@ -41,6 +52,9 @@ pub enum BoothError {
     NotFound,
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    /// 送信先が許可リストに無い（資格情報を送らない）。
+    #[error("blocked download url: {0}")]
+    BlockedUrl(String),
     #[error("cancelled")]
     Cancelled,
 }
@@ -85,6 +99,49 @@ pub struct BoothClient {
 }
 
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// 診断用 HTML ダンプの有効化スイッチ。値が `1` のときだけ書き出す。
+const HTML_DUMP_ENV: &str = "THUNDOKU_BOOTH_HTML_DUMP";
+
+/// ダンプを書き出すディレクトリ（一時領域直下を汚さないよう専用フォルダに置く）。
+fn html_dump_dir() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("thundoku-shelf")
+        .join("booth-dumps")
+}
+
+/// 取得した HTML を診断用に保存する（**既定では保存しない**）。
+///
+/// 購入履歴・ライブラリの HTML には購入内容や個人情報が含まれるため、通常動作で
+/// 一時領域へ複製すると、一時ファイルの収集・共有を通じて漏れる。パーサー修正で
+/// 実物が必要なときだけ `THUNDOKU_BOOTH_HTML_DUMP=1` を明示して有効化する。
+fn dump_html_if_enabled(file_name: &str, html: &str) {
+    if std::env::var(HTML_DUMP_ENV).as_deref() != Ok("1") {
+        return;
+    }
+    let dir = html_dump_dir();
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        log::warn!("booth: html dump dir failed: {error}");
+        return;
+    }
+    let path = dir.join(file_name);
+    match std::fs::write(&path, html) {
+        Ok(()) => log::info!("booth: html dump -> {}", path.display()),
+        Err(error) => log::warn!("booth: html dump failed: {error}"),
+    }
+}
+
+/// 既存のダンプ（旧バージョンが無条件に書き出した分を含む）を削除する。
+/// ログアウト時に呼び、購入情報の複製を残さない。
+fn remove_html_dumps() {
+    let dir = html_dump_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
 
 impl BoothClient {
     pub fn new(session: &BoothSession) -> Self {
@@ -166,6 +223,8 @@ impl BoothClient {
             .map(|v| v.to_string())
             .unwrap_or_default();
         log::info!("booth logout(booth): status={status} location={location:?}");
+        // 診断用ダンプ（旧バージョンが無条件に書いた分を含む）を残さない。
+        remove_html_dumps();
         Ok(())
     }
 
@@ -236,14 +295,9 @@ impl BoothClient {
                 );
                 return Err(BoothError::NotLoggedIn);
             }
-            // パーサー修正のための実物ダンプ（リンク先が無い・取得できない本の
-            // 構造を確認する）。アプリの同期後にこのファイルを解析してパーサーを直す。
-            let dump_path = std::env::temp_dir().join(format!("booth_library_page_{page}.html"));
-            if let Err(e) = std::fs::write(&dump_path, &html) {
-                log::warn!("booth library: html dump failed: {e}");
-            } else {
-                log::info!("booth library: html dump -> {}", dump_path.display());
-            }
+            // パーサー修正のための実物ダンプ（既定では書き出さない。
+            // `THUNDOKU_BOOTH_HTML_DUMP=1` を明示したときだけ保存する）。
+            dump_html_if_enabled(&format!("booth_library_page_{page}.html"), &html);
             let parsed = parse_library(&html);
             log::info!(
                 "booth library: page={page} parsed={} max_page={max_page}",
@@ -273,13 +327,8 @@ impl BoothClient {
                 &format!("https://accounts.booth.pm/orders?page={page}"),
                 "text/html",
             )?;
-            // パーサー修正のための実物ダンプ（ライブラリに載らない購入品の構造確認）
-            let dump_path = std::env::temp_dir().join(format!("booth_orders_page_{page}.html"));
-            if let Err(e) = std::fs::write(&dump_path, &html) {
-                log::warn!("booth orders: html dump failed: {e}");
-            } else {
-                log::info!("booth orders: html dump -> {}", dump_path.display());
-            }
+            // パーサー修正のための実物ダンプ（`dump_html_if_enabled` 参照。既定 off）
+            dump_html_if_enabled(&format!("booth_orders_page_{page}.html"), &html);
             let parsed = parse_orders(&html);
             if parsed.is_empty() {
                 break;
@@ -315,6 +364,10 @@ impl BoothClient {
         download_url: &str,
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, BoothError> {
+        // 認証（Cookie）を付ける前に送信先を検証する。保存 URL はバックアップ由来も
+        // あり得るため、外部ホストへセッションを渡さない。
+        crate::download_url::check(download_url, BOOTH_DOWNLOAD_RULES)
+            .map_err(|error| BoothError::BlockedUrl(format!("{download_url}: {error}")))?;
         let mut request = self
             .agent
             .get(download_url)
@@ -342,8 +395,22 @@ impl BoothClient {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let mut reader = response.into_reader();
-        crate::tbf::transport::read_body_with_progress(&mut reader, total, on_progress)
-            .ok_or(BoothError::Cancelled)
+        use crate::tbf::transport::BodyOutcome;
+        match crate::tbf::transport::read_body_with_progress(
+            &mut reader,
+            total,
+            crate::tbf::transport::MAX_DOWNLOAD_BODY_BYTES,
+            on_progress,
+        ) {
+            BodyOutcome::Read(body) => Ok(body),
+            BodyOutcome::Cancelled => Err(BoothError::Cancelled),
+            BodyOutcome::TooLarge(limit) => Err(BoothError::Network(format!(
+                "ダウンロードが上限（{limit} バイト）を超えました"
+            ))),
+            BodyOutcome::Io(message) => Err(BoothError::Network(format!(
+                "ダウンロードの読み出しに失敗しました: {message}"
+            ))),
+        }
     }
 
     /// 商品詳細 API から表紙画像（オリジナルサイズ）を取得する。
@@ -614,6 +681,20 @@ fn parse_orders(html: &str) -> Vec<BoothOrder> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 通常動作では取得 HTML を保存しない（購入内容・個人情報を一時領域に複製しない）。
+    #[test]
+    fn html_dump_is_off_by_default() {
+        assert_ne!(
+            std::env::var(HTML_DUMP_ENV).as_deref(),
+            Ok("1"),
+            "このテストはダンプ無効が既定であることを前提にする"
+        );
+        let path = html_dump_dir().join("booth_dump_regression.html");
+        let _ = std::fs::remove_file(&path);
+        dump_html_if_enabled("booth_dump_regression.html", "<html>purchase secret</html>");
+        assert!(!path.exists(), "既定で HTML ダンプを書いてはいけない");
+    }
 
     #[test]
     fn session_logged_in_and_cookie_header() {

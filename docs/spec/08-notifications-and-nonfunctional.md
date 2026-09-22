@@ -107,7 +107,7 @@
 | 手動ダウンロード 1 件 | `std::thread::spawn` した専用スレッドで実行し、結果を `mpsc::channel`（unbounded）で UI スレッドへ返す。進捗は UI 側で 16 ms 間隔のタイマーで取り込む | `crates/app/src/views/bookshelf.rs:2750-2790`, `:3222-3226` |
 | 技術書典チェックリストのポーリング | `tbf` クライアントの `Mutex` で手動同期と直列化。周期は `checklist.poll.interval_min`（`n.max(1)`、既定 5 分） | `crates/app/src/workspace.rs:245-250`, `:265-266` |
 | Drive 同期 | 単一タスクで逐次（ダウンロード方向 → アップロード方向 → DB バックアップ）。並列化なし | `crates/core/src/drive/sync.rs:205-390` |
-| Google ログイン | WebView 表示 + 別スレッドで `finish_authorize`（ブロッキング accept ループ） | `crates/app/src/views/google_login.rs:79-95` |
+| Google ログイン | **システムブラウザ**で認可 + 別スレッドで `finish_authorize`（ブロッキング accept ループ）。WebView を作らない | `crates/app/src/views/google_login.rs` |
 
 ### 5.5 メモリ上限の定数
 
@@ -136,7 +136,7 @@
   - `pdfium-render` の `thread_safe` feature は `unsafe impl Send/Sync` を足すだけでロックしないため呼び出し側の責任 `crates/core/src/import/pdf.rs:14-16`。
   - 1 冊の中の描画は元々逐次なので単冊の速度は変わらず、複数冊を並行取り込みするときだけ待ち合う `crates/core/src/import/pdf.rs:20-21`。
   - pdfium のグローバル `BINDINGS` はプロセスに 1 つだけなので、`LazyLock` で一度だけ初期化して再利用する（2 回目の `Pdfium::new` は panic）`crates/core/src/import/pdf.rs:57-79`。
-  - PDFium は**実行時ロード**（静的リンクしない）で、探索順は ① `./`（テスト実行時の CWD） ② 実行ファイルと同じディレクトリ ③ macOS は実行ファイルの `../Frameworks`（`.app` の `Contents/Frameworks`）。prebuilt の static ライブラリは macOS で `FPDF_FORMFILL` を欠きリンクできないため `crates/core/src/import/pdf.rs:8-12`, `:37-55`。
+  - PDFium は**実行時ロード**（静的リンクしない）で、探索順は ① ビルド時の `CARGO_MANIFEST_DIR`（= `crates/core`） ② 実行ファイルと同じディレクトリ ③ macOS は実行ファイルの `../Frameworks`（`.app` の `Contents/Frameworks`）。**CWD は探索しない**（DLL 配置攻撃対策）。prebuilt の static ライブラリは macOS で `FPDF_FORMFILL` を欠きリンクできないため `crates/core/src/import/pdf.rs`。
 - その他の直列化: `AppState` の各クライアントは `parking_lot::Mutex`（`tbf`, `google`, 各セッション、`google_profile` 等）`crates/app/src/app_state.rs:39-60`。Drive 同期・TBF 同期は同じ Mutex を通るため相互排他。
 - UI スレッドの再入回避: トースト通知・認証モーダル開閉は `cx.defer` / `AtomicBool` フラグ + 監視タスク経由（`cx.notify()` の RefCell 再入回避）`crates/app/src/app_state.rs:358-362`, `crates/app/src/workspace.rs:160-220`。
 
@@ -190,10 +190,10 @@
 | 手動 Drive 同期の要約 | `sync_drive_now: start` / `folder_id={id:?}` / `creating folder` / `token ok, drive client ready` / `running sync engine` / `done dl={} ul={} skip={} conflicts={} db_backup={}` | `crates/app/src/views/settings.rs:783-830` |
 | Drive 復元判定 | `startup backup check: drive backup differs from local (md5={:?})` | `crates/app/src/workspace.rs:564-567` |
 | Google OAuth | `google authorize url: {url}` / `google callback received, exchanging code` / `token exchange: client_id=…, client_secret=configured\|MISSING` / `token exchange succeeded (status {s})` / `token exchange failed: status {s}, body: {body}` / `google callback error: {e}`(error) | `crates/core/src/google.rs:388`, `:436`, `:459-479`, `:191-192` |
-| Google ログイン UI | `google login: window_handle() failed: …` / `google login: wry build() failed: …`（error） | `crates/app/src/views/google_login.rs:71`, `:76` |
+| Google ログイン UI | `google login: ブラウザで認可を開始 {url（クエリ無し）}` / `google login: ブラウザを開けません: {e}`（warn） | `crates/app/src/views/google_login.rs` |
 | Google プロフィール復元 | `google profile restored from stored tokens` | `crates/app/src/views/settings.rs:593` |
-| セッション復元（BOOTH） | `booth session: 起動時復元 = ログイン済み（cookies={n}）` / `未ログイン` | `crates/app/src/app_state.rs:200-212` |
-| セッション保存（BOOTH） | `booth session: DB 保存成功（cookies={n}）` / `booth session: DB 保存失敗: {e}`（error） | `crates/app/src/app_state.rs:396-402` |
+| セッション復元（BOOTH） | `booth session: 起動時復元 = ログイン済み（cookies={n}）` / `未ログイン` / `{store} session: 保存値を復号できないため破棄します（再ログインが必要）`（warn） | `crates/app/src/app_state.rs`, `crates/core/src/session_store.rs` |
+| セッション保存（BOOTH） | `booth session: DB 保存成功（暗号化）` / `{store} session: DB 保存失敗: {e}`（error） / `{store} session: 暗号鍵が無いため保存しません（次回起動では再ログインが必要）`（warn） | `crates/app/src/app_state.rs` |
 | セッション保存（技術書典） | `tbf session saved -> tbf_logged_in = true` | `crates/app/src/app_state.rs:383` |
 | ログアウト | `logout_tbf: server logout ok\|failed` / `logout_tbf: session cleared` / `logout_tbf: done ({elapsed})` / `logout_google: client logout ({elapsed})` / `logout_booth: server logout …` / `logout_dlsite: cleared ({elapsed})` | `crates/app/src/views/settings.rs:611-616`, `:640`, `:648`, `:658`, `:687-694`, `:750`; `docs/logout.md:41` |
 | ダウンロード/取り込み | `download_item: スレッド完了、UI 反映開始` / `download_item: 失敗しました: {msg}`(warn) / `download_item: UI 反映完了（reload 含む）（{elapsed}）` | `crates/app/src/views/bookshelf.rs:3218-3234` |
@@ -215,9 +215,9 @@
 - `docs/account-switch.md:78` は Drive フォルダを `drive.sync.folder_id.{sub}`（アカウントごとに別フォルダ）と記載するが、実装は単一キー `drive.sync.folder_id` のみ `crates/app/src/views/settings.rs:787`, `crates/app/src/workspace.rs:518`。doc と実装のどちらが正か（実装未追随か文書が先行案か）は不明。
 - `drive.sync.enabled` を false にしたとき、どの自動同期（起動時の復元確認・チェックリスト連動・終了時アップロード）が止まるかの明記がコード・docs に無い `crates/app/src/views/settings.rs:754-766`。
 - `credentials::USER_BOOTH`（`crates/core/src/secrets.rs:13`）は定義のみで参照が無い（BOOTH は DB 保存）。使用予定があったかは不明。
-- Google ログイン完了後に WebView を自動で閉じるかは未確認（実装は `webview.hide()` のみ）`crates/app/src/views/google_login.rs:104-107`。
+- Google ログインは WebView を使わない（システムブラウザ）ため、`webview.hide()` 相当の後始末は不要。残るのはブラウザ側の残存ログインのみ（アプリからは制御しない）。
 - Drive 同期の多重実行排他: `sync_drive_now` は UI の `busy` フラグでしかガードしておらず `crates/app/src/views/settings.rs:770`、バックグラウンドのポーラーや終了時同期と衝突した場合の挙動は不明。
-- `receive_callback` の 300 秒タイムアウト後に WebView 側の表示がどうなるか（エラー表示の有無）はコードから判断できない（`GoogleError::Auth` が `google_login_error` に入るのみ）。
+- `receive_callback` の 300 秒タイムアウト後の見え方は、`GoogleError::Auth` が `google_login_error` に入り `google_login_done` が立つ（Workspace が認証モーダルを閉じる）ところまで。ブラウザ側のタブはアプリから閉じられない。
 - **[DLsite]** 購入履歴 1 ページあたりの実件数（コードに定数なし。`MAX_PAGES_PER_STORE` のコメントは「1 ページあたりの行数境界（実測は未確認）」だが実装は最大ページ数）。`crates/core/src/dlsite/client.rs:16-17`
 - **[DLsite]** `age_category` の実測値の全パターン（コメントは「2 以上（R18 想定）」で、2 以上を実測確認した記述はない）。`crates/core/src/dlsite/mod.rs:78-80`
 - **[DLsite]** `login.dlsite.com` 側に年齢確認・2 段階認証があるか（コードに分岐・文言が存在しないため判断不能）。`crates/app/src/views/dlsite_login.rs:106-154`

@@ -47,7 +47,12 @@ fn authorize_url_contains_required_params() {
     assert!(url.contains("state=state-456"));
     assert!(url.contains("code_challenge=challenge-123"));
     assert!(url.contains("code_challenge_method=S256"));
-    assert!(url.contains("https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly"));
+    // 要求スコープは `drive.file` のみ（Drive 全体の `drive.readonly` は要求しない）。
+    assert!(url.contains("https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file"));
+    assert!(
+        !url.contains("drive.readonly"),
+        "Drive 全体の読み取り権限を要求している: {url}"
+    );
     assert!(url.contains("openid"));
 }
 

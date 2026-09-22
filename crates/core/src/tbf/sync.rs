@@ -67,7 +67,14 @@ fn ensure_event(
 }
 
 /// Upsert bookshelf items; returns the number of rows written.
-pub fn save_bookshelf(pool: &SqlitePool, items: &[TbfShelfItem]) -> Result<usize, sqlx::Error> {
+///
+/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。書き込んだ行に所有者を
+/// 付ける（Drive バックアップを現在のアカウントに絞るため）。
+pub fn save_bookshelf(
+    pool: &SqlitePool,
+    items: &[TbfShelfItem],
+    owner: Option<&str>,
+) -> Result<usize, sqlx::Error> {
     let timestamp = now();
     for item in items {
         if let Some(slug) = item.event_slug.as_deref().filter(|slug| !slug.is_empty()) {
@@ -123,6 +130,7 @@ pub fn save_bookshelf(pool: &SqlitePool, items: &[TbfShelfItem]) -> Result<usize
             },
         )?;
     }
+    bookshelf::attribute_owner(pool, SITE_ID_TECHBOOKFEST, owner)?;
     Ok(items.len())
 }
 
@@ -160,6 +168,7 @@ pub fn save_checklist(
     pool: &SqlitePool,
     event_slug: &str,
     entries: &[TbfChecklistEntry],
+    owner: Option<&str>,
 ) -> Result<usize, sqlx::Error> {
     ensure_event(pool, event_slug, None)?;
     let timestamp = now();
@@ -202,6 +211,7 @@ pub fn save_checklist(
             },
         )?;
     }
+    checklist::attribute_owner(pool, event_slug, owner)?;
     Ok(entries.len())
 }
 
@@ -245,6 +255,7 @@ pub fn refresh_checklist(
     db: &SqlitePool,
     client: &mut TbfClient,
     event_slug: &str,
+    owner: Option<&str>,
 ) -> Result<SyncPollOutcome, String> {
     let before_events = checklist::list_events(db).map_err(|e| e.to_string())?;
     let before_items = checklist::list_items(db, event_slug).map_err(|e| e.to_string())?;
@@ -253,7 +264,7 @@ pub fn refresh_checklist(
     let entries = client.checklist(event_slug).map_err(|e| e.to_string())?;
 
     save_events(db, &events).map_err(|e| e.to_string())?;
-    save_checklist(db, event_slug, &entries).map_err(|e| e.to_string())?;
+    save_checklist(db, event_slug, &entries, owner).map_err(|e| e.to_string())?;
 
     let _ = crate::db::settings::set(
         db,
@@ -400,11 +411,12 @@ mod tests {
             &pool,
             "tbf20",
             &[entry("tbf20:p1", "A"), entry("tbf20:p2", "B")],
+            None,
         )
         .unwrap();
         assert_eq!(checklist::list_items(&pool, "tbf20").unwrap().len(), 2);
         // p2 を含まない同期 → p2 が削除され、イベントのデータが完全になる
-        save_checklist(&pool, "tbf20", &[entry("tbf20:p1", "A")]).unwrap();
+        save_checklist(&pool, "tbf20", &[entry("tbf20:p1", "A")], None).unwrap();
         let items = checklist::list_items(&pool, "tbf20").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "tbf20:p1");
@@ -414,10 +426,10 @@ mod tests {
     fn save_checklist_keeps_other_events_rows() {
         let pool = crate::db::test_pool();
         migrate(&pool).unwrap();
-        save_checklist(&pool, "tbf20", &[entry("tbf20:p1", "A")]).unwrap();
-        save_checklist(&pool, "tbf19", &[entry("tbf19:p1", "B")]).unwrap();
+        save_checklist(&pool, "tbf20", &[entry("tbf20:p1", "A")], None).unwrap();
+        save_checklist(&pool, "tbf19", &[entry("tbf19:p1", "B")], None).unwrap();
         // tbf20 の再同期で tbf19 の行は消えない
-        save_checklist(&pool, "tbf20", &[entry("tbf20:p1", "A")]).unwrap();
+        save_checklist(&pool, "tbf20", &[entry("tbf20:p1", "A")], None).unwrap();
         assert_eq!(checklist::list_items(&pool, "tbf20").unwrap().len(), 1);
         assert_eq!(checklist::list_items(&pool, "tbf19").unwrap().len(), 1);
     }
@@ -434,9 +446,10 @@ mod tests {
             &pool,
             "tbf20",
             &[checklist_entry("tbf20:p1", "A", "あ-01", "本")],
+            None,
         )
         .unwrap();
-        let outcome = refresh_checklist(&pool, &mut client, "tbf20").unwrap();
+        let outcome = refresh_checklist(&pool, &mut client, "tbf20", None).unwrap();
         assert_eq!(outcome.count, 1);
         assert!(!outcome.changed);
     }
@@ -453,9 +466,10 @@ mod tests {
             &pool,
             "tbf20",
             &[checklist_entry("tbf20:p1", "A", "あ-01", "本")],
+            None,
         )
         .unwrap();
-        let outcome = refresh_checklist(&pool, &mut client, "tbf20").unwrap();
+        let outcome = refresh_checklist(&pool, &mut client, "tbf20", None).unwrap();
         assert_eq!(outcome.count, 2);
         assert!(outcome.changed);
     }

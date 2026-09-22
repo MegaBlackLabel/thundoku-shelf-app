@@ -719,7 +719,11 @@ fn rewrite_pack_content_name_sync(
         return;
     };
     let pack_id = book.pack_id.clone().unwrap_or_else(|| book.id.clone());
-    let path = packs_dir.join(format!("{pack_id}.opfspack"));
+    // 保存領域の外を指す id（改変バックアップ由来）では読み書きしない。
+    let Ok(path) = thundoku_core::pack_path::pack_path(packs_dir, &pack_id) else {
+        log::warn!("pack の名前書き換えをスキップ（不正な pack id）: {pack_id:?}");
+        return;
+    };
     // 未ダウンロードの本は pack が無い（DB の名前だけが正）
     let Ok(bytes) = std::fs::read(&path) else {
         return;
@@ -1269,7 +1273,6 @@ mod tests {
                         height: 1,
                         mime_type: "image/webp".into(),
                         file_size: 1,
-                        extracted_text: None,
                         pack_entry_path: None,
                         created_at: "2026-08-21 00:00:00".into(),
                     },
@@ -1362,7 +1365,6 @@ mod tests {
                         height: 1,
                         mime_type: "image/webp".into(),
                         file_size: 1,
-                        extracted_text: None,
                         pack_entry_path: None,
                         created_at: stamp.into(),
                     },
@@ -1473,7 +1475,6 @@ mod tests {
                         height: 1,
                         mime_type: "image/webp".into(),
                         file_size: 1,
-                        extracted_text: None,
                         pack_entry_path: None,
                         created_at: stamp.into(),
                     },
@@ -1817,7 +1818,6 @@ mod tests {
                         height: 1,
                         mime_type: "image/webp".into(),
                         file_size: 1,
-                        extracted_text: None,
                         pack_entry_path: None,
                         created_at: stamp.into(),
                     },

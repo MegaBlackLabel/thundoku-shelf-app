@@ -158,7 +158,10 @@ fn download_with_progress_aborts_when_the_callback_returns_false() {
         xsrf_token: "x".into(),
     });
     let error = client
-        .download_with_progress("https://example.com/file.pdf", &mut |_, _| false)
+        .download_with_progress(
+            "https://techbookfest.org/api/product-dlc/1/download",
+            &mut |_, _| false,
+        )
         .expect_err("中止を要求したのに本文が返っている");
     assert!(
         matches!(error, TbfError::Cancelled),
@@ -185,10 +188,13 @@ fn download_with_progress_reports_full_body_and_cookies() {
     });
     let mut progress: Vec<(u64, u64)> = Vec::new();
     let bytes = client
-        .download_with_progress("https://example.com/file.pdf", &mut |downloaded, total| {
-            progress.push((downloaded, total));
-            true
-        })
+        .download_with_progress(
+            "https://techbookfest.org/api/product-dlc/1/download",
+            &mut |downloaded, total| {
+                progress.push((downloaded, total));
+                true
+            },
+        )
         .unwrap();
     assert_eq!(bytes, vec![1, 2, 3, 4, 5]);
     // Default transport reports the whole body once; session cookies and the

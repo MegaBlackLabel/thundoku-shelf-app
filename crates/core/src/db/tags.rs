@@ -101,13 +101,24 @@ pub fn all_tags(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
     })
 }
 
-pub fn set_favorite(pool: &SqlitePool, tag_name: &str, favorite: bool) -> Result<(), sqlx::Error> {
+/// タグのお気に入りを登録・解除する（登録は冪等）。
+///
+/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。登録時に付与し、
+/// 既存行（`ON CONFLICT DO NOTHING`）の所有者は書き換えない。
+pub fn set_favorite(
+    pool: &SqlitePool,
+    tag_name: &str,
+    favorite: bool,
+    owner: Option<&str>,
+) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         if favorite {
             sqlx::query(
-                "INSERT INTO favorite_tags (tag_name) VALUES (?1) ON CONFLICT(tag_name) DO NOTHING",
+                "INSERT INTO favorite_tags (tag_name, owner_sub) VALUES (?1, ?2) \
+                 ON CONFLICT(tag_name) DO NOTHING",
             )
             .bind(tag_name)
+            .bind(owner)
             .execute(pool)
             .await?;
         } else {
@@ -225,9 +236,9 @@ mod tag_crud_tests {
     #[test]
     fn favorite_tags_roundtrip() {
         let pool = open_db();
-        set_favorite(&pool, "react", true).unwrap();
-        set_favorite(&pool, "rust", true).unwrap();
-        set_favorite(&pool, "react", false).unwrap();
+        set_favorite(&pool, "react", true, None).unwrap();
+        set_favorite(&pool, "rust", true, None).unwrap();
+        set_favorite(&pool, "react", false, None).unwrap();
         let favs = list_favorites(&pool).unwrap();
         assert_eq!(favs, vec!["rust".to_string()]);
     }

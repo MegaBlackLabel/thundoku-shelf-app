@@ -15,6 +15,7 @@ use thundoku_core::fanza::client::FanzaSession;
 use thundoku_core::github::{GithubClient, GithubToken, GithubUser};
 use thundoku_core::google::{GoogleClient, GoogleProfile};
 use thundoku_core::secrets::SecretStore;
+use thundoku_core::session_store::{PurgeMarker, SessionVault, StoreSession};
 use thundoku_core::tbf::{TbfClient, TbfSession};
 /// The Google OAuth client id (public info; embedded at build time from
 /// `THUNDOKU_GOOGLE_CLIENT_ID`). Web 版（thundoku-web）と同じクライアントを
@@ -43,6 +44,15 @@ pub const DEFAULT_GITHUB_CLIENT_ID: &str = match option_env!("THUNDOKU_GITHUB_CL
     Some(value) if !value.is_empty() => value,
     _ => "Ov23liUeEiN5CSmII2BH",
 };
+
+/// ログアウト時に削除できなかった資格情報の印に使うスロット名（Google）。
+pub const GOOGLE_LOGOUT_SLOT: &str = "google";
+
+/// 「ログアウトしたのに保存値を消せなかった」印。データディレクトリのファイルに置く
+/// （DB / keyring とは別の障害領域なので、そちらが使えなくても記録できる）。
+pub fn purge_marker(state: &AppState) -> PurgeMarker {
+    PurgeMarker::new(&state.data_dir)
+}
 
 pub struct AppState {
     pub data_dir: PathBuf,
@@ -78,6 +88,8 @@ pub struct AppState {
     /// DLsite（www.dlsite.com）のセッション Cookie
     pub dlsite_session: Arc<Mutex<Option<DlsiteSession>>>,
     pub dlsite_logged_in: Arc<Mutex<bool>>,
+    /// ストアのセッション Cookie の暗号化保存（keyring の鍵が使えない環境では `None`）。
+    pub session_vault: Option<SessionVault>,
     /// サイトのログイン完了で立てる同期要求（サイト id。`Workspace` が消費する）。
     ///
     /// ログイン直後の本棚は購入済みの一覧が空なので、手動で「同期」を押させずに
@@ -177,12 +189,10 @@ fn restore_github_token(secrets: &SecretStore) -> (GithubClient, bool) {
 /// 「復元しますか」が出る（Drive 側は所有者で絞られた古いバックアップのため）。
 fn restore_google_profile(secrets: &SecretStore) -> Option<thundoku_core::google::GoogleProfile> {
     let profile = thundoku_core::google::saved_profile(secrets);
+    // `sub` はログに出さない（pack の master key の導出元 = 実質の復号秘密）。
     log::info!(
         "google profile: 起動時復元 = {}",
-        match &profile {
-            Some(profile) => format!("あり（sub={}）", profile.sub),
-            None => "なし".to_string(),
-        }
+        thundoku_core::google::profile_log_label(profile.as_ref())
     );
     profile
 }
@@ -230,6 +240,17 @@ impl AppState {
             };
 
         let client_id = default_client_id();
+        // 前回のログアウトで keyring から削除できなかった資格情報は復元しない
+        // （「ログアウトしたのに次回起動で勝手にログインし直す」のを防ぐ）。
+        let purge_marker = PurgeMarker::new(&data_dir);
+        if purge_marker.is_pending(GOOGLE_LOGOUT_SLOT) {
+            log::warn!(
+                "google: 前回のログアウトで資格情報を削除できなかったため復元しません（再ログインが必要）"
+            );
+            let _ = secrets.delete(thundoku_core::secrets::USER_GOOGLE);
+            thundoku_core::google::delete_saved_profile(&secrets);
+            purge_marker.clear(GOOGLE_LOGOUT_SLOT);
+        }
         let mut google: Option<GoogleClient> = if client_id.is_empty() {
             None
         } else {
@@ -268,14 +289,24 @@ impl AppState {
             }
         );
 
-        // BOOTH セッションを DB（app_settings）から復元する。
+        // BOOTH / FANZA / DLsite のセッションを DB（app_settings）から復元する。
         // セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を
-        // 超えることがあるため、keyring ではなく DB に保存する。
-        let booth_session = db::settings::get(&db_pool, "booth.session")
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .filter(|session: &BoothSession| session.logged_in());
+        // 超えることがあるため DB に置くが、**keyring の鍵で暗号化して**保存する
+        // （平文の旧値・改ざん・別鍵は復号できず、未ログインとして破棄される）。
+        let session_vault = match SessionVault::new(&secrets, &data_dir) {
+            Ok(vault) => Some(vault),
+            Err(error) => {
+                // 鍵が取れない = セッションを安全に保存できない。平文で保存しない。
+                log::warn!(
+                    "session vault を初期化できないためストアのセッションを復元/保存しません: {error}"
+                );
+                None
+            }
+        };
+        let booth_session = session_vault
+            .as_ref()
+            .and_then(|vault| vault.load::<BoothSession>(&db_pool, StoreSession::Booth))
+            .filter(BoothSession::logged_in);
         let booth_logged_in = booth_session.is_some();
         log::info!(
             "booth session: 起動時復元 = {}",
@@ -289,22 +320,16 @@ impl AppState {
             }
         );
 
-        // FANZA同人セッションも DB（app_settings）から復元する（BOOTH と同様、
-        // Cookie が巨大で keyring 上限を超えるため DB 保存）。
-        let fanza_session = db::settings::get(&db_pool, "fanza.session")
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .filter(|session: &FanzaSession| session.logged_in());
+        let fanza_session = session_vault
+            .as_ref()
+            .and_then(|vault| vault.load::<FanzaSession>(&db_pool, StoreSession::Fanza))
+            .filter(FanzaSession::logged_in);
         let fanza_logged_in = fanza_session.is_some();
 
-        // DLsite セッションも DB（app_settings）から復元する（FANZA と同様、
-        // Cookie が巨大で keyring 上限を超えるため DB 保存）。
-        let dlsite_session = db::settings::get(&db_pool, "dlsite.session")
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .filter(|session: &DlsiteSession| session.logged_in());
+        let dlsite_session = session_vault
+            .as_ref()
+            .and_then(|vault| vault.load::<DlsiteSession>(&db_pool, StoreSession::Dlsite))
+            .filter(DlsiteSession::logged_in);
         let dlsite_logged_in = dlsite_session.is_some();
 
         cx.set_global(Self {
@@ -330,6 +355,7 @@ impl AppState {
             fanza_logged_in: Arc::new(Mutex::new(fanza_logged_in)),
             dlsite_session: Arc::new(Mutex::new(dlsite_session)),
             dlsite_logged_in: Arc::new(Mutex::new(dlsite_logged_in)),
+            session_vault,
             login_sync_requested: Arc::new(Mutex::new(None)),
             toast_message: Arc::new(Mutex::new(None)),
             toast_kind: Arc::new(Mutex::new(ToastKind::Info)),
@@ -374,6 +400,8 @@ impl AppState {
         let client_id = default_client_id();
         let secrets = SecretStore::new();
         // 本番と同じ復元経路を通す（keyring の代わりにメモリバックエンド）
+        let session_vault =
+            SessionVault::new(&secrets, &std::env::temp_dir().join("thundoku-shelf-test")).ok();
         let (github, github_logged_in) = restore_github_token(&secrets);
         cx.set_global(Self {
             data_dir: std::env::temp_dir().join("thundoku-shelf-test"),
@@ -404,6 +432,7 @@ impl AppState {
             tbf_logged_in: Arc::new(Mutex::new(false)),
             booth_session: Arc::new(Mutex::new(None)),
             booth_logged_in: Arc::new(Mutex::new(false)),
+            session_vault,
             fanza_session: Arc::new(Mutex::new(None)),
             fanza_logged_in: Arc::new(Mutex::new(false)),
             dlsite_session: Arc::new(Mutex::new(None)),
@@ -526,13 +555,38 @@ pub fn store_google_profile_secret(
     })
 }
 
+/// `owner_token` の実体。バックグラウンドタスクから `AppState` 全体を持たずに
+/// 呼べるよう、プロフィールと鍵だけを受け取る。
+pub fn owner_token_from(
+    profile: Option<&thundoku_core::google::GoogleProfile>,
+    secrets: &SecretStore,
+) -> Option<String> {
+    let sub = profile.map(|profile| profile.sub.as_str())?;
+    let key = secrets.db_key().ok()?;
+    Some(thundoku_core::owner::encrypt(&key, sub))
+}
+
+/// 現在の Google アカウントの所有者トークン（keyring の DB 鍵で暗号化した `sub`）。
+///
+/// 本棚・チェックリスト・お気に入りの `owner_sub` に書く値。DB バックアップを
+/// 現在のアカウントの行だけに絞るために使う。未ログイン、または暗号鍵が無いときは
+/// `None`（＝未所属のまま。誰のものでもないことを表す）。
+pub fn owner_token(state: &AppState) -> Option<String> {
+    let profile = state.google_profile.lock().clone();
+    owner_token_from(profile.as_ref(), &state.secrets)
+}
+
 /// メモリ上のプロフィールを更新する（keyring への保存が済んだ後に呼ぶ）。
+///
+/// ログに `sub` を出さない: pack の master key は `sub` から導出されるため、
+/// `sub` は実質の復号秘密であり、ログ（Windows は `%TEMP%/thundoku-shelf/thundoku.log`
+/// に既定 debug レベルで残る）へ書くと pack を取得した第三者に復号材料を渡すことになる。
 pub fn set_google_profile(cx: &App, profile: &thundoku_core::google::GoogleProfile) {
     let state = AppState::global(cx);
     *state.google_profile.lock() = Some(profile.clone());
     *state.google_logged_in.lock() = true;
     *state.google_login_error.lock() = None;
-    log::info!("google profile: 状態を更新（sub={}）", profile.sub);
+    log::info!("google profile: 状態を更新");
 }
 
 /// Google プロフィールを keyring に保存し、メモリ上の状態を更新する（同期版）。
@@ -681,71 +735,93 @@ pub fn save_tbf_session(cx: &App, session: &TbfSession) {
     log::info!("tbf session saved -> tbf_logged_in = true");
 }
 
-/// BOOTH のセッションを DB（app_settings）に永続化し、グローバル状態を更新する。
+/// BOOTH のセッションを DB（app_settings）に暗号化して永続化し、グローバル状態を更新する。
 /// Windows Credential Manager の上限（2560 UTF-16 文字）を Cookie が超えることが
-/// あるため、keyring ではなく DB を使う。
+/// あるため DB を使い、**値は keyring の鍵で暗号化する**（平文で置かない）。
 pub fn save_booth_session(cx: &App, session: &BoothSession) {
     let state = AppState::global(cx);
     let logged_in = session.logged_in();
-    if let Ok(json) = serde_json::to_string(session) {
-        match db::settings::set(&state.db_pool, "booth.session", &json) {
-            Ok(()) => log::info!(
-                "booth session: DB 保存成功（cookies={}）",
-                session.cookies.len()
-            ),
-            Err(e) => log::error!("booth session: DB 保存失敗: {e}"),
-        }
-    }
+    save_store_session(state, StoreSession::Booth, session);
     *state.booth_session.lock() = Some(session.clone());
     *state.booth_logged_in.lock() = logged_in;
 }
 
 /// BOOTH のセッションを破棄する（ログアウト）。
-pub fn clear_booth_session(cx: &App) {
+///
+/// メモリ上は即座に未ログインへ落とす。**永続値の削除に失敗したら `Err`** を返すので、
+/// 呼び出し側は「消えた」と誤って表示しないこと（次回起動で復元され得る）。
+pub fn clear_booth_session(cx: &App) -> Result<(), String> {
     let state = AppState::global(cx);
-    let _ = db::settings::delete(&state.db_pool, "booth.session");
     *state.booth_session.lock() = None;
     *state.booth_logged_in.lock() = false;
+    clear_store_session(state, StoreSession::Booth)
 }
 
-/// FANZA同人 のセッションを DB（app_settings）に永続化し、グローバル状態を更新する。
-/// BOOTH と同様、セッション Cookie は keyring 上限を超えるため DB に保存する。
+/// ストアのセッションを暗号化して DB に保存する。
+///
+/// 暗号鍵が取れない環境では**保存しない**（平文へのフォールバックは禁止）。
+/// その場合、そのセッションは次回起動で復元されない（＝再ログインが必要）。
+fn save_store_session<T: serde::Serialize>(state: &AppState, store: StoreSession, value: &T) {
+    let label = store.label();
+    match &state.session_vault {
+        Some(vault) => match vault.save(&state.db_pool, store, value) {
+            Ok(()) => log::info!("{label} session: DB 保存成功（暗号化）"),
+            Err(error) => log::error!("{label} session: DB 保存失敗: {error}"),
+        },
+        None => log::warn!(
+            "{label} session: 暗号鍵が無いため保存しません（次回起動では再ログインが必要）"
+        ),
+    }
+}
+
+/// ストアのセッションの永続値を消す。失敗したら「次回起動で復元しない」印を残す。
+fn clear_store_session(state: &AppState, store: StoreSession) -> Result<(), String> {
+    let label = store.label();
+    match &state.session_vault {
+        Some(vault) => vault.clear(&state.db_pool, store).map_err(|error| {
+            log::error!("{label} session: 永続値の削除に失敗: {error}");
+            error.to_string()
+        }),
+        None => {
+            // 鍵が無い＝暗号化して保存していない。旧平文が残っていれば消しておく。
+            let _ = db::settings::delete(&state.db_pool, store.settings_key());
+            Ok(())
+        }
+    }
+}
+
+/// FANZA同人 のセッションを DB（app_settings）に暗号化して永続化し、グローバル状態を更新する。
 pub fn save_fanza_session(cx: &App, session: &FanzaSession) {
     let state = AppState::global(cx);
     let logged_in = session.logged_in();
-    if let Ok(json) = serde_json::to_string(session) {
-        let _ = db::settings::set(&state.db_pool, "fanza.session", &json);
-    }
+    save_store_session(state, StoreSession::Fanza, session);
     *state.fanza_session.lock() = Some(session.clone());
     *state.fanza_logged_in.lock() = logged_in;
 }
 
-/// FANZA同人 のセッションを破棄する（ログアウト）。
-pub fn clear_fanza_session(cx: &App) {
+/// FANZA同人 のセッションを破棄する（ログアウト）。削除に失敗したら `Err`。
+pub fn clear_fanza_session(cx: &App) -> Result<(), String> {
     let state = AppState::global(cx);
-    let _ = db::settings::delete(&state.db_pool, "fanza.session");
     *state.fanza_session.lock() = None;
     *state.fanza_logged_in.lock() = false;
+    clear_store_session(state, StoreSession::Fanza)
 }
 
-/// DLsite のセッションを DB（app_settings）に永続化し、グローバル状態を更新する。
-/// BOOTH/FANZA と同様、セッション Cookie は keyring 上限を超えるため DB に保存する。
+/// DLsite のセッションを DB（app_settings）に暗号化して永続化し、グローバル状態を更新する。
 pub fn save_dlsite_session(cx: &App, session: &DlsiteSession) {
     let state = AppState::global(cx);
     let logged_in = session.logged_in();
-    if let Ok(json) = serde_json::to_string(session) {
-        let _ = db::settings::set(&state.db_pool, "dlsite.session", &json);
-    }
+    save_store_session(state, StoreSession::Dlsite, session);
     *state.dlsite_session.lock() = Some(session.clone());
     *state.dlsite_logged_in.lock() = logged_in;
 }
 
-/// DLsite のセッションを破棄する（ログアウト）。
-pub fn clear_dlsite_session(cx: &App) {
+/// DLsite のセッションを破棄する（ログアウト）。削除に失敗したら `Err`。
+pub fn clear_dlsite_session(cx: &App) -> Result<(), String> {
     let state = AppState::global(cx);
-    let _ = db::settings::delete(&state.db_pool, "dlsite.session");
     *state.dlsite_session.lock() = None;
     *state.dlsite_logged_in.lock() = false;
+    clear_store_session(state, StoreSession::Dlsite)
 }
 
 /// 保存済みのウィンドウ状態（最大化/通常/フルスクリーン + 復元 size）の DB キー。

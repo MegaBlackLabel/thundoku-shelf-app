@@ -75,6 +75,9 @@ pub enum TbfError {
     Upstream(String),
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    /// 送信先が許可リストに無い（セッション Cookie / XSRF を送らない）。
+    #[error("blocked download url: {0}")]
+    BlockedUrl(String),
     #[error("cancelled")]
     Cancelled,
 }
@@ -131,6 +134,23 @@ pub struct SamplePage {
     pub width: Option<i64>,
     pub height: Option<i64>,
 }
+
+/// ダウンロード URL 解決（`resolve_download_url`）で cookie を付けて GET してよいホスト。
+///
+/// 解決対象は `bookshelf_items.download_url`（= GraphQL の `downloadURL`、改変
+/// バックアップ由来もあり得る）と、そこから作る自サイト URL。自サイト以外へは
+/// セッション Cookie を送らない。
+const TBF_RESOLVE_RULES: &[crate::download_url::HostRule] =
+    &[crate::download_url::HostRule::exact(
+        "techbookfest.org",
+        None,
+    )];
+
+/// 解決後のファイル本体を取得してよいホスト（`validate_download_url` と同じ範囲）。
+const TBF_DOWNLOAD_RULES: &[crate::download_url::HostRule] = &[
+    crate::download_url::HostRule::exact("techbookfest.org", Some("/api/product-dlc/")),
+    crate::download_url::HostRule::exact("storage.googleapis.com", Some("/tbf-tokyo-product-dlc/")),
+];
 
 pub struct TbfClient {
     transport: Box<dyn Transport>,
@@ -526,6 +546,10 @@ impl TbfClient {
     /// `/api/product-dlc/{id}/download` URL — mirrors the Web
     /// `resolveDownloadUrlFromTechBookFest` (including `validateDownloadUrl`).
     pub fn resolve_download_url(&mut self, url: &str) -> Result<String, TbfError> {
+        // Cookie / XSRF を付ける前に解決対象のホストを検証する（保存 URL は
+        // バックアップ由来もあり得る）。
+        crate::download_url::check(url, TBF_RESOLVE_RULES)
+            .map_err(|error| TbfError::BlockedUrl(format!("{url}: {error}")))?;
         let resp = self.request(
             "GET",
             url,
@@ -567,6 +591,10 @@ impl TbfClient {
         url: &str,
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, TbfError> {
+        // 本体取得も認証付き。送信先を検証してから Cookie を付ける
+        // （リダイレクト追跡はライブラリ任せだが、起点を許可ホストに限る）。
+        crate::download_url::check(url, TBF_DOWNLOAD_RULES)
+            .map_err(|error| TbfError::BlockedUrl(format!("{url}: {error}")))?;
         let mut headers: Vec<(String, String)> =
             vec![("User-Agent".to_string(), USER_AGENT.to_string())];
         let cookie_header = self.cookie_header();

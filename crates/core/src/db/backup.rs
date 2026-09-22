@@ -35,8 +35,13 @@ const TABLES: &[&str] = &[
     "zenn_tag_metadata",
     "view_history",
 ];
-/// 画像・バイナリとして除外するカラム名。
-const EXCLUDED_COLUMNS: &[&str] = &["thumbnail_data", "image_data"];
+/// 画像・バイナリ・本文テキストとして除外するカラム名。
+///
+/// `extracted_text`（`document_images`）は暗号化 pack から取り出したページ本文で、
+/// 平文のまま Drive のバックアップ JSON に載ると、pack を暗号化した意味が失われる。
+/// アプリはこの列を読まない（本文は `document_text` 側にあり、そちらは
+/// バックアップ対象テーブルに含まれない）ため、除外しても復元結果は変わらない。
+const EXCLUDED_COLUMNS: &[&str] = &["thumbnail_data", "image_data", "extracted_text"];
 
 /// 比較のときに無視する揮発列（アプリ自身が同期のたびに書き換える時刻）。
 /// 内容が同じでも値が変わるため、そのまま比較すると毎回「差分あり」になる。
@@ -128,13 +133,51 @@ pub fn canonical_md5_str(
     Ok(canonical_md5(&value, keep_tables))
 }
 
+/// 所有者フィルタ。`owner_sub` 列を持つテーブルを「現在の sub の行」に絞る。
+///
+/// `books` は `book_ids`（呼び出し側が復号して求めた id 集合）で絞るが、本棚・
+/// チェックリスト・お気に入りは `book_id` を持たない（本に紐づかない）ため、
+/// それぞれの `owner_sub` を復号して判定する。`owner_sub` は毎回 IV が変わる
+/// 暗号文なので SQL では比較できない。
+pub struct OwnerFilter<'a> {
+    /// `owner_sub` の復号鍵（keyring の DB 鍵）
+    pub key: &'a [u8; 32],
+    /// 現在の sub。`None`（未ログイン）は未所属（`owner_sub IS NULL`）の行。
+    pub sub: Option<&'a str>,
+}
+
+/// `owner_sub` で絞る（= Google アカウントに紐づくデータ）テーブル。
+/// 公開メタ（`tbf_events` / `zenn_tag_metadata`）と、`books` から id で辿れる
+/// テーブルは対象外。
+const OWNER_SCOPED_TABLES: &[&str] = &[
+    "bookshelf_items",
+    "checked_items",
+    "book_first_events",
+    "favorite_tags",
+    "favorite_entities",
+];
+
+/// 行の `owner_sub`（暗号文 or NULL）が現在の sub に帰属するか。
+fn owner_matches(filter: &OwnerFilter<'_>, blob: Option<&str>) -> bool {
+    match filter.sub {
+        Some(sub) => {
+            blob.and_then(|blob| crate::owner::decrypt(filter.key, blob))
+                .as_deref()
+                == Some(sub)
+        }
+        None => blob.is_none(),
+    }
+}
+
 /// 主要テーブルを JSON 文字列にエクスポートする。
 /// `book_ids` が `Some(ids)` のとき、所有者（本の id 集合）に連動して
 /// `books` とその下位テーブルだけをエクスポートする（P3）。`None` は全件。
+/// `owner` が `Some` のとき、[`OWNER_SCOPED_TABLES`] を現在の sub に絞る。
 #[allow(clippy::explicit_auto_deref)]
 pub fn export_json(
     pool: &SqlitePool,
     book_ids: Option<&std::collections::HashSet<String>>,
+    owner: Option<&OwnerFilter<'_>>,
 ) -> Result<String, sqlx::Error> {
     crate::db::block_on(async {
         // 複数テーブルを跨いで読み出すため、トランザクションで一貫した
@@ -143,7 +186,7 @@ pub fn export_json(
         let mut tx = pool.begin().await?;
         let mut payload = Map::new();
         for table in TABLES {
-            let rows = table_rows(&mut *tx, table, book_ids).await?;
+            let rows = table_rows(&mut *tx, table, book_ids, owner).await?;
             payload.insert((*table).to_string(), Value::Array(rows));
         }
         tx.commit().await?;
@@ -174,6 +217,25 @@ pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
                 log::warn!("drive restore: no PK mapping for {table}, skipping");
                 continue;
             };
+            // 改変バックアップ対策: `books.id` / `books.pack_id` は
+            // `packs/{id}.opfspack` のファイル名になる。保存領域の外を指す id を
+            // 取り込むと読み出し・改名・削除が領域外へ及ぶ（CWE-22）。
+            // 行だけ捨てると子テーブル（reading_progress 等）の FK 違反で
+            // 復元全体がロールバックするため、**復元を拒否**して利用者に見せる。
+            if *table == "books" {
+                for row in rows {
+                    for column in ["id", "pack_id"] {
+                        let Some(id) = row.get(column).and_then(serde_json::Value::as_str) else {
+                            continue;
+                        };
+                        if !crate::pack_path::is_safe_id(id) {
+                            return Err(sqlx::Error::Protocol(format!(
+                                "バックアップの books.{column} が不正な値のため復元を中止しました: {id:?}"
+                            )));
+                        }
+                    }
+                }
+            }
             // 競合判定は自然キーがあればそちらを使う（PK と別の UNIQUE 制約を
             // 持つ表で、もう片方の制約違反により復元が失敗するのを防ぐ）。
             let conflict = conflict_columns(table).unwrap_or(pk);
@@ -229,6 +291,7 @@ async fn table_rows(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
     book_ids: Option<&std::collections::HashSet<String>>,
+    owner: Option<&OwnerFilter<'_>>,
 ) -> Result<Vec<Value>, sqlx::Error> {
     // 画像（blob）カラムは SELECT から除外して読み込みコストを削る
     let cols: Vec<String> = {
@@ -311,6 +374,19 @@ async fn table_rows(
             obj.insert(column.clone(), value);
         }
         out.push(Value::Object(obj));
+    }
+    // アカウントに紐づくテーブルは現在の sub の行だけを出す（他アカウント・
+    // 未所属のメタを Drive バックアップへ混ぜない）。`owner_sub` は暗号文なので
+    // SQL では絞れず、ここで復号して判定する。
+    if let Some(filter) = owner
+        && OWNER_SCOPED_TABLES.contains(&table)
+    {
+        out.retain(|row| {
+            owner_matches(
+                filter,
+                row.get("owner_sub").and_then(serde_json::Value::as_str),
+            )
+        });
     }
     Ok(out)
 }
@@ -510,7 +586,7 @@ mod tests {
         )
         .unwrap();
 
-        let json = export_json(&pool, None).unwrap();
+        let json = export_json(&pool, None, None).unwrap();
         let payload: Value = serde_json::from_str(&json).unwrap();
         // books テーブルに 1 件
         let books = payload["books"].as_array().unwrap();
@@ -609,7 +685,7 @@ mod tests {
         crate::db::page_views::add_dwell(&src, "book-1", "c1", 1, 3.5).unwrap();
         crate::db::page_views::add_dwell(&src, "book-1", "c1", 2, 1.25).unwrap();
 
-        let json = export_json(&src, None).unwrap();
+        let json = export_json(&src, None, None).unwrap();
         // view_history がバックアップに含まれる
         let payload: Value = serde_json::from_str(&json).unwrap();
         let vh = payload["view_history"].as_array().unwrap();
@@ -710,7 +786,7 @@ mod tests {
 
         // A の所有のみ → book-A とその進捗だけ
         let owned_a: std::collections::HashSet<String> = ["book-A".into()].into();
-        let json = export_json(&pool, Some(&owned_a)).unwrap();
+        let json = export_json(&pool, Some(&owned_a), None).unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         let books = v["books"].as_array().unwrap();
         assert_eq!(books.len(), 1);
@@ -720,9 +796,180 @@ mod tests {
         assert_eq!(prog[0]["book_id"], "book-A");
 
         // 全件（None）→ 両方
-        let json_full = export_json(&pool, None).unwrap();
+        let json_full = export_json(&pool, None, None).unwrap();
         let vf: Value = serde_json::from_str(&json_full).unwrap();
         assert_eq!(vf["books"].as_array().unwrap().len(), 2);
         assert_eq!(vf["reading_progress"].as_array().unwrap().len(), 2);
+    }
+
+    /// アカウントに紐づくテーブル（本棚・チェックリスト・お気に入り）も、
+    /// 現在の sub の行だけが出ること。
+    ///
+    /// これらは `book_id` を持たない（または本に紐づかない）ため `books` の
+    /// 所有者フィルタでは絞れない。他アカウントの購入情報がバックアップに
+    /// 混ざると、アカウント切替後の Drive に前のアカウントのデータが残る。
+    #[test]
+    fn export_json_filters_account_scoped_tables_by_owner() {
+        let pool = crate::db::test_pool();
+        crate::db::migrate(&pool).unwrap();
+        let key = [29u8; 32];
+        let owner_a = crate::owner::encrypt(&key, "A");
+        let owner_b = crate::owner::encrypt(&key, "B");
+
+        crate::db::block_on(async {
+            sqlx::query(
+                "INSERT INTO tbf_events (id, site_id, event_name) VALUES ('tbf20', 'techbookfest', '技術書典20')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            for (site, database_id, owner) in [
+                ("booth", "shelf-a", Some(&owner_a)),
+                ("booth", "shelf-b", Some(&owner_b)),
+                ("booth", "shelf-none", None),
+            ] {
+                sqlx::query(
+                    "INSERT INTO bookshelf_items (site_id, database_id, title, owner_sub) \
+                     VALUES (?1, ?2, '本', ?3)",
+                )
+                .bind(site)
+                .bind(database_id)
+                .bind(owner)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            // book_first_events は book_first_events.bookshelf_items への FK を持つ子テーブル。
+            sqlx::query(
+                "INSERT INTO book_first_events (site_id, database_id, first_event_name, owner_sub) \
+                 VALUES ('booth', 'shelf-a', '技術書典20', ?1)",
+            )
+            .bind(&owner_a)
+            .execute(&pool)
+            .await
+            .unwrap();
+            for (id, owner) in [
+                ("check-a", Some(&owner_a)),
+                ("check-b", Some(&owner_b)),
+                ("check-none", None),
+            ] {
+                sqlx::query(
+                    "INSERT INTO checked_items (id, event_id, circle_name, owner_sub) \
+                     VALUES (?1, 'tbf20', 'サークル', ?2)",
+                )
+                .bind(id)
+                .bind(owner)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            for (tag, owner) in [
+                ("tag-a", Some(&owner_a)),
+                ("tag-b", Some(&owner_b)),
+                ("tag-none", None),
+            ] {
+                sqlx::query("INSERT INTO favorite_tags (tag_name, owner_sub) VALUES (?1, ?2)")
+                    .bind(tag)
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            for (name, owner) in [
+                ("circle-a", Some(&owner_a)),
+                ("circle-b", Some(&owner_b)),
+                ("circle-none", None),
+            ] {
+                sqlx::query(
+                    "INSERT INTO favorite_entities (entity_kind, entity_name, owner_sub) \
+                     VALUES ('circle', ?1, ?2)",
+                )
+                .bind(name)
+                .bind(owner)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        });
+
+        let filter_a = OwnerFilter {
+            key: &key,
+            sub: Some("A"),
+        };
+        let json = export_json(&pool, None, Some(&filter_a)).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let ids = |table: &str, column: &str| -> Vec<String> {
+            value[table]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row[column].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids("bookshelf_items", "database_id"), vec!["shelf-a"]);
+        assert_eq!(ids("book_first_events", "database_id"), vec!["shelf-a"]);
+        assert_eq!(ids("checked_items", "id"), vec!["check-a"]);
+        assert_eq!(ids("favorite_tags", "tag_name"), vec!["tag-a"]);
+        assert_eq!(ids("favorite_entities", "entity_name"), vec!["circle-a"]);
+
+        // 未ログイン（sub = None）は未所属の行だけ。他アカウントの行は出ない。
+        let filter_anon = OwnerFilter {
+            key: &key,
+            sub: None,
+        };
+        let json = export_json(&pool, None, Some(&filter_anon)).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let ids = |table: &str, column: &str| -> Vec<String> {
+            value[table]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row[column].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids("bookshelf_items", "database_id"), vec!["shelf-none"]);
+        assert_eq!(ids("checked_items", "id"), vec!["check-none"]);
+        assert_eq!(ids("favorite_tags", "tag_name"), vec!["tag-none"]);
+        assert_eq!(ids("favorite_entities", "entity_name"), vec!["circle-none"]);
+        assert!(ids("book_first_events", "database_id").is_empty());
+    }
+
+    /// `attribute_owner` は未所属（NULL）の行だけを埋める。
+    ///
+    /// 既に所有者が付いた行を上書きすると、A の購入一覧が B の同期で B のものに
+    /// 化けて B のバックアップに混ざる。
+    #[test]
+    fn attribute_owner_never_rewrites_an_existing_owner() {
+        let pool = crate::db::test_pool();
+        crate::db::migrate(&pool).unwrap();
+        let key = [31u8; 32];
+        let owner_a = crate::owner::encrypt(&key, "A");
+        let owner_b = crate::owner::encrypt(&key, "B");
+
+        crate::db::block_on(async {
+            sqlx::query(
+                "INSERT INTO bookshelf_items (site_id, database_id, title, owner_sub) \
+                 VALUES ('booth', 'already-a', '本', ?1), ('booth', 'unowned', '本', NULL)",
+            )
+            .bind(&owner_a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        });
+
+        // B として同期しても、A の行は A のまま。未所属の行だけが B になる。
+        let claimed =
+            crate::db::bookshelf::attribute_owner(&pool, "booth", Some(&owner_b)).unwrap();
+        assert_eq!(claimed, 1, "書き換えてよいのは未所属の 1 行だけ");
+        let rows: Vec<(String, Option<String>)> = crate::db::block_on(async {
+            sqlx::query_as(
+                "SELECT database_id, owner_sub FROM bookshelf_items ORDER BY database_id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        });
+        assert_eq!(rows[0].1.as_deref(), Some(owner_a.as_str()));
+        assert_eq!(rows[1].1.as_deref(), Some(owner_b.as_str()));
     }
 }

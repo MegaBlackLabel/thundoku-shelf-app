@@ -431,6 +431,8 @@ impl Workspace {
         let db = AppState::global(cx).db_pool.clone();
         let tbf_client = AppState::global(cx).tbf.clone();
         let tbf_logged_in = AppState::global(cx).tbf_logged_in.clone();
+        let google_profile = AppState::global(cx).google_profile.clone();
+        let secrets = AppState::global(cx).secrets.clone();
         let settings_entity = self.settings.downgrade();
         cx.spawn(async move |_window, cx| {
             // セッション切れの OpenAuth は 1 回だけ出す（連続で出さない）
@@ -459,11 +461,18 @@ impl Workspace {
                 // tbf クライアントの Mutex ロックで手動 sync() と直列化する。
                 // スコープを限定して await の前に必ず解放する（clippy: await_holding_lock）。
                 let (any_changed, session_expired) = {
+                    // 所有者（現在の Google アカウント）は周期ごとに読み直す
+                    // （ログイン/ログアウトが次の周期から反映される）。
+                    let owner = {
+                        let profile = google_profile.lock().clone();
+                        crate::app_state::owner_token_from(profile.as_ref(), &secrets)
+                    };
                     let mut client = tbf_client.lock();
                     let mut any_changed = false;
                     let mut session_expired = false;
                     for slug in &enabled {
-                        match tbf::sync::refresh_checklist(&db, &mut client, slug) {
+                        match tbf::sync::refresh_checklist(&db, &mut client, slug, owner.as_deref())
+                        {
                             Ok(outcome) => {
                                 if outcome.changed {
                                     any_changed = true;
@@ -742,7 +751,7 @@ impl Workspace {
         // 差分判定は所有者ベースで揃える。所有者（ログイン中の sub）が分からないときは
         // 比較しない: Drive 側は所有者で絞られたバックアップなので、ローカル全件と
         // 突き合わせると内容が同じでも必ず差分ありになり、起動のたびに復元確認が出る。
-        let Some(book_ids) = backup_owner_ids(state) else {
+        let Some(owner) = backup_owner_scope(state) else {
             log::info!(
                 "startup backup check: 所有者（Google プロフィール）が未取得のため復元確認をスキップ"
             );
@@ -769,7 +778,8 @@ impl Workspace {
                 &db,
                 &mut drive,
                 &folder_id,
-                Some(&book_ids),
+                Some(&owner.book_ids),
+                Some(&owner_filter_of(&owner)),
                 baseline.as_deref(),
             )
             .ok()??;
@@ -2858,19 +2868,36 @@ impl Workspace {
     }
 }
 
-/// 起動時の復元確認・終了時のアップロードで使う所有者集合（現在の Google アカウントの本）。
+/// 起動時の復元確認・終了時のアップロードで使う所有者スコープ（現在の Google アカウント）。
 ///
-/// Drive 側の `thundoku-backup.json` は「アップロードした時点のアカウントに帰属する本」
-/// だけを含むため、比較・アップロードも同じ範囲で行う必要がある。プロフィール
-/// （`sub`）か暗号鍵が無ければ範囲を決められないので `None` を返す（＝所有者不明）。
-fn backup_owner_ids(state: &AppState) -> Option<std::collections::HashSet<String>> {
+/// Drive 側の `thundoku-backup.json` は「アップロードした時点のアカウントに帰属する
+/// データ」だけを含むため、比較・アップロードも同じ範囲で行う必要がある。
+/// `book_ids` は `books`（本の id で辿れるテーブル）用、`key` / `sub` は
+/// 本棚・チェックリスト・お気に入りの `owner_sub` 判定（`OwnerFilter`）用。
+struct BackupOwnerScope {
+    key: [u8; 32],
+    sub: String,
+    book_ids: std::collections::HashSet<String>,
+}
+
+/// プロフィール（`sub`）か暗号鍵が無ければ `None`（＝所有者不明）。
+fn backup_owner_scope(state: &AppState) -> Option<BackupOwnerScope> {
     let sub = state
         .google_profile
         .lock()
         .as_ref()
         .map(|p| p.sub.clone())?;
     let key = state.secrets.db_key().ok()?;
-    db::books::owned_book_ids(&state.db_pool, &key, Some(&sub)).ok()
+    let book_ids = db::books::owned_book_ids(&state.db_pool, &key, Some(&sub)).ok()?;
+    Some(BackupOwnerScope { key, sub, book_ids })
+}
+
+/// バックアップ（`export_json` / `inspect_drive_backup`）用の所有者フィルタ。
+fn owner_filter_of(scope: &BackupOwnerScope) -> thundoku_core::db::backup::OwnerFilter<'_> {
+    thundoku_core::db::backup::OwnerFilter {
+        key: &scope.key,
+        sub: Some(&scope.sub),
+    }
 }
 
 /// F11 用: 最大化⇔復元をトグルする。
@@ -3875,7 +3902,6 @@ mod tests {
                         height: 1,
                         mime_type: "image/webp".into(),
                         file_size: 1,
-                        extracted_text: None,
                         pack_entry_path: None,
                         created_at: "2026-08-21 00:00:00".into(),
                     },
@@ -4459,7 +4485,7 @@ mod tests {
                 "前提: プロフィール未取得"
             );
             assert!(
-                backup_owner_ids(state).is_none(),
+                backup_owner_scope(state).is_none(),
                 "所有者が分からないのに比較対象の集合を作っている"
             );
         });
@@ -4490,7 +4516,7 @@ mod tests {
             *state.google_profile.lock() = Some(google_profile("sub-1"));
 
             assert_eq!(
-                backup_owner_ids(state),
+                backup_owner_scope(state).map(|scope| scope.book_ids),
                 Some(std::collections::HashSet::from(["b-mine".to_string()])),
                 "現在のアカウントに帰属する本だけを対象にする"
             );

@@ -169,6 +169,31 @@ pub fn upsert_item(pool: &SqlitePool, item: &CheckedItem) -> Result<(), sqlx::Er
     })
 }
 
+/// 未所属（`owner_sub IS NULL`）の行に所有者（暗号化済み sub）を与える。
+///
+/// 本棚（`bookshelf::attribute_owner`）と同じ帰属規則。既に所有者が付いている
+/// 行は書き換えない。戻り値は更新した行数。
+pub fn attribute_owner(
+    pool: &SqlitePool,
+    event_id: &str,
+    owner: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let Some(owner) = owner else {
+        return Ok(0);
+    };
+    crate::db::block_on(async {
+        let result = sqlx::query(
+            "UPDATE checked_items SET owner_sub = ?1 \
+             WHERE event_id = ?2 AND owner_sub IS NULL",
+        )
+        .bind(owner)
+        .bind(event_id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
+    })
+}
+
 pub fn list_items(pool: &SqlitePool, event_id: &str) -> Result<Vec<CheckedItem>, sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query_as::<_, CheckedItem>(

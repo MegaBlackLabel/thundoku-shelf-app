@@ -15,8 +15,13 @@ pub const GOOGLE_OAUTH_AUTH: &str = "https://accounts.google.com/o/oauth2/v2/aut
 pub const GOOGLE_OAUTH_TOKEN: &str = "https://oauth2.googleapis.com/token";
 pub const GOOGLE_USERINFO: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
 pub const DEFAULT_REDIRECT_PORT: u16 = 38387;
-/// `drive.readonly` + `drive.file` — the app never uses `appdata`.
-const OAUTH_SCOPE: &str = "openid email https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file";
+/// `drive.file` のみ（アプリが作成・利用者が選択したファイルだけ）。
+///
+/// 以前は `drive.readonly`（Drive 全体の閲覧・ダウンロード）も要求していたが、
+/// 本アプリが触るのは自分で作った `thundoku-shelf/` フォルダとその中の
+/// バックアップファイルだけなので、`drive.file` で足りる。トークンが漏れた場合の
+/// 影響を「アプリが作成したファイル」に限定する。appdata は使わない。
+const OAUTH_SCOPE: &str = "openid email https://www.googleapis.com/auth/drive.file";
 /// Refresh tokens this many seconds before expiry.
 const REFRESH_SKEW_SECONDS: i64 = 60;
 
@@ -36,6 +41,20 @@ pub struct GoogleProfile {
     pub email: String,
     pub name: String,
     pub picture: Option<String>,
+}
+
+/// ログ用のラベル。**`sub` を含めない**。
+///
+/// pack の master key は `sub` から導出される（`opfspack::crypto::master_key`）ため、
+/// `sub` は実質の復号秘密であり、ログに書くと pack を入手した第三者へ復号材料を
+/// 渡すことになる（Windows は `%TEMP%/thundoku-shelf/thundoku.log` に既定 debug
+/// レベルで残る）。有無だけを伝える。
+pub fn profile_log_label(profile: Option<&GoogleProfile>) -> &'static str {
+    if profile.is_some() {
+        "あり"
+    } else {
+        "なし"
+    }
 }
 
 /// 取得済みプロフィールを keyring に保存する（**ブロッキング**。UI スレッドでは呼ばない）。
@@ -713,6 +732,23 @@ impl GoogleClient {
 mod tests {
     use super::*;
     use crate::tbf::{RequestSpec, ResponseSpec, Transport};
+
+    /// ログ用ラベルは `sub` を含まない（ログ = pack 復号材料の漏洩経路にしない）。
+    #[test]
+    fn profile_log_label_never_contains_sub() {
+        let profile = GoogleProfile {
+            sub: "1234567890-secret-sub".to_string(),
+            email: "user@example.com".to_string(),
+            name: "ユーザー".to_string(),
+            picture: None,
+        };
+        let label = profile_log_label(Some(&profile));
+        assert!(
+            !label.contains(&profile.sub),
+            "ログ用ラベルに sub が入っている: {label}"
+        );
+        assert_ne!(profile_log_label(None), label);
+    }
 
     /// メモリバックエンド（`SecretStore`）はプロセス内で共有されるため、
     /// `USER_GOOGLE_PROFILE` スロットを使うテストはこの Mutex で直列化する。

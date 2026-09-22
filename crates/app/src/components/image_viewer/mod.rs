@@ -262,7 +262,8 @@ impl PageLoader for PackPageLoader {
             let db = &self.db;
             let book = db::books::get(db, &book_id_of(image, db)).ok()??;
             let pack_id = book.pack_id.as_deref().unwrap_or(&book.id).to_string();
-            let path = self.packs_dir.join(format!("{pack_id}.opfspack"));
+            // 保存領域の外を指す id（改変バックアップ由来）では読まない。
+            let path = thundoku_core::pack_path::pack_path(&self.packs_dir, &pack_id).ok()?;
             let bytes = std::fs::read(path).ok()?;
             Some((pack_id, Arc::new(bytes)))
         });
@@ -4566,7 +4567,6 @@ mod tests {
                     height: 80,
                     mime_type: "image/png".into(),
                     file_size: 1,
-                    extracted_text: None,
                     pack_entry_path: Some(format!("pages/page_{page:04}.png")),
                     created_at: stamp.into(),
                 },
@@ -4640,7 +4640,6 @@ mod tests {
                 height: 80,
                 mime_type: "image/png".into(),
                 file_size: 1,
-                extracted_text: None,
                 pack_entry_path: Some("pages/page_0001.png".into()),
                 created_at: "2026-01-01 00:00:00".into(),
             }],

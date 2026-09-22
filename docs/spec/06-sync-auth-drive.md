@@ -26,11 +26,13 @@
 | 技術書典 | OS keyring | service=`com.megablacklabel.thundoku-shelf`, user=`techbookfest` | `TbfSession` の JSON（cookies / xsrf_raw / xsrf_token） | OS 資格情報ストア（macOS キーチェーン / Windows Credential Manager）に平文相当で預ける。独自暗号化なし |
 | Google | OS keyring | user=`google` | `OAuthTokens` の JSON（access_token / refresh_token / expires_at） | 同上 |
 | Google Drive 用 DB 鍵 | OS keyring | user=`thundoku-shelf.db-key` | 32 byte 乱数の BASE64 文字列 | 同上 |
-| BOOTH | アプリ DB（`app_settings`） | `booth.session` | `BoothSession` の JSON | **暗号化なし（平文 JSON）** |
-| FANZA同人 | アプリ DB（`app_settings`） | `fanza.session` | `FanzaSession` の JSON | **暗号化なし（平文 JSON）** |
-| DLsite | アプリ DB（`app_settings`） | `dlsite.session` | `DlsiteSession` の JSON | **暗号化なし（平文 JSON）** |
+| BOOTH | アプリ DB（`app_settings`） | `booth.session` | `BoothSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）** |
+| FANZA同人 | アプリ DB（`app_settings`） | `fanza.session` | `FanzaSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）** |
+| DLsite | アプリ DB（`app_settings`） | `dlsite.session` | `DlsiteSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）** |
 
-- keyring の service 名と user 名の定数: `crates/core/src/secrets.rs:9`（`SERVICE`）, `:10`（`USER_TECHBOOKFEST`）, `:11`（`USER_GOOGLE`）, `:13`（`USER_BOOTH` ※定義のみ・実際の BOOTH 保存は DB）, `:15`（`USER_DB_KEY`）。
+- keyring の service 名と user 名の定数: `crates/core/src/secrets.rs`（`SERVICE` / `USER_TECHBOOKFEST` / `USER_GOOGLE` / `USER_BOOTH` / `USER_DB_KEY` / `USER_SESSION_KEY`）。
+- **DB 保存の 3 ストアは keyring の鍵で暗号化する**: 鍵は `thundoku-shelf.session-key`（`USER_DB_KEY` とは別スロット＝別鍵）、値は AES-256-GCM（AAD に用途名と形式版）で `enc:v1:` + base64 として `app_settings` に入る。**復号できない値は未ログインとして破棄**し、平文へはフォールバックしない `crates/core/src/session_store.rs`。
+- keyring の鍵が取得できない環境では**セッションを保存しない**（平文で保存しない）。その場合、次回起動では再ログインが必要。
 - モジュール冒頭の宣言: 「OS keyring-backed secret storage (sessions, OAuth tokens). Passwords are never stored — only session cookies / tokens.」`crates/core/src/secrets.rs:1-2`。
 - keyring 操作は `keyring::Entry::new(service, user)` の `set_password` / `get_password` / `delete_credential`。`NoEntry` は `None`（load）／成功扱い（delete）`crates/core/src/secrets.rs:37-66`。
 - BOOTH / FANZA / DLsite を DB に置く理由（コード内コメント）: 「セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を超えることがあるため、keyring ではなく DB に保存する」`crates/app/src/app_state.rs:187-190`, `:389-391`, `:415-417`, `:435-437`。
@@ -53,6 +55,12 @@
 - 復号: 誤鍵・破損・非 UTF-8 は `None`。**未知の所有者は「未所属」扱いにせず非表示に留める**（P1）`crates/core/src/owner.rs:30-41`。
 - 暗号化が必要な理由（モジュールコメント）: pack 鍵が `sub + pack_id`（PBKDF2 → HKDF）から導出され、`pack_id` は平文で `books` にあるため、平文 `sub` があると DB 保持者が全 pack 鍵を導出できてしまう `crates/core/src/owner.rs:1-6`。同趣旨が `docs/account-switch.md`「データモデル」節にも記載。
 - 復号鍵は keyring 保持のため、**keyring を失うと `owner_sub` の復号・所有者復元ができず pack も読めない**（`docs/account-switch.md`「セキュリティ / リスク」節）。
+- **同じ列をアカウントに紐づく他テーブルにも持つ**: `bookshelf_items` / `checked_items` /
+  `book_first_events` / `favorite_tags` / `favorite_entities`（値は同じ DB 鍵による暗号文）。
+  追加は `db/mod.rs` のプログラム的マイグレーション（`ensure_column`、テーブル作成がすべて
+  終わった後にまとめて実行）。`favorite_entities` は同関数内で後から CREATE されるため順序が要る。
+- **`sub` はログに出さない**: pack の master key の導出元（= 実質の復号秘密）なので、
+  ログには有無だけを書く（`google::profile_log_label`）。`crates/core/src/google.rs`。
 
 ---
 
@@ -66,7 +74,7 @@
 | トークンエンドポイント | `https://oauth2.googleapis.com/token` | `crates/core/src/google.rs:15` |
 | userinfo | `https://www.googleapis.com/oauth2/v3/userinfo` | `crates/core/src/google.rs:16` |
 | ループバック固定ポート | `DEFAULT_REDIRECT_PORT = 38387` | `crates/core/src/google.rs:17` |
-| スコープ | `openid email https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file`（appdata は使わない） | `crates/core/src/google.rs:19` |
+| スコープ | `openid email https://www.googleapis.com/auth/drive.file`（**`drive.readonly` は要求しない**。appdata も使わない） | `crates/core/src/google.rs:18-25` |
 | リフレッシュ余裕 | `REFRESH_SKEW_SECONDS = 60` 秒 | `crates/core/src/google.rs:21` |
 | コールバック待ちタイムアウト | 300 秒（5 分） | `crates/core/src/google.rs:151` |
 | コールバックのポーリング間隔 | 100 ms（非ブロッキング accept） | `crates/core/src/google.rs:155-163` |
@@ -74,23 +82,27 @@
 | コールバック受信バッファ | 4096 byte | `crates/core/src/google.rs:170` |
 | `expires_in` 既定値 | 3600 秒（応答に無い場合） | `crates/core/src/google.rs:126-129` |
 | 既定 client_id（ビルド時 `THUNDOKU_GOOGLE_CLIENT_ID` 未設定時） | `1054619943130-2kaqpgnm719bp8l8rslm8rkuvdhb945s.apps.googleusercontent.com` | `crates/app/src/app_state.rs:21-25` |
-| 既定 client_secret | `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`（`THUNDOKU_GOOGLE_CLIENT_SECRET` で上書き可。デスクトップでは公開情報扱いとコメント） | `crates/app/src/app_state.rs:27-32` |
+| 既定 client_secret | コード内の `DEFAULT_GOOGLE_CLIENT_SECRET`（`THUNDOKU_GOOGLE_CLIENT_SECRET` で上書き可）。**デスクトップではクライアント種別が「デスクトップ アプリ」である前提**で扱う（§2.5）。実値は仕様書に転記しない | `crates/app/src/app_state.rs:27-32` |
 
 ### 2.2 OAuth フロー（installed-app / PKCE S256 + ループバック受信）
 
-1. ログインモーダル `GoogleLoginView::new` が `AppState.google` の `GoogleClient::begin_authorize()` を呼ぶ `crates/app/src/views/google_login.rs:44-48`。
+1. ログインモーダル `GoogleLoginView::new` が `AppState.google` の `GoogleClient::begin_authorize()` を呼ぶ `crates/app/src/views/google_login.rs`。
 2. `begin_authorize()`: ループバック listener を確保 → `redirect_uri = http://127.0.0.1:{port}` を組み立て → verifier / challenge / state を生成 → 認可 URL を返す `crates/core/src/google.rs:408-431`。
 3. listener 確保 `bind_loopback()`: `SO_REUSEADDR` を設定し `127.0.0.1:38387` に bind、`listen(128)`。失敗時は `127.0.0.1:0`（動的ポート）へフォールバック（Google Cloud Console 登録の redirect_uri と一致させるため固定ポート優先）`crates/core/src/google.rs:239-266`。
 4. PKCE 素材: verifier = 32 byte 乱数の base64url（パディング無し）、challenge = `base64url(SHA-256(verifier))`、state = 16 byte 乱数の base64url `crates/core/src/google.rs:67-86`。
 5. 認可 URL のクエリ: `client_id`, `redirect_uri`, `response_type=code`, `scope`, `access_type=offline`, `prompt=consent`, `state`, `code_challenge`, `code_challenge_method=S256` `crates/core/src/google.rs:90-104`。
-6. **アプリ内 WebView（gpui-wry）** に認可 URL を load して表示（システムブラウザは開かない）`crates/app/src/views/google_login.rs:1-7`, `:52-58`。※ `GoogleClient::authorize()`（システムブラウザを開く実装）も存在するが、アプリ経路は `begin_authorize`/`finish_authorize` `crates/core/src/google.rs:387-392`。
-7. `finish_authorize()` が別スレッドで `receive_callback` を実行 `crates/app/src/views/google_login.rs:79-95`, `crates/core/src/google.rs:433-443`。
+6. **OS の既定ブラウザ**で認可 URL を開く（`google::open_browser`）。アプリ内 WebView は使わない
+   （RFC 8252 はネイティブアプリに外部ユーザーエージェントを求め、Google も埋め込み UA を拒否する）。
+   ブラウザを開けなかった場合は URL を画面に出して手動で開いてもらう `crates/app/src/views/google_login.rs`, `crates/core/src/google.rs`（`open_browser`）。
+   ※ `GoogleClient::authorize()` はブラウザを開いて最後まで実行する版で、アプリ経路は `begin_authorize`
+   （URL を作る）→ ブラウザで開く → `finish_authorize`（ループバック受信〜トークン交換）に分ける `crates/core/src/google.rs`。
+7. `finish_authorize()` が別スレッドで `receive_callback` を実行 `crates/app/src/views/google_login.rs`, `crates/core/src/google.rs:433-443`。
 8. `receive_callback`: 非ブロッキング accept ループ。`cancel: AtomicBool` が立っていれば `GoogleError::Cancelled`、300 秒で `Auth("authorization timed out")`。1 接続のみ受けて HTTP リクエスト行の query を `percent_decode` し、`error` → `Auth`、`state` 不一致 → `Auth("state mismatch")`、`code` 無し → `Auth("missing code")`。応答は `HTTP/1.1 200 OK` + `text/html; charset=utf-8` の短文（成功時「認証完了。このタブを閉じてください。」）`crates/core/src/google.rs:142-237`。
 9. `exchange_code`: `POST https://oauth2.googleapis.com/token`、`Content-Type: application/x-www-form-urlencoded`、form は `grant_type=authorization_code&code&redirect_uri&client_id&code_verifier`（`client_secret` が設定されていれば `&client_secret=` を追加）。HTTP ステータスが 2xx 以外は `GoogleError::Token` `crates/core/src/google.rs:446-488`。
 10. `parse_token_response`: JSON の `error` を検査。`access_token` 必須（空文字不可）。`refresh_token` は任意。`expires_at = 現在時刻(Unix 秒) + expires_in` `crates/core/src/google.rs:105-140`。
 11. `profile()`: userinfo に `Authorization: Bearer {token}` で GET（リダイレクト追跡 5）。2xx 以外は `Auth`。`sub` / `email` / `name` / `picture` を取り出し（欠落は空文字 / None）`crates/core/src/google.rs:537-575`。
-12. トークンを keyring に JSON で保存（`USER_GOOGLE`）。refresh_token を含むため期限切れ後も自動リフレッシュ可 `crates/app/src/views/google_login.rs:112-125`。
-13. グローバル状態更新: `google_profile = Some(profile)`, `google_logged_in = true`, `google_login_error = None`, `google_login_done = true`（`cx.emit` は RefCell 再入でパニックするため使わない）`crates/app/src/views/google_login.rs:127-140`。
+12. トークンを keyring に JSON で保存（`USER_GOOGLE`）。refresh_token を含むため期限切れ後も自動リフレッシュ可 `crates/app/src/views/google_login.rs`。
+13. グローバル状態更新: `google_profile = Some(profile)`, `google_logged_in = true`, `google_login_error = None`, `google_login_done = true`（`cx.emit` は RefCell 再入でパニックするため使わない）`crates/app/src/views/google_login.rs`。
 14. Workspace の監視タスク（100 ms 間隔）が `google_login_done` を検知 → `show_auth=false`, 認証モーダル破棄, `drive.last_sync_at` が未設定なら Drive 有効化ダイアログを表示, 本棚を再フィルタ `crates/app/src/workspace.rs:170-216`。
 
 ### 2.3 トークンのリフレッシュとログイン状態
@@ -123,6 +135,27 @@
   2. keyring に保持するトークンは 1 アカウント分だけだが、他アカウントの `owner_sub` 暗号文は DB に残り、そのアカウントで再ログインすれば同じ DB 鍵で復号できる `crates/core/src/secrets.rs:72-88`, `crates/app/src/app_state.rs:165-186`。
   3. 非現在アカウントの pub は復元手段が無く、`owner_sub` 破損時はその pack を読めない（許容と明記）`docs/account-switch.md`「セキュリティ / リスク」。
 - 初回起動時の既存データクリア（P4）: `app_settings['owner_sub_model.initialized']` が無ければ、`product_sample_pages` … `drive_sync_state` の 17 テーブルを DELETE し、`packs` / `thumbnails` ディレクトリを削除→再作成、`drive.last_sync_at` / `drive.sync.enabled` / `drive.sync.folder_id` を削除してからフラグを立てる `crates/core/src/db/mod.rs:399-457`。呼び出しは起動時 `crates/app/src/app_state.rs:148-150`。
+
+---
+
+### 2.5 OAuth クライアントの前提（公開前の確認事項 / C-01）
+
+デスクトップアプリのバイナリに埋め込んだ値は利用者から隠せないため、`client_secret` を
+「秘密」として扱うことはできない（公開クライアントとして設計する）。したがって
+**Google Cloud 側の設定がどうなっているかで安全性の評価が変わる**。ここはコードだけでは
+決められないので、公開前に次を確認する。
+
+| 確認項目 | 期待する状態 | 違反していた場合の対応 |
+|---|---|---|
+| クライアント種別 | **デスクトップ アプリ**（インストール型）として登録されている | Web アプリ等の機密クライアントを共用しているなら、デスクトップ用を別途作成して分離する |
+| Web 版との共用 | Web 版（thundoku-web）と `client_id` / `client_secret` を共用していない | 共用しているなら Web 側の `client_secret` を失効・再発行し、公開履歴を確認する |
+| リダイレクト URI | ループバック（`http://127.0.0.1`）が許可されている | 未登録だとフォールバック（動的ポート）で認可できない |
+| 要求スコープ | `openid email` + `drive.file` のみ | `drive.readonly` を要求していたら最小権限に戻す（§2.1） |
+| 同意画面 | アプリ名・サポート連絡先・プライバシーポリシーが設定されている | 未設定だと利用者に警告が出る |
+
+注: `client_secret` を環境変数化・難読化しても**配布バイナリ内の秘密にはならない**
+（ビルド時に埋め込まれる）。保護になるのは「クライアント種別とスコープを正しく設定すること」
+であって、文字列を隠すことではない。
 
 ---
 
@@ -193,8 +226,16 @@
 
 - 目的（モジュールコメント）: 画像 base64 を含む DB ファイル全体（200MB 級）を上げるのは重いため、主要テーブルのテキストのみ JSON 化する。`thumbnail_data` / `image_data` と環境依存設定（`drive.*` / `api.last_sync_at` 等）は含めない `crates/core/src/db/backup.rs:1-8`。
 - 対象テーブル（16 個、この順で処理。FK 参照元が先）: `books`, `bookshelf_items`, `checked_items`, `tbf_events`, `book_contents`, `content_formats`, `reading_progress`, `page_views`, `book_tags`, `favorite_tags`, `favorite_entities`, `imported_documents`, `document_images`, `book_first_events`, `zenn_tag_metadata`, `view_history` `crates/core/src/db/backup.rs:14-31`。
-- 除外カラム: `thumbnail_data`, `image_data` `crates/core/src/db/backup.rs:38-39`。
-- owner フィルタ（P3）: `book_ids` を渡すと `books` を絞り、関連テーブルも `book_id IN (...)` で連動して除外する `crates/core/src/db/backup.rs:135-160`, `:248-277`。
+- 除外カラム: `thumbnail_data`, `image_data`, `extracted_text`（`document_images` の
+  ページ本文。暗号化 pack から取り出した平文で、バックアップに載ると暗号化の意味が
+  失われる。アプリはこの列を読まない）`crates/core/src/db/backup.rs`。
+- owner フィルタ（P3）: `book_ids` を渡すと `books` を絞り、関連テーブルも `book_id IN (...)` で連動して除外する。加えて `OwnerFilter { key, sub }` を渡すと、本に紐づかない
+  `OWNER_SCOPED_TABLES`（`bookshelf_items` / `checked_items` / `book_first_events` /
+  `favorite_tags` / `favorite_entities`）を `owner_sub` の復号比較で絞る `crates/core/src/db/backup.rs`。
+  - `book_first_events` は `bookshelf_items` の子（FK）なので、親と同じ規則で絞らないと
+    復元時に FK 違反で全体がロールバックする。
+  - 復元 `import_json` は `books.id` / `books.pack_id` が安全な id でなければ**復元を中止**する
+    （`pack_path::is_safe_id`。保存領域外を指す pack パスを作らせない）。
 - 復元 `import_json`: 各テーブルを PK 競合時 `DO UPDATE` の UPSERT でマージ（**Drive 側優先**）。`INSERT ... ON CONFLICT DO UPDATE` は DELETE を伴わないため FK の `ON DELETE CASCADE` を発火させない `crates/core/src/db/backup.rs:163-190`, `:318-355`。PK 定義は `books:[id]`, `bookshelf_items:[site_id,database_id]`, `checked_items:[id]`, `tbf_events:[id]`, `book_contents:[content_id]`, `content_formats:[format_id]`, `reading_progress:[book_id,content_id]`, `page_views:[book_id,content_id,page_number]`, `book_tags:[id]`, `favorite_tags:[tag_name]`, `favorite_entities:[entity_kind,entity_name]`, `imported_documents:[id]`, `document_images:[id]`, `book_first_events:[site_id,database_id]`, `zenn_tag_metadata:[tag_name]`, `view_history:[id]` `crates/core/src/db/backup.rs:204-226`。
 - Drive 上のファイル名: `const DB_BACKUP_NAME = "thundoku-backup.json"` `crates/core/src/drive/sync.rs:417`。
 - 復元 API: `check_drive_backup(drive, folder_id)` → `DriveBackupInfo{file_id, md5, size, modified_time}`（無ければ `None`）`crates/core/src/drive/sync.rs:419-446`; `restore_drive_backup(drive, folder_id, pool)` はダウンロードして `backup::import_json` `crates/core/src/drive/sync.rs:448-470`。

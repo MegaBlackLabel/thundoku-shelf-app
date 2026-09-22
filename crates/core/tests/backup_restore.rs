@@ -73,7 +73,7 @@ fn seed_source_pool() -> sqlx::SqlitePool {
 #[test]
 fn restore_into_fresh_db_keeps_event_children() {
     let src = seed_source_pool();
-    let json = backup::export_json(&src, None).unwrap();
+    let json = backup::export_json(&src, None, None).unwrap();
 
     let dst = thundoku_core::db::test_pool(); // 空の新規 DB（sites のみ seed 済み）
     backup::import_json(&dst, &json).expect("restore into a fresh DB should succeed");
@@ -117,7 +117,7 @@ fn restore_keeps_user_page_notes() {
     )
     .unwrap();
 
-    let json = backup::export_json(&src, None).unwrap();
+    let json = backup::export_json(&src, None, None).unwrap();
     assert!(
         json.contains("page_notes"),
         "エクスポートに page_notes が含まれること"
@@ -137,7 +137,7 @@ fn old_backup_does_not_null_out_newer_columns() {
     let src = thundoku_core::db::test_pool();
     books::insert(&src, &book("b1")).unwrap();
     let mut json: serde_json::Value =
-        serde_json::from_str(&backup::export_json(&src, None).unwrap()).unwrap();
+        serde_json::from_str(&backup::export_json(&src, None, None).unwrap()).unwrap();
     // 旧バージョンのバックアップを模す: 後から追加された列を落とす
     for row in json["books"].as_array_mut().unwrap() {
         let obj = row.as_object_mut().unwrap();
@@ -183,7 +183,7 @@ fn old_backup_missing_not_null_column_still_imports() {
     let src = thundoku_core::db::test_pool();
     books::insert(&src, &book("b1")).unwrap();
     let mut json: serde_json::Value =
-        serde_json::from_str(&backup::export_json(&src, None).unwrap()).unwrap();
+        serde_json::from_str(&backup::export_json(&src, None, None).unwrap()).unwrap();
     for row in json["books"].as_array_mut().unwrap() {
         row.as_object_mut().unwrap().remove("is_drm");
     }
@@ -200,7 +200,7 @@ fn old_backup_missing_not_null_column_still_imports() {
 fn failed_restore_rolls_back_completely() {
     let src = seed_source_pool();
     let mut json: serde_json::Value =
-        serde_json::from_str(&backup::export_json(&src, None).unwrap()).unwrap();
+        serde_json::from_str(&backup::export_json(&src, None, None).unwrap()).unwrap();
     // 存在しないサイトを参照させて FK 違反を起こす（books の後で失敗する）
     for row in json["bookshelf_items"].as_array_mut().unwrap() {
         row.as_object_mut()
@@ -241,7 +241,7 @@ fn restore_merges_page_notes_that_differ_only_by_id() {
         },
     )
     .unwrap();
-    let json = backup::export_json(&src, None).unwrap();
+    let json = backup::export_json(&src, None, None).unwrap();
 
     // 復元先には同じページの付箋が別 id で存在する
     let dst = thundoku_core::db::test_pool();

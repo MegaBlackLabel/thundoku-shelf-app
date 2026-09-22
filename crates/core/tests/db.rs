@@ -73,15 +73,22 @@ fn migrate_creates_all_schema_tables() {
 #[test]
 fn favorite_entities_roundtrip() {
     let pool = memory_db();
-    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-a", true).unwrap();
+    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-a", true, None).unwrap();
     // 同じ名前を二度お気に入りにしても重複しない（ON CONFLICT DO NOTHING）
-    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-a", true).unwrap();
-    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-b", true).unwrap();
-    favorites::set_favorite(&pool, favorites::EntityKind::Author, "author-x", true).unwrap();
+    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-a", true, None).unwrap();
+    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-b", true, None).unwrap();
+    favorites::set_favorite(&pool, favorites::EntityKind::Author, "author-x", true, None).unwrap();
     // 同名でも種別が違えば独立
-    favorites::set_favorite(&pool, favorites::EntityKind::Author, "circle-a", true).unwrap();
+    favorites::set_favorite(&pool, favorites::EntityKind::Author, "circle-a", true, None).unwrap();
     // 解除
-    favorites::set_favorite(&pool, favorites::EntityKind::Circle, "circle-b", false).unwrap();
+    favorites::set_favorite(
+        &pool,
+        favorites::EntityKind::Circle,
+        "circle-b",
+        false,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         favorites::list_favorites(&pool, favorites::EntityKind::Circle).unwrap(),
@@ -1106,13 +1113,13 @@ fn tags_set_list_and_favorites() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].tag_name, "rust");
 
-    tags::set_favorite(&pool, "rust", true).unwrap();
-    tags::set_favorite(&pool, "typescript", true).unwrap();
+    tags::set_favorite(&pool, "rust", true, None).unwrap();
+    tags::set_favorite(&pool, "typescript", true, None).unwrap();
     assert_eq!(
         tags::list_favorites(&pool).unwrap(),
         vec!["rust", "typescript"]
     );
-    tags::set_favorite(&pool, "rust", false).unwrap();
+    tags::set_favorite(&pool, "rust", false, None).unwrap();
     assert_eq!(tags::list_favorites(&pool).unwrap(), vec!["typescript"]);
 }
 
@@ -1301,7 +1308,6 @@ fn books_delete_removes_dependent_rows() {
             height: 10,
             mime_type: "image/webp".into(),
             file_size: 1,
-            extracted_text: None,
             pack_entry_path: None,
             created_at: stamp.into(),
         }],

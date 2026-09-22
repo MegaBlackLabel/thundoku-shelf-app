@@ -11,11 +11,28 @@
 
 ### 7.0 ストア横断サマリ
 
+**ダウンロード URL の検証（全ストア共通）**: セッション Cookie / XSRF を付けた送信は、
+送信直前に `download_url::check`（`crates/core/src/download_url.rs`）で `https` + 許可
+ホスト（+ 必要なパス）を検証する。理由は `bookshelf_items.download_url` が Drive の
+JSON バックアップから復元でき、改変したバックアップを復元させると外部ホストへ Cookie が
+送られるため。302 を手動追跡する経路（DLsite / FANZA）は `Location` も検証する。
+
+| ストア | 検証点 | 許可（ホスト / パス） |
+|---|---|---|
+| BOOTH | `download_with_progress`（Cookie 付与の前） | `booth.pm` + `/downloadables/`（完全一致） |
+| DLsite | `down_url` と 302 の `Location` | `*.dlsite.com`（Cookie のスコープに一致） |
+| FANZA | proxy URL と 302 の `Location` | `*.dmm.co.jp`（実測 CDN は `doujin.contents.doujin.dmm.co.jp`） |
+| 技術書典 | `resolve_download_url` の入力 | `techbookfest.org`（完全一致） |
+| 技術書典 | `download_with_progress`（本体） | `techbookfest.org` + `/api/product-dlc/`、`storage.googleapis.com` + `/tbf-tokyo-product-dlc/` |
+
+検証に失敗したら**リクエストを送らずに** `BlockedUrl` を返す
+（`crates/core/tests/download_credentials.rs` で「1 件も送らないこと」を確認している）。
+
 | ストア | site_id | 同期エントリポイント | 取得対象 | ログイン方式 | セッション保存先 / 保護 | 差分判定 |
 |---|---|---|---|---|---|---|
-| DLsite | `"dlsite"` `crates/core/src/dlsite/sync.rs:13` | `dlsite::sync::save_purchases` `crates/core/src/dlsite/sync.rs:23`（アプリ側は `BookshelfView::sync_dlsite` `crates/app/src/views/bookshelf.rs:2557`） | 購入済み一覧。走査フロア `["maniax","home","books","ai"]` `crates/core/src/dlsite/client.rs:15`、`RJ\d+` のみ採用 | アプリ内 WebView（DLsite ログイン → `www` + `login` の Cookie 収集）`crates/app/src/views/dlsite_login.rs:114-146` | `app_settings["dlsite.session"]`（**平文 JSON**）`crates/app/src/app_state.rs:439-441` | なし（毎回 全ストア × 全ページ + 全件 UPSERT、削除なし）`crates/core/src/dlsite/sync.rs:23-100` |
-| FANZA同人 | `"fanza"` `crates/core/src/fanza/sync.rs:13` | `fanza::sync::save_purchases` `crates/core/src/fanza/sync.rs:51` | mylibrary API。`PAGE_LIMIT = 20` 件/ページ `crates/core/src/fanza/client.rs:17`、安全弁 2000 件 `:212` | アプリ内 WebView（購入済み作品ページ → 年齢確認）`crates/app/src/views/fanza_login.rs:3` | `app_settings["fanza.session"]`（**平文 JSON**）`crates/app/src/app_state.rs:419-421` | なし（全件 UPSERT）`crates/core/src/fanza/sync.rs:52-100` |
-| BOOTH | `"booth"` 固定 `crates/app/src/views/bookshelf.rs:2341` | **core に同期エンジンが無くアプリ層** `BookshelfView::sync_booth` `crates/app/src/views/bookshelf.rs:2253` | `BoothClient::library()`（`accounts.booth.pm/library`）と `BoothClient::orders()`（`accounts.booth.pm/orders`）`crates/core/src/booth.rs:200`, `:266` | アプリ内 WebView（incognito）+ 1 秒間隔の URL 監視 `crates/app/src/views/booth_login.rs:46`, `:83` | `app_settings["booth.session"]`（**平文 JSON**）`crates/app/src/app_state.rs:394-396` | 全件 UPSERT + 集合差 DELETE 3 種 `crates/app/src/views/bookshelf.rs:2383-2430` |
+| DLsite | `"dlsite"` `crates/core/src/dlsite/sync.rs:13` | `dlsite::sync::save_purchases` `crates/core/src/dlsite/sync.rs:23`（アプリ側は `BookshelfView::sync_dlsite` `crates/app/src/views/bookshelf.rs:2557`） | 購入済み一覧。走査フロア `["maniax","home","books","ai"]` `crates/core/src/dlsite/client.rs:15`、`RJ\d+` のみ採用 | アプリ内 WebView（DLsite ログイン → `www` + `login` の Cookie 収集）`crates/app/src/views/dlsite_login.rs:114-146` | `app_settings["dlsite.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:439-441` | なし（毎回 全ストア × 全ページ + 全件 UPSERT、削除なし）`crates/core/src/dlsite/sync.rs:23-100` |
+| FANZA同人 | `"fanza"` `crates/core/src/fanza/sync.rs:13` | `fanza::sync::save_purchases` `crates/core/src/fanza/sync.rs:51` | mylibrary API。`PAGE_LIMIT = 20` 件/ページ `crates/core/src/fanza/client.rs:17`、安全弁 2000 件 `:212` | アプリ内 WebView（購入済み作品ページ → 年齢確認）`crates/app/src/views/fanza_login.rs:3` | `app_settings["fanza.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:419-421` | なし（全件 UPSERT）`crates/core/src/fanza/sync.rs:52-100` |
+| BOOTH | `"booth"` 固定 `crates/app/src/views/bookshelf.rs:2341` | **core に同期エンジンが無くアプリ層** `BookshelfView::sync_booth` `crates/app/src/views/bookshelf.rs:2253` | `BoothClient::library()`（`accounts.booth.pm/library`）と `BoothClient::orders()`（`accounts.booth.pm/orders`）`crates/core/src/booth.rs:200`, `:266` | アプリ内 WebView（incognito）+ 1 秒間隔の URL 監視 `crates/app/src/views/booth_login.rs:46`, `:83` | `app_settings["booth.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:394-396` | 全件 UPSERT + 集合差 DELETE 3 種 `crates/app/src/views/bookshelf.rs:2383-2430` |
 | 技術書典 | `"techbookfest"` `crates/core/src/tbf/mod.rs:22` | `tbf::sync::save_bookshelf` `crates/core/src/tbf/sync.rs:70` / `save_events` `:130` / `refresh_checklist` `:244` | GraphQL。本棚・チェックリスト・イベント。`first: 100` + `endCursor` カーソル `crates/core/src/tbf/mod.rs:289-327` | アプリ内 WebView（`techbookfest.org/user/signin`）+ 1 秒間隔の URL 監視 | **OS keyring**（`techbookfest`）に `TbfSession` JSON `crates/core/src/secrets.rs:10` | `refresh_checklist` が `SyncPollOutcome.changed` を返す `crates/core/src/tbf/sync.rs:211-244` |
 
 ### 7.1 DLsite
@@ -803,7 +820,7 @@
 | ログアウト（booth.pm 側）401/403 | `ureq::Error::Status(401|403)` | `BoothError::NotLoggedIn` `crates/core/src/booth.rs:156-158` |
 | CSRF トークンが取れない | `extract_csrf_token` が `None` | `BoothError::Network("csrf token not found in page")` `crates/core/src/booth.rs:109-110` |
 | ログアウト（plaza 側）失敗 | 任意のエラー | **無視して続行**（`log::info!("booth logout(plaza): failed ({e})")`） `crates/core/src/booth.rs:135-137` |
-| HTML ダンプ書き込み失敗 | `std::fs::write` のエラー | `log::warn!` のみで続行 `crates/core/src/booth.rs:240-242`,`:276-278` |
+| HTML ダンプ | **通常動作では書き出さない**。`THUNDOKU_BOOTH_HTML_DUMP=1` を明示したときだけ `%TEMP%/thundoku-shelf/booth-dumps/` へ保存し、失敗は `log::warn!` のみで続行。ログアウト時にダンプを削除する `crates/core/src/booth.rs`（`dump_html_if_enabled` / `remove_html_dumps`） |
 | 同期全体の失敗 | 上記いずれかが `?` で伝播 | スレッドから `Err(String)` を返し、UI で `log::error!` + Error トースト。`"not logged in"` を含む場合のみ再ログインダイアログを自動表示 `crates/app/src/views/bookshelf.rs:2461-2469` |
 
 - **リトライは一切無い**（429/5xx 含む。`retry` / `backoff` / `attempt` の grep 結果 0 件）。
@@ -869,17 +886,17 @@
 | 項目 | 事実 | アンカー |
 |---|---|---|
 | 保存先 | SQLite の `app_settings` テーブル、キー `"booth.session"` | `crates/app/src/app_state.rs:392`、`crates/core/src/db/schema.sql:25-30` |
-| 形式 | `BoothSession` の `serde_json` 文字列（`{"cookies":{"name":"value",...}}`）をそのまま `value` 列へ | `crates/app/src/views/booth_login.rs:144-148`、`crates/app/src/app_state.rs:390-392` |
-| 暗号化 | **なし（平文 JSON）**。`db::settings::set` は素の `INSERT ... ON CONFLICT(key) DO UPDATE` | `crates/core/src/db/settings.rs:17-28` |
-| keyring を使わない理由（コメント） | セッション Cookie は Windows Credential Manager の上限（**2560 UTF-16 文字**）を超えることがあるため DB 保存 | `crates/app/src/app_state.rs:191-192`、`:386-387` |
-| 実行時キャッシュ | `AppState.booth_session: Arc<parking_lot::Mutex<Option<BoothSession>>>` と `booth_logged_in: Arc<Mutex<bool>>` | `crates/app/src/app_state.rs:52-53` |
-| 保存関数 | `pub fn save_booth_session(cx: &App, session: &BoothSession)`（JSON 化失敗時は DB 保存をスキップし、メモリ状態は更新する） | `crates/app/src/app_state.rs:388-402` |
-| 起動時復元 | `db::settings::get(&db_pool, "booth.session")` → JSON parse → `logged_in()` フィルタ → `booth_logged_in` を決定。パース失敗は `None`（未ログイン扱い） | `crates/app/src/app_state.rs:193-198` |
-| 削除（ログアウト） | `SettingsView::logout_booth`: サーバー側 `logout()` 実行 → メモリクリア → `db::settings::delete(db, "booth.session")` を `cx.background_spawn` で非同期実行（結果は `let _ =` で無視） | `crates/app/src/views/settings.rs:678-704` |
-| 削除（汎用ヘルパー） | `pub fn clear_booth_session(cx: &App)` も存在するが、**呼び出し箇所が無い**（`crates` 全体の grep で定義 1 件のみ） | `crates/app/src/app_state.rs:405-410` |
+| 形式 | `BoothSession` を `serde_json` 化したものを暗号化した文字列（`enc:v1:` + base64）を `value` 列へ。**平文 JSON では保存しない** | `crates/core/src/session_store.rs`、`crates/app/src/views/booth_login.rs:144-148` |
+| 暗号化 | **keyring の鍵（`thundoku-shelf.session-key`）で AES-256-GCM**（AAD に用途名・形式版）。保存値は `enc:v1:` + base64(IV ‖ 暗号文 ‖ tag)。復号できない値（旧平文・改ざん・別鍵）は未ログインとして破棄し、**平文へは戻さない** | `crates/core/src/session_store.rs` |
+| keyring を使わない理由（コメント） | セッション Cookie は Windows Credential Manager の上限（**2560 UTF-16 文字**）を超えることがあるため DB 保存 | `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |
+| 実行時キャッシュ | `AppState.booth_session: Arc<parking_lot::Mutex<Option<BoothSession>>>` と `booth_logged_in: Arc<Mutex<bool>>` | `crates/app/src/app_state.rs` |
+| 保存関数 | `pub fn save_booth_session(cx: &App, session: &BoothSession)` → `SessionVault::save`。**鍵が無ければ保存しない**（平文へフォールバックしない）。失敗時はログのみで、メモリ状態は更新する | `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |
+| 起動時復元 | `SessionVault::load::<BoothSession>`（復号 → JSON parse）→ `logged_in()` フィルタ → `booth_logged_in` を決定。**復号できない値は未ログイン扱いで行ごと削除** | `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |
+| 削除（ログアウト） | `SettingsView::logout_booth`: サーバー側 `logout()` 実行 → `clear_booth_session` で**メモリを即時クリアし、DB 削除の成否を待って通知**する。失敗時は「端末に保存したセッション情報を削除できませんでした」と表示し、**次回起動で復元しない印**（`<data_dir>/session-purge.pending`）を残す | `crates/app/src/views/settings.rs`、`crates/core/src/session_store.rs` |
+| 削除（汎用ヘルパー） | `pub fn clear_booth_session(cx: &App) -> Result<(), String>`（`logout_booth` から呼ぶ）。`Err` は永続値の削除失敗を意味する | `crates/app/src/app_state.rs` |
 | 保存タイミング | ログイン成立時（`check_login` 内）のみ。同期では保存しない | `crates/app/src/views/booth_login.rs:148` |
 | `secrets.rs` の `USER_BOOTH` | `pub const USER_BOOTH: &str = "booth";`（keyring 用キーとして定義）— **リポジトリ内で参照箇所ゼロ**（未使用） | `crates/core/src/secrets.rs:12` |
-| keyring の共通定数 | `SERVICE = "com.megablacklabel.thundoku-shelf"`、`USER_DB_KEY = "thundoku-shelf.db-key"` | `crates/core/src/secrets.rs:5`,`:14` |
+| keyring の共通定数 | `SERVICE = "com.megablacklabel.thundoku-shelf"`、`USER_DB_KEY = "thundoku-shelf.db-key"`、`USER_SESSION_KEY = "thundoku-shelf.session-key"`（セッション Cookie 暗号化用・別鍵） | `crates/core/src/secrets.rs` |
 | `owner_sub`（別物） | BOOTH の ID からは作られない。ダウンロード時に Google ログイン中の `sub` を AES-256-GCM で暗号化して `books.owner_sub` に入れる（未ログイン時は `NULL`） | `crates/app/src/views/bookshelf.rs:2742-2745`,`:3007-3013`,`:3126-3132`、`crates/core/src/db/books.rs:250-265`、`crates/core/src/owner.rs:14-27` |
 | `owner_sub` 列 | `books.owner_sub TEXT`（NULL 可）。実行時 DDL で冪等に追加（`pragma_table_info` 確認後 `ALTER TABLE books ADD COLUMN owner_sub TEXT`） | `crates/core/src/db/schema.sql:50`、`crates/core/src/db/mod.rs:236-244` |
 
@@ -899,7 +916,7 @@
 | 同期結果ポーリング間隔 | 120 ms | `crates/app/src/views/bookshelf.rs:2443` |
 | ログイン URL 監視間隔 | 1 秒 | `crates/app/src/views/booth_login.rs:83` |
 | ダウンロード読み取りバッファ | 65,536 バイト（64 KiB）。読み取りループは BOOTH と 3 ストア（TBF/FANZA/DLsite）で共有し、**進捗コールバックが `false` を返すと中断**して途中のバイト列は破棄する（`read_body_with_progress`） | `crates/core/src/tbf/transport.rs:134-171` |
-| ダウンロード総量の上限 | **なし**（`Vec<u8>` に全量保持）。ただしユーザーの中止（本棚の「ダウンロード中止」）で中断・破棄される | `crates/core/src/tbf/transport.rs:141-171`; `crates/app/src/views/bookshelf.rs:2986-3002,4197-4220` |
+| ダウンロード総量の上限 | **2 GiB**（`MAX_DOWNLOAD_BODY_BYTES`）。超えたら読み込みを打ち切ってエラー（宣言サイズではなく実バイト数で判定）。API 応答（JSON/HTML）は **16 MiB**（`MAX_API_BODY_BYTES`）、読み出しエラーも失敗として伝播する | `crates/core/src/tbf/transport.rs`; `crates/app/src/views/bookshelf.rs:2986-3002,4197-4220` |
 | BOOTH 側の一時 URL 有効期限 | 署名付き S3 URL は 180 秒（コメント記載） | `crates/core/src/booth.rs:301-302` |
 | ページ数の安全弁 | 最大 100 ページ（library / orders 共通） | `crates/core/src/booth.rs:258-260`,`:291-293` |
 

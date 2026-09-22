@@ -25,20 +25,26 @@ impl EntityKind {
 }
 
 /// サークル / 作者のお気に入りを登録・解除する（登録は冪等）。
+///
+/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。登録時に付与し、
+/// 既存行（`ON CONFLICT DO NOTHING`）の所有者は書き換えない。
 pub fn set_favorite(
     pool: &SqlitePool,
     kind: EntityKind,
     name: &str,
     favorite: bool,
+    owner: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         if favorite {
             sqlx::query(
-                "INSERT INTO favorite_entities (entity_kind, entity_name) VALUES (?1, ?2) \
+                "INSERT INTO favorite_entities (entity_kind, entity_name, owner_sub) \
+                 VALUES (?1, ?2, ?3) \
                  ON CONFLICT(entity_kind, entity_name) DO NOTHING",
             )
             .bind(kind.as_str())
             .bind(name)
+            .bind(owner)
             .execute(pool)
             .await?;
         } else {

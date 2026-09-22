@@ -127,6 +127,11 @@ fn raw_inflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     Ok(out)
 }
 
+/// index エントリの最小整列サイズ（空パス・空 MIME の 44 バイトを 8 バイト境界へ
+/// 切り上げ）。`entry_count` から確保する前に「index 長で説明できる件数か」を
+/// 判定するために使う。
+const MIN_INDEX_ENTRY_SIZE: usize = 48;
+
 /// インデックス領域（CRC を含まない）をエントリ列へ解釈する。
 /// 各エントリの格納領域が本体（ヘッダ〜インデックス）に収まっていることも検証する。
 fn parse_index_entries(
@@ -134,6 +139,16 @@ fn parse_index_entries(
     index_offset: u64,
     entry_count: u32,
 ) -> Result<Vec<PackEntry>, PackError> {
+    // 件数は index 長から導ける上限で先に検査する。ここを飛ばすと、細工した
+    // `entry_count`（u32::MAX 等）+ 68 バイトのデータで数百 GB の
+    // `Vec::with_capacity` を試みさせられる（ヘッダ CRC は攻撃者も計算できるため
+    // 改竄の検知にはならない）。
+    let max_entries = index.len() / MIN_INDEX_ENTRY_SIZE;
+    if entry_count as usize > max_entries {
+        return Err(PackError::Corrupted(format!(
+            "entry_count {entry_count} exceeds index capacity {max_entries}"
+        )));
+    }
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos = 0;
     for _ in 0..entry_count {

@@ -33,7 +33,6 @@ pub struct DocumentImage {
     pub height: i64,
     pub mime_type: String,
     pub file_size: i64,
-    pub extracted_text: Option<String>,
     pub pack_entry_path: Option<String>,
     pub created_at: String,
 }
@@ -112,9 +111,9 @@ pub fn insert_image(pool: &SqlitePool, image: &DocumentImage) -> Result<(), sqlx
     crate::db::block_on(async {
         sqlx::query(
             "INSERT INTO document_images (id, document_id, content_id, format_id, page_number, \
-             image_type, opfs_path, width, height, mime_type, file_size, extracted_text, \
+             image_type, opfs_path, width, height, mime_type, file_size, \
              pack_entry_path, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(&image.id)
         .bind(&image.document_id)
@@ -127,7 +126,6 @@ pub fn insert_image(pool: &SqlitePool, image: &DocumentImage) -> Result<(), sqlx
         .bind(image.height)
         .bind(&image.mime_type)
         .bind(image.file_size)
-        .bind(&image.extracted_text)
         .bind(&image.pack_entry_path)
         .bind(&image.created_at)
         .execute(pool)
@@ -188,7 +186,7 @@ pub fn images_for_selection(
         sqlx::query_as::<_, DocumentImage>(
             "SELECT di.id, di.document_id, di.content_id, di.format_id, di.page_number, \
              di.image_type, di.opfs_path, di.width, di.height, di.mime_type, di.file_size, \
-             di.extracted_text, di.pack_entry_path, di.created_at
+             di.pack_entry_path, di.created_at
              FROM document_images di
              JOIN imported_documents d ON d.id = di.document_id
              WHERE d.book_id = ?1
@@ -266,12 +264,12 @@ pub fn insert_images_batch(pool: &SqlitePool, images: &[DocumentImage]) -> Resul
         for chunk in images.chunks(200) {
             let mut sql = String::from(
                 "INSERT INTO document_images (id, document_id, content_id, format_id, page_number, \
-                 image_type, opfs_path, width, height, mime_type, file_size, extracted_text, \
+                 image_type, opfs_path, width, height, mime_type, file_size, \
                  pack_entry_path, created_at) VALUES ",
             );
             let mut values = Vec::with_capacity(chunk.len());
             for _ in 0..chunk.len() {
-                values.push("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string());
+                values.push("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string());
             }
             sql.push_str(&values.join(", "));
             let mut q = sqlx::query(&sql);
@@ -288,7 +286,6 @@ pub fn insert_images_batch(pool: &SqlitePool, images: &[DocumentImage]) -> Resul
                     .bind(img.height)
                     .bind(&img.mime_type)
                     .bind(img.file_size)
-                    .bind(&img.extracted_text)
                     .bind(&img.pack_entry_path)
                     .bind(&img.created_at);
             }

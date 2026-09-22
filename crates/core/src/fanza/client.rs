@@ -16,9 +16,25 @@ pub const LIBRARY_BASE: &str = "https://www.dmm.co.jp/dc/doujin/api/mylibraries/
 /// jar 等の参照メタ列は一覧 API では返さない（`details` / 商品ページで取得）。
 pub const PAGE_LIMIT: usize = 20;
 
-/// DMM/FANZA は非ブラウザの User-Agent を 403 で弾くため、ブラウザ UA + Referer を送る
+/// FANZA同人 は非ブラウザの User-Agent を 403 で弾くため、ブラウザ UA + Referer を送る
 ///（BoothClient と同じ流儀）。
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// ダウンロード proxy（詳細 API の `downloadLinks`）を叩いてよいホスト。
+/// Cookie は `domain=.dmm.co.jp` で発行されるため、その範囲だけを許可する。
+const FANZA_DOWNLOAD_RULES: &[crate::download_url::HostRule] =
+    &[crate::download_url::HostRule::with_subdomains(
+        "dmm.co.jp",
+        None,
+    )];
+
+/// 302 の転送先（CloudFront 署名 Cookie を送る先）。
+/// 実測の CDN は `doujin.contents.doujin.dmm.co.jp`（`dmm.co.jp` のサブドメイン）。
+const FANZA_CDN_RULES: &[crate::download_url::HostRule] =
+    &[crate::download_url::HostRule::with_subdomains(
+        "dmm.co.jp",
+        None,
+    )];
 
 #[derive(Debug, thiserror::Error)]
 pub enum FanzaError {
@@ -32,6 +48,9 @@ pub enum FanzaError {
     Http(u16),
     #[error("parsing failed: {0}")]
     Parse(String),
+    /// 送信先が許可リストに無い（資格情報を送らない）。
+    #[error("blocked download url: {0}")]
+    BlockedUrl(String),
     #[error("db: {0}")]
     Database(#[from] sqlx::Error),
     #[error("transport: {0}")]
@@ -291,6 +310,11 @@ impl FanzaClient {
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, FanzaError> {
         // 1) proxy を manual（redirects=0）で叩いて 302 Location を取得
+        //
+        // Cookie（セッション / 署名）を付ける前に送信先を検証する。proxy URL と
+        // その 302 の `Location` のどちらも外部ホストを指し得る。
+        crate::download_url::check(download_url, FANZA_DOWNLOAD_RULES)
+            .map_err(|error| FanzaError::BlockedUrl(format!("{download_url}: {error}")))?;
         let proxy_headers = vec![
             ("Cookie".to_string(), self.session.cookie_header()),
             ("User-Agent".to_string(), USER_AGENT.to_string()),
@@ -321,6 +345,9 @@ impl FanzaClient {
         } else {
             return Err(FanzaError::Http(proxy_resp.status));
         };
+        // 転送先も検証する（任意ホストへ Cookie を転送させない）。
+        crate::download_url::check(&cd_url, FANZA_CDN_RULES)
+            .map_err(|error| FanzaError::BlockedUrl(format!("{cd_url}: {error}")))?;
         // 2) CDN へ直接（署名 Cookie 込みのフルブラウザヘッダ付き）
         //    署名 Cookie（CloudFront-*）はログイン時ではなく、このダウンロード proxy の
         //    応答（Set-Cookie）で lazy に発行されるため、ここで取って CDN へ送る。

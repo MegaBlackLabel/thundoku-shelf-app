@@ -48,7 +48,13 @@ pub fn full_size_thumb(url: &str) -> String {
 
 /// 購入済み作品のうち画像系（comic / cg）だけを `bookshelf_items(site_id='fanza')` に
 /// 保存し、保存件数を返す。除外カテゴリ（voice / game / video）は upsert しない。
-pub fn save_purchases(pool: &SqlitePool, client: &mut FanzaClient) -> Result<usize, FanzaError> {
+///
+/// `owner` は暗号化済み sub（ログイン中のみ `Some`）。書き込んだ行に所有者を付ける。
+pub fn save_purchases(
+    pool: &SqlitePool,
+    client: &mut FanzaClient,
+    owner: Option<&str>,
+) -> Result<usize, FanzaError> {
     let items = client.purchased()?;
     let mut saved = 0usize;
     for p in items {
@@ -97,6 +103,7 @@ pub fn save_purchases(pool: &SqlitePool, client: &mut FanzaClient) -> Result<usi
         bookshelf::upsert(pool, &item)?;
         saved += 1;
     }
+    bookshelf::attribute_owner(pool, SITE_ID_FANZA, owner)?;
     Ok(saved)
 }
 
@@ -255,7 +262,7 @@ mod tests {
         let session = FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]));
         let mut client = FanzaClient::with_transport(Box::new(transport), session);
 
-        let saved = save_purchases(&pool, &mut client).unwrap();
+        let saved = save_purchases(&pool, &mut client, None).unwrap();
         assert_eq!(saved, 3);
 
         let rows = bookshelf::list(&pool, SITE_ID_FANZA).unwrap();
@@ -302,7 +309,7 @@ mod tests {
         };
         let session = FanzaSession::new(HashMap::from([("login_id".into(), "abc".into())]));
         let mut client = FanzaClient::with_transport(Box::new(transport), session);
-        save_purchases(pool, &mut client).unwrap();
+        save_purchases(pool, &mut client, None).unwrap();
     }
 
     /// 商品ページ（`genreTag__txt` 入り HTML）を返す。叩かれた回数を数える。

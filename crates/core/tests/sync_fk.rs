@@ -29,7 +29,7 @@ fn bookshelf_sync_with_unknown_event_slug_does_not_violate_fk() {
     }];
 
     // tbf_events contains only canonical events (tbf1..tbf20) — tbf21 absent.
-    let count = save_bookshelf(&pool, &items).unwrap();
+    let count = save_bookshelf(&pool, &items, None).unwrap();
     assert_eq!(count, 1);
 
     // bookshelf row persisted with the FK target auto-created
@@ -59,7 +59,7 @@ fn checklist_sync_with_unknown_event_slug_does_not_violate_fk() {
     }];
 
     // event tbf22 not yet in tbf_events.
-    let count = save_checklist(&pool, "tbf22", &entries).unwrap();
+    let count = save_checklist(&pool, "tbf22", &entries, None).unwrap();
     assert_eq!(count, 1);
 
     let items = db::checklist::list_items(&pool, "tbf22").unwrap();
@@ -69,6 +69,77 @@ fn checklist_sync_with_unknown_event_slug_does_not_violate_fk() {
     // FK target row was created
     let events = db::checklist::list_events(&pool).unwrap();
     assert!(events.iter().any(|e| e.id == "tbf22"));
+}
+
+/// 同期は書き込んだ行に「現在のアカウント」の所有者を付ける。
+///
+/// Drive の DB バックアップは現在の sub の行だけを出すため、属性付けが漏れると
+/// 本棚・チェックリストがバックアップから消える（逆に他アカウントの行に付くと混ざる）。
+/// `None`（未ログイン）のときは未所属（NULL）のままにする。
+#[test]
+fn sync_attributes_rows_to_the_current_owner() {
+    let pool = db();
+    let owner = "enc-owner-A";
+    let items = vec![TbfShelfItem {
+        id: "db-owner-1".into(),
+        title: "本".into(),
+        circle_name: "サークルA".into(),
+        thumbnail_url: None,
+        format: "PDF".into(),
+        caused_at: None,
+        event_name: None,
+        event_slug: Some("tbf21".into()),
+        file_name: None,
+        download_url: None,
+        is_downloadable: true,
+        tags: None,
+    }];
+    let entries = vec![TbfChecklistEntry {
+        id: "tbf23:p1".into(),
+        circle_name: "サークルB".into(),
+        space_number: "あ-01".into(),
+        tbf_circle_id: None,
+        product_id: Some("p1".into()),
+        product_title: "本".into(),
+        thumbnail_url: None,
+        price: None,
+        is_purchased: false,
+        created_at: None,
+    }];
+
+    save_bookshelf(&pool, &items, Some(owner)).unwrap();
+    save_checklist(&pool, "tbf23", &entries, Some(owner)).unwrap();
+    // 未ログイン相当（None）は未所属のまま
+    save_bookshelf(
+        &pool,
+        &[TbfShelfItem {
+            id: "db-owner-2".into(),
+            ..items[0].clone()
+        }],
+        None,
+    )
+    .unwrap();
+
+    let owners: Vec<(String, Option<String>)> = db::block_on(async {
+        sqlx::query_as("SELECT database_id, owner_sub FROM bookshelf_items ORDER BY database_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+    });
+    assert_eq!(
+        owners,
+        vec![
+            ("db-owner-1".to_string(), Some(owner.to_string())),
+            ("db-owner-2".to_string(), None),
+        ]
+    );
+    let checked: Vec<Option<String>> = db::block_on(async {
+        sqlx::query_scalar("SELECT owner_sub FROM checked_items")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+    });
+    assert_eq!(checked, vec![Some(owner.to_string())]);
 }
 
 #[test]
@@ -111,7 +182,7 @@ fn bookshelf_sync_keeps_existing_event_row() {
         is_downloadable: false,
         tags: None,
     }];
-    save_bookshelf(&pool, &items).unwrap();
+    save_bookshelf(&pool, &items, None).unwrap();
 
     let event = db::checklist::list_events(&pool)
         .unwrap()

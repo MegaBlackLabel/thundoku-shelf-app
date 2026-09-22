@@ -457,7 +457,12 @@ impl HistoryView {
         let is_favorite = self.favorite_tags.iter().any(|t| t == tag);
         {
             let state = AppState::global(cx);
-            let _ = db::tags::set_favorite(&state.db_pool, tag, !is_favorite);
+            let _ = db::tags::set_favorite(
+                &state.db_pool,
+                tag,
+                !is_favorite,
+                crate::app_state::owner_token(state).as_deref(),
+            );
         }
         if is_favorite {
             self.favorite_tags.retain(|t| t != tag);
@@ -480,7 +485,13 @@ impl HistoryView {
         };
         {
             let state = AppState::global(cx);
-            let _ = db::favorites::set_favorite(&state.db_pool, kind, value, !is_favorite);
+            let _ = db::favorites::set_favorite(
+                &state.db_pool,
+                kind,
+                value,
+                !is_favorite,
+                crate::app_state::owner_token(state).as_deref(),
+            );
         }
         let favorites = match kind {
             db::favorites::EntityKind::Circle => &mut self.favorite_circles,

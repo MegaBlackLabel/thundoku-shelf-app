@@ -412,11 +412,17 @@ impl ChecklistView {
         let tbf_client = state.tbf.clone();
         let db = state.db_pool.clone();
         let slug_for_task = slug.clone();
+        let owner = crate::app_state::owner_token(state);
         let task: gpui_kit::Task<Result<usize, String>> =
             cx.background_executor().spawn(async move {
                 let mut client = tbf_client.lock();
-                let outcome = tbf::sync::refresh_checklist(&db, &mut client, &slug_for_task)
-                    .map_err(|e| e.to_string())?;
+                let outcome = tbf::sync::refresh_checklist(
+                    &db,
+                    &mut client,
+                    &slug_for_task,
+                    owner.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
                 Ok(outcome.count)
             });
         cx.spawn(async move |_window, cx| {
@@ -461,13 +467,14 @@ impl ChecklistView {
         let tbf_client = state.tbf.clone();
         let db = state.db_pool.clone();
         let slug_for_task = slug.clone();
+        let owner = crate::app_state::owner_token(state);
         let task: gpui_kit::Task<Result<usize, String>> =
             cx.background_executor().spawn(async move {
                 let mut client = tbf_client.lock();
                 let entries = client
                     .favorites(&slug_for_task)
                     .map_err(|e| e.to_string())?;
-                tbf::sync::save_checklist(&db, &slug_for_task, &entries)
+                tbf::sync::save_checklist(&db, &slug_for_task, &entries, owner.as_deref())
                     .map_err(|e| e.to_string())?;
                 Ok(entries.len())
             });

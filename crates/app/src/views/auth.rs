@@ -281,13 +281,12 @@ impl AuthDialog {
                 cx.notify();
             });
         }
-        // Google: WebView（wry）は実ウィンドウが必要なため、ログインモーダルを
-        // 開いたときだけ作成する（テスト環境で WebView を作らない）。
-        // ウィンドウ借用中の WebView 生成は RefCell 再入でウィンドウ描画が固まるため、
-        // render 後に defer_in で生成する。
+        // Google: 認可はシステムブラウザで行う（RFC 8252 / Google の埋め込み UA 非推奨）。
+        // WebView（wry）を作らないため実ウィンドウは不要だが、他のプロバイダと同じ
+        // defer_in の経路に揃えておく（生成タイミングを変えない）。
         if self.show_google_login && self.google_login.is_none() {
-            cx.defer_in(window, |this, window, cx| {
-                let google_login = cx.new(|cx| GoogleLoginView::new(window, cx));
+            cx.defer_in(window, |this, _window, cx| {
+                let google_login = cx.new(GoogleLoginView::new);
                 // 成功: プロフィールを保存してモーダル全体を閉じる
                 let _done = cx.subscribe(
                     &google_login,
@@ -437,11 +436,8 @@ impl Render for AuthDialog {
         {
             booth.update(cx, |view, cx| view.show(cx));
         }
-        if self.show_google_login
-            && let Some(google) = &self.google_login
-        {
-            google.update(cx, |view, cx| view.show(cx));
-        }
+        // Google: 認可はシステムブラウザで行う（WebView を持たない）ため、
+        // 他プロバイダのような「WebView を可視化する」処理は無い。
         if self.show_tbf_login
             && let Some(tbf) = &self.tbf_login
         {
@@ -483,8 +479,9 @@ impl Render for AuthDialog {
                     None => div().into_any_element(),
                 }
             } else if self.show_google_login {
+                // Google は WebView を使わない（システムブラウザ）ため deferred にしない。
                 match &self.google_login {
-                    Some(google) => deferred(google.clone()).into_any_element(),
+                    Some(google) => google.clone().into_any_element(),
                     None => div().into_any_element(),
                 }
             } else if self.show_tbf_login {

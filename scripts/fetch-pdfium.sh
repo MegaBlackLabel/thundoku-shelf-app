@@ -2,9 +2,10 @@
 # PDFium の動的ライブラリを取得して crates/core/ に置く。
 #
 # PDF レンダリングは PDFium を**実行時ロード**する（静的リンクしない。prebuilt の
-# static ライブラリは macOS で FPDF_FORMFILL を欠きリンクできない）。テストは
-# crates/core を CWD として ./libpdfium.dylib（Windows は ./pdfium.dll）を探すので、
-# テストの前にこれを実行する。無い場合、PDF を描画するテストはスキップされる。
+# static ライブラリは macOS で FPDF_FORMFILL を欠きリンクできない）。探索先は
+# ビルド時の `CARGO_MANIFEST_DIR`（= crates/core）と実行ファイルの隣なので、
+# テスト・`cargo run` のどちらもこの配置で足りる（CWD は探索しない）。
+# 無い場合、PDF を描画するテストはスキップされる。
 #
 # ライブラリはリポジトリにコミットしない（.gitignore）。取得元は pdfium-render の
 # pdfium_7881 バインディングに対応する chromium/7881 で、SHA256 を検証する。
@@ -62,9 +63,6 @@ fi
 tar -xzf "$TGZ" -C "$TMP" "$LIB"
 mkdir -p "$ROOT/crates/core"
 cp "$TMP/$LIB" "$ROOT/crates/core/$DEST"
-# `mise run run`（cargo run）は CWD がリポジトリ直下なので、探索先 1 つ目の
-# ./libpdfium.dylib も満たしておく（.gitignore はスラッシュ無しで無視する）。
-cp "$TMP/$LIB" "$ROOT/$DEST"
 rm -f "$TGZ"
 
-echo "配置しました: crates/core/$DEST と $DEST"
+echo "配置しました: crates/core/$DEST"

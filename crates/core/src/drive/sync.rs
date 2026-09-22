@@ -19,7 +19,7 @@ use opfspack::{Identity, PackError, PackReader, entry_flags};
 use crate::db::{SqlitePool, books, sync_state};
 use crate::drive::{DriveApi, DriveError, DriveFile};
 
-pub const PACK_EXTENSION: &str = "opfspack";
+pub use crate::pack_path::PACK_EXTENSION;
 const META_ENTRY: &str = "metadata.json";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -56,15 +56,7 @@ pub enum SyncError {
 
 fn pack_id_from_name(name: &str) -> Option<&str> {
     name.strip_suffix(&format!(".{PACK_EXTENSION}"))
-        .filter(|id| {
-            !id.is_empty()
-                && !id.contains('/')
-                && !id.contains('\\')
-                && !id.contains("..")
-                && !id.contains(':')
-                && !id.starts_with('.')
-                && !id.chars().any(char::is_control)
-        })
+        .filter(|id| crate::pack_path::is_safe_id(id))
 }
 
 fn now() -> String {
@@ -249,7 +241,8 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             outcome.skipped.push((*pack_id).to_string());
             continue;
         }
-        let local_path = packs_dir.join(format!("{pack_id}.{PACK_EXTENSION}"));
+        let local_path = crate::pack_path::pack_path(packs_dir, pack_id)
+            .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
 
         let bytes = drive.download(&file.id)?;
         let reader = PackReader::open(&bytes)
@@ -266,13 +259,15 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
         // local_changed が false になるため、条件にするとローカル専有の内容を退避せずに
         // 上書きしてしまう。ローカルに実体がある限り必ず退避する。
         if local_path.exists() {
-            let backup = packs_dir.join(format!("{pack_id}.conflict-local.{PACK_EXTENSION}"));
+            let backup = crate::pack_path::conflict_backup_path(packs_dir, pack_id)
+                .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
             std::fs::copy(&local_path, &backup)?;
             outcome.conflicts.push((*pack_id).to_string());
         }
         std::fs::create_dir_all(downloads_dir)?;
         std::fs::create_dir_all(packs_dir)?;
-        let temp = downloads_dir.join(format!("{pack_id}.{PACK_EXTENSION}"));
+        let temp = crate::pack_path::pack_path(downloads_dir, pack_id)
+            .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
         std::fs::write(&temp, &bytes)?;
         // 直接 write だと書き込み途中のクラッシュで pack が壊れるため、
         // 同一ファイルシステム内の rename で置換する（原子的）。
@@ -318,7 +313,8 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
         if !upload_ids.contains(&book.id) {
             continue;
         }
-        let local_path: PathBuf = packs_dir.join(format!("{pack_id}.{PACK_EXTENSION}"));
+        let local_path: PathBuf = crate::pack_path::pack_path(packs_dir, &pack_id)
+            .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
         if !local_path.exists() {
             continue;
         }
@@ -370,7 +366,14 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
         );
     }
     if db_path.is_some() && can_backup_db {
-        let json = crate::db::backup::export_json(pool, Some(&upload_ids))?;
+        let owner_filter = match (owner_key, identity_sub) {
+            (Some(key), Some(sub)) => Some(crate::db::backup::OwnerFilter {
+                key,
+                sub: Some(sub),
+            }),
+            _ => None,
+        };
+        let json = crate::db::backup::export_json(pool, Some(&upload_ids), owner_filter.as_ref())?;
         let bytes = json.as_bytes();
         let local_md5 = format!("{:x}", md5::compute(bytes));
         let existing = files.iter().find(|f| f.name == DB_BACKUP_NAME);
@@ -511,6 +514,7 @@ pub fn inspect_drive_backup(
     drive: &mut dyn DriveApi,
     folder_id: &str,
     book_ids: Option<&std::collections::HashSet<String>>,
+    owner: Option<&crate::db::backup::OwnerFilter<'_>>,
     baseline_md5: Option<&str>,
 ) -> Result<Option<BackupStatus>, SyncError> {
     let Some(info) = check_drive_backup(drive, folder_id)? else {
@@ -520,7 +524,7 @@ pub fn inspect_drive_backup(
     let drive_json: serde_json::Value = serde_json::from_slice(&drive_bytes)
         .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
     let local_json: serde_json::Value =
-        serde_json::from_str(&crate::db::backup::export_json(pool, book_ids)?)
+        serde_json::from_str(&crate::db::backup::export_json(pool, book_ids, owner)?)
             .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
     let table_names: Vec<String> = drive_json
         .as_object()
@@ -696,7 +700,7 @@ mod tests {
             },
         )
         .unwrap();
-        let json = crate::db::backup::export_json(&src, None).unwrap();
+        let json = crate::db::backup::export_json(&src, None, None).unwrap();
 
         let mut drive = MockDrive {
             files: vec![crate::drive::DriveFile {
@@ -779,7 +783,7 @@ mod tests {
             },
         )
         .unwrap();
-        let json = crate::db::backup::export_json(&src, None).unwrap();
+        let json = crate::db::backup::export_json(&src, None, None).unwrap();
         let json_md5 = format!("{:x}", md5::compute(json.as_bytes()));
 
         // 同一データの DB: md5 一致 -> 差分なし
@@ -945,7 +949,8 @@ mod tests {
 
         // Drive のバックアップは古い形式: view_history キーを含まない
         let local_json: serde_json::Value =
-            serde_json::from_str(&crate::db::backup::export_json(&local, None).unwrap()).unwrap();
+            serde_json::from_str(&crate::db::backup::export_json(&local, None, None).unwrap())
+                .unwrap();
         let mut drive_obj = local_json.as_object().cloned().unwrap();
         drive_obj.remove("view_history");
         let drive_bytes = serde_json::to_vec(&serde_json::Value::Object(drive_obj)).unwrap();
@@ -1274,7 +1279,7 @@ mod tests {
         drive: &mut MockDrive,
         baseline: Option<&str>,
     ) -> Option<super::BackupStatus> {
-        super::inspect_drive_backup(pool, drive, "folder", None, baseline).unwrap()
+        super::inspect_drive_backup(pool, drive, "folder", None, None, baseline).unwrap()
     }
 
     fn progress(
@@ -1299,7 +1304,7 @@ mod tests {
         let pool = crate::db::test_pool();
         migrate(&pool).unwrap();
         crate::db::books::insert(&pool, &test_book("book-1")).unwrap();
-        let uploaded = crate::db::backup::export_json(&pool, None).unwrap();
+        let uploaded = crate::db::backup::export_json(&pool, None, None).unwrap();
         let baseline = crate::db::backup::canonical_md5_str(&uploaded, None).unwrap();
         let mut drive = drive_with_backup(&uploaded);
 
@@ -1323,7 +1328,7 @@ mod tests {
         crate::db::books::insert(&other, &test_book("book-1")).unwrap();
         crate::db::progress::upsert(&other, &progress("book-1", 42, "2026-09-19 01:00:00"))
             .unwrap();
-        let moved = crate::db::backup::export_json(&other, None).unwrap();
+        let moved = crate::db::backup::export_json(&other, None, None).unwrap();
         let mut drive = drive_with_backup(&moved);
 
         let status = inspect_backup(&pool, &mut drive, Some(&baseline)).expect("backup exists");
@@ -1342,7 +1347,7 @@ mod tests {
         migrate(&pool).unwrap();
         crate::db::checklist::upsert_event(&pool, &test_event("tbf20", "2026-09-14 10:00:00"))
             .unwrap();
-        let uploaded = crate::db::backup::export_json(&pool, None).unwrap();
+        let uploaded = crate::db::backup::export_json(&pool, None, None).unwrap();
         let baseline = crate::db::backup::canonical_md5_str(&uploaded, None).unwrap();
         let mut drive = drive_with_backup(&uploaded);
 
@@ -1369,7 +1374,7 @@ mod tests {
             crate::db::checklist::upsert_event(&pool, &test_event(id, "2026-09-14 10:00:00"))
                 .unwrap();
         }
-        let uploaded = crate::db::backup::export_json(&pool, None).unwrap();
+        let uploaded = crate::db::backup::export_json(&pool, None, None).unwrap();
         let baseline = crate::db::backup::canonical_md5_str(&uploaded, None).unwrap();
 
         // Drive 側のファイルは行の並びが逆
@@ -1398,7 +1403,7 @@ mod tests {
         let pool = crate::db::test_pool();
         migrate(&pool).unwrap();
         crate::db::books::insert(&pool, &test_book("book-1")).unwrap();
-        let uploaded = crate::db::backup::export_json(&pool, None).unwrap();
+        let uploaded = crate::db::backup::export_json(&pool, None, None).unwrap();
         let mut drive = drive_with_backup(&uploaded);
         // ローカルには Drive のバックアップに無い本がある
         crate::db::books::insert(&pool, &test_book("book-2")).unwrap();
@@ -1426,8 +1431,8 @@ mod tests {
             crate::db::checklist::upsert_event(&b, &test_event(id, "2026-09-14 10:00:00")).unwrap();
         }
         assert_eq!(
-            crate::db::backup::export_json(&a, None).unwrap(),
-            crate::db::backup::export_json(&b, None).unwrap(),
+            crate::db::backup::export_json(&a, None, None).unwrap(),
+            crate::db::backup::export_json(&b, None, None).unwrap(),
             "同じ内容の DB からは同じ JSON を書き出す"
         );
     }
@@ -1445,7 +1450,7 @@ mod tests {
         let src = crate::db::test_pool();
         migrate(&src).unwrap();
         crate::db::books::insert(&src, &test_book("book-1")).unwrap();
-        let backup = crate::db::backup::export_json(&src, None).unwrap();
+        let backup = crate::db::backup::export_json(&src, None, None).unwrap();
         let mut drive = drive_with_backup(&backup);
 
         super::restore_drive_backup(&mut drive, "folder", &pool).unwrap();
@@ -1466,7 +1471,7 @@ mod tests {
         migrate(&other).unwrap();
         crate::db::books::insert(&other, &test_book("book-1")).unwrap();
         crate::db::books::insert(&other, &test_book("book-3")).unwrap();
-        let moved = crate::db::backup::export_json(&other, None).unwrap();
+        let moved = crate::db::backup::export_json(&other, None, None).unwrap();
         let mut drive = drive_with_backup(&moved);
 
         let status = inspect_backup(&pool, &mut drive, baseline.as_deref()).expect("backup exists");
