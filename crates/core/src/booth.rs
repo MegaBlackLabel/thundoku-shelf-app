@@ -23,6 +23,13 @@ impl BoothSession {
     /// 収集元ホスト →（Cookie 名 → 属性つき Cookie）。ログイン時に WebView から作る。
     pub fn new(origins: BTreeMap<String, BTreeMap<String, CookieEntry>>) -> Self {
         Self {
+            origins: HostScopedCookies::from_named(origins),
+        }
+    }
+
+    /// ログイン時に WebView から収集した形（ホスト → Cookie の並び）から作る。
+    pub fn from_collected(origins: BTreeMap<String, Vec<CookieEntry>>) -> Self {
+        Self {
             origins: HostScopedCookies::new(origins),
         }
     }

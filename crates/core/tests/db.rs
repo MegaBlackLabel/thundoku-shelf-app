@@ -8,6 +8,49 @@ fn memory_db() -> thundoku_core::db::SqlitePool {
     thundoku_core::db::test_pool()
 }
 
+/// `is_drm` の既定値は「不明（2）」であること。
+///
+/// 既定が `0`（= 「DRM なしと確認済み」）だと、列を指定しない INSERT が**嘘のメタ**を
+/// 書き込む。3 状態（0 = なし / 1 = あり / 2 = 不明）では「不明」が安全側の既定。
+/// 既存 DB は列追加済みなので既定は変わらない（この既定は新規 DB に効く）。
+#[test]
+fn is_drm_defaults_to_unknown() {
+    let pool = memory_db();
+    for table in ["bookshelf_items", "books"] {
+        let default: Option<String> = thundoku_core::db::block_on(async {
+            sqlx::query_scalar(&format!(
+                "SELECT dflt_value FROM pragma_table_info('{table}') WHERE name = 'is_drm'",
+            ))
+            .fetch_one(&pool)
+            .await
+        })
+        .unwrap();
+        assert_eq!(
+            default.as_deref(),
+            Some("2"),
+            "{table}.is_drm の既定が「不明（2）」でない"
+        );
+    }
+
+    // 列を指定しない INSERT が「不明」になる（既定が実際に効いている）
+    thundoku_core::db::block_on(async {
+        sqlx::query(
+            "INSERT INTO bookshelf_items (site_id, database_id, title) \
+             VALUES ('techbookfest', 'y', 'z')",
+        )
+        .execute(&pool)
+        .await
+    })
+    .unwrap();
+    let is_drm: i64 = thundoku_core::db::block_on(async {
+        sqlx::query_scalar("SELECT is_drm FROM bookshelf_items WHERE database_id = 'y'")
+            .fetch_one(&pool)
+            .await
+    })
+    .unwrap();
+    assert_eq!(is_drm, 2, "既定が効いていない（DRM なし扱いになる）");
+}
+
 #[test]
 fn migrate_creates_all_schema_tables() {
     let pool = memory_db();

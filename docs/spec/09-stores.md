@@ -20,12 +20,12 @@ JSON バックアップから復元でき、改変したバックアップを復
 | ストア | 検証点 | 許可（ホスト / パス） |
 |---|---|---|
 | BOOTH | `download_with_progress`（Cookie 付与の前） | `booth.pm` + `/downloadables/`（完全一致） |
-| DLsite | `down_url` | `www.dlsite.com`（完全一致） |
-| DLsite | 302 の `Location`（CDN） | `*.dlsite.com`（Cookie のスコープに一致。実測 `download.dlsite.com`） |
-| FANZA | proxy URL | `www.dmm.co.jp`（完全一致。実測 2026-09-23） |
-| FANZA | 302 の `Location`（CDN） | `*.dmm.co.jp`（実測は **2 種類**: `doujin.contents.doujin.dmm.co.jp` / `doujin03.contents.doujin.dmm.co.jp`） |
+| DLsite | `down_url` | `www.dlsite.com`（完全一致）+ `/{store}/download/`（`store` は同期対象の `STORES` = maniax / home / books / ai） |
+| DLsite | 302 の `Location`（CDN） | `download.dlsite.com`（完全一致。実測値） |
+| FANZA | proxy URL | `www.dmm.co.jp`（完全一致）+ `/dc/-/proxy/`（実測 2026-09-23） |
+| FANZA | 302 の `Location`（CDN） | `contents.doujin.dmm.co.jp` とそのサブドメイン（実測は **2 種類**: `doujin.contents.doujin.dmm.co.jp` / `doujin03.contents.doujin.dmm.co.jp`。どちらも配下） |
 | 技術書典 | `resolve_download_url` の入力 | `techbookfest.org`（完全一致） |
-| 技術書典 | `download_with_progress`（本体） | `techbookfest.org` + `/api/product-dlc/`、`storage.googleapis.com` + `/tbf-tokyo-product-dlc/` |
+| 技術書典 | `download_with_progress`（本体） | `techbookfest.org` + `/api/product-dlc/`、`storage.googleapis.com` + `/tbf-tokyo-product-dlc/`。**許可 = Cookie を付けるではない**: `Cookie` / `X-XSRF-TOKEN` は宛先が `techbookfest.org` のときだけ付ける（GCS は配布先であってセッションの宛先ではない） |
 
 検証に失敗したら**リクエストを送らずに** `BlockedUrl` を返す
 （`crates/core/tests/download_credentials.rs` で「1 件も送らないこと」を確認している）。
@@ -41,6 +41,9 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 宛先が収集元でなければ Cookie は空になり、**許可リストも実測値まで狭めた**
 （DLsite / BOOTH / 技術書典 = 完全一致、FANZA proxy = `www.dmm.co.jp` 完全一致。
 FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のまま）。
+**proxy のパスも実測値に限る**（DLsite = `/{store}/download/`、FANZA = `/dc/-/proxy/`）。**302 の CDN も実測値まで狭めた**（DLsite = `download.dlsite.com` 完全一致、FANZA = `contents.doujin.dmm.co.jp` とそのサブドメイン）。
+同じホストに複数のルールを並べるため、`download_url::check` は**ホストが一致したルールを
+全部見て**、どれかのパスに一致すれば許可、どれにも一致しなければ `PathNotAllowed` を返す。
 残る候補は Cookie の `Domain` / `Path` 属性を保存する Cookie Jar 化。
 なお待機は **DLsite のみ**（`PAGE_INTERVAL = 10 s`、`crates/core/src/dlsite/sync.rs:90`, `:129-131`）
 で、FANZA の一覧取得に待機は無い（1 回 = 5 ページ × 20 件、`crates/core/src/fanza/sync.rs`）。
@@ -280,7 +283,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 |---|---|---|
 | 保存先 | `app_settings` テーブル（key-value） | `crates/core/src/db/schema.sql:25-30`, `crates/core/src/db/settings.rs:11-28` |
 | 保存キー | `"dlsite.session"` | `crates/app/src/app_state.rs:222`, `:867`, `:878` |
-| 保存値の形式 | `serde_json::to_string(&DlsiteSession)` の JSON 文字列。`DlsiteSession` は `origins: HostScopedCookies` 1 フィールドで、`HostScopedCookies` は `#[serde(transparent)]` なので実体は `{"origins":{"www.dlsite.com":{"<name>":"<value>", …},"login.dlsite.com":{…}}}`（**収集元ホストごと**） | `crates/app/src/app_state.rs:867-877`, `crates/core/src/dlsite/client.rs:97-100` |
+| 保存値の形式 | `serde_json::to_string(&DlsiteSession)` の JSON 文字列。`DlsiteSession` は `origins: HostScopedCookies` 1 フィールドで、`HostScopedCookies` は「収集元ホスト → Cookie の配列」なので実体は `{"origins":{"www.dlsite.com":[{"name":"…","value":"…",…},…],"login.dlsite.com":[…]}}`（**収集元ホストごと**。名前をキーにした旧形式も読める） | `crates/app/src/app_state.rs:867-877`, `crates/core/src/dlsite/client.rs:97-100` |
 | 保護 | **AES-256-GCM で暗号化**。値は `enc:v2:` + base64 で `app_settings.value` に入る。鍵は keyring の専用スロット（`thundoku-shelf.session-key`）にあり、**DB のコピーだけでは復元できない**。復号できない値（旧 `enc:v1`・平文・改ざん・別鍵）は未ログインとして破棄する。**保存から 7 日**（`SESSION_MAX_AGE_SECONDS`）を過ぎた値も行ごと破棄する（保存時刻は暗号文の中にあり、DB を書き換えても期限は延ばせない）。keyring の鍵が取れない環境では**保存しない**（平文へフォールバックしない） | `crates/core/src/session_store.rs:7-11`, `:37-38`, `:175-183` |
 | keyring に Cookie を直接置かない理由 | Cookie が巨大で keyring の値長上限（2560 UTF-16 文字）を超えるため、**鍵だけ**を keyring に置いて DB 側を暗号化する（BOOTH / FANZA と同流儀） | `crates/core/src/session_store.rs`, `crates/app/src/app_state.rs:433-434` |
 | 書き込みタイミング | ログイン完了直後（`save_dlsite_session`）のみ | `crates/app/src/views/dlsite_login.rs:177` |
@@ -414,7 +417,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | リクエストヘッダ | `Cookie: {cookie_header_for(SITE_HOST)}` / `Accept: application/json` / `User-Agent: {USER_AGENT}` | `crates/core/src/fanza/client.rs:221-227`（生成）、`:243`（適用） |
 | User-Agent 実値（**自認 UA**。`THUNDOKU_FANZA_UA` で差し替え可） | `ThundokuShelf/<version> (+https://github.com/MegaBlackLabel/thundoku-shelf-app)`。ブラウザ偽装はしていない | `crates/core/src/fanza/client.rs:24-33` |
 | リダイレクト追跡 | `redirects: 3`（一覧/詳細 API） | `crates/core/src/fanza/client.rs:245` |
-| Cookie 送信形式 | 宛先ホスト向けの Cookie を `name=value` 形式で `"; "` 連結（`BTreeMap` 順なので**安定**）。収集元（www / accounts）をまとめた和集合は送らない | `crates/core/src/session_cookies.rs:70-77` |
+| Cookie 送信形式 | 宛先ホスト向けの Cookie を `name=value` 形式で `"; "` 連結（**長い `Path` が先、同じなら名前順**で安定）。収集元（www / accounts）をまとめた和集合は送らない | `crates/core/src/session_cookies.rs:70-77` |
 | CSRF | 送らない（コメント「GET に CSRF 不要」） | `crates/core/src/fanza/client.rs:3-4` |
 
 - User-Agent の扱い（コメント）: 「以前は『DMM/FANZA は非ブラウザ UA を 403 で弾く』という観測から Mac の Chrome を名乗っていたが、購入一覧 API が**自認 UA でも 200** を返すことを実機で確認した（未ログインでは UA に関わらず 401）」。弾かれるようになったら `THUNDOKU_FANZA_UA` で差し替える（`crates/core/src/ua.rs`）。`crates/core/src/fanza/client.rs:19-33`。
@@ -532,9 +535,9 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
    - `url::Url` パース後の host が **`www.dmm.co.jp` と完全一致**（`is_some_and`）: `crates/app/src/views/fanza_login.rs:105-108`
    - URL に `"age_check"` を含まない: `crates/app/src/views/fanza_login.rs:110`, `:112`
    - URL に `"accounts.dmm.co.jp"` も `"/service/login"` も含まない: `crates/app/src/views/fanza_login.rs:111-112`
-6. Cookie 収集: `cookies_for_url` を **`https://www.dmm.co.jp` → `https://accounts.dmm.co.jp` の順**に呼び、全 Cookie の `name`/`value` を `HashMap` へ入れる。同名 Cookie は**先勝ち**（`or_insert`）: `crates/app/src/views/fanza_login.rs:115-128`。
+6. Cookie 収集: `cookies_for_url` を **`https://www.dmm.co.jp` → `https://accounts.dmm.co.jp` の順**に呼び、全 Cookie の `name`/`value` を `HashMap` へ入れる。同名でも `Path` / `Domain` が違えば**別の Cookie として両方保つ**（同じ組み合わせだけ置き換える）: `crates/app/src/views/fanza_login.rs:115-128`。
 7. 収集結果が空なら `log::warn!("fanza login: セッション Cookie を取得できませんでした")` を出して `false`（監視継続）: `crates/app/src/views/fanza_login.rs:130-133`。
-8. `FanzaSession::new(cookie_pairs)` を生成し、`log::info!("fanza login: {} cookies captured", session.cookies_count())`: `crates/app/src/views/fanza_login.rs:134-135`。
+8. `FanzaSession::from_collected(cookie_pairs)` を生成し、`log::info!("fanza login: {} cookies captured", session.cookies_count())`: `crates/app/src/views/fanza_login.rs:134-135`。
 9. `crate::app_state::save_fanza_session(cx, &session)` で DB 永続化: `crates/app/src/views/fanza_login.rs:136`（→ §3）。
 10. WebView を `hide()` し、`FanzaLoginDone` を emit して `true` を返す（監視ループ終了）: `crates/app/src/views/fanza_login.rs:137-141`。
 11. `auth.rs` が `FanzaLoginDone` を受けて `show_fanza_login = false` / `fanza_login = None` / `fanza_subscription = None` にし、`CloseAuth` アクションを dispatch: `crates/app/src/views/auth.rs:171-184`。
@@ -546,10 +549,10 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 |---|---|---|
 | Cookie 名 | **特定名に依存しない**。`www.dmm.co.jp` と `accounts.dmm.co.jp` の全 Cookie を無差別に保存 | `crates/app/src/views/fanza_login.rs:117-128` |
 | 収集元オリジン | `https://www.dmm.co.jp`、`https://accounts.dmm.co.jp`（この 2 つのみ） | `crates/app/src/views/fanza_login.rs:117` |
-| 型 | `origins: HostScopedCookies`（収集元ホスト → Cookie 名 → 値。`serde(transparent)` なので保存 JSON は `{"origins":{"www.dmm.co.jp":{…},"accounts.dmm.co.jp":{…}}}`） | `crates/core/src/fanza/client.rs:84-91`, `crates/core/src/session_cookies.rs:12-21` |
+| 型 | `origins: HostScopedCookies`（収集元ホスト → Cookie の**配列**。各 Cookie が名前 / 属性を持つので同名・別 `Path` も両方保てる。保存 JSON は `{"origins":{"www.dmm.co.jp":[{…},{…}],"accounts.dmm.co.jp":[…]}}`。名前をキーにした旧形式も読める） | `crates/core/src/fanza/client.rs:84-91`, `crates/core/src/session_cookies.rs:12-21` |
 | テストで使う Cookie 名 | `login_id`（実値の例示ではなくテスト用モック） | `crates/core/src/fanza/client.rs:479-484`, `crates/core/src/fanza/sync.rs:194` |
 | `logged_in()` 判定 | `!self.origins.is_empty()`（**Cookie が 1 つでもあるかだけ**。サーバー検証はしない） | `crates/core/src/fanza/client.rs:107-109` |
-| Cookie ヘッダ生成 | `cookie_header_for(host)` = **その宛先ホスト向けに収集した Cookie だけ**を `k=v` で `"; "` 連結（`BTreeMap` 順で安定。**完全一致**、大小文字は区別しない） | `crates/core/src/fanza/client.rs:116-123`, `crates/core/src/session_cookies.rs:34-52` |
+| Cookie ヘッダ生成 | `cookie_header_for(host)` = **その宛先ホスト向けに収集した Cookie だけ**を `k=v` で `"; "` 連結（長い `Path` が先、同じなら名前順で安定。**完全一致**、大小文字は区別しない） | `crates/core/src/fanza/client.rs:116-123`, `crates/core/src/session_cookies.rs:34-52` |
 | Cookie 数 | `cookies_count()` = 全収集元の合計（`HostScopedCookies::count`） | `crates/core/src/fanza/client.rs:123-127`, `crates/core/src/session_cookies.rs:59-61` |
 | サーバー側検証 | 一覧/詳細 API の `error_code != 0` を `SessionExpired` として検出（Cookie 検証 API は無い） | `crates/core/src/fanza/client.rs:180-182` |
 | 追加認証（メールログイン / OTP / 2FA）の分岐 | **コード上に存在しない**。すべて WebView 内のユーザー操作に委ねる | `crates/app/src/views/fanza_login.rs` 全体 |
@@ -574,7 +577,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 |---|---|---|
 | 保存先 | **DB（`app_settings` テーブル）**。keyring に置くのは**暗号鍵だけ**（Cookie 本体は keyring の値長上限を超えるため） | `crates/app/src/app_state.rs:847-856` |
 | 保存キー | `"fanza.session"`（`app_settings.key` の 1 行。`StoreSession::Fanza.settings_key()`） | `crates/core/src/session_store.rs:78-83` |
-| 形式 | `serde_json::to_string(&FanzaSession)` → `{"origins":{"www.dmm.co.jp":{"<name>":"<value>",…},"accounts.dmm.co.jp":{…}}}`（`FanzaSession` は `origins: HostScopedCookies` 1 フィールド、`HostScopedCookies` は `#[serde(transparent)]`）。**平文 JSON のままでは保存しない**（暗号化してから `app_settings.value` へ） | `crates/core/src/fanza/client.rs:86-91`, `crates/app/src/app_state.rs:847-856` |
+| 形式 | `serde_json::to_string(&FanzaSession)` → `{"origins":{"www.dmm.co.jp":[{"name":"…","value":"…",…},…],"accounts.dmm.co.jp":[…]}}`（`FanzaSession` は `origins: HostScopedCookies` 1 フィールド、`HostScopedCookies` は `#[serde(transparent)]`）。**平文 JSON のままでは保存しない**（暗号化してから `app_settings.value` へ） | `crates/core/src/fanza/client.rs:86-91`, `crates/app/src/app_state.rs:847-856` |
 | 暗号化 | **AES-256-GCM**（AAD に用途名・形式版）。値は `enc:v2:` + base64(IV ‖ 暗号文 ‖ tag)。鍵は keyring の専用スロット `thundoku-shelf.session-key`（`USER_SESSION_KEY`。DB 鍵とは**別**）。復号できない値（旧 `enc:v1`・平文・改ざん・別鍵）は未ログインとして破棄し、**保存から 7 日**（`SESSION_MAX_AGE_SECONDS`）を過ぎた値も行ごと破棄する（保存時刻は暗号文の中にあり、DB を書き換えても期限は延ばせない）。keyring の鍵が取れない環境では**保存しない**（平文へフォールバックしない） | `crates/core/src/session_store.rs:7-11`, `:33`, `:38`, `:107-200` |
 | keyring を使わない理由（コメント） | 「セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を超えることがあるため」DB に置き、**鍵だけ**を keyring へ | `crates/app/src/app_state.rs:340-346` |
 | keyring の FANZA 定数 | **FANZA 専用の定数は無い**。暗号鍵はストア共通の `USER_SESSION_KEY`（`thundoku-shelf.session-key`）。`secrets.rs` には `techbookfest` / `google` / `google-profile` / `github` / `booth` / `thundoku-shelf.db-key` / `thundoku-shelf.session-key` がある | `crates/core/src/secrets.rs:55-71` |
@@ -909,7 +912,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 - 成否判定は **URL ベースのみ**: 「ホストが `booth.pm` で終わる」かつ「URL に `/users/sign_in` を含まない」 → セッション確立とみなす `crates/app/src/views/booth_login.rs:113-122`。
 - 追加条件: 収集した Cookie が 0 件なら `log::warn!` して false（未完了扱い、WebView は開いたまま） `crates/app/src/views/booth_login.rs:140-143`。
 - **サーバーへの検証リクエストは行わない**（`accounts.booth.pm/library` を叩いて 200 を確認する等はしない）。実際の検証は次の同期時の `NotLoggedIn` 判定で行われる `crates/core/src/booth.rs:183`,`:227-237`。
-- Cookie は `cookies_for_url(url)` の戻り（`raw()` 経由）から `name()` / `value()` を取り出し、**収集元ホストごとの `BTreeMap<String, BTreeMap<String,String>>`**（`booth.pm` / `accounts.booth.pm`）へ詰める。1 つに潰さないのは、`accounts` 側にしか送るべきでない Cookie（`_plaza_session_*`）を `booth.pm` や画像 CDN へ流さないため `crates/app/src/views/booth_login.rs:134-159`。
+- Cookie は `cookies_for_url(url)` の戻り（`raw()` 経由）から `name()` / `value()` を取り出し、**収集元ホストごとの `BTreeMap<String, Vec<CookieEntry>>`**（`booth.pm` / `accounts.booth.pm`。同名でも `Path` / `Domain` が違えば別に保つ）へ詰める。1 つに潰さないのは、`accounts` 側にしか送るべきでない Cookie（`_plaza_session_*`）を `booth.pm` や画像 CDN へ流さないため `crates/app/src/views/booth_login.rs:134-159`。
 - 取得する Cookie 名は**ハードコードされていない**（ドメインに紐づく全 Cookie を無条件で保存）。
 - コード/ドキュメント上で名前が出てくる Cookie:
   - `_plaza_session_*`（`accounts.booth.pm` の pixiv セッション。ログアウトに必要） — `crates/app/src/views/booth_login.rs:124`、`docs/logout.md:39`、`crates/core/src/booth.rs:102-103`。
@@ -922,7 +925,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | 項目 | 事実 | アンカー |
 |---|---|---|
 | 保存先 | SQLite の `app_settings` テーブル、キー `"booth.session"` | `crates/app/src/app_state.rs:392`、`crates/core/src/db/schema.sql:25-30` |
-| 形式 | `BoothSession` を `serde_json` 化したものを暗号化した文字列（`enc:v2:` + base64）を `value` 列へ。**平文 JSON では保存しない**。`BoothSession` は `origins: HostScopedCookies` 1 フィールドなので実体は `{"origins":{"booth.pm":{"<name>":"<value>", …},"accounts.booth.pm":{…}}}`（**収集元ホストごと**。旧 `{"cookies":{…}}` 形式は復元できず再ログインになる） | `crates/core/src/session_store.rs:33`、`crates/app/src/views/booth_login.rs:160-166` |
+| 形式 | `BoothSession` を `serde_json` 化したものを暗号化した文字列（`enc:v2:` + base64）を `value` 列へ。**平文 JSON では保存しない**。`BoothSession` は `origins: HostScopedCookies` 1 フィールドなので実体は `{"origins":{"booth.pm":[{"name":"…","value":"…",…},…],"accounts.booth.pm":[…]}}`（**収集元ホストごと**。旧 `{"cookies":{…}}` 形式は復元できず再ログインになる） | `crates/core/src/session_store.rs:33`、`crates/app/src/views/booth_login.rs:160-166` |
 | 暗号化 | **keyring の鍵（`thundoku-shelf.session-key`）で AES-256-GCM**（AAD に用途名・形式版）。保存値は `enc:v2:` + base64(IV ‖ 暗号文 ‖ tag)。復号できない値（旧 `enc:v1`・平文・改ざん・別鍵）は未ログインとして破棄し、**平文へは戻さない**。**保存から 7 日**を過ぎた値も行ごと破棄する | `crates/core/src/session_store.rs:7-11`, `:33`, `:38`, `:107-200` |
 | keyring を使わない理由（コメント） | セッション Cookie は Windows Credential Manager の上限（**2560 UTF-16 文字**）を超えることがあるため DB 保存 | `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |
 | 実行時キャッシュ | `AppState.booth_session: Arc<parking_lot::Mutex<Option<BoothSession>>>` と `booth_logged_in: Arc<Mutex<bool>>` | `crates/app/src/app_state.rs` |

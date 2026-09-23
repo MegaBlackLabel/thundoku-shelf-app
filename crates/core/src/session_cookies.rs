@@ -24,6 +24,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// クロスサイトのリクエスト文脈が無いアプリ内の HTTP 呼び出しには効かない）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CookieEntry {
+    /// Cookie 名。`from_origin` / `from_origin_entries` は名前をキーから埋める
+    /// （保存形式では各 Cookie が名前を持つ）。
+    #[serde(default)]
+    pub name: String,
     pub value: String,
     /// `Domain` 属性。WebView2 は host-only も domain 指定も**先頭ドット無し**で返す
     /// （`www.dlsite.com` / `dlsite.com`）。判定は [`domain_matches`] を参照。
@@ -37,9 +41,10 @@ pub struct CookieEntry {
 }
 
 impl CookieEntry {
-    /// 値だけの Cookie（host-only / `Path` 指定なし / 非 Secure / 期限なし）。
+    /// 値だけの Cookie（host-only / `Path` 指定なし / 非 Secure / 期限なし）。名前は収納時に付く。
     pub fn new(value: impl Into<String>) -> Self {
         Self {
+            name: String::new(),
             value: value.into(),
             domain: None,
             path: None,
@@ -49,6 +54,7 @@ impl CookieEntry {
     }
 
     /// WebView が返す属性から作る（core は cookie クレートに依存しないよう素の値で受ける）。
+    /// 名前は [`Self::named`] で付ける。
     pub fn with_attributes(
         value: String,
         domain: Option<String>,
@@ -57,12 +63,19 @@ impl CookieEntry {
         expires: Option<i64>,
     ) -> Self {
         Self {
+            name: String::new(),
             value,
             domain,
             path,
             secure,
             expires,
         }
+    }
+
+    /// 名前を付ける（WebView が返す `name` / 収納先のキー）。
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// 宛先（ホスト / パス / https か / 現在時刻）に送ってよいか。
@@ -95,6 +108,8 @@ impl<'de> Deserialize<'de> for CookieEntry {
         enum Raw {
             Value(String),
             Full {
+                #[serde(default)]
+                name: String,
                 value: String,
                 #[serde(default)]
                 domain: Option<String>,
@@ -110,26 +125,75 @@ impl<'de> Deserialize<'de> for CookieEntry {
         Ok(match Raw::deserialize(deserializer)? {
             Raw::Value(value) => Self::new(value),
             Raw::Full {
+                name,
                 value,
                 domain,
                 path,
                 secure,
                 expires,
-            } => Self::with_attributes(value, domain, path, secure, expires),
+            } => Self::with_attributes(value, domain, path, secure, expires).named(name),
         })
     }
 }
 
-/// 収集元ホスト →（Cookie 名 → Cookie）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
+/// 収集元ホスト → Cookie の並び。
+///
+/// **名前だけで引かない**: `foo=root; Path=/` と `foo=dc; Path=/dc/` のように同名でも
+/// `Path`（や `Domain`）が違う Cookie は別物として両方保つ。送信時に宛先で選ぶ。
+/// 保存形式は「ホスト → Cookie の配列」で、各 Cookie が名前を持つ。名前をキーにした
+/// 旧形式（`{"host":{"name":"value"}}` / 名前キー + 属性）も読める（再ログインを強いない）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostScopedCookies {
-    origins: BTreeMap<String, BTreeMap<String, CookieEntry>>,
+    origins: BTreeMap<String, Vec<CookieEntry>>,
+}
+
+/// 保存形式の読み取り（現行 = 配列、旧 = 名前キーのオブジェクト）。
+impl<'de> Deserialize<'de> for HostScopedCookies {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            /// 旧形式: ホスト →（Cookie 名 → 値 or 属性つき）。
+            Named(BTreeMap<String, BTreeMap<String, CookieEntry>>),
+            /// 現行: ホスト → Cookie の配列。
+            Listed(BTreeMap<String, Vec<CookieEntry>>),
+        }
+
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Named(origins) => Self::from_named(origins),
+            Raw::Listed(origins) => Self::new(origins),
+        })
+    }
+}
+
+/// 保存形式の書き出し（ホスト → Cookie の配列）。
+impl Serialize for HostScopedCookies {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.origins.serialize(serializer)
+    }
 }
 
 impl HostScopedCookies {
-    pub fn new(origins: BTreeMap<String, BTreeMap<String, CookieEntry>>) -> Self {
+    /// 収集した形（ホスト → Cookie の並び）から作る。
+    pub fn new(origins: BTreeMap<String, Vec<CookieEntry>>) -> Self {
         Self { origins }
+    }
+
+    /// 名前をキーにした形（旧形式の保存データ / 呼び出し側の便宜）から作る。
+    /// キーの名前を各 Cookie へ移す。
+    pub fn from_named(origins: BTreeMap<String, BTreeMap<String, CookieEntry>>) -> Self {
+        Self::new(
+            origins
+                .into_iter()
+                .map(|(host, cookies)| {
+                    let cookies = cookies
+                        .into_iter()
+                        .map(|(name, cookie)| cookie.named(name))
+                        .collect();
+                    (host, cookies)
+                })
+                .collect(),
+        )
     }
 
     /// 1 つの収集元（ログインで Cookie を拾ったホスト）だけを、値だけの Cookie で作る。
@@ -143,13 +207,19 @@ impl HostScopedCookies {
         )
     }
 
-    /// 1 つの収集元だけを持つ。
+    /// 1 つの収集元だけを持つ（キーの Cookie 名を各 Cookie へ移す）。
     pub fn from_origin_entries(
         host: &str,
         cookies: BTreeMap<String, CookieEntry>,
     ) -> Self {
         Self {
-            origins: BTreeMap::from([(host.to_string(), cookies)]),
+            origins: BTreeMap::from([(
+                host.to_string(),
+                cookies
+                    .into_iter()
+                    .map(|(name, cookie)| cookie.named(name))
+                    .collect(),
+            )]),
         }
     }
 
@@ -161,32 +231,42 @@ impl HostScopedCookies {
     /// セッション Cookie を広げないという決定を維持する。Cookie は宛先別に絞ってあり、
     /// CDN へは 302 で受け取る署名 Cookie だけを送る）。
     ///
-    /// URL を解釈できないときは空（fail-closed）。
+    /// 並びはブラウザと同じ「長い `Path` が先、同じなら名前順」（同名で別 `Path` の Cookie を
+    /// 取り違えないようにする）。URL を解釈できないときは空（fail-closed）。
     pub fn header_for_url(&self, url: &str) -> String {
         let Some((host, path, https)) = split_url(url) else {
             return String::new();
         };
         let now = now_unix();
-        join(
-            self.origins
-                .iter()
-                .filter(|(origin, _)| origin.eq_ignore_ascii_case(host))
-                .flat_map(|(_, cookies)| cookies.iter())
-                .filter(|(_, cookie)| cookie.applies_to(host, path, https, now))
-                .map(|(name, cookie)| (name, &cookie.value)),
-        )
+        let mut matched: Vec<(&CookieEntry, usize)> = self
+            .origins
+            .iter()
+            .filter(|(origin, _)| origin.eq_ignore_ascii_case(host))
+            .flat_map(|(_, cookies)| cookies.iter())
+            .filter(|cookie| cookie.applies_to(host, path, https, now))
+            .map(|cookie| (cookie, cookie.path.as_deref().unwrap_or("/").len()))
+            .collect();
+        // 長い Path を先に、同じなら名前順（安定した並び）
+        matched.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.name.cmp(&b.0.name))
+                .then_with(|| a.0.path.cmp(&b.0.path))
+        });
+        join(matched.into_iter().map(|(cookie, _)| (&cookie.name, &cookie.value)))
     }
 
     /// 収集元ホストの Cookie 値（認証済み判定・ログ用）。収集元をまたがない。
+    /// 同名が複数あるときは最初の 1 つ（並びは保存順）。
     pub fn value(&self, host: &str, name: &str) -> Option<&str> {
         self.origins
             .get(host)?
-            .get(name)
+            .iter()
+            .find(|cookie| cookie.name == name)
             .map(|cookie| cookie.value.as_str())
     }
 
     pub fn count(&self) -> usize {
-        self.origins.values().map(BTreeMap::len).sum()
+        self.origins.values().map(Vec::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -266,7 +346,7 @@ mod tests {
     }
 
     fn bag() -> HostScopedCookies {
-        HostScopedCookies::new(BTreeMap::from([
+        HostScopedCookies::from_named(BTreeMap::from([
             (
                 "www.dmm.co.jp".to_string(),
                 BTreeMap::from([entry("login_id", "abc")]),
@@ -520,7 +600,11 @@ mod tests {
         let back: HostScopedCookies = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back, bag());
         assert_eq!(
-            json["www.dmm.co.jp"]["login_id"]["value"],
+            json["www.dmm.co.jp"][0]["name"],
+            serde_json::json!("login_id")
+        );
+        assert_eq!(
+            json["www.dmm.co.jp"][0]["value"],
             serde_json::json!("abc")
         );
 
@@ -541,5 +625,78 @@ mod tests {
         let json = serde_json::to_value(&with_attrs).unwrap();
         let back: HostScopedCookies = serde_json::from_value(json).unwrap();
         assert_eq!(back, with_attrs);
+        // 保存済みセッション（属性つき・名前キー）の実物の形を読み続ける
+        // （`DlsiteSession` の保存 JSON。再ログインを強いない）。
+        let stored = serde_json::json!({
+            "origins": {
+                "www.dlsite.com": {
+                    "__DLsite_SID": {
+                        "value": "sid",
+                        "domain": "dlsite.com",
+                        "path": "/",
+                        "secure": true,
+                        "expires": null
+                    }
+                }
+            }
+        });
+        let loaded: crate::dlsite::client::DlsiteSession =
+            serde_json::from_value(stored).unwrap();
+        assert_eq!(
+            loaded.cookie_header_for_url("https://www.dlsite.com/maniax/mypage/userbuy/"),
+            "__DLsite_SID=sid"
+        );
+    }
+
+    /// 同名でも `Path` が違う Cookie は**両方**保持し、宛先のパスで選ぶ。
+    ///
+    /// 名前だけをキーにすると `foo=root; Path=/` と `foo=dc; Path=/dc/` の片方しか残らず、
+    /// 必要なパスへ送るべき値が失われる。RFC 6265 の path-match では `/dc/x` に両方が
+    /// 一致するので、長い `Path` を先に送る（ブラウザと同じ順）。
+    #[test]
+    fn same_name_cookies_with_different_paths_are_kept_and_selected_by_path() {
+        let cookies = HostScopedCookies::new(BTreeMap::from([(
+            "www.example.com".to_string(),
+            vec![
+                CookieEntry::with_attributes("root".into(), None, Some("/".into()), true, None)
+                    .named("foo"),
+                CookieEntry::with_attributes("dc".into(), None, Some("/dc/".into()), true, None)
+                    .named("foo"),
+                CookieEntry::with_attributes("b".into(), None, Some("/dc/".into()), true, None)
+                    .named("bar"),
+            ],
+        )]));
+
+        // `/dc/` に一致するものだけ（長い Path が先）
+        assert_eq!(
+            cookies.header_for_url("https://www.example.com/dc/x"),
+            "bar=b; foo=dc; foo=root"
+        );
+        // ルートにしか一致しない
+        assert_eq!(
+            cookies.header_for_url("https://www.example.com/other"),
+            "foo=root"
+        );
+        assert_eq!(cookies.count(), 3, "同名でも Path が違えば別に数える");
+        // 値の取り出しは名前で引く（同名なら保存順の最初）
+        assert_eq!(cookies.value("www.example.com", "foo"), Some("root"));
+    }
+
+    /// 同名・別 `Path` の Cookie も書き出し → 読み直しで保たれる（保存形式の往復）。
+    #[test]
+    fn same_name_cookies_round_trip_through_the_saved_shape() {
+        let cookies = HostScopedCookies::new(BTreeMap::from([(
+            "www.example.com".to_string(),
+            vec![
+                CookieEntry::with_attributes("root".into(), None, Some("/".into()), true, None)
+                    .named("foo"),
+                CookieEntry::with_attributes("dc".into(), None, Some("/dc/".into()), true, None)
+                    .named("foo"),
+            ],
+        )]));
+        let json = serde_json::to_value(&cookies).unwrap();
+        let back: HostScopedCookies = serde_json::from_value(json).unwrap();
+        assert_eq!(back, cookies);
+        assert_eq!(back.count(), 2);
     }
 }

@@ -38,22 +38,32 @@ fn user_agent() -> String {
     crate::ua::for_store(USER_AGENT, crate::ua::ENV_DLSITE)
 }
 
-/// ダウンロード要求を送ってよいホスト（**完全一致**）。
+/// ダウンロード要求を送ってよいホスト（**完全一致**）とパス。
 ///
 /// `bookshelf_items.download_url`（= `down_url`）は Drive の JSON バックアップから
 /// 復元でき、改変したバックアップを復元させると外部ホストへリクエストを飛ばせる。
 /// 実測の `down_url` は `https://www.dlsite.com/{store}/download/=/product_id/{id}.html`
 /// なので、サブドメインまで許す必要が無い（Cookie は宛先別に絞ってあるため漏れはしないが、
 /// 未認証のリクエストも飛ばさないほうが安全）。
-const DLSITE_DOWNLOAD_RULES: &[crate::download_url::HostRule] =
-    &[crate::download_url::HostRule::exact("www.dlsite.com", None)];
+///
+/// **パスも `/{store}/download/` に限る**: ストアは同期対象の [`STORES`] だけを並べる
+/// （同期で一覧に入らないストアの URL は、改変された `download_url` と見なして拒否する）。
+/// 有効な store を増やすときは [`STORES`] と**両方**を直す（取りこぼすとダウンロードが
+/// `BlockedUrl` で止まる。`download_rules_cover_every_store` が検知する）。
+const DLSITE_DOWNLOAD_RULES: &[crate::download_url::HostRule] = &[
+    crate::download_url::HostRule::exact("www.dlsite.com", Some("/maniax/download/")),
+    crate::download_url::HostRule::exact("www.dlsite.com", Some("/home/download/")),
+    crate::download_url::HostRule::exact("www.dlsite.com", Some("/books/download/")),
+    crate::download_url::HostRule::exact("www.dlsite.com", Some("/ai/download/")),
+];
 
-/// 302 の転送先（署名 `jwt` + セッション Cookie を送る先）。Cookie は
-/// `domain=.dlsite.com` で発行されるため、その範囲（本体 + CDN）だけを許可する。
-/// 実測の CDN は `download.dlsite.com`。
+/// 302 の転送先（署名 `jwt` + セッション Cookie を送る先）。
+///
+/// 実測の CDN は `download.dlsite.com` だけなので**完全一致**にする（`www` / `login` は
+/// Cookie の収集元だが CDN ではない。署名 `jwt` を送る先を実測値に限る）。
 const DLSITE_CDN_RULES: &[crate::download_url::HostRule] =
-    &[crate::download_url::HostRule::with_subdomains(
-        "dlsite.com",
+    &[crate::download_url::HostRule::exact(
+        "download.dlsite.com",
         None,
     )];
 
@@ -102,6 +112,13 @@ pub struct DlsiteSession {
 impl DlsiteSession {
     /// 収集元ホスト →（Cookie 名 → 属性つき Cookie）。ログイン時に WebView から作る。
     pub fn new(origins: BTreeMap<String, BTreeMap<String, CookieEntry>>) -> Self {
+        Self {
+            origins: HostScopedCookies::from_named(origins),
+        }
+    }
+
+    /// ログイン時に WebView から収集した形（ホスト → Cookie の並び）から作る。
+    pub fn from_collected(origins: BTreeMap<String, Vec<CookieEntry>>) -> Self {
         Self {
             origins: HostScopedCookies::new(origins),
         }
@@ -954,6 +971,76 @@ mod tests {
             proxy_spec.lock().is_none(),
             "拒否したのにリクエストを送っている"
         );
+    }
+
+    /// proxy のホストが正しくても、パスが `/{store}/download/` の外なら
+    /// **リクエストを送らずに**拒否する（購入履歴など他のページへ Cookie を載せない）。
+    ///
+    /// ストアは同期対象の `STORES`（maniax / home / books / ai）に限る。それ以外のストアは
+    /// 同期で一覧に入らないので、出てきた時点で改変された `download_url` と見なせる。
+    #[test]
+    fn download_proxy_path_outside_the_allowlist_is_blocked_without_sending() {
+        for url in [
+            // 同じストアでもダウンロード以外のパス
+            "https://www.dlsite.com/maniax/mypage/userbuy/=/type/all/",
+            // 同期対象外のストア
+            "https://www.dlsite.com/girls/download/=/product_id/RJ01234567.html",
+        ] {
+            let (transport, proxy_spec) = download_transport();
+            let mut client =
+                DlsiteClient::with_transport(Box::new(transport), two_origin_session());
+            let mut on = |_: u64, _: u64| true;
+            let err = client.download_with_progress(url, &mut on).unwrap_err();
+            assert!(
+                matches!(err, DlsiteError::BlockedUrl(_)),
+                "パス制限が効いていない（{url}）: {err:?}"
+            );
+            assert!(
+                proxy_spec.lock().is_none(),
+                "拒否したのにリクエストを送っている（{url}）"
+            );
+        }
+    }
+
+    /// 同期対象のストア（`STORES`）のダウンロード URL は、すべて許可リストを通ること。
+    ///
+    /// ストアを増やすときに `DLSITE_DOWNLOAD_RULES` を直し忘れると、そのストアの
+    /// ダウンロードが `BlockedUrl` で止まる（同期は成功するので気付きにくい）。
+    #[test]
+    fn download_rules_cover_every_store() {
+        for store in STORES {
+            let url =
+                format!("https://www.dlsite.com/{store}/download/=/product_id/RJ01234567.html");
+            assert!(
+                crate::download_url::check(&url, DLSITE_DOWNLOAD_RULES).is_ok(),
+                "{store} のダウンロード URL が許可されていない: {url}"
+            );
+        }
+    }
+
+    /// 302 の転送先（CDN）は**実測値まで狭める**（`download.dlsite.com` 完全一致）。
+    /// `www` や `login` は Cookie の収集元だが CDN ではないので、署名 `jwt` を送る先にしない。
+    #[test]
+    fn download_cdn_hosts_outside_the_observed_set_are_blocked() {
+        assert!(
+            crate::download_url::check(
+                "https://download.dlsite.com/get/=/type/work/file/RJ1.zip",
+                DLSITE_CDN_RULES
+            )
+            .is_ok(),
+            "実測の CDN を弾いている"
+        );
+        for url in [
+            "https://www.dlsite.com/x.zip",
+            "https://login.dlsite.com/x.zip",
+            "https://dlsite.com/x.zip",
+            "https://download.dlsite.com.evil.example.com/x.zip",
+        ] {
+            assert!(
+                crate::download_url::check(url, DLSITE_CDN_RULES).is_err(),
+                "実測外のホストを通している: {url}"
+            );
+        }
     }
 
     /// 購入履歴（www）への送信に login の Cookie を混ぜない。

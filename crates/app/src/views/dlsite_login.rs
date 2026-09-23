@@ -149,7 +149,7 @@ impl DlsiteLoginView {
             // 収集中に閉じ直された。この tick の結果は捨てる。
             return true;
         }
-        let session = DlsiteSession::new(collected);
+        let session = DlsiteSession::from_collected(collected);
         // 認証済み: __DLsite_SID に加えて uid_jp / uhashjp（ログイン中の認証 ID）が揃ったら完了。
         // 未ログインだと www 側はゲスト __DLsite_SID だけが付く（oauth2 コールバック未完了）。
         let has = |name: &str| {

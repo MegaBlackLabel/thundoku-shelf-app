@@ -153,7 +153,7 @@ impl BoothLoginView {
             // 収集中に閉じ直された。この tick の結果は捨てる。
             return true;
         }
-        let session = thundoku_core::booth::BoothSession::new(collected);
+        let session = thundoku_core::booth::BoothSession::from_collected(collected);
         if !session.logged_in() {
             log::warn!("booth login: セッション Cookie を取得できませんでした");
             return false;

@@ -4,6 +4,61 @@
 
 ## [Unreleased]
 
+### Security
+
+- **技術書典のダウンロードで、別ホスト（GCS）へセッション Cookie を送らないようにする**:
+  `download_with_progress` は宛先ホストを見ずに `Cookie` / `X-XSRF-TOKEN` を付けていたが、
+  本体は `storage.googleapis.com`（`/tbf-tokyo-product-dlc/`）から落ちることもあり、その場合
+  **技術書典のセッション Cookie が Google へ飛ぶ**（`TBF_DOWNLOAD_RULES` が GCS を許可して
+  いるため、許可リストでは防げない）。ヘッダ構築を `download_headers` に切り出し、
+  宛先が収集元（`SITE_HOST` = `techbookfest.org`、サブドメイン含む）のときだけ資格情報を
+  付ける（その他のホストへは `User-Agent` のみ。URL を解釈できないときは付けない = fail-closed）。
+  `crates/core/src/tbf/mod.rs`、`docs/spec/09-stores.md`
+
+### Fixed
+
+- **302 の転送先（CDN）を実測値まで狭める**: ダウンロードの CDN は `*.dlsite.com` /
+  `*.dmm.co.jp` を丸ごと許可していたが、実測は DLsite が `download.dlsite.com` のみ、
+  FANZA が `doujin.contents.doujin.dmm.co.jp` / `doujin03.contents.doujin.dmm.co.jp`
+  （= `contents.doujin.dmm.co.jp` 配下）だった。DLsite は**完全一致**、FANZA は
+  `contents.doujin.dmm.co.jp` とそのサブドメインに限る（番号付きホストが増えても通る）。
+  `crates/core/src/{dlsite,fanza}/client.rs`
+
+- **同名・別 `Path` の Cookie を両方保持する（保存形式を「ホスト → Cookie の配列」へ）**:
+  収納先を「Cookie 名 → 1 件」にしていたため、`foo=root; Path=/` と `foo=dc; Path=/dc/` の
+  ように同名で `Path`（や `Domain`）が違う Cookie の片方しか残らず、必要なパスへ送る値が
+  失われていた。各 Cookie が名前 / 属性を持ち、送信時に**長い `Path` が先、同じなら名前順**で
+  宛先に合うものを載せる。収集時は同じ (名前, `Path`, `Domain`) だけ置き換える。
+  **名前をキーにした旧形式の保存データは読み続ける**（再ログインを強いない）。
+  `crates/core/src/session_cookies.rs`、`crates/core/src/{booth,dlsite,fanza,tbf}`、
+  `crates/app/src/views/{mod,tbf_login,dlsite_login,fanza_login,booth_login}.rs`
+
+- **`is_drm` 列の既定を「不明（2）」にする**: 既定が `0`（= 「DRM なしと確認済み」）だと、
+  列を指定しない INSERT が**嘘のメタ**を書き込む。3 状態では「不明」が安全側。既存 DB は
+  列追加済みなので既定は変わらない（この既定は新規 DB に効く）。
+  `crates/core/src/db/mod.rs`
+
+- **バックアップに形式版（`format_version`）を持たせ、旧仕様の `is_drm = 0` を「不明」として復元する**:
+  旧仕様の同期は `is_drm` に `0` を固定で書いていた（= 「未確認」の意味）ため、その時代の
+  バックアップを復元すると本棚が「DRM なしと確認済み」と嘘をついた。版が無いバックアップは
+  1 とみなし、`is_drm = 0` を「不明（2）」へ寄せる（現行形式の `0` = 確認済みはそのまま保つ）。
+  形式版は表ではないので内容の比較（md5）には含めない（無駄なアップロードを起こさない）。
+  `crates/core/src/db/backup.rs`、`docs/spec/{02-data-model,09-stores}.md`
+
+- **ダウンロード proxy の宛先をホストだけでなくパスでも絞る**: `bookshelf_items.download_url`
+  （DLsite の `down_url` / FANZA の `downloadLinks`）は Drive の JSON バックアップから復元でき、
+  改変したバックアップを復元させると `www.dlsite.com` / `www.dmm.co.jp` の**無関係なパス**へ
+  セッション Cookie を載せたリクエストを飛ばせた（ホストは実測値まで狭めてあったがパスは
+  未検証だった）。実測値に合わせ、DLsite は `/{store}/download/`（ストアは同期対象の
+  `STORES` = maniax / home / books / ai のみ）、FANZA は `/dc/-/proxy/` に限る。
+  あわせて `download_url::check` を「ホストが一致したルールを**全部**見て、どれかのパスに
+  一致すれば許可」に直した（最初のホスト一致で確定していたため、同じホストに複数ルールを
+  並べると 2 本目以降のパスが効かなかった）。`.` / `..` のセグメントを含むパスは拒否する
+  （生の接頭辞だけで見ると `…/downloadables/../../x` が通り、実際に送られるのは `/x` なので
+  迂回になる）。
+  `crates/core/src/download_url.rs`、`crates/core/src/{dlsite,fanza}/client.rs`、
+  `docs/spec/09-stores.md`
+
 ## [0.2.7] - 2026-09-23
 
 ### Changed

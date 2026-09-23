@@ -134,22 +134,37 @@ pub fn parse(url: &str) -> Result<ParsedUrl<'_>, UrlError> {
     } else {
         "/"
     };
+    // `.` / `..` のセグメントは解決せず**拒否**する（`&str` を借用で返すため解決後の形を
+    // 持てない）。生の接頭辞だけで判定すると `…/downloadables/../../x` が通り、実際に
+    // 送られるパス（URL パーサが解決する）は `/x` になる＝許可リストの迂回になる。
+    // 正規のダウンロード URL にドットセグメントは現れないので fail-closed で足りる。
+    if path.split('/').any(|segment| segment == "." || segment == "..") {
+        return Err(UrlError::Malformed);
+    }
     Ok(ParsedUrl { host, path })
 }
 
 /// 許可ルールに照らして検証する。通れば解析結果を返す。
+///
+/// 同じホストに複数のルールを並べられる（DLsite のストア別のように、パスだけが違う
+/// ルール）。そのため**ホストが一致したルールを全部見て**、どれかのパスに一致すれば許可し、
+/// ホストは一致したのにパスがどれにも一致しないときだけ `PathNotAllowed` を返す
+/// （最初のホスト一致で確定させると、2 本目以降のパスが効かない）。
 pub fn check<'a>(url: &'a str, rules: &[HostRule]) -> Result<ParsedUrl<'a>, UrlError> {
     let parsed = parse(url)?;
+    let mut host_matched = false;
     for rule in rules {
         if !host_matches(rule, parsed.host) {
             continue;
         }
-        if let Some(prefix) = rule.path_prefix
-            && !parsed.path.starts_with(prefix)
-        {
-            return Err(UrlError::PathNotAllowed(parsed.path.to_string()));
+        host_matched = true;
+        match rule.path_prefix {
+            Some(prefix) if !parsed.path.starts_with(prefix) => continue,
+            _ => return Ok(parsed),
         }
-        return Ok(parsed);
+    }
+    if host_matched {
+        return Err(UrlError::PathNotAllowed(parsed.path.to_string()));
     }
     Err(UrlError::HostNotAllowed(parsed.host.to_string()))
 }
@@ -208,6 +223,51 @@ mod tests {
             check("https://download.booth.pm/downloadables/1", RULES),
             Err(UrlError::HostNotAllowed(_))
         ));
+    }
+
+    /// 同じホストに複数のルールを並べたとき（DLsite のストア別のように）、**どれかの
+    /// パスに一致すれば許可**し、どれにも一致しなければ拒否する。
+    #[test]
+    fn several_rules_for_the_same_host_are_all_considered() {
+        const STORES: &[HostRule] = &[
+            HostRule::exact("www.dlsite.com", Some("/maniax/download/")),
+            HostRule::exact("www.dlsite.com", Some("/home/download/")),
+        ];
+        // 2 本目のルールで一致するものも通る
+        assert!(check("https://www.dlsite.com/home/download/=/product_id/RJ1.html", STORES).is_ok());
+        assert!(check("https://www.dlsite.com/maniax/download/=/product_id/RJ1.html", STORES).is_ok());
+        // ホストは一致するがパスがどこにも一致しないときは拒否（理由もパス）
+        assert!(matches!(
+            check("https://www.dlsite.com/maniax/mypage/userbuy/=/x/", STORES),
+            Err(UrlError::PathNotAllowed(_))
+        ));
+        // ホストが一致しないときはホストで拒否
+        assert!(matches!(
+            check("https://dl.dlsite.com/maniax/download/=/x/", STORES),
+            Err(UrlError::HostNotAllowed(_))
+        ));
+    }
+
+    /// `.` / `..` のセグメントを含むパスは**拒否**する（fail-closed）。
+    ///
+    /// 生の文字列の接頭辞を見るだけでは `https://host/downloadables/../../x` が通ってしまい、
+    /// 実際に送られるリクエスト（URL パーサがドットセグメントを解決する）は `/x` になるため、
+    /// パスの許可リストを迂回できる。正規のダウンロード URL にドットセグメントは現れないので、
+    /// 解決する代わりに拒否する。
+    #[test]
+    fn dot_segments_in_the_path_are_rejected() {
+        for url in [
+            "https://booth.pm/downloadables/../../x",
+            "https://booth.pm/downloadables/./1",
+            "https://booth.pm/..",
+        ] {
+            assert!(
+                matches!(check(url, RULES), Err(UrlError::Malformed)),
+                "ドットセグメントを通している: {url}"
+            );
+        }
+        // クエリの中の `.` はパスではないので影響しない
+        assert!(check("https://booth.pm/downloadables/1?x=../y", RULES).is_ok());
     }
 
     #[test]

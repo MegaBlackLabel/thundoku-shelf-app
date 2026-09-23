@@ -15,8 +15,9 @@ use thundoku_core::tbf::TbfSession;
 /// セッション Cookie を集める起点（技術書典は単一ホスト）。
 const SESSION_ORIGIN: &str = "https://techbookfest.org";
 
-/// 収集元ホスト（`CollectedCookies` のキー）。
-const SESSION_HOST: &str = "techbookfest.org";
+/// 収集元ホスト（`CollectedCookies` のキー）。定義は core と共有する
+/// （ダウンロードで資格情報を付ける先の判定と同じ値を使う）。
+const SESSION_HOST: &str = thundoku_core::tbf::SITE_HOST;
 
 /// ログイン完了イベント（セッション Cookie を取得して永続化した後に発行）。
 pub struct TbfLoginDone;
@@ -203,7 +204,7 @@ impl TbfLoginView {
         let session = TbfSession::from_cookies(
             cookies
                 .iter()
-                .map(|(name, cookie)| (name.clone(), cookie.value.clone()))
+                .map(|cookie| (cookie.name.clone(), cookie.value.clone()))
                 .collect(),
         );
         if !session.is_logged_in() {

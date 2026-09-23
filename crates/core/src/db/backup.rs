@@ -66,6 +66,11 @@ pub fn canonicalize_json(
     };
     let mut out = Map::new();
     for (table, rows) in object {
+        // 表は配列。`format_version` のような付帯情報（表ではない）は比較に含めない
+        // （内容が同じなら版が増えても md5 を変えない＝無駄なアップロードを起こさない）。
+        if !rows.is_array() {
+            continue;
+        }
         if let Some(keep) = keep_tables
             && !keep.iter().any(|name| name == table)
         {
@@ -169,6 +174,13 @@ fn owner_matches(filter: &OwnerFilter<'_>, blob: Option<&str>) -> bool {
     }
 }
 
+/// バックアップ JSON の形式版。
+///
+/// 版が無いバックアップは **1**（`is_drm` に「未確認」の意味で `0` を書いていた時代）と
+/// みなす。3 状態（0 = なし / 1 = あり / 2 = 不明）になってからの `0` は「DRM なしと
+/// 確認できた」なので、復元時に意味を取り違えないよう版を持たせる。
+pub const FORMAT_VERSION: i64 = 2;
+
 /// 主要テーブルを JSON 文字列にエクスポートする。
 /// `book_ids` が `Some(ids)` のとき、所有者（本の id 集合）に連動して
 /// `books` とその下位テーブルだけをエクスポートする（P3）。`None` は全件。
@@ -185,6 +197,12 @@ pub fn export_json(
         // 食い違ったバックアップを作らない）。
         let mut tx = pool.begin().await?;
         let mut payload = Map::new();
+        // 形式版。表ではないので本文（行の比較）には含めない（`canonicalize_json` は
+        // 配列以外の値を無視する）。
+        payload.insert(
+            "format_version".to_string(),
+            Value::Number(Number::from(FORMAT_VERSION)),
+        );
         for table in TABLES {
             let rows = table_rows(&mut *tx, table, book_ids, owner).await?;
             payload.insert((*table).to_string(), Value::Array(rows));
@@ -206,6 +224,13 @@ pub fn export_json(
 pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
     let payload: serde_json::Value =
         serde_json::from_str(json).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    // 形式版が無いバックアップは 1（`is_drm` の `0` が「未確認」の意味だった時代）。
+    // 1 のバックアップは `0` を「不明」に寄せて復元する（下の `legacy_drm`）。
+    let format_version = payload
+        .get("format_version")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(1);
+    let legacy_drm = format_version < FORMAT_VERSION;
     crate::db::block_on(async {
         // 1 行でも失敗したら全て巻き戻す（部分復元を残さない）。
         let mut tx = pool.begin().await?;
@@ -239,7 +264,7 @@ pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
             // 競合判定は自然キーがあればそちらを使う（PK と別の UNIQUE 制約を
             // 持つ表で、もう片方の制約違反により復元が失敗するのを防ぐ）。
             let conflict = conflict_columns(table).unwrap_or(pk);
-            upsert_rows(&mut tx, table, pk, conflict, rows).await?;
+            upsert_rows(&mut tx, table, pk, conflict, rows, legacy_drm).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -397,6 +422,10 @@ async fn upsert_rows(
     pk: &[&str],
     conflict_cols: &[&str],
     rows: &[serde_json::Value],
+    // 旧仕様（`format_version` 無し = 1）のバックアップか。旧仕様の `is_drm = 0` は
+    // 「DRM なしと確認できた」ではなく「判定していない」の意味だった（同期が `0` 固定で
+    // 書いていた）。そのまま入れると本棚が嘘のメタを出すので「不明」に寄せる。
+    legacy_drm: bool,
 ) -> Result<(), sqlx::Error> {
     // 画像（blob）カラムは対象外（エクスポート時と同じ除外リスト）
     let table_cols: Vec<String> = {
@@ -424,9 +453,13 @@ async fn upsert_rows(
         };
         // 旧バックアップ（`is_drm` 列を足す前に取ったもの）は、そのまま復元すると
         // スキーマの DEFAULT（0 = 「DRM なしと確認済み」）になり**嘘のメタ**になる。
-        // 欠落しているときは「不明」として補う。
+        // 欠落しているときは「不明」として補う。旧仕様（形式版 1）で `0` が入っている行も
+        // 同じ意味（未確認）なので「不明」に寄せる。
         let with_drm_default;
-        let obj = if matches!(table, "books" | "bookshelf_items") && !obj.contains_key("is_drm") {
+        let obj = if matches!(table, "books" | "bookshelf_items")
+            && (legacy_drm && obj.get("is_drm").and_then(serde_json::Value::as_i64) == Some(0)
+                || !obj.contains_key("is_drm"))
+        {
             let mut owned = obj.clone();
             owned.insert(
                 "is_drm".to_string(),

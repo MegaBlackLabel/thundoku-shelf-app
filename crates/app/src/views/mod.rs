@@ -231,7 +231,7 @@ pub(crate) fn login_modal_geometry(
 }
 
 /// 収集した Cookie（収集元ホスト → 名前 → 属性つき Cookie）。
-pub(crate) type CollectedCookies = BTreeMap<String, BTreeMap<String, CookieEntry>>;
+pub(crate) type CollectedCookies = BTreeMap<String, Vec<CookieEntry>>;
 
 /// URL 監視ループ 1 tick 分の指示（`begin_check` の戻り値）。
 pub(crate) enum CheckStep {
@@ -269,9 +269,16 @@ pub(crate) fn collect_session_cookies(
         };
         let entry = collected.entry(parsed.host.to_string()).or_default();
         for cookie in cookies {
-            entry
-                .entry(cookie.name().to_string())
-                .or_insert_with(|| cookie_entry(&cookie));
+            let candidate = cookie_entry(&cookie);
+            // 同名でも `Path` / `Domain` が違えば別の Cookie。同じ組み合わせだけ置き換える。
+            match entry.iter_mut().find(|existing| {
+                existing.name == candidate.name
+                    && existing.path == candidate.path
+                    && existing.domain == candidate.domain
+            }) {
+                Some(existing) => *existing = candidate,
+                None => entry.push(candidate),
+            }
         }
     }
     collected
@@ -299,6 +306,7 @@ pub(crate) fn cookie_entry(
         cookie.secure().unwrap_or(true),
         expires,
     )
+    .named(cookie.name())
 }
 
 #[cfg(test)]

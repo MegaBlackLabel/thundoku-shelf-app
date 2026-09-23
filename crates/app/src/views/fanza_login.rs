@@ -148,7 +148,7 @@ impl FanzaLoginView {
             // 収集中に閉じ直された。この tick の結果は捨てる。
             return true;
         }
-        let session = thundoku_core::fanza::client::FanzaSession::new(collected);
+        let session = thundoku_core::fanza::client::FanzaSession::from_collected(collected);
         if !session.logged_in() {
             log::warn!("fanza login: セッション Cookie を取得できませんでした");
             return false;

@@ -202,6 +202,66 @@ fn old_backup_missing_is_drm_restores_as_unknown() {
     );
 }
 
+/// 旧仕様のバックアップ（`format_version` 無し）は、`is_drm = 0` を「未確認」として
+/// 「不明（2）」に寄せる。
+///
+/// 旧仕様の同期は `is_drm` に `0` を固定で書いていた（= 「DRM なしと確認できた」ではなく
+/// 「判定していない」）。`format_version` を持たないバックアップはその時代のものなので、
+/// `0` をそのまま入れると本棚が「DRM なしと確認済み」と嘘をつく。
+#[test]
+fn legacy_backup_without_format_version_treats_is_drm_zero_as_unknown() {
+    // 旧仕様の形（`format_version` を持たない）のバックアップを組む。実データを
+    // エクスポートして版の印だけ外すので、列の過不足で結果が変わらない。
+    let src = thundoku_core::db::test_pool();
+    books::insert(&src, &book("b0")).unwrap(); // is_drm = 0（旧仕様では「未確認」の意味）
+    let mut drm_book = book("b1");
+    drm_book.is_drm = 1;
+    books::insert(&src, &drm_book).unwrap();
+    let exported = backup::export_json(&src, None, None).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("format_version")
+        .expect("エクスポートには format_version が入っているはず");
+    let legacy = value.to_string();
+
+    let dst = thundoku_core::db::test_pool();
+    backup::import_json(&dst, &legacy).expect("旧バックアップの復元に失敗した");
+
+    let is_drm = |id: &str| -> i64 {
+        block_on(
+            sqlx::query_scalar("SELECT is_drm FROM books WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&dst),
+        )
+        .unwrap()
+    };
+    assert_eq!(is_drm("b0"), 2, "旧仕様の 0 は「不明」として復元すること");
+    assert_eq!(is_drm("b1"), 1, "DRM ありはそのまま復元すること");
+}
+
+/// 現行形式（`format_version` つき）のバックアップでは `is_drm = 0` を保つ
+/// （= 「DRM なしと確認できた」）。
+#[test]
+fn current_backup_keeps_is_drm_zero_as_verified_none() {
+    let src = thundoku_core::db::test_pool();
+    books::insert(&src, &book("b0")).unwrap();
+    let json = backup::export_json(&src, None, None).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(
+        parsed.get("format_version").is_some(),
+        "エクスポートに format_version が含まれること"
+    );
+
+    let dst = thundoku_core::db::test_pool();
+    backup::import_json(&dst, &json).unwrap();
+    let value: i64 =
+        block_on(sqlx::query_scalar("SELECT is_drm FROM books WHERE id = 'b0'").fetch_one(&dst))
+            .unwrap();
+    assert_eq!(value, 0, "現行形式の 0 は「確認済みなし」として保つこと");
+}
+
 /// 途中で失敗した復元は全体が巻き戻り、部分復元が残らないこと。
 #[test]
 fn failed_restore_rolls_back_completely() {

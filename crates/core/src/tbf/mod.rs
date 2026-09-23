@@ -135,20 +135,51 @@ pub struct SamplePage {
     pub height: Option<i64>,
 }
 
+/// セッション Cookie の収集元。**このホスト（とそのサブドメイン）宛にだけ**資格情報を付ける。
+pub const SITE_HOST: &str = "techbookfest.org";
+
+/// ダウンロード要求のヘッダ。
+///
+/// Cookie（と `X-XSRF-TOKEN`）は**収集元ホスト宛のときだけ**付ける。技術書典の本体は
+/// `storage.googleapis.com`（`/tbf-tokyo-product-dlc/`）から落ちるため、無条件に付けると
+/// 別システム（Google）へセッション Cookie が飛ぶ。URL を解釈できないときは付けない
+/// （fail-closed。`User-Agent` だけは常に付ける）。
+fn download_headers(
+    cookie_header: &str,
+    xsrf_token: Option<&str>,
+    url: &str,
+) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> =
+        vec![("User-Agent".to_string(), USER_AGENT.to_string())];
+    let Ok(parsed) = crate::download_url::parse(url) else {
+        return headers;
+    };
+    if !crate::download_url::host_within(parsed.host, SITE_HOST) {
+        return headers;
+    }
+    if !cookie_header.is_empty() {
+        headers.push(("Cookie".into(), cookie_header.to_string()));
+    }
+    if let Some(token) = xsrf_token {
+        headers.push(("X-XSRF-TOKEN".into(), token.to_string()));
+    }
+    headers
+}
+
 /// ダウンロード URL 解決（`resolve_download_url`）で cookie を付けて GET してよいホスト。
 ///
 /// 解決対象は `bookshelf_items.download_url`（= GraphQL の `downloadURL`、改変
 /// バックアップ由来もあり得る）と、そこから作る自サイト URL。自サイト以外へは
 /// セッション Cookie を送らない。
 const TBF_RESOLVE_RULES: &[crate::download_url::HostRule] =
-    &[crate::download_url::HostRule::exact(
-        "techbookfest.org",
-        None,
-    )];
+    &[crate::download_url::HostRule::exact(SITE_HOST, None)];
 
 /// 解決後のファイル本体を取得してよいホスト（`validate_download_url` と同じ範囲）。
+///
+/// **許可 = Cookie を付ける、ではない**: 本体が GCS のときは [`download_headers`] が
+/// Cookie を外す（`storage.googleapis.com` は配布先であって、こちらのセッションの宛先ではない）。
 const TBF_DOWNLOAD_RULES: &[crate::download_url::HostRule] = &[
-    crate::download_url::HostRule::exact("techbookfest.org", Some("/api/product-dlc/")),
+    crate::download_url::HostRule::exact(SITE_HOST, Some("/api/product-dlc/")),
     crate::download_url::HostRule::exact("storage.googleapis.com", Some("/tbf-tokyo-product-dlc/")),
 ];
 
@@ -595,15 +626,7 @@ impl TbfClient {
         // （リダイレクト追跡はライブラリ任せだが、起点を許可ホストに限る）。
         crate::download_url::check(url, TBF_DOWNLOAD_RULES)
             .map_err(|error| TbfError::BlockedUrl(format!("{url}: {error}")))?;
-        let mut headers: Vec<(String, String)> =
-            vec![("User-Agent".to_string(), USER_AGENT.to_string())];
-        let cookie_header = self.cookie_header();
-        if !cookie_header.is_empty() {
-            headers.push(("Cookie".into(), cookie_header));
-        }
-        if let Some(token) = &self.xsrf_token {
-            headers.push(("X-XSRF-TOKEN".into(), token.clone()));
-        }
+        let headers = download_headers(&self.cookie_header(), self.xsrf_token.as_deref(), url);
         let response = self.transport.send_download(
             RequestSpec {
                 method: "GET".to_string(),
@@ -1189,6 +1212,58 @@ pub(crate) fn canonical_events() -> Vec<TbfEventInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ダウンロードの Cookie / XSRF は**収集元ホスト宛のときだけ**付ける。
+    ///
+    /// 技術書典の本体は `storage.googleapis.com`（`/tbf-tokyo-product-dlc/`）から落ちる。
+    /// ここへセッション Cookie を付けると、別システム（Google）へ資格情報が飛ぶ。
+    #[test]
+    fn download_headers_send_cookies_only_to_the_site_host() {
+        let cookies = "session=sess-123";
+        // 本体（GCS）へは付けない
+        let gcs = download_headers(
+            cookies,
+            Some("tok"),
+            "https://storage.googleapis.com/tbf-tokyo-product-dlc/x.zip",
+        );
+        assert!(
+            !gcs.iter().any(|(name, _)| name == "Cookie"),
+            "別ホストへ Cookie を送っている: {gcs:?}"
+        );
+        assert!(
+            !gcs.iter().any(|(name, _)| name == "X-XSRF-TOKEN"),
+            "別ホストへ XSRF を送っている: {gcs:?}"
+        );
+        assert!(
+            gcs.iter()
+                .any(|(name, value)| name == "User-Agent" && !value.is_empty()),
+            "User-Agent は付ける: {gcs:?}"
+        );
+
+        // サイト自身（API 経由の本体）へは従来どおり付ける
+        let site = download_headers(
+            cookies,
+            Some("tok"),
+            "https://techbookfest.org/api/product-dlc/xyz",
+        );
+        assert!(
+            site.iter()
+                .any(|(name, value)| name == "Cookie" && value == cookies),
+            "サイト宛に Cookie を付けていない: {site:?}"
+        );
+        assert!(
+            site.iter()
+                .any(|(name, value)| name == "X-XSRF-TOKEN" && value == "tok"),
+            "サイト宛に XSRF を付けていない: {site:?}"
+        );
+
+        // URL を解釈できないときは付けない（fail-closed）
+        let broken = download_headers(cookies, Some("tok"), "not-a-url");
+        assert!(
+            !broken.iter().any(|(name, _)| name == "Cookie"),
+            "解釈できない URL へ Cookie を送っている: {broken:?}"
+        );
+    }
 
     #[test]
     fn session_from_cookies_extracts_xsrf() {

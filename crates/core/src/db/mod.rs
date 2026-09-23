@@ -377,7 +377,10 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             let cols = [
                 "media_category TEXT",
                 "ai_type TEXT",
-                "is_drm INTEGER NOT NULL DEFAULT 0",
+                // 既定は「不明（2）」。`0` を既定にすると、列を指定しない INSERT が
+                // 「DRM なしと確認済み」の意味になってしまう（同期は明示的に値を入れる）。
+                // 既存 DB は列追加済みなので既定は 0 のまま変わる（この既定は新規 DB に効く）。
+                "is_drm INTEGER NOT NULL DEFAULT 2",
                 "release_date TEXT",
                 "description TEXT",
                 "theme TEXT",

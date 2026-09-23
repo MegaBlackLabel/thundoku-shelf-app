@@ -37,25 +37,33 @@ pub const SITE_HOST: &str = "www.dmm.co.jp";
 /// アカウント（`accounts.dmm.co.jp`）。ログインの Cookie はここでも発行される。
 pub const ACCOUNT_HOST: &str = "accounts.dmm.co.jp";
 
-/// ダウンロード proxy（詳細 API の `downloadLinks`）を叩いてよいホスト（**完全一致**）。
+/// ダウンロード proxy（詳細 API の `downloadLinks`）を叩いてよいホスト（**完全一致**）とパス。
 ///
 /// `downloadLinks["1"]` は相対パスで返り `https://www.dmm.co.jp` を前置する（絶対 URL の場合も
 /// そのまま使う）。実機の観測は `https://www.dmm.co.jp/dc/-/proxy/...`（2026-09-23、
-/// ダウンロード時のログ行 `fanza download: proxy=… cdn=…`）。同じ `*.dmm.co.jp` でも
-/// サブドメインは許可しない（Cookie は宛先別に絞ってあるので漏れはしないが、
-/// 未認証のリクエストも飛ばさない）。
-const FANZA_DOWNLOAD_RULES: &[crate::download_url::HostRule] =
-    &[crate::download_url::HostRule::exact("www.dmm.co.jp", None)];
+/// ダウンロード時のログ行 `fanza download: proxy=… cdn=…`、詳細 API の応答も
+/// `/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=…/`）。
+///
+/// 同じ `*.dmm.co.jp` でもサブドメインは許可しない（Cookie は宛先別に絞ってあるので漏れは
+/// しないが、未認証のリクエストも飛ばさない）。さらに**パスも proxy 配下に限る**:
+/// `bookshelf_items.download_url` は改変したバックアップから復元され得るため、同じ
+/// `www.dmm.co.jp` の無関係なパス（作品ページ・API 等）へセッション Cookie を送らせない。
+const FANZA_DOWNLOAD_RULES: &[crate::download_url::HostRule] = &[crate::download_url::HostRule::exact(
+    "www.dmm.co.jp",
+    Some("/dc/-/proxy/"),
+)];
 
 /// 302 の転送先（CloudFront 署名 Cookie を送る先）。署名 Cookie は `domain=dmm.co.jp` で
-/// 発行されるため、その範囲だけを許可する。
+/// 発行されるが、**実測の 2 ホストが属する範囲**まで狭める。
 ///
-/// 実測の CDN は **複数ある**: `doujin.contents.doujin.dmm.co.jp`（テスト・初期の観測）と
-/// `doujin03.contents.doujin.dmm.co.jp`（2026-09-23 の実機観測）。ホスト名が固定できないため
-/// サブドメイン許可のままにする（送るのは 302 で受け取った署名 Cookie だけ）。
+/// 実測は `doujin.contents.doujin.dmm.co.jp`（テスト・初期の観測）と
+/// `doujin03.contents.doujin.dmm.co.jp`（2026-09-23 の実機観測）で、どちらも
+/// `contents.doujin.dmm.co.jp` の下。番号付きのホストが増えても通るよう、
+/// `contents.doujin.dmm.co.jp` とそのサブドメインだけを許可する
+/// （`www.dmm.co.jp` のような別ホストへは署名 Cookie を送らない）。
 const FANZA_CDN_RULES: &[crate::download_url::HostRule] =
     &[crate::download_url::HostRule::with_subdomains(
-        "dmm.co.jp",
+        "contents.doujin.dmm.co.jp",
         None,
     )];
 
@@ -99,6 +107,13 @@ pub struct FanzaSession {
 impl FanzaSession {
     /// 収集元ホスト →（Cookie 名 → 属性つき Cookie）。ログイン時に WebView から作る。
     pub fn new(origins: BTreeMap<String, BTreeMap<String, CookieEntry>>) -> Self {
+        Self {
+            origins: HostScopedCookies::from_named(origins),
+        }
+    }
+
+    /// ログイン時に WebView から収集した形（ホスト → Cookie の並び）から作る。
+    pub fn from_collected(origins: BTreeMap<String, Vec<CookieEntry>>) -> Self {
         Self {
             origins: HostScopedCookies::new(origins),
         }
@@ -902,6 +917,70 @@ mod tests {
             "拒否されていない: {err:?}"
         );
         assert_eq!(*calls.lock(), 0, "拒否したのにリクエストを送っている");
+    }
+
+    /// proxy のホストが正しくても、パスが許可リスト（`/dc/-/proxy/`）の外なら
+    /// **リクエストを送らずに**拒否する。
+    ///
+    /// `bookshelf_items.download_url` は改変したバックアップから復元され得るため、
+    /// 同じ `www.dmm.co.jp` でもダウンロードと無関係なパスへセッション Cookie を送らせない。
+    #[test]
+    fn download_proxy_path_outside_the_allowlist_is_blocked_without_sending() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls2 = calls.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |_spec: RequestSpec| {
+                *calls2.lock() += 1;
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: vec![],
+                })
+            }),
+        };
+        let mut client = FanzaClient::with_transport(Box::new(transport), session());
+        let mut on = |_: u64, _: u64| true;
+        let err = client
+            .download_with_progress(
+                "https://www.dmm.co.jp/dc/doujin/-/detail/=/cid=x/",
+                &mut on,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, FanzaError::BlockedUrl(_)),
+            "パス制限が効いていない: {err:?}"
+        );
+        assert_eq!(*calls.lock(), 0, "拒否したのにリクエストを送っている");
+    }
+
+    /// 302 の転送先（CDN）も**実測値まで狭める**。署名 Cookie は `domain=dmm.co.jp` で
+    /// 発行されるため `*.dmm.co.jp` を丸ごと許す必要は無く、実測の 2 ホストが属する
+    /// `*.contents.doujin.dmm.co.jp` だけで足りる（`www.dmm.co.jp` のような別ホストへ
+    /// 署名 Cookie を送らない）。
+    #[test]
+    fn download_cdn_hosts_outside_the_observed_set_are_blocked() {
+        for host in [
+            "doujin.contents.doujin.dmm.co.jp",
+            "doujin03.contents.doujin.dmm.co.jp",
+        ] {
+            assert!(
+                crate::download_url::check(&format!("https://{host}/bb/x.zip"), FANZA_CDN_RULES)
+                    .is_ok(),
+                "実測の CDN を弾いている: {host}"
+            );
+        }
+        for url in [
+            "https://www.dmm.co.jp/x.zip",
+            "https://dmm.co.jp/x.zip",
+            "https://contents.doujin.dmm.co.jp.evil.example.com/x.zip",
+        ] {
+            assert!(
+                crate::download_url::check(url, FANZA_CDN_RULES).is_err(),
+                "実測外のホストを通している: {url}"
+            );
+        }
     }
 
     /// 作品ページ HTML からジャンルタグ（genreTag__txt）を抽出する。
