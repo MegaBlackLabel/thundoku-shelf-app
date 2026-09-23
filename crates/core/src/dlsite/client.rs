@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::session_cookies::HostScopedCookies;
+use crate::session_cookies::{CookieEntry, HostScopedCookies};
 use crate::tbf::TbfError;
 use crate::tbf::transport::{RequestSpec, Transport};
 
@@ -100,7 +100,8 @@ pub struct DlsiteSession {
 }
 
 impl DlsiteSession {
-    pub fn new(origins: BTreeMap<String, BTreeMap<String, String>>) -> Self {
+    /// 収集元ホスト →（Cookie 名 → 属性つき Cookie）。ログイン時に WebView から作る。
+    pub fn new(origins: BTreeMap<String, BTreeMap<String, CookieEntry>>) -> Self {
         Self {
             origins: HostScopedCookies::new(origins),
         }
@@ -122,13 +123,13 @@ impl DlsiteSession {
         self.origins.value(host, name)
     }
 
-    /// 宛先ホスト向けの Cookie ヘッダ。**そのホスト向けに収集したものだけ**を返す
-    /// （収集元と一致するか、その収集元の子ドメイン）。
+    /// 宛先 URL 向けの Cookie ヘッダ。**その URL のホスト向けに収集した Cookie だけ**を返し、
+    /// `Path` / `Secure` / 期限も満たすものだけを載せる（`HostScopedCookies::header_for_url`）。
     ///
     /// 収集元すべてをまとめる API は**持たない**: `down_url` の proxy のように宛先が実行時に
     /// 決まる送信先へ、片方の収集元にしか送るべきでない Cookie を載せないため。
-    pub fn cookie_header_for(&self, host: &str) -> String {
-        self.origins.header_for(host)
+    pub fn cookie_header_for_url(&self, url: &str) -> String {
+        self.origins.header_for_url(url)
     }
 
     pub fn cookies_count(&self) -> usize {
@@ -192,11 +193,11 @@ impl DlsiteClient {
         Self { transport, session }
     }
 
-    /// 宛先ホスト向けのヘッダ。`Cookie` は**そのホスト向けに収集したものだけ**を載せる
-    /// （収集元をまたいで 1 本にまとめない）。
-    fn cookie_headers_for(&self, host: &str) -> Vec<(String, String)> {
+    /// 宛先 URL 向けのヘッダ。`Cookie` は**その URL のホスト向けに収集したものだけ**を載せる
+    /// （収集元をまたいで 1 本にまとめない。`Path` / `Secure` / 期限も見る）。
+    fn cookie_headers_for(&self, url: &str) -> Vec<(String, String)> {
         vec![
-            ("Cookie".to_string(), self.session.cookie_header_for(host)),
+            ("Cookie".to_string(), self.session.cookie_header_for_url(url)),
             ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dlsite.com/".to_string()),
             // DLsite は non-browser リクエストをアプリ認証で弾く（Sec-Fetch / Accept が
@@ -254,12 +255,13 @@ impl DlsiteClient {
             let joined = chunk.join(",");
             let url =
                 format!("https://www.dlsite.com/maniax/product/info/ajax?product_id={joined}");
+            let headers = self.ajax_headers_for(&url);
             let resp = self
                 .transport
                 .send(RequestSpec {
                     method: "GET".into(),
                     url,
-                    headers: self.ajax_headers_for(SITE_HOST),
+                    headers,
                     body: None,
                     redirects: 3,
                 })
@@ -300,12 +302,13 @@ impl DlsiteClient {
         // その 302 の `Location`。Cookie を付ける前に双方を検証する。
         let proxy = crate::download_url::check(down_url, DLSITE_DOWNLOAD_RULES)
             .map_err(|error| DlsiteError::BlockedUrl(format!("{down_url}: {error}")))?;
-        // proxy へは**宛先ホスト向けに収集した Cookie だけ**を送る。www と login を 1 本に
-        // まとめると、`down_url` が別サブドメインを指したときにもう片方の収集元の Cookie まで飛ぶ。
+        // proxy へは**宛先 URL のホスト向けに収集した Cookie だけ**を送る。www と login を
+        // 1 本にまとめると、`down_url` が別サブドメインを指したときにもう片方の収集元の Cookie まで飛ぶ。
+        let proxy_headers = self.cookie_headers_for(down_url);
         let proxy_spec = RequestSpec {
             method: "GET".into(),
             url: down_url.into(),
-            headers: self.cookie_headers_for(proxy.host),
+            headers: proxy_headers,
             body: None,
             redirects: 0,
         };
@@ -333,7 +336,7 @@ impl DlsiteClient {
         // 2) CDN へ送る Cookie は**そのホスト向けに収集したもの + 署名 `jwt`** だけ。
         //    www の認証セッションは別システム（CDN）には要らないので送らない。
         //    `jwt` は 302 の Set-Cookie で渡される署名付きダウンロード鍵。
-        let mut cookie = self.session.cookie_header_for(cdn.host);
+        let mut cookie = self.session.cookie_header_for_url(&cd_url);
         for (k, v) in proxy_resp.set_cookies() {
             if k == "jwt" && !cookie.contains("jwt=") {
                 if !cookie.is_empty() {
@@ -384,15 +387,16 @@ impl DlsiteClient {
         Ok(resp.body)
     }
 
-    /// HTML ページを取得する（購入履歴・作品ページ）。いずれも `www.dlsite.com` なので
-    /// 宛先は `SITE_HOST`（login の Cookie は載せない）。
+    /// HTML ページを取得する（購入履歴・作品ページ）。Cookie は**宛先 URL のホスト向け**だけを
+    /// 載せる（`login` の Cookie は載らない）。
     fn get_html(&mut self, url: &str) -> Result<String, DlsiteError> {
+        let headers = self.cookie_headers_for(url);
         let resp = self
             .transport
             .send(RequestSpec {
                 method: "GET".into(),
                 url: url.into(),
-                headers: self.cookie_headers_for(SITE_HOST),
+                headers,
                 body: None,
                 redirects: 3,
             })
@@ -852,11 +856,17 @@ mod tests {
         DlsiteSession::new(BTreeMap::from([
             (
                 SITE_HOST.to_string(),
-                BTreeMap::from([("__DLsite_SID".to_string(), "shop".to_string())]),
+                BTreeMap::from([(
+                    "__DLsite_SID".to_string(),
+                    CookieEntry::new("shop"),
+                )]),
             ),
             (
                 LOGIN_HOST.to_string(),
-                BTreeMap::from([("login_ticket".to_string(), "t".to_string())]),
+                BTreeMap::from([(
+                    "login_ticket".to_string(),
+                    CookieEntry::new("t"),
+                )]),
             ),
         ]))
     }
@@ -978,21 +988,39 @@ mod tests {
         let session = DlsiteSession::new(BTreeMap::from([
             (
                 SITE_HOST.to_string(),
-                BTreeMap::from([("__DLsite_SID".to_string(), "shop".to_string())]),
+                BTreeMap::from([(
+                    "__DLsite_SID".to_string(),
+                    crate::session_cookies::CookieEntry::new("shop"),
+                )]),
             ),
             (
                 LOGIN_HOST.to_string(),
-                BTreeMap::from([("login_ticket".to_string(), "t".to_string())]),
+                BTreeMap::from([(
+                    "login_ticket".to_string(),
+                    crate::session_cookies::CookieEntry::new("t"),
+                )]),
             ),
         ]));
 
         // 宛先が収集元でなければ 1 つも送らない（CDN はこれに当たる）
-        assert_eq!(session.cookie_header_for("download.dlsite.com"), "");
-        assert_eq!(session.cookie_header_for("evil.example.com"), "");
+        assert_eq!(
+            session.cookie_header_for_url("https://download.dlsite.com/get/x.zip"),
+            ""
+        );
+        assert_eq!(session.cookie_header_for_url("https://evil.example.com/"), "");
         // 収集元は完全一致（サブドメインへは送らない）
-        assert_eq!(session.cookie_header_for(SITE_HOST), "__DLsite_SID=shop");
-        assert_eq!(session.cookie_header_for("sub.www.dlsite.com"), "");
-        assert_eq!(session.cookie_header_for(LOGIN_HOST), "login_ticket=t");
+        assert_eq!(
+            session.cookie_header_for_url("https://www.dlsite.com/home/mypage"),
+            "__DLsite_SID=shop"
+        );
+        assert_eq!(
+            session.cookie_header_for_url("https://sub.www.dlsite.com/"),
+            ""
+        );
+        assert_eq!(
+            session.cookie_header_for_url("https://login.dlsite.com/login"),
+            "login_ticket=t"
+        );
 
         // 収集元をまたいだ取り出し（認証判定用）
         assert_eq!(

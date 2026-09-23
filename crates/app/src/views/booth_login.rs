@@ -6,11 +6,11 @@
 
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
+    Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_wry::WebView;
-use raw_window_handle::HasWindowHandle;
+use thundoku_core::session_cookies::CookieEntry;
 
 /// ログイン完了イベント（Cookie を取得して永続化した後に発行）。
 pub struct BoothLoginDone;
@@ -22,6 +22,8 @@ pub struct BoothLoginView {
     webview: Option<Entity<WebView>>,
     /// URL 監視タイマーの世代（重複チェック防止）
     check_generation: u64,
+    /// WebView を表示したいか。生成が非同期（Windows はタスク）なので、生成完了時に反映する。
+    visible: bool,
 }
 
 impl BoothLoginView {
@@ -29,48 +31,38 @@ impl BoothLoginView {
         // wry の WebView を作成して booth.pm のログインページを開く。
         // テスト環境など native window handle が取得できない場合は
         // WebView なしで作成する（backdrop のみ表示）。
-        let webview = Self::try_create_webview(window, cx);
         let mut this = Self {
-            webview,
+            webview: None,
             check_generation: 0,
+            visible: false,
         };
+        // 生成は App の借用外（Windows はタスク）で行われる。理由は
+        // `super::create_login_webview` のドキュメント参照。
+        super::create_login_webview(
+            &mut this,
+            window,
+            cx,
+            // incognito（non-persistent）WebView: Cookie はメモリのみ。
+            // 永続ストアだと pixiv/booth のセッションがアプリ再起動をまたいで
+            // 残り、ログアウト後に再ログイン WebView を開くと pixiv の SSO で
+            // 自動再ログインされてしまうため（ログアウトが効かないように見える）。
+            true,
+            "https://booth.pm/users/sign_in",
+            |this, webview, window, cx| {
+                this.webview = Some(webview);
+                this.apply_webview_bounds(window, cx);
+                // 生成前に show() されていたら、その意図をここで反映する。
+                if this.visible
+                    && let Some(webview) = &this.webview
+                {
+                    webview.update(cx, |view, _| view.show());
+                }
+                // 生成完了を 1 回描画へ反映する（配置と可視化のため）。
+                cx.notify();
+            },
+        );
         this.start_url_check(cx);
         this
-    }
-
-    fn try_create_webview(window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<WebView>> {
-        // incognito（non-persistent）WebView: Cookie はメモリのみ。
-        // 永続ストアだと pixiv/booth のセッションがアプリ再起動をまたいで
-        // 残り、ログアウト後に再ログイン WebView を開くと pixiv の SSO で
-        // 自動再ログインされてしまうため（ログアウトが効かないように見える）。
-        let builder = lb_wry::WebViewBuilder::new().with_incognito(true);
-        #[cfg(debug_assertions)]
-        let builder = builder.with_devtools(true);
-        let window_handle = match window.window_handle() {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!("booth login: window_handle() failed: {e:?}");
-                return None;
-            }
-        };
-        // WebView2 の生成は内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
-        // その間に他の定期タスクが App を更新すると gpui の借用と衝突して落ちるため、
-        // ここでカウンタを立てて知らせる。
-        let _pumping = crate::app_state::WebviewPumpGuard::enter();
-        let webview = match builder.build(&window_handle) {
-            Ok(w) => w,
-            Err(e) => {
-                log::error!("booth login: wry build() failed: {e:?} | {e}");
-                return None;
-            }
-        };
-        let entity = cx.new(|cx| WebView::new(webview, window, cx));
-        entity.update(cx, |view, _| {
-            view.load_url("https://booth.pm/users/sign_in");
-            // モーダルを開くまでは隠しておく（AuthDialog の show で表示）
-            view.hide();
-        });
-        Some(entity)
     }
 
     /// 1 秒ごとに WebView の URL を確認し、booth.pm に戻ってログインが
@@ -86,10 +78,8 @@ impl BoothLoginView {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                // WebView2 がメッセージループを回している間は更新しない（次の tick に回す）。
-                if crate::app_state::webview_pumping() > 0 {
-                    continue;
-                }
+                // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
+                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                 let Ok(done) = handle.update(cx, |this, cx| {
                     if this.check_generation != generation {
                         return true; // 新しい監視が始まっている
@@ -138,7 +128,7 @@ impl BoothLoginView {
         // Cookie が booth.pm や画像 CDN へ飛ぶ）。
         let mut origins: std::collections::BTreeMap<
             String,
-            std::collections::BTreeMap<String, String>,
+            std::collections::BTreeMap<String, CookieEntry>,
         > = std::collections::BTreeMap::new();
         for url in ["https://booth.pm", "https://accounts.booth.pm"] {
             let cookies = webview
@@ -154,7 +144,7 @@ impl BoothLoginView {
             for cookie in cookies {
                 entry
                     .entry(cookie.name().to_string())
-                    .or_insert_with(|| cookie.value().to_string());
+                    .or_insert_with(|| super::cookie_entry(&cookie));
             }
         }
         let session = thundoku_core::booth::BoothSession::new(origins);
@@ -168,12 +158,14 @@ impl BoothLoginView {
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| view.hide());
         }
+        self.visible = false;
         cx.emit(BoothLoginDone);
         true
     }
 
     /// WebView を表示する（ログインモーダルを開く）。
     pub fn show(&mut self, cx: &mut Context<Self>) {
+        self.visible = true;
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| view.show());
         }
@@ -184,22 +176,24 @@ impl BoothLoginView {
     /// キャンセル/閉じる。
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.check_generation += 1; // 監視を止める
+        self.visible = false;
         if let Some(webview) = self.webview.take() {
             webview.update(cx, |view, _| view.hide());
         }
     }
-}
 
-impl EventEmitter<BoothLoginDone> for BoothLoginView {}
-impl EventEmitter<BoothLoginCancelled> for BoothLoginView {}
-
-impl Render for BoothLoginView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // モーダル領域（中央 480x640）に WebView を配置する
+    /// WebView をモーダル領域（中央 480x640）へ配置する。
+    ///
+    /// 生成が非同期（Windows はタスク）なので、生成直後にも呼ぶ。`render` 任せだと
+    /// 生成完了後に再描画が走らず、**配置されないまま表示**される。
+    fn apply_webview_bounds(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(webview) = &self.webview else {
+            return;
+        };
         let bounds = {
             let window_bounds = window.bounds();
-            let width = 480.0_f32;
-            let height = 640.0_f32;
+            let width = 480_f32;
+            let height = 640_f32;
             let left = (window_bounds.size.width.as_f32() - width) / 2.0;
             let top = (window_bounds.size.height.as_f32() - height) / 2.0;
             gpui_kit::bounds(
@@ -213,24 +207,28 @@ impl Render for BoothLoginView {
                 },
             )
         };
-        if let Some(webview) = &self.webview {
-            webview.update(cx, |view, _| {
-                let _ = view.raw().set_bounds(lb_wry::Rect {
-                    position: lb_wry::dpi::Position::Physical(lb_wry::dpi::PhysicalPosition::new(
-                        bounds.origin.x.as_f32() as i32,
-                        bounds.origin.y.as_f32() as i32,
-                    )),
-                    size: lb_wry::dpi::Size::Physical(lb_wry::dpi::PhysicalSize::new(
-                        bounds.size.width.as_f32() as u32,
-                        bounds.size.height.as_f32() as u32,
-                    )),
-                });
+        webview.update(cx, |view, _| {
+            let _ = view.raw().set_bounds(lb_wry::Rect {
+                position: lb_wry::dpi::Position::Physical(lb_wry::dpi::PhysicalPosition::new(
+                    bounds.origin.x.as_f32() as i32,
+                    bounds.origin.y.as_f32() as i32,
+                )),
+                size: lb_wry::dpi::Size::Physical(lb_wry::dpi::PhysicalSize::new(
+                    bounds.size.width.as_f32() as u32,
+                    bounds.size.height.as_f32() as u32,
+                )),
             });
-        }
-        // GPUI 側は backdrop（暗い背景）と閉じるボタンのみ描画する。
-        // WebView 自体は GPUI ウィンドウの上に重なる。
-        // （呼び出し側が deferred レイヤーに置いて最前面表示する）
-        div()
+        });
+    }
+}
+
+impl EventEmitter<BoothLoginDone> for BoothLoginView {}
+impl EventEmitter<BoothLoginCancelled> for BoothLoginView {}
+
+impl Render for BoothLoginView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_webview_bounds(window, cx);
+div()
             .id("booth-login-backdrop")
             .absolute()
             .top_0()
@@ -274,6 +272,7 @@ impl Render for BoothLoginView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
 
     /// テスト用のウィンドウルート（描くものは無い）。

@@ -6,11 +6,11 @@
 
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
+    Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_wry::WebView;
-use raw_window_handle::HasWindowHandle;
+use thundoku_core::session_cookies::CookieEntry;
 
 /// ログイン完了イベント（Cookie を取得して永続化した後に発行）。
 pub struct FanzaLoginDone;
@@ -24,51 +24,44 @@ const SESSION_ORIGINS: [&str; 2] = ["https://www.dmm.co.jp", "https://accounts.d
 pub struct FanzaLoginView {
     webview: Option<Entity<WebView>>,
     check_generation: u64,
+    /// WebView を表示したいか。生成が非同期（Windows はタスク）なので、生成完了時に反映する。
+    visible: bool,
 }
 
 impl FanzaLoginView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let webview = Self::try_create_webview(window, cx);
         let mut this = Self {
-            webview,
+            webview: None,
             check_generation: 0,
+            visible: false,
         };
-        this.start_url_check(cx);
-        this
-    }
-
-    fn try_create_webview(window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<WebView>> {
-        // incognito（non-persistent）WebView: Cookie はメモリのみ。
-        // 永続ストアだと再ログイン時に SSO で自動再ログインされるため使わない。
-        let builder = lb_wry::WebViewBuilder::new().with_incognito(true);
-        #[cfg(debug_assertions)]
-        let builder = builder.with_devtools(true);
-        let window_handle = match window.window_handle() {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!("fanza login: window_handle() failed: {e:?}");
-                return None;
-            }
-        };
-        // WebView2 の生成は内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
-        // その間に他の定期タスクが App を更新すると gpui の借用と衝突して落ちるため、
-        // ここでカウンタを立てて知らせる。
-        let _pumping = crate::app_state::WebviewPumpGuard::enter();
-        let webview = match builder.build(&window_handle) {
-            Ok(w) => w,
-            Err(e) => {
-                log::error!("fanza login: wry build() failed: {e:?} | {e}");
-                return None;
-            }
-        };
-        let entity = cx.new(|cx| WebView::new(webview, window, cx));
-        entity.update(cx, |view, _| {
+        // 生成は App の借用外（Windows はタスク）で行われる。理由は
+        // `super::create_login_webview` のドキュメント参照。
+        super::create_login_webview(
+            &mut this,
+            window,
+            cx,
+            // incognito（non-persistent）WebView: Cookie はメモリのみ。
+            // 永続ストアだと再ログイン時に SSO で自動再ログインされるため使わない。
+            true,
             // 購入済み作品ページを起点にする。年齢確認 → accounts ログイン → 復帰で
             // セッションが確立する。
-            view.load_url("https://www.dmm.co.jp/dc/-/mylibrary/");
-            view.hide();
-        });
-        Some(entity)
+            "https://www.dmm.co.jp/dc/-/mylibrary/",
+            |this, webview, window, cx| {
+                this.webview = Some(webview);
+                this.apply_webview_bounds(window, cx);
+                // 生成前に show() されていたら、その意図をここで反映する。
+                if this.visible
+                    && let Some(webview) = &this.webview
+                {
+                    webview.update(cx, |view, _| view.show());
+                }
+                // 生成完了を 1 回描画へ反映する（配置と可視化のため）。
+                cx.notify();
+            },
+        );
+        this.start_url_check(cx);
+        this
     }
 
     fn start_url_check(&mut self, cx: &mut Context<Self>) {
@@ -82,10 +75,8 @@ impl FanzaLoginView {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                // WebView2 がメッセージループを回している間は更新しない（次の tick に回す）。
-                if crate::app_state::webview_pumping() > 0 {
-                    continue;
-                }
+                // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
+                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                 let Ok(done) = handle.update(cx, |this, cx| {
                     if this.check_generation != generation {
                         return true;
@@ -133,7 +124,7 @@ impl FanzaLoginView {
         // しか送るべきでない Cookie がもう片方や CDN へ飛ぶ）。
         let mut origins: std::collections::BTreeMap<
             String,
-            std::collections::BTreeMap<String, String>,
+            std::collections::BTreeMap<String, CookieEntry>,
         > = std::collections::BTreeMap::new();
         for url in SESSION_ORIGINS {
             let cookies = webview
@@ -149,7 +140,7 @@ impl FanzaLoginView {
             for cookie in cookies {
                 entry
                     .entry(cookie.name().to_string())
-                    .or_insert_with(|| cookie.value().to_string());
+                    .or_insert_with(|| super::cookie_entry(&cookie));
             }
         }
         let session = thundoku_core::fanza::client::FanzaSession::new(origins);
@@ -162,11 +153,13 @@ impl FanzaLoginView {
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| view.hide());
         }
+        self.visible = false;
         cx.emit(FanzaLoginDone);
         true
     }
 
     pub fn show(&mut self, cx: &mut Context<Self>) {
+        self.visible = true;
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| view.show());
         }
@@ -176,22 +169,24 @@ impl FanzaLoginView {
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.check_generation += 1;
+        self.visible = false;
         if let Some(webview) = self.webview.take() {
             webview.update(cx, |view, _| view.hide());
         }
     }
-}
 
-impl EventEmitter<FanzaLoginDone> for FanzaLoginView {}
-impl EventEmitter<FanzaLoginCancelled> for FanzaLoginView {}
-
-impl Render for FanzaLoginView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // モーダル領域（中央 640x480）に WebView を配置する
+    /// WebView をモーダル領域（中央 640x480）へ配置する。
+    ///
+    /// 生成が非同期（Windows はタスク）なので、生成直後にも呼ぶ。`render` 任せだと
+    /// 生成完了後に再描画が走らず、**配置されないまま表示**される。
+    fn apply_webview_bounds(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(webview) = &self.webview else {
+            return;
+        };
         let bounds = {
             let window_bounds = window.bounds();
-            let width = 640.0_f32;
-            let height = 480.0_f32;
+            let width = 640_f32;
+            let height = 480_f32;
             let left = (window_bounds.size.width.as_f32() - width) / 2.0;
             let top = (window_bounds.size.height.as_f32() - height) / 2.0;
             gpui_kit::bounds(
@@ -205,21 +200,28 @@ impl Render for FanzaLoginView {
                 },
             )
         };
-        if let Some(webview) = &self.webview {
-            webview.update(cx, |view, _| {
-                let _ = view.raw().set_bounds(lb_wry::Rect {
-                    position: lb_wry::dpi::Position::Physical(lb_wry::dpi::PhysicalPosition::new(
-                        bounds.origin.x.as_f32() as i32,
-                        bounds.origin.y.as_f32() as i32,
-                    )),
-                    size: lb_wry::dpi::Size::Physical(lb_wry::dpi::PhysicalSize::new(
-                        bounds.size.width.as_f32() as u32,
-                        bounds.size.height.as_f32() as u32,
-                    )),
-                });
+        webview.update(cx, |view, _| {
+            let _ = view.raw().set_bounds(lb_wry::Rect {
+                position: lb_wry::dpi::Position::Physical(lb_wry::dpi::PhysicalPosition::new(
+                    bounds.origin.x.as_f32() as i32,
+                    bounds.origin.y.as_f32() as i32,
+                )),
+                size: lb_wry::dpi::Size::Physical(lb_wry::dpi::PhysicalSize::new(
+                    bounds.size.width.as_f32() as u32,
+                    bounds.size.height.as_f32() as u32,
+                )),
             });
-        }
-        div()
+        });
+    }
+}
+
+impl EventEmitter<FanzaLoginDone> for FanzaLoginView {}
+impl EventEmitter<FanzaLoginCancelled> for FanzaLoginView {}
+
+impl Render for FanzaLoginView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_webview_bounds(window, cx);
+div()
             .id("fanza-login-backdrop")
             .absolute()
             .top_0()
@@ -262,6 +264,7 @@ impl Render for FanzaLoginView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
 
     /// テスト用のウィンドウルート（描くものは無い）。

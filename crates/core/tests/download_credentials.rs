@@ -61,10 +61,7 @@ fn sent_urls(log: &Log) -> Vec<String> {
 /// BOOTH: `booth.pm/downloadables/` 以外へは（Cookie を付ける前に）拒否する。
 #[test]
 fn booth_never_attaches_the_session_outside_the_allowlist() {
-    let session = BoothSession::new(BTreeMap::from([(
-        "booth.pm".to_string(),
-        session_cookies(),
-    )]));
+    let session = BoothSession::from_origin("booth.pm", session_cookies());
     let client = BoothClient::new(&session);
 
     for url in [

@@ -10,12 +10,12 @@ use std::collections::BTreeMap;
 
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
+    Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_wry::WebView;
-use raw_window_handle::HasWindowHandle;
 use thundoku_core::dlsite::client::{DlsiteSession, LOGIN_HOST, SITE_HOST};
+use thundoku_core::session_cookies::CookieEntry;
 
 use crate::app_state::WebviewPumpGuard;
 
@@ -31,45 +31,26 @@ pub struct DlsiteLoginCancelled;
 pub struct DlsiteLoginView {
     webview: Option<Entity<WebView>>,
     check_generation: u64,
+    /// WebView を表示したいか。生成が非同期（Windows はタスク）なので、生成完了時に反映する。
+    visible: bool,
 }
 
 impl DlsiteLoginView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let webview = Self::try_create_webview(window, cx);
         let mut this = Self {
-            webview,
+            webview: None,
             check_generation: 0,
+            visible: false,
         };
-        this.start_url_check(cx);
-        this
-    }
-
-    fn try_create_webview(window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<WebView>> {
-        // incognito（non-persistent）WebView: Cookie はメモリのみ。
-        // 永続ストアだと再ログイン時に SSO で自動再ログインされるため使わない。
-        let builder = lb_wry::WebViewBuilder::new().with_incognito(true);
-        #[cfg(debug_assertions)]
-        let builder = builder.with_devtools(true);
-        let window_handle = match window.window_handle() {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!("dlsite login: window_handle() failed: {e:?}");
-                return None;
-            }
-        };
-        // WebView2 の生成は内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
-        // その間に他の定期タスクが App を更新すると gpui の借用と衝突して落ちるため、
-        // ここでカウンタを立てて知らせる。
-        let _pumping = WebviewPumpGuard::enter();
-        let webview = match builder.build(&window_handle) {
-            Ok(w) => w,
-            Err(e) => {
-                log::error!("dlsite login: wry build() failed: {e:?} | {e}");
-                return None;
-            }
-        };
-        let entity = cx.new(|cx| WebView::new(webview, window, cx));
-        entity.update(cx, |view, _| {
+        // 生成は App の借用外（Windows はタスク）で行われる。理由は
+        // `super::create_login_webview` のドキュメント参照。
+        super::create_login_webview(
+            &mut this,
+            window,
+            cx,
+            // incognito（non-persistent）WebView: Cookie はメモリのみ。
+            // 永続ストアだと再ログイン時に SSO で自動再ログインされるため使わない。
+            true,
             // ストアのログインルートを起点にする。これは viviON のログインフォーム
             // （login.dlsite.com の oauth2 consumer SSO）を最初に表示し、ログイン完了で
             // www.dlsite.com/home/mypage へ戻って認証セッション（__DLsite_SID + uid_jp /
@@ -77,12 +58,22 @@ impl DlsiteLoginView {
             // 直接 login.dlsite.com/login?user=self は consumer SSO を完了せずゲストのまま、
             // www.dlsite.com/ を最初に出すとログインフォームが出ない（手動でログインを
             // クリックが必要）ため、このストアログインルートを使う。
-            view.load_url(
-                "https://www.dlsite.com/home/login/=/skip_register/1/_query/https://www.dlsite.com/home/mypage",
-            );
-            view.hide();
-        });
-        Some(entity)
+            "https://www.dlsite.com/home/login/=/skip_register/1/_query/https://www.dlsite.com/home/mypage",
+            |this, webview, window, cx| {
+                this.webview = Some(webview);
+                this.apply_webview_bounds(window, cx);
+                // 生成前に show() されていたら、その意図をここで反映する。
+                if this.visible
+                    && let Some(webview) = &this.webview
+                {
+                    webview.update(cx, |view, _| view.show());
+                }
+                // 生成完了を 1 回描画へ反映する（配置と可視化のため）。
+                cx.notify();
+            },
+        );
+        this.start_url_check(cx);
+        this
     }
 
     fn start_url_check(&mut self, cx: &mut Context<Self>) {
@@ -96,10 +87,8 @@ impl DlsiteLoginView {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                // WebView2 がメッセージループを回している間は更新しない（次の tick に回す）。
-                if crate::app_state::webview_pumping() > 0 {
-                    continue;
-                }
+                // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
+                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                 let Ok(done) = handle.update(cx, |this, cx| {
                     if this.check_generation != generation {
                         return true;
@@ -139,7 +128,7 @@ impl DlsiteLoginView {
         // 0 件になる）。
         // Cookie 取得も内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
         let _pumping = WebviewPumpGuard::enter();
-        let mut origins: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut origins: BTreeMap<String, BTreeMap<String, CookieEntry>> = BTreeMap::new();
         for url in SESSION_ORIGINS {
             let cookies = webview
                 .read(cx)
@@ -154,7 +143,7 @@ impl DlsiteLoginView {
             for cookie in cookies {
                 entry
                     .entry(cookie.name().to_string())
-                    .or_insert_with(|| cookie.value().to_string());
+                    .or_insert_with(|| super::cookie_entry(&cookie));
             }
         }
         let session = DlsiteSession::new(origins);
@@ -175,6 +164,7 @@ impl DlsiteLoginView {
         }
         log::info!("dlsite login: {} cookies captured", session.cookies_count());
         crate::app_state::save_dlsite_session(cx, &session);
+        self.visible = false;
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| view.hide());
         }
@@ -183,6 +173,7 @@ impl DlsiteLoginView {
     }
 
     pub fn show(&mut self, cx: &mut Context<Self>) {
+        self.visible = true;
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| view.show());
         }
@@ -192,18 +183,20 @@ impl DlsiteLoginView {
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.check_generation += 1;
+        self.visible = false;
         if let Some(webview) = self.webview.take() {
             webview.update(cx, |view, _| view.hide());
         }
     }
-}
 
-impl EventEmitter<DlsiteLoginDone> for DlsiteLoginView {}
-impl EventEmitter<DlsiteLoginCancelled> for DlsiteLoginView {}
-
-impl Render for DlsiteLoginView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // モーダル領域（中央 640x480）に WebView を配置する
+    /// WebView をモーダル領域（中央 640x480）へ配置する。
+    ///
+    /// 生成が非同期（Windows はタスク）なので、生成直後にも呼ぶ。`render` 任せだと
+    /// 生成完了後に再描画が走らず、**配置されないまま表示**される。
+    fn apply_webview_bounds(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(webview) = &self.webview else {
+            return;
+        };
         let bounds = {
             let window_bounds = window.bounds();
             let width = 640.0_f32;
@@ -221,20 +214,27 @@ impl Render for DlsiteLoginView {
                 },
             )
         };
-        if let Some(webview) = &self.webview {
-            webview.update(cx, |view, _| {
-                let _ = view.raw().set_bounds(lb_wry::Rect {
-                    position: lb_wry::dpi::Position::Physical(lb_wry::dpi::PhysicalPosition::new(
-                        bounds.origin.x.as_f32() as i32,
-                        bounds.origin.y.as_f32() as i32,
-                    )),
-                    size: lb_wry::dpi::Size::Physical(lb_wry::dpi::PhysicalSize::new(
-                        bounds.size.width.as_f32() as u32,
-                        bounds.size.height.as_f32() as u32,
-                    )),
-                });
+        webview.update(cx, |view, _| {
+            let _ = view.raw().set_bounds(lb_wry::Rect {
+                position: lb_wry::dpi::Position::Physical(lb_wry::dpi::PhysicalPosition::new(
+                    bounds.origin.x.as_f32() as i32,
+                    bounds.origin.y.as_f32() as i32,
+                )),
+                size: lb_wry::dpi::Size::Physical(lb_wry::dpi::PhysicalSize::new(
+                    bounds.size.width.as_f32() as u32,
+                    bounds.size.height.as_f32() as u32,
+                )),
             });
-        }
+        });
+    }
+}
+
+impl EventEmitter<DlsiteLoginDone> for DlsiteLoginView {}
+impl EventEmitter<DlsiteLoginCancelled> for DlsiteLoginView {}
+
+impl Render for DlsiteLoginView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_webview_bounds(window, cx);
         div()
             .id("dlsite-login-backdrop")
             .absolute()
@@ -278,6 +278,7 @@ impl Render for DlsiteLoginView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
 
     /// テスト用のウィンドウルート（描くものは無い）。

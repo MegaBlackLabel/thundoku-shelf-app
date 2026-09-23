@@ -155,6 +155,11 @@ pub struct AppState {
 /// `RefCell already borrowed` で panic する（実測: DLsite のログインを開いた瞬間に
 /// `Workspace::start_login_done_watcher` の update が衝突して abort した）。
 ///
+/// **生成は借用の外へ出した**（`views::create_login_webview` が Windows では
+/// `Context::spawn_in` のタスクで作る）ので、このガードが無くても衝突しない。
+/// 残るのは **Cookie 取得・URL 取得**（WebView を保持する entity の中から呼ぶため
+/// 借用を外せない）で、そこは今もこのガードに頼っている。
+///
 /// 定期タスクは tick の先頭で [`webview_pumping`] を見て、0 でなければ次の tick に回す。
 /// AppState ではなく static なのは、**借用せずに読める**ようにするため（判定のために
 /// 借用を取ること自体がこの問題の引き金なので、それでは意味がない）。
@@ -163,6 +168,23 @@ static WEBVIEW_PUMPING: AtomicUsize = AtomicUsize::new(0);
 /// WebView2 を触っている最中か（カウンタ値。0 なら触っていない）。
 pub fn webview_pumping() -> usize {
     WEBVIEW_PUMPING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// WebView2 がメッセージループを回している間、**タイマーで譲りながら待つ**。
+///
+/// WebView2 の呼び出し（生成・Cookie 取得）は内部でメッセージループを回し、その間に
+/// gpui の前景タスクを走らせる。このとき App を借用していると `RefCell already borrowed`
+/// でタスクが落ちる（理由は [`webview_pumping`]）。待たずに `continue` で回すと
+/// **相手のメッセージループが戻らないまま互いに待ち合う**ため、必ずタイマーで譲る。
+///
+/// ```ignore
+/// crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
+/// handle.update(cx, |this, cx| { ... });
+/// ```
+pub async fn wait_while_webview_pumping(executor: &gpui_kit::gpui::BackgroundExecutor) {
+    while webview_pumping() > 0 {
+        executor.timer(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// WebView2（メッセージループを回す API）を呼んでいる間だけカウンタを立てるガード。

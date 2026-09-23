@@ -340,10 +340,8 @@ impl Workspace {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(100))
                     .await;
-                // WebView2 がメッセージループを回している間は更新しない（次の tick に回す）。
-                if crate::app_state::webview_pumping() > 0 {
-                    continue;
-                }
+                // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
+                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                 // 認証モーダルを開く要求（SettingsView → 直接 update の RefCell 再入を回避）
                 if auth_open.load(std::sync::atomic::Ordering::SeqCst) {
                     auth_open.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -492,6 +490,8 @@ impl Workspace {
                     }
                     (any_changed, session_expired)
                 };
+                // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
+                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                 if session_expired && !auth_dispatched {
                     auth_dispatched = true;
                     cx.update(|app| {
@@ -592,6 +592,8 @@ impl Workspace {
                     .timer(Duration::from_millis(3000))
                     .await;
                 // マウスがウィンドウ内のサイドバー領域（左端 256px）にあるか
+                // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
+                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                 let in_sidebar = cx
                     .update(|window, _| {
                         let m = window.mouse_position();

@@ -1869,9 +1869,7 @@ impl ImageViewer {
                     .timer(Duration::from_millis(interval_ms))
                     .await;
                 // WebView2 がメッセージループを回している間は更新しない（次のフレームに回す）。
-                if crate::app_state::webview_pumping() > 0 {
-                    continue;
-                }
+                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                 let done = handle.update(cx, |this, cx| {
                     if !this.autoplay || this.autoplay_generation != generation {
                         return true;
@@ -2026,9 +2024,7 @@ impl ImageViewer {
                     .timer(Duration::from_millis(16))
                     .await;
                 // WebView2 がメッセージループを回している間は更新しない（次のフレームに回す）。
-                if crate::app_state::webview_pumping() > 0 {
-                    continue;
-                }
+                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                 let stop = handle.update(cx, |this, cx| {
                     if this.inertia_generation != generation {
                         return true;

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::session_cookies::HostScopedCookies;
+use crate::session_cookies::{CookieEntry, HostScopedCookies};
 
 /// BOOTH のセッション（`booth.pm` / `accounts.booth.pm` の Cookie 群）。
 ///
@@ -20,9 +20,17 @@ pub struct BoothSession {
 }
 
 impl BoothSession {
-    pub fn new(origins: BTreeMap<String, BTreeMap<String, String>>) -> Self {
+    /// 収集元ホスト →（Cookie 名 → 属性つき Cookie）。ログイン時に WebView から作る。
+    pub fn new(origins: BTreeMap<String, BTreeMap<String, CookieEntry>>) -> Self {
         Self {
             origins: HostScopedCookies::new(origins),
+        }
+    }
+
+    /// 1 つの収集元を**値だけの Cookie** で作る（属性なし = host-only / `Path` なし / 非 Secure）。
+    pub fn from_origin(host: &str, cookies: BTreeMap<String, String>) -> Self {
+        Self {
+            origins: HostScopedCookies::from_origin(host, cookies),
         }
     }
 
@@ -31,11 +39,12 @@ impl BoothSession {
         !self.origins.is_empty()
     }
 
-    /// 宛先ホスト向けの `Cookie: name=value; ...` ヘッダー値。
+    /// 宛先 URL 向けの `Cookie: name=value; ...` ヘッダー値。
     ///
-    /// **そのホスト向けに収集したものだけ**を返す（収集元と完全一致。大小文字は区別しない）。
-    pub fn cookie_header_for(&self, host: &str) -> String {
-        self.origins.header_for(host)
+    /// **その URL のホスト向けに収集した Cookie だけ**を返し、`Path` / `Secure` / 期限も
+    /// 満たすものだけを載せる（`HostScopedCookies::header_for_url`）。
+    pub fn cookie_header_for_url(&self, url: &str) -> String {
+        self.origins.header_for_url(url)
     }
 
     pub fn cookies_count(&self) -> usize {
@@ -179,15 +188,12 @@ impl BoothClient {
         }
     }
 
-    /// 宛先 URL 向けの `Cookie` ヘッダー値。**そのホスト向けに収集したものだけ**を返す。
+    /// 宛先 URL 向けの `Cookie` ヘッダー値。**その URL のホスト向けに収集したものだけ**を返す。
     ///
     /// URL が解釈できない（`https` でない等）ときは空にする（fail-closed。
     /// 送信先が確定できないリクエストに資格情報を載せない）。
     fn cookie_for(&self, url: &str) -> String {
-        match crate::download_url::parse(url) {
-            Ok(parsed) => self.session.cookie_header_for(parsed.host),
-            Err(_) => String::new(),
-        }
+        self.session.cookie_header_for_url(url)
     }
 
     /// サーバー側のセッションを無効化する（ログアウト）。
@@ -737,14 +743,18 @@ mod tests {
 
     /// 収集元が 2 つ（booth.pm / accounts.booth.pm）のセッション。
     fn two_origin_session() -> BoothSession {
+        use crate::session_cookies::CookieEntry;
         BoothSession::new(BTreeMap::from([
             (
                 "booth.pm".to_string(),
-                BTreeMap::from([("_booth_session".to_string(), "abc123".to_string())]),
+                BTreeMap::from([(
+                    "_booth_session".to_string(),
+                    CookieEntry::new("abc123"),
+                )]),
             ),
             (
                 "accounts.booth.pm".to_string(),
-                BTreeMap::from([("_plaza_session".to_string(), "xyz".to_string())]),
+                BTreeMap::from([("_plaza_session".to_string(), CookieEntry::new("xyz"))]),
             ),
         ]))
     }
@@ -753,34 +763,40 @@ mod tests {
     fn session_logged_in_and_cookie_header() {
         let session = BoothSession::default();
         assert!(!session.logged_in(), "empty session is not logged in");
-        assert_eq!(session.cookie_header_for("booth.pm"), "");
+        assert_eq!(session.cookie_header_for_url("https://booth.pm/ja"), "");
 
         let session = two_origin_session();
         assert!(session.logged_in());
-        assert_eq!(session.cookie_header_for("booth.pm"), "_booth_session=abc123");
         assert_eq!(
-            session.cookie_header_for("accounts.booth.pm"),
+            session.cookie_header_for_url("https://booth.pm/ja"),
+            "_booth_session=abc123"
+        );
+        assert_eq!(
+            session.cookie_header_for_url("https://accounts.booth.pm/library"),
             "_plaza_session=xyz"
         );
     }
 
-    /// Cookie は宛先ホスト別に送る。**完全一致**なので、収集元のサブドメインや
+    /// Cookie は宛先 URL のホスト別に送る。**完全一致**なので、収集元のサブドメインや
     /// 別システム（画像 CDN など）へは送らない。
     #[test]
     fn session_cookie_header_is_scoped_to_the_destination_host() {
         let session = two_origin_session();
 
-        for host in [
-            "example.com",
-            "booth.pximg.net",
-            "sub.booth.pm",
-            "evilbooth.pm",
-            "BOOTH.PM.EVIL.EXAMPLE.COM",
+        for url in [
+            "https://example.com/ja",
+            "https://booth.pximg.net/x.jpg",
+            "https://sub.booth.pm/ja",
+            "https://evilbooth.pm/ja",
+            "https://booth.pm.evil.example.com/ja",
         ] {
-            assert_eq!(session.cookie_header_for(host), "", "{host}");
+            assert_eq!(session.cookie_header_for_url(url), "", "{url}");
         }
         // 大小文字だけの違いは同一ホスト
-        assert_eq!(session.cookie_header_for("BOOTH.PM"), "_booth_session=abc123");
+        assert_eq!(
+            session.cookie_header_for_url("https://BOOTH.PM/ja"),
+            "_booth_session=abc123"
+        );
         assert_eq!(session.cookies_count(), 2);
     }
 

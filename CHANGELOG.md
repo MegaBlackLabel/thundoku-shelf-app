@@ -6,6 +6,49 @@
 
 ### Fixed
 
+- **`Domain` 属性つき Cookie を 1 つも送らない不具合を直す（ログイン後に「セッション切れ・未ログイン」になる）**:
+  Cookie を属性つきで保存するようにした際、`Domain` に先頭ドットが無いものを **host-only**
+  と解釈していた。しかし RFC 6265 では `Domain` のドットは有無に関わらずサブドメインに適用され、
+  **WebView2 は domain 指定をドット無し（`dlsite.com`）で返す**。このため `www.dlsite.com` への
+  リクエストで `__DLsite_SID` / `uhashjp` / `uid_jp`（すべて `domain=dlsite.com`）が除外され、
+  **ログインは成功しているのに同期が未ログイン扱い**になり、再ログイン画面が出ていた
+  （実測: 同期 URL 向けヘッダが 2 個 → 修正後 21 個。FANZA も `domain=dmm.co.jp` で同じ）。
+  判定を「ドットを無視して『ホスト自身 or そのサブドメイン』」に統一した。収集元の完全一致で
+  宛先を絞る方針は変えていないので、CDN など別システムへ広がることはない。
+  `crates/core/src/session_cookies.rs`
+
+- **ログイン画面の WebView を生成直後に配置する**: WebView の `set_bounds` は各ビューの
+  `render` でしか呼んでいなかったため、生成をタスクへ出した（下記）後は**生成完了後に
+  再描画が走らず、WebView が配置されないまま**表示されていた（中身は読み込まれて
+  ログインも成功するのに、画面が真っ白 / 位置がおかしい状態）。bounds 適用を
+  `apply_webview_bounds` に切り出して `render` と**生成直後の両方**から呼び、
+  生成完了時に `cx.notify()` で 1 回描画へ反映する。
+  `crates/app/src/views/{mod,dlsite_login,fanza_login,booth_login,tbf_login}.rs`
+
+- **WebView2 のポンプ待ちを「タイマーで譲る」に統一する**:
+  メッセージループ中の更新回避を `if webview_pumping() > 0 { continue; }` で書いていたため、
+  ループの形によっては**タイマーを挟まずに回り続け**、相手のメッセージループが戻らないまま
+  互いに待ち合っていた（ログの `foreground task timeout reached` と、それに続く
+  `RefCell already borrowed` の原因）。`app_state::wait_while_webview_pumping(executor)` を
+  追加し、**待つ**形へ統一（11 か所）。あわせて、ガードが無かった定期タスク
+  （FANZA タグ取得の完了反映、サイドバー自動クローズ、チェックリストのポーリング）にも
+  同じ待ちを入れた。
+  `crates/app/src/app_state.rs`、`crates/app/src/{workspace,views/bookshelf,views/{dlsite,fanza,booth,tbf}_login,components/image_viewer/mod}.rs`
+
+- **WebView2 の生成を App の借用外へ出し、ログインを開いた瞬間の `RefCell already borrowed` を無くす**:
+  `WebViewBuilder::build` は内部で `webview2_com::wait_with_pump` を呼び、**Windows の
+  メッセージループを回す**。gpui はメッセージを処理するたびに保留中の foreground タスクを
+  実行するため、entity の構築中（= App を借用中）にこれを呼ぶと、その間に走った他タスクの
+  `update` が `RefCell already borrowed` で弾かれる（実機ログではログインを開いた 1 秒間に
+  58 行の `ERROR` が出ていた）。生成を `Context::spawn_in` のタスクへ出し、ウィンドウ
+  ハンドルは HWND の値だけ持ち運ぶ `OwnedHwnd`（`raw_window_handle::HasWindowHandle` を
+  自前で実装）にして借用を切った。既存の `WebviewPumpGuard` は**生成には不要**になり、
+  借用を外せない Cookie / URL 取得（WebView entity の中から呼ぶ）専用として残る。
+  生成が非同期になったぶん、`show()` が生成完了より先に呼ばれても表示が失われないよう
+  各ビューに表示意図（`visible`）を持たせて生成完了時に反映する。
+  `crates/app/src/views/mod.rs`、`crates/app/src/views/{dlsite,fanza,booth,tbf}_login.rs`、
+  `crates/app/src/app_state.rs`
+
 - **ダウンロードの宛先をさらに絞り、ログイン完了判定のホスト検証を直す**: DLsite の
   ダウンロード（`down_url`）は `*.dlsite.com` を許していたため、改変したバックアップで
   `dl.dlsite.com` のような別サブドメインを指されると（Cookie は宛先別で空になるものの）
@@ -42,6 +85,22 @@
   持っているので、穴が空いていたのは DLsite だけだった。
 
 ### Changed
+
+- **Cookie を値だけでなく属性つきで保持する（Cookie Jar 化）**: 保存していたのは
+  `ホスト → Cookie 名 → 値` だけで、ブラウザ本来の `Domain` / `Path` / `Secure` /
+  `HttpOnly` / `SameSite` / `Expires` を捨てていた。そのため (1) `Path` を無視して
+  リクエスト先のパスに無関係な Cookie まで送る、(2) host-only Cookie（`Domain` 未指定）を
+  収集元のサブドメインへ送る余地が残る、(3) `Secure` の意味が失われる、という状態だった。
+  `CookieEntry`（属性つき）を導入し、**送信時に `Path` 前方一致と `Secure` を判定**、
+  `Domain` 未指定は **host-only として完全一致のみ**に送る。収集（WebView から）と復元
+  （バックアップから）の両方で属性を取り込み、**ドメインが収集元と一致しない Cookie は
+  採用しない**（`evil.example.com` の cookie jar から `www.dmm.co.jp` のセッションを
+  植え付けられないようにする）。保存形式は属性つきへ変わるが、**旧形式（値だけ）も読める**
+  ので、既存の保存済みセッションはそのまま動く（値だけの分は host-only / `Path` なし /
+  非 Secure として扱う）。Cookie が常に 1 件以上ある経路ではファイルサイズはほぼ変わらない。
+  `crates/core/src/session_cookies.rs`、`crates/core/src/{booth,dlsite,fanza}.rs`、
+  `crates/core/src/{dlsite,fanza}/client.rs`、`crates/app/src/views/{mod,booth_login,dlsite_login,fanza_login}.rs`、
+  `crates/app/src/app_state.rs`
 
 - **Cookie の宛先を完全一致にし、BOOTH も収集元ホスト別に持つ**: セッション Cookie は
   収集元（`www.dmm.co.jp` / `accounts.dmm.co.jp`、`www.dlsite.com` / `login.dlsite.com`）別に

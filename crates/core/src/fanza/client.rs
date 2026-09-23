@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::fanza::classify;
-use crate::session_cookies::HostScopedCookies;
+use crate::session_cookies::{CookieEntry, HostScopedCookies};
 use crate::tbf::TbfError;
 use crate::tbf::transport::{RequestSpec, ResponseSpec, Transport};
 use serde::Deserialize;
@@ -97,7 +97,8 @@ pub struct FanzaSession {
 }
 
 impl FanzaSession {
-    pub fn new(origins: BTreeMap<String, BTreeMap<String, String>>) -> Self {
+    /// 収集元ホスト →（Cookie 名 → 属性つき Cookie）。ログイン時に WebView から作る。
+    pub fn new(origins: BTreeMap<String, BTreeMap<String, CookieEntry>>) -> Self {
         Self {
             origins: HostScopedCookies::new(origins),
         }
@@ -119,13 +120,13 @@ impl FanzaSession {
         self.origins.value(host, name)
     }
 
-    /// 宛先ホスト向けの Cookie ヘッダ。**そのホスト向けに収集したものだけ**を返す
-    /// （収集元と一致するか、その収集元の子ドメイン）。
+    /// 宛先 URL 向けの Cookie ヘッダ。**その URL のホスト向けに収集した Cookie だけ**を返し、
+    /// `Path` / `Secure` / 期限も満たすものだけを載せる（`HostScopedCookies::header_for_url`）。
     ///
     /// 収集元すべてをまとめる API は**持たない**: `downloadLinks` の proxy のように宛先が
     /// 実行時に決まる送信先へ、片方の収集元にしか送るべきでない Cookie を載せないため。
-    pub fn cookie_header_for(&self, host: &str) -> String {
-        self.origins.header_for(host)
+    pub fn cookie_header_for_url(&self, url: &str) -> String {
+        self.origins.header_for_url(url)
     }
 
     pub fn cookies_count(&self) -> usize {
@@ -220,9 +221,9 @@ impl FanzaClient {
         Self { transport, session }
     }
 
-    fn cookie_headers_for(&self, host: &str) -> Vec<(String, String)> {
+    fn cookie_headers_for(&self, url: &str) -> Vec<(String, String)> {
         vec![
-            ("Cookie".to_string(), self.session.cookie_header_for(host)),
+            ("Cookie".to_string(), self.session.cookie_header_for_url(url)),
             ("Accept".to_string(), "application/json".to_string()),
             ("User-Agent".to_string(), user_agent()),
         ]
@@ -239,10 +240,11 @@ impl FanzaClient {
     }
 
     fn get_json(&mut self, url: &str) -> Result<Value, FanzaError> {
+        let headers = self.cookie_headers_for(url);
         let spec = RequestSpec {
             method: "GET".into(),
             url: url.into(),
-            headers: self.cookie_headers_for(SITE_HOST),
+            headers,
             body: None,
             redirects: 3,
         };
@@ -337,10 +339,11 @@ impl FanzaClient {
     /// 作品ページ（SSR HTML、一般公開）からジャンルタグ等を取得する。
     pub fn product_page(&mut self, cid: &str) -> Result<FanzaProductPage, FanzaError> {
         let url = format!("https://www.dmm.co.jp/dc/doujin/-/detail/=/cid={cid}/");
+        let headers = self.cookie_headers_for(&url);
         let spec = RequestSpec {
             method: "GET".into(),
             url,
-            headers: self.cookie_headers_for(SITE_HOST),
+            headers,
             body: None,
             redirects: 3,
         };
@@ -367,13 +370,14 @@ impl FanzaClient {
         // その 302 の `Location` のどちらも外部ホストを指し得る。
         let proxy = crate::download_url::check(download_url, FANZA_DOWNLOAD_RULES)
             .map_err(|error| FanzaError::BlockedUrl(format!("{download_url}: {error}")))?;
-        // proxy へは**宛先ホスト向けに収集した Cookie だけ**を送る。www と accounts を
+        // proxy へは**宛先 URL のホスト向けに収集した Cookie だけ**を送る。www と accounts を
         // 1 本にまとめると、`downloadLinks` が別サブドメインを指したときに
         // もう片方の収集元の Cookie まで飛ぶ（宛先は許可リスト内でも別システム）。
+        // `Path` / `Secure` / 期限も見る（`HostScopedCookies::header_for_url`）。
         let proxy_headers = vec![
             (
                 "Cookie".to_string(),
-                self.session.cookie_header_for(proxy.host),
+                self.session.cookie_header_for_url(download_url),
             ),
             ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
@@ -416,7 +420,7 @@ impl FanzaClient {
         //
         //    www / accounts の**セッション Cookie は CDN へ送らない**（別システムなので
         //    要らない）。宛先ホスト向けに収集した Cookie だけを載せる。
-        let mut cookie = self.session.cookie_header_for(cdn.host);
+        let mut cookie = self.session.cookie_header_for_url(&cd_url);
         for (k, v) in proxy_resp.set_cookies() {
             if k.starts_with("CloudFront-") && !cookie.contains(&format!("{k}=")) {
                 if !cookie.is_empty() {
@@ -560,11 +564,11 @@ mod tests {
         FanzaSession::new(BTreeMap::from([
             (
                 SITE_HOST.to_string(),
-                BTreeMap::from([("login_id".to_string(), "abc".to_string())]),
+                BTreeMap::from([("login_id".to_string(), CookieEntry::new("abc"))]),
             ),
             (
                 ACCOUNT_HOST.to_string(),
-                BTreeMap::from([("acct".to_string(), "1".to_string())]),
+                BTreeMap::from([("acct".to_string(), CookieEntry::new("1"))]),
             ),
         ]))
     }
