@@ -186,7 +186,7 @@ fn save_purchase(
         .unwrap_or(p.site_id.as_str());
     let age_category = meta.and_then(|m| m.age_category);
     let cfg = classify(&p.work_type, &p.genre_icons, site_id, age_category);
-    if !is_viewable_included(&cfg, true) {
+    if !is_viewable_included(&cfg) {
         return Ok(false);
     }
     let ts = now();
@@ -237,6 +237,8 @@ fn save_purchase(
         updated_at: ts,
         media_category: Some(media_to_str(cfg.media).into()),
         ai_type: Some(ai_to_str(cfg.ai).into()),
+        // 同期では DRM を判定できない（実データではなく既定値）。DRM 付きは
+        // 取り込み時に読める形式でなければ失敗する（`ImportError::NotAReadableWork`）。
         is_drm: 0,
         release_date: meta.and_then(|m| m.regist_date.clone()),
         description: None,

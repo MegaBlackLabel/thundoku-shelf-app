@@ -111,13 +111,17 @@ pub fn classify(
     }
 }
 
-/// ビューアー（画像系）対象か。画像系（`Comic` / `Cg`。AI バリアント含む）かつ DRM 無しのみ。
-pub fn is_viewable_included(meta: &DlsiteMeta, drm_ok: bool) -> bool {
-    drm_ok
-        && matches!(
-            meta.media,
-            DlsiteMediaCategory::Comic | DlsiteMediaCategory::Cg
-        )
+/// ビューアー（画像系）対象か。画像系（`Comic` / `Cg`。AI バリアント含む）のみ。
+///
+/// **DRM の有無はここでは見ない**。同期の時点では DRM を判定できない
+/// （FANZA は取り込み直前に詳細 API で判定して拒否し、DLsite は取り込み時に
+/// 読める形式でなければ失敗する）。`bookshelf_items.is_drm` も実データではなく
+/// 同期が入れる既定値なので、判定材料にしない。
+pub fn is_viewable_included(meta: &DlsiteMeta) -> bool {
+    matches!(
+        meta.media,
+        DlsiteMediaCategory::Comic | DlsiteMediaCategory::Cg
+    )
 }
 
 /// `DlsiteMediaCategory` → 正規化文字列（`bookshelf_items.media_category` の値）。
@@ -218,76 +222,27 @@ mod tests {
         assert_eq!(classify("MNG", &[], "home", None).age, None);
     }
 
-    /// 画像系（comic/cg。AI 含む）+ DRM 無しのみ viewable。ノベル / 音声 / ゲーム /
-    /// 動画 / 不明は除外。
+    /// 画像系（comic/cg。AI 含む）のみ viewable。ノベル / 音声 / ゲーム / 動画 / 不明は除外。
+    /// **DRM は同期では判定できない**（取り込み時に読めなければ失敗する）ので判定に含めない。
     #[test]
-    fn is_viewable_included_filters_image_only_and_drm() {
+    fn is_viewable_included_filters_image_media_only() {
         use DlsiteAiType::FullAi;
         use DlsiteMediaCategory::*;
-        assert!(is_viewable_included(
-            &DlsiteMeta {
-                media: Comic,
-                ai: DlsiteAiType::None,
-                age: None
-            },
-            true
-        ));
-        assert!(is_viewable_included(
-            &DlsiteMeta {
-                media: Cg,
-                ai: FullAi,
-                age: None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &DlsiteMeta {
-                media: Voice,
-                ai: DlsiteAiType::None,
-                age: None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &DlsiteMeta {
-                media: Game,
-                ai: DlsiteAiType::None,
-                age: None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &DlsiteMeta {
-                media: Novel,
-                ai: DlsiteAiType::None,
-                age: None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &DlsiteMeta {
-                media: Video,
-                ai: DlsiteAiType::None,
-                age: None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &DlsiteMeta {
-                media: Other,
-                ai: DlsiteAiType::None,
-                age: None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &DlsiteMeta {
-                media: Comic,
-                ai: DlsiteAiType::None,
-                age: None
-            },
-            false
-        )); // DRM
+        for (media, ai, expected) in [
+            (Comic, DlsiteAiType::None, true),
+            (Cg, FullAi, true),
+            (Voice, DlsiteAiType::None, false),
+            (Game, DlsiteAiType::None, false),
+            (Novel, DlsiteAiType::None, false),
+            (Video, DlsiteAiType::None, false),
+            (Other, DlsiteAiType::None, false),
+        ] {
+            assert_eq!(
+                is_viewable_included(&DlsiteMeta { media, ai, age: None }),
+                expected,
+                "{media:?} / {ai:?}"
+            );
+        }
     }
 
     /// 正規化文字列（DB 値）。

@@ -86,10 +86,13 @@ pub fn classify(image_src: &str, genre: &str) -> FanzaMeta {
     }
 }
 
-/// ビューアー（画像系）対象か。画像系（`Comic` / `Cg`。AI バリアント含む）かつ
-/// DRM 無しだけを許可する。ボイス / ゲーム / 動画は含めない。
-pub fn is_viewable_included(meta: &FanzaMeta, drm_ok: bool) -> bool {
-    drm_ok && matches!(meta.media, MediaCategory::Comic | MediaCategory::Cg)
+/// ビューアー（画像系）対象か。画像系（`Comic` / `Cg`。AI バリアント含む）のみ。
+///
+/// **DRM の有無はここでは見ない**。同期の時点では DRM を判定できない
+/// （取り込み直前に詳細 API で判定し、DRM 付きは拒否する）。`bookshelf_items.is_drm` も
+/// 実データではなく同期が入れる既定値なので、判定材料にしない。
+pub fn is_viewable_included(meta: &FanzaMeta) -> bool {
+    matches!(meta.media, MediaCategory::Comic | MediaCategory::Cg)
 }
 
 /// `MediaCategory` → 正規化文字列（`bookshelf_items.media_category` の値）。
@@ -194,57 +197,23 @@ mod tests {
         );
     }
 
-    /// 画像系（comic/cg。AI 含む）+ DRM 無しのみ viewable。未知メディアは安全側（除外）。
+    /// 画像系（comic/cg。AI 含む）のみ viewable。未知メディアは安全側（除外）。
+    /// **DRM は同期では判定できない**（取り込み直前に詳細 API で判定して拒否する）ので含めない。
     #[test]
-    fn is_viewable_included_filters_image_only_and_drm() {
-        assert!(is_viewable_included(
-            &FanzaMeta {
-                media: MediaCategory::Comic,
-                ai: AiType::None
-            },
-            true
-        ));
-        assert!(is_viewable_included(
-            &FanzaMeta {
-                media: MediaCategory::Comic,
-                ai: AiType::FullAi
-            },
-            true
-        ));
-        assert!(is_viewable_included(
-            &FanzaMeta {
-                media: MediaCategory::Cg,
-                ai: AiType::PartialAi
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &FanzaMeta {
-                media: MediaCategory::Voice,
-                ai: AiType::None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &FanzaMeta {
-                media: MediaCategory::Game,
-                ai: AiType::None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &FanzaMeta {
-                media: MediaCategory::Video,
-                ai: AiType::None
-            },
-            true
-        ));
-        assert!(!is_viewable_included(
-            &FanzaMeta {
-                media: MediaCategory::Comic,
-                ai: AiType::None
-            },
-            false
-        )); // DRM 付き
+    fn is_viewable_included_filters_image_media_only() {
+        for (media, ai, expected) in [
+            (MediaCategory::Comic, AiType::None, true),
+            (MediaCategory::Comic, AiType::FullAi, true),
+            (MediaCategory::Cg, AiType::PartialAi, true),
+            (MediaCategory::Voice, AiType::None, false),
+            (MediaCategory::Game, AiType::None, false),
+            (MediaCategory::Video, AiType::None, false),
+        ] {
+            assert_eq!(
+                is_viewable_included(&FanzaMeta { media, ai }),
+                expected,
+                "{media:?} / {ai:?}"
+            );
+        }
     }
 }

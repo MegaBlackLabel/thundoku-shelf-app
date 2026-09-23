@@ -157,7 +157,7 @@ fn finish_batch(
 /// 購入 1 件を本棚へ upsert する（画像系以外は保存しない）。保存したら `true`。
 fn save_purchase(pool: &SqlitePool, p: FanzaPurchase) -> Result<bool, FanzaError> {
     let meta = classify(&p.image_src, &p.genre);
-    if !is_viewable_included(&meta, true) {
+    if !is_viewable_included(&meta) {
         return Ok(false);
     }
     let ts = now();
@@ -189,6 +189,8 @@ fn save_purchase(pool: &SqlitePool, p: FanzaPurchase) -> Result<bool, FanzaError
         updated_at: ts,
         media_category: Some(media_to_str(meta.media).into()),
         ai_type: Some(ai_to_str(meta.ai).into()),
+        // 同期では DRM を判定できない（実データではなく既定値）。DRM 付きは取り込み直前に
+        // 詳細 API で判定して拒否する（`bookshelf.rs` の `detail.is_drm`）。
         is_drm: 0,
         release_date: None,
         description: None,
