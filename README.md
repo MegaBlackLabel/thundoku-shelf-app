@@ -1,6 +1,6 @@
 # Thundoku Shelf
 
-各ストアで購入した同人誌を、デスクトップで管理・閲覧するアプリです。
+Webサイトで購入した電子書籍の同人誌を、デスクトップで閲覧するビューアーアプリです。
 
 > **本アプリは非公式のアプリです。** 個人が開発しているもので、DMM.com、FANZA、DLsite、BOOTH、
 > 技術書典をはじめとする各サービスの運営会社とは提携・関連しておらず、各社による提供・承認・
@@ -66,7 +66,6 @@
 
 - **不具合・要望の報告**: アプリの「レポート」機能（GitHub ログインが必要）から送るか、[Issues](https://github.com/MegaBlackLabel/thundoku-shelf-app/issues/new/choose) へどうぞ。Issue テンプレートを用意しています
 - **バージョンの確認**: 「このアプリについて」画面の下部に出ています
-- **機能の詳細と既知の制約**: [docs/features.md](docs/features.md)
 
 ## 既知の制約
 
@@ -76,10 +75,6 @@
 - 「レポート」の画像添付は、投稿先リポジトリへの書き込み権限が必要です。権限が無い場合は本文のみで送信できます
 - レポートの投稿先はこのアプリのリポジトリ（`MegaBlackLabel/thundoku-shelf-app`）に固定です
 - macOS 版は Developer ID で署名し、Apple の公証（Notarization）を受けています。v0.2.5 以前の配布物は未署名・未公証で、初回だけ Gatekeeper の解除が必要です（手順はその配布物に同梱の「はじめにお読みください」にあります）
-
-## 開発者向け
-
-実装の詳細・設計メモ・DB スキーマは [docs/](docs/) にあります。ビルドやテストはリポジトリの `.mise.toml` のタスク（`mise run build` / `mise run test` / `mise run lint`）を使ってください。
 
 ## ライセンス
 
