@@ -400,6 +400,9 @@ impl FanzaClient {
         // 転送先も検証する（任意ホストへ Cookie を転送させない）。
         let cdn = crate::download_url::check(&cd_url, FANZA_CDN_RULES)
             .map_err(|error| FanzaError::BlockedUrl(format!("{cd_url}: {error}")))?;
+        // 実機で観測したホストを残す（proxy の許可リストを実測値まで狭めるための材料。
+        // `downloadLinks` は絶対 URL を返すことがあり、`www` 以外のホストは未確認）。
+        log::info!("fanza download: proxy={} cdn={}", proxy.host, cdn.host);
         // 2) CDN へ直接（署名 Cookie のみのフルブラウザヘッダ付き）
         //    署名 Cookie（CloudFront-*）はログイン時ではなく、このダウンロード proxy の
         //    応答（Set-Cookie）で lazy に発行されるため、ここで取って CDN へ送る。

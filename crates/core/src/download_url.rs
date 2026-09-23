@@ -45,17 +45,30 @@ impl HostRule {
     }
 }
 
-/// ルールが `host` に一致するか（大文字小文字は区別しない）。
-fn host_matches(rule: &HostRule, host: &str) -> bool {
-    if host.eq_ignore_ascii_case(rule.host) {
-        return true;
+/// `host` が `domain` そのもの、またはそのサブドメインか（大文字小文字は区別しない）。
+///
+/// `<something>.domain` の形だけを許す（`evilbooth.pm` のような接尾辞の部分一致は不可）。
+/// ログイン完了判定（WebView が目的のサイトへ戻ったか）と Cookie の収集元判定が使う。
+pub fn host_within(host: &str, domain: &str) -> bool {
+    let (host, domain) = (host.as_bytes(), domain.as_bytes());
+    if host.len() == domain.len() {
+        return host.eq_ignore_ascii_case(domain);
     }
-    if !rule.subdomains || host.len() <= rule.host.len() {
+    if host.len() < domain.len() {
         return false;
     }
-    // `<something>.host` の形だけを許す（`evilhost` のような部分一致は不可）。
-    host[..host.len() - rule.host.len()].ends_with('.')
-        && host[host.len() - rule.host.len()..].eq_ignore_ascii_case(rule.host)
+    // `<something>.domain` の形だけを許す（`evilhost` のような部分一致は不可）。
+    host[host.len() - domain.len() - 1] == b'.'
+        && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain)
+}
+
+/// ルールが `host` に一致するか（大文字小文字は区別しない）。
+fn host_matches(rule: &HostRule, host: &str) -> bool {
+    if rule.subdomains {
+        host_within(host, rule.host)
+    } else {
+        host.len() == rule.host.len() && host.as_bytes().eq_ignore_ascii_case(rule.host.as_bytes())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -154,6 +167,27 @@ mod tests {
         assert_eq!(parsed.path, "/downloadables/12345");
     }
 
+    /// `host_within` は「そのドメイン or そのサブドメイン」だけを真にする
+    /// （`evilbooth.pm` のような接尾辞の部分一致は偽、大文字小文字は区別しない）。
+    ///
+    /// ログイン完了判定（WebView が目的のサイトに戻ったか）と Cookie の収集元判定が
+    /// これを使う。`ends_with("booth.pm")` は `evilbooth.pm` を通してしまう。
+    #[test]
+    fn host_within_requires_a_label_boundary() {
+        assert!(host_within("booth.pm", "booth.pm"));
+        assert!(host_within("accounts.booth.pm", "booth.pm"));
+        assert!(host_within("BOOTH.PM", "booth.pm"));
+        assert!(host_within("Accounts.Booth.pm", "booth.pm"));
+        assert!(host_within("techbookfest.org", "techbookfest.org"));
+
+        assert!(!host_within("evilbooth.pm", "booth.pm"));
+        assert!(!host_within("booth.pm.evil.example.com", "booth.pm"));
+        assert!(!host_within("eviltechbookfest.org", "techbookfest.org"));
+        assert!(!host_within("booth.p", "booth.pm"));
+        assert!(!host_within("", "booth.pm"));
+    }
+
+    /// 接尾辞の部分一致（`evildmm.co.jp`）は許可しない
     #[test]
     fn subdomain_rules_require_a_label_boundary() {
         const CDN: &[HostRule] = &[HostRule::with_subdomains("dmm.co.jp", None)];

@@ -122,10 +122,7 @@ impl BoothLoginView {
             "booth login check: url={}",
             url.split(['?', '#']).next().unwrap_or(&url)
         );
-        let is_booth = url
-            .parse::<url::Url>()
-            .map(|u| u.host_str().is_some_and(|h| h.ends_with("booth.pm")))
-            .unwrap_or(false);
+        let is_booth = super::url_is_on_host(&url, "booth.pm");
         // ログインページ自体から pixiv に遷移している間は待つ。
         // booth.pm に戻り、かつログインページでなければセッション確立とみなす。
         let on_sign_in = url.contains("/users/sign_in");

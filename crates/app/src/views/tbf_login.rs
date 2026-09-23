@@ -131,13 +131,7 @@ impl TbfLoginView {
         let Ok(url) = webview.read(cx).raw().url() else {
             return false;
         };
-        let is_tbf = url
-            .parse::<url::Url>()
-            .map(|u| {
-                u.host_str()
-                    .is_some_and(|h| h.ends_with("techbookfest.org"))
-            })
-            .unwrap_or(false);
+        let is_tbf = super::url_is_on_host(&url, "techbookfest.org");
         // ログインページ自体から遷移していない間は待つ。
         let on_login_page = url.contains("/user/signin");
         if !is_tbf || on_login_page {

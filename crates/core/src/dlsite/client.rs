@@ -38,19 +38,19 @@ fn user_agent() -> String {
     crate::ua::for_store(USER_AGENT, crate::ua::ENV_DLSITE)
 }
 
-/// ダウンロード要求を送ってよいホスト。
+/// ダウンロード要求を送ってよいホスト（**完全一致**）。
 ///
 /// `bookshelf_items.download_url`（= `down_url`）は Drive の JSON バックアップから
-/// 復元でき、改変したバックアップを復元させると外部ホストへセッション Cookie が
-/// 送られる。自サイトだけを許可する。
+/// 復元でき、改変したバックアップを復元させると外部ホストへリクエストを飛ばせる。
+/// 実測の `down_url` は `https://www.dlsite.com/{store}/download/=/product_id/{id}.html`
+/// なので、サブドメインまで許す必要が無い（Cookie は宛先別に絞ってあるため漏れはしないが、
+/// 未認証のリクエストも飛ばさないほうが安全）。
 const DLSITE_DOWNLOAD_RULES: &[crate::download_url::HostRule] =
-    &[crate::download_url::HostRule::with_subdomains(
-        "dlsite.com",
-        None,
-    )];
+    &[crate::download_url::HostRule::exact("www.dlsite.com", None)];
 
 /// 302 の転送先（署名 `jwt` + セッション Cookie を送る先）。Cookie は
 /// `domain=.dlsite.com` で発行されるため、その範囲（本体 + CDN）だけを許可する。
+/// 実測の CDN は `download.dlsite.com`。
 const DLSITE_CDN_RULES: &[crate::download_url::HostRule] =
     &[crate::download_url::HostRule::with_subdomains(
         "dlsite.com",
@@ -328,6 +328,8 @@ impl DlsiteClient {
         // 転送先も検証する（任意ホストへ Cookie を転送させない）。
         let cdn = crate::download_url::check(&cd_url, DLSITE_CDN_RULES)
             .map_err(|error| DlsiteError::BlockedUrl(format!("{cd_url}: {error}")))?;
+        // 実機で観測したホストを残す（許可リストを実測値まで狭めるための材料）。
+        log::info!("dlsite download: proxy={} cdn={}", proxy.host, cdn.host);
         // 2) CDN へ送る Cookie は**そのホスト向けに収集したもの + 署名 `jwt`** だけ。
         //    www の認証セッションは別システム（CDN）には要らないので送らない。
         //    `jwt` は 302 の Set-Cookie で渡される署名付きダウンロード鍵。
@@ -917,24 +919,30 @@ mod tests {
         assert_eq!(cookie_of(&proxy), "__DLsite_SID=shop");
     }
 
-    /// proxy が収集元以外のホストを指す場合、セッション Cookie は 1 つも送らない
-    /// （fail-closed。ダウンロード用の署名 `jwt` は 302 応答で受け取ってから CDN へ送る）。
+    /// `down_url` が収集元（`www.dlsite.com`）以外を指す場合、**リクエストを送らずに**拒否する。
+    ///
+    /// 許可リストをサブドメインまで広げると、`download_url`（Drive の改変バックアップから
+    /// 復元され得る）を `*.dlsite.com` の別ホストへ向けられたときに、Cookie は宛先別で
+    /// 空になるものの**未認証のリクエストは飛ぶ**。実測の proxy は `www` なので、
+    /// ホストは完全一致に絞る（fail-closed）。
     #[test]
-    fn download_proxy_on_unknown_subdomain_sends_no_session_cookies() {
+    fn download_proxy_on_another_subdomain_is_blocked_without_sending() {
         let (transport, proxy_spec) = download_transport();
         let mut client = DlsiteClient::with_transport(Box::new(transport), two_origin_session());
         let mut on = |_: u64, _: u64| true;
-        client
+        let err = client
             .download_with_progress(
                 "https://dl.dlsite.com/maniax/download/=/product_id/RJ01234567.html",
                 &mut on,
             )
-            .unwrap();
-        let proxy = proxy_spec.lock().clone().expect("proxy request made");
-        assert_eq!(
-            cookie_of(&proxy),
-            "",
-            "セッション Cookie を送ってはいけない"
+            .unwrap_err();
+        assert!(
+            matches!(err, DlsiteError::BlockedUrl(_)),
+            "拒否されていない: {err:?}"
+        );
+        assert!(
+            proxy_spec.lock().is_none(),
+            "拒否したのにリクエストを送っている"
         );
     }
 

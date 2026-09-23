@@ -62,20 +62,10 @@ impl HostScopedCookies {
 
 /// `host` が収集元 `origin` そのもの、またはその子ドメインか。
 ///
-/// 大文字小文字は区別しない（URL 検証側 `download_url::host_matches` と揃える）。
-/// 区別すると、302 の `Location` が `HTTPS://WWW.DLsite.COM/...` のような URL を返したときに
-/// 検証は通るのに Cookie が空になり、**黙って未認証で叩く**ことになる。
+/// 判定は `download_url::host_within` と**同じ実装**を使う（大小文字の扱いが
+/// URL 検証側と食い違うと、検証は通るのに Cookie が空になって黙って未認証になる）。
 fn is_origin_of(origin: &str, host: &str) -> bool {
-    let (origin, host) = (origin.as_bytes(), host.as_bytes());
-    if host.len() == origin.len() {
-        return host.eq_ignore_ascii_case(origin);
-    }
-    if host.len() < origin.len() {
-        return false;
-    }
-    // `<something>.origin` の形だけを許す（`evilhost` のような部分一致は不可）。
-    host[host.len() - origin.len() - 1] == b'.'
-        && host[host.len() - origin.len()..].eq_ignore_ascii_case(origin)
+    crate::download_url::host_within(host, origin)
 }
 
 /// Cookie 名と値の組を `Cookie` ヘッダの形に連結する（順序は BTreeMap 順で安定）。
