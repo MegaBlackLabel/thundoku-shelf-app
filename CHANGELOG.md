@@ -4,7 +4,34 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **作品の DRM 状態を 3 状態（なし / あり / 不明）にする**: `is_drm` は同期時に `0` 固定で保存されていて、
+  「DRM なしと確認できた」ではなく「判定していない」の意味だった（DLsite / BOOTH / 技術書典 は DRM の情報を
+  返さず、FANZA だけが取り込み直前に詳細 API の `drm` を見て拒否している）。`DrmStatus`（`0` = なし /
+  `1` = あり / `2` = 不明）を導入し、**同期は `2`（不明）**を保存、**FANZA は判定できた結果**を
+  `db::bookshelf::set_drm_status` で記録する（次の同期で消えないよう、UPSERT は「不明」を送られたとき
+  既存値を保つ）。既存 DB の `0`（未検証の意味で書かれていた値）は起動時に一度だけ `2` へ移し、
+  旧バックアップ（列が無い）の復元時は `is_drm` 欠落を `2` として補う。
+  `crates/core/src/drm.rs`、`crates/core/src/db/{mod,bookshelf,backup}.rs`、
+  `crates/core/src/{dlsite,fanza,tbf}/sync.rs`、`crates/app/src/{app_state,views/bookshelf}.rs`、
+  `docs/spec/{02-data-model,09-stores}.md`
+
 ### Fixed
+
+- **モーダルは同時に 1 つだけ表示する（終了確認と同期の続き通知が重なるのを直す）**: 終了確認
+  （アップロードの確認）は閉じる要求から出るが、**他のモーダルの表示中でも出ていた**ため、
+  「終了時の確認」と「取り込みの確認」、あるいは「終了確認」と「同期の続きがある通知」が同時に
+  出て操作が取り合いになっていた（実機で確認）。各ビューが自分のモーダルを
+  `app_state::ModalKind` の登録簿へ申告し、**優先度が最も高い 1 つだけを描く**方式にした
+  （`SyncNotice` < `DownloadCancel` < `DownloadConfirm` < `Import` < `Login` < `SettingsConfirm`
+  < `NoteDialog`）。負けた側は状態を保持したまま描かれないので、勝者が閉じれば自然に出る。
+  閉じる要求とメニューの「終了」は、勝者（待っている相手がいる取り込み・ログイン・終了確認）が
+  居る間は**拒否**して理由をトーストで伝える（ログイン中は特に、閉じるとサイト側の同意や SSO が
+  途中で切れる）。本棚のモーダルは**本棚を表示しているときだけ**登録し、他画面にいる間に
+  見えないモーダルで「閉じる」を塞がないようにした。起動時の Drive 復元確認は既存仕様どおり
+  「そのまま閉じる」。
+  `crates/app/src/{app_state,workspace}.rs`、`crates/app/src/views/{auth,bookshelf,settings,reader}.rs`
 
 - **描画のたびに呼ばれる `show()` で URL 監視を再起動しない（ログイン後にモーダルが閉じない）**:
   `AuthDialog::render` は表示中のログインビューへ**描画のたび** `show()` を呼ぶ。`show()` が

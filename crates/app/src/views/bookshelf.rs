@@ -1271,7 +1271,7 @@ pub struct BookshelfView {
     /// ダウンロード中止の確認ダイアログ（表示中だけ Some）
     pending_cancel_download: Option<PendingCancelDownload>,
     /// 分割同期の続き通知（表示中だけ Some）
-    pending_sync_notice: Option<SyncNotice>,
+    pub(crate) pending_sync_notice: Option<SyncNotice>,
     /// ダウンロード完了後に開く本（リモート本棚の database_id）。
     /// 「はい」でダウンロードを始めた本・すでにダウンロード中の本を記録する。
     pending_open_after_download: Option<String>,
@@ -1521,17 +1521,17 @@ fn tag_fetch_notice(outcome: &thundoku_core::fanza::sync::TagFetchOutcome) -> Op
 /// 分割同期の「続きがある」通知（ダイアログで出す）。
 ///
 /// 購入一覧を 1 回で全部取らず、あと何回で取り込みが終わるかをユーザーに伝える。
-struct SyncNotice {
+pub(crate) struct SyncNotice {
     /// 同期サイトの id（`sync_site` に渡す）。
-    site_id: &'static str,
+    pub(crate) site_id: &'static str,
     /// 表示名（FANZA / DLsite）。
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// 今回取り込んだ件数。
-    saved: usize,
+    pub(crate) saved: usize,
     /// 一覧の総件数（0 = 分からない）。
-    total_items: usize,
+    pub(crate) total_items: usize,
     /// 完了までにあと何回この操作が必要か。
-    remaining_runs: usize,
+    pub(crate) remaining_runs: usize,
 }
 
 /// 分割同期の通知文（ダイアログ本文）。
@@ -2187,7 +2187,8 @@ impl BookshelfView {
                             updated_at: entry.book.updated_at.clone(),
                             media_category: None,
                             ai_type: None,
-                            is_drm: 0,
+                            // ローカルの本のメタをそのまま使う（判定できないものを 0 にしない）
+                            is_drm: entry.book.is_drm,
                             release_date: None,
                             description: None,
                             theme: None,
@@ -3310,7 +3311,8 @@ impl BookshelfView {
                             updated_at: "2026-08-25 00:00:00".into(),
                             media_category: None,
                             ai_type: None,
-                            is_drm: 0,
+                            // BOOTH は DRM の情報を返さない（「不明」として保存する）
+                            is_drm: thundoku_core::drm::DrmStatus::Unknown.as_db(),
                             release_date: None,
                             description: None,
                             theme: None,
@@ -3896,6 +3898,18 @@ impl BookshelfView {
                     let mut client =
                         FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
                     let detail = client.detail(&product_id).map_err(|e| e.to_string())?;
+                    // 判定できた結果を本棚へ記録する（同期は「不明」で入れている）。
+                    // 記録に失敗しても取り込みは続ける（メタデータの話で、止める理由がない）。
+                    let status = if detail.is_drm {
+                        thundoku_core::drm::DrmStatus::Protected
+                    } else {
+                        thundoku_core::drm::DrmStatus::NoDrm
+                    };
+                    if let Err(error) =
+                        thundoku_core::db::bookshelf::set_drm_status(&db, "fanza", &product_id, status)
+                    {
+                        log::warn!("fanza: DRM 判定（{}）の記録に失敗: {error}", status.label());
+                    }
                     if detail.is_drm {
                         return Err(ImportFailure::Message(
                             "DRM 付き作品は取り込めません".to_string(),
@@ -4557,6 +4571,21 @@ impl BookshelfView {
             let _ = pending.reply.send(Some(pending.selected));
         }
         cx.notify();
+    }
+
+    /// 分割同期の続き通知が表示中か。
+    pub(crate) fn has_pending_sync_notice(&self) -> bool {
+        self.pending_sync_notice.is_some()
+    }
+
+    /// ダウンロード中止の確認ダイアログが表示中か（閉じる要求を拒否する判断に使う）。
+    pub(crate) fn has_pending_download_cancel(&self) -> bool {
+        self.pending_cancel_download.is_some()
+    }
+
+    /// 未ダウンロード本のダウンロード確認（はい / いいえ）が表示中か。
+    pub(crate) fn has_pending_download_confirm(&self) -> bool {
+        self.pending_download_confirm.is_some()
     }
 
     /// 取り込み確認モーダルが出ているか（ビューアーを重ねない判断に使う）。
@@ -7195,23 +7224,57 @@ impl Render for BookshelfView {
         let selected_tags = self.selected_tags.clone();
         let read_filter = self.read_filter;
         let busy = self.sync_busy > 0;
+        // 自分のモーダルを登録簿へ反映し、**優先度が最も高い 1 つだけ**を描く
+        // （Workspace が親にいない単体テストでも勝者を決められるよう、ここでも登録する）。
+        // 負けた側は状態を保持したまま描かれないので、勝者が閉じれば自然に出る。
+        {
+            use crate::app_state::{ModalKind, set_modal};
+            set_modal(cx, ModalKind::Import, self.pending_import.is_some());
+            set_modal(
+                cx,
+                ModalKind::DownloadConfirm,
+                self.pending_download_confirm.is_some(),
+            );
+            set_modal(
+                cx,
+                ModalKind::DownloadCancel,
+                self.pending_cancel_download.is_some(),
+            );
+            set_modal(
+                cx,
+                ModalKind::SyncNotice,
+                self.pending_sync_notice.is_some(),
+            );
+        }
+        let modal = crate::app_state::active_modal(cx);
         // 未ダウンロード本のダウンロード確認（はい / いいえ）
-        let pending_download_confirm = self.pending_download_confirm.clone();
+        let pending_download_confirm = (modal == Some(crate::app_state::ModalKind::DownloadConfirm))
+            .then(|| self.pending_download_confirm.clone())
+            .flatten();
         // 分割同期の続き（あと何回で完了するかを伝える）
-        let pending_sync_notice = self.pending_sync_notice.as_ref().map(sync_notice_message);
+        let pending_sync_notice = (modal == Some(crate::app_state::ModalKind::SyncNotice))
+            .then(|| self.pending_sync_notice.as_ref().map(sync_notice_message))
+            .flatten();
         // ダウンロード中止の確認（表示中だけ）
-        let pending_cancel_download = self
-            .pending_cancel_download
-            .as_ref()
-            .map(|pending| (pending.database_id.clone(), pending.title.clone()));
+        let pending_cancel_download = (modal == Some(crate::app_state::ModalKind::DownloadCancel))
+            .then(|| {
+                self.pending_cancel_download
+                    .as_ref()
+                    .map(|pending| (pending.database_id.clone(), pending.title.clone()))
+            })
+            .flatten();
         // 取り込み確認モーダル（§6.3）: 要約だけなので clone して描画に使う
-        let pending_import = self.pending_import.as_ref().map(|pending| {
-            (
-                pending.title.clone(),
-                pending.choices.clone(),
-                pending.selected,
-            )
-        });
+        let pending_import = (modal == Some(crate::app_state::ModalKind::Import))
+            .then(|| {
+                self.pending_import.as_ref().map(|pending| {
+                    (
+                        pending.title.clone(),
+                        pending.choices.clone(),
+                        pending.selected,
+                    )
+                })
+            })
+            .flatten();
         let handle = cx.entity();
         let card_tag_order = tag_order.clone();
 
@@ -15297,6 +15360,60 @@ mod tests {
                 "{id} が画面外に出ている: {bounds:?}"
             );
         }
+    }
+
+    /// 終了確認が出ている間は、同期の続き通知を**描かない**（実機で重なっていた組み合わせ）。
+    ///
+    /// 通知は状態を保持したまま描かれないので、終了確認を閉じれば自然に出る（破棄しない）。
+    #[gpui_kit::test]
+    async fn sync_notice_is_not_drawn_while_another_modal_wins(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                // 実機で重なっていた状態（98 件 / 全体 290 件 / あと 2 回）
+                this.pending_sync_notice = Some(SyncNotice {
+                    site_id: "fanza",
+                    label: "FANZA",
+                    saved: 98,
+                    total_items: 290,
+                    remaining_runs: 2,
+                });
+                // 終了確認が勝者（別画面のモーダル）になっている
+                crate::app_state::set_modal(cx, crate::app_state::ModalKind::ExitConfirm, true);
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(900.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+        assert!(
+            visual.debug_bounds("sync-notice-continue").is_none(),
+            "終了確認が出ているのに、同期の続き通知も描いている（重なる）"
+        );
+
+        // 終了確認が閉じたら描かれる（状態は残っている）
+        cx.update(|cx| {
+            crate::app_state::set_modal(cx, crate::app_state::ModalKind::ExitConfirm, false)
+        });
+        visual.update(|window, cx| {
+            let arena_clear = window.draw(cx);
+            arena_clear.clear(cx);
+        });
+        assert!(
+            visual.debug_bounds("sync-notice-continue").is_some(),
+            "終了確認を閉じたら、続き通知が出ること（破棄されていない）"
+        );
     }
 
     /// 取り込み確認の選択肢リストが、スクロールできる状態になっていること。

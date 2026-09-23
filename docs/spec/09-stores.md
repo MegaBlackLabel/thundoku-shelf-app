@@ -169,7 +169,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | `synced_at` / `created_at` / `updated_at` | すべて同一の `now()`（UTC `%Y-%m-%d %H:%M:%S`） | `crates/core/src/dlsite/sync.rs:83-85` |
 | `media_category` | `media_to_str(cfg.media)`（`comic`/`cg`/…） | `crates/core/src/dlsite/sync.rs:86` |
 | `ai_type` | `ai_to_str(cfg.ai)`（`none`/`partial`/`full`） | `crates/core/src/dlsite/sync.rs:87` |
-| `is_drm` | `0` 固定（**実データではなく同期が入れる既定値**。DRM は取り込み時に判定する: 読める形式でなければ `ImportError::NotAReadableWork`） | `crates/core/src/dlsite/sync.rs:240-242` |
+| `is_drm` | `2`（**不明**）。同期では DRM を判定できないので「なし（0）」とは書かない（3 状態は `crates/core/src/drm.rs`） | `crates/core/src/dlsite/sync.rs:236-244` |
 | `release_date` | meta の `regist_date`（形式例 `2025-06-17 16:00:00`、DLsite は唯一 release_date を取得するサイト） | `crates/core/src/dlsite/sync.rs:89`, `docs/features.md:209` |
 | `description` / `theme` / `page_count` | `None` | `crates/core/src/dlsite/sync.rs:90-92` |
 | `maker_id` | meta の `maker_id`（`RG\d+`） | `crates/core/src/dlsite/sync.rs:93` |
@@ -183,6 +183,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 - トランザクション単位: **1 件 1 文（autocommit）**。`bookshelf::upsert` は `block_on(async { sqlx::query(...).execute(pool).await })` のみで `BEGIN`/`COMMIT` を発行しない。`crates/core/src/db/bookshelf.rs:61-62`, `:139-143`
 - DB 接続設定: `journal_mode(WAL)` / `busy_timeout = 5 秒` / `foreign_keys(true)`。`crates/core/src/db/mod.rs:51-57`
 - `block_on` はプロセス共通ランタイム（`worker_threads(2)` のマルチスレッド tokio）。`crates/core/src/db/mod.rs:30-45`
+- `is_drm` だけは例外: 同期は「不明（2）」を送るので、そのときは既存値（判定済みの `0` / `1`）を保つ（`crates/core/src/db/bookshelf.rs` の UPSERT）。判定済みの値を同期で消さないため
 - DO UPDATE で **更新される**列（DLsite 同期の値で上書き）: `title` / `circle_name` / `author` / `thumbnail_url` / `format` / `causedAt` / `event_name` / `event_slug` / `event_id` / `file_name` / `download_url` / `is_downloadable` / `is_checked` / `is_purchased` / `is_new` / `is_active` / `synced_at` / `updated_at` / `media_category` / `ai_type` / `is_drm` / `release_date` / `description` / `theme` / `maker_id` / `page_count` / `age_rating` / `series_name`。`crates/core/src/db/bookshelf.rs:67-102`
 - DO UPDATE で **保持される**列: `is_hidden` / `hidden_at`（既存値のまま）、`tags_json` は `COALESCE(excluded.tags_json, bookshelf_items.tags_json)`（NULL のときだけ既存保持）。`crates/core/src/db/bookshelf.rs:84-86`
 - `author` は DO UPDATE 内で **2 回**代入される（前半 `author = excluded.author`、後半 `author = CASE WHEN excluded.author = '' THEN bookshelf_items.author ELSE excluded.author END`）。`crates/core/src/db/bookshelf.rs:70`, `:87-90`
@@ -469,7 +470,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | `synced_at` / `created_at` / `updated_at` | すべて同じ `now()` 文字列（UTC `YYYY-MM-DD HH:MM:SS`）。`created_at` は DO UPDATE に含まれないため初回値が残る | `crates/core/src/fanza/sync.rs:83-85`、`crates/core/src/db/bookshelf.rs:88-89` |
 | `media_category` | `media_to_str(meta.media)` = `"comic"` / `"cg"`（保存対象はこの 2 値のみ） | `crates/core/src/fanza/sync.rs:86`, `crates/core/src/fanza/mod.rs:96-105` |
 | `ai_type` | `ai_to_str(meta.ai)` = `"none"` / `"partial"` / `"full"` | `crates/core/src/fanza/sync.rs:87`, `crates/core/src/fanza/mod.rs:107-115` |
-| `is_drm` | `0` 固定（**実データではなく同期が入れる既定値**。DRM は取り込み直前に `detail().is_drm` で判定し、付きは拒否する） | `crates/core/src/fanza/sync.rs:192-194`、`crates/app/src/views/bookshelf.rs:3921-3925` |
+| `is_drm` | `2`（**不明**）で同期が保存する。取り込み直前に `detail().is_drm` で判定し、結果を `db::bookshelf::set_drm_status` で `0`（なし）/ `1`（あり）として記録する（ありのときは取り込みを拒否） | `crates/core/src/fanza/sync.rs:188-196`、`crates/app/src/views/bookshelf.rs:3900-3917` |
 | `release_date` / `description` / `theme` / `maker_id` / `page_count` / `age_rating` / `series_name` | すべて `None`（FANZA では未使用。一覧 API が返さない） | `crates/core/src/fanza/sync.rs:89-95` |
 
 - 列・テーブルは DB 起動時に冪等 DDL で追加される（`bookshelf_items` と `books` の両方に `media_category` / `ai_type` / `is_drm` / `release_date` / `description` / `theme` / `maker_id` / `page_count` / `age_rating` / `series_name`）: `crates/core/src/db/mod.rs:360-381`。
@@ -1295,7 +1296,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | `hidden_at` | `None`（UPSERT 時は既存値を保持） | `crates/core/src/tbf/sync.rs:109`, `crates/core/src/db/bookshelf.rs:84-85` |
 | `tags_json` | `item.tags` を `serde_json::to_string`（失敗時 `None`。UPSERT は `COALESCE` で既存保持） | `crates/core/src/tbf/sync.rs:75-79`, `crates/core/src/db/bookshelf.rs:86` |
 | `synced_at` / `created_at` / `updated_at` | すべて `now()` = `Utc::now().format("%Y-%m-%d %H:%M:%S")` | `crates/core/src/tbf/sync.rs:8-10`, `:110-112` |
-| 共有ソースメタ列（`media_category`,`ai_type`,`is_drm`,`release_date`,`description`,`theme`,`maker_id`,`page_count`,`age_rating`,`series_name`） | `None` / `0` 固定（TBF では未使用） | `crates/core/src/tbf/sync.rs:113-124` |
+| 共有ソースメタ列（`media_category`,`ai_type`,`is_drm`,`release_date`,`description`,`theme`,`maker_id`,`page_count`,`age_rating`,`series_name`） | `None` / `is_drm` は `2`（不明）。他は TBF では未使用 | `crates/core/src/tbf/sync.rs:113-124` |
 | 競合キー | `ON CONFLICT(site_id, database_id)` | `crates/core/src/db/bookshelf.rs:67` |
 | トランザクション | **無し**（1 行 1 ステートメントを `block_on` で逐次実行） | `crates/core/src/db/bookshelf.rs:61-77`, `crates/core/src/db/mod.rs:44-45` |
 | 返り値 | `items.len()`（実際の UPSERT 成功件数ではなく入力件数） | `crates/core/src/tbf/sync.rs:127` |

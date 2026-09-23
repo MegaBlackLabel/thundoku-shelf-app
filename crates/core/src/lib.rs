@@ -3,6 +3,7 @@ pub mod booth;
 pub mod db;
 pub mod dlsite;
 pub mod download_url;
+pub mod drm;
 pub mod drive;
 pub mod fanza;
 pub mod github;

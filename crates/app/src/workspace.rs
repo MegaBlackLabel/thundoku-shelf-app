@@ -948,12 +948,67 @@ impl Workspace {
         self.show_restore_prompt
     }
 
+    /// いま表示中のモーダルを登録簿へ反映する（描画の先頭と、閉じる要求の判定前に呼ぶ）。
+    ///
+    /// 各ビューが自分の状態を独立に持っているので、**ここで全員ぶんを 1 か所に集める**
+    /// （`Workspace` は本棚のモーダルも getter で読める）。登録簿は優先度で 1 つだけを
+    /// 勝者にするので、同じ画面に 2 つ出ることはない。
+    pub(crate) fn sync_modals(&self, cx: &App) {
+        use crate::app_state::{ModalKind, set_modal};
+        set_modal(cx, ModalKind::Login, self.show_auth);
+        set_modal(cx, ModalKind::ExitConfirm, self.exit_upload_prompt);
+        // 本棚のモーダルは**本棚が表示されているときだけ**登録する。表示されていない
+        // （他画面にいる）間は登録を外し、見えないモーダルで「閉じる」を塞がないようにする。
+        let bookshelf_active = matches!(self.active, NavTarget::Bookshelf | NavTarget::Favorites);
+        let bookshelf = self.bookshelf.read(cx);
+        set_modal(
+            cx,
+            ModalKind::Import,
+            bookshelf_active && bookshelf.has_pending_import(),
+        );
+        set_modal(
+            cx,
+            ModalKind::DownloadConfirm,
+            bookshelf_active && bookshelf.has_pending_download_confirm(),
+        );
+        set_modal(
+            cx,
+            ModalKind::DownloadCancel,
+            bookshelf_active && bookshelf.has_pending_download_cancel(),
+        );
+        set_modal(
+            cx,
+            ModalKind::SyncNotice,
+            bookshelf_active && bookshelf.has_pending_sync_notice(),
+        );
+    }
+
     /// ウィンドウの「閉じる」要求を処理する（true = 閉じてよい）。
     ///
     /// 終了時のアップロード中は、進行中のアップロードを中断させないため閉じない
-    /// （閉じるボタンは無効にできないので、ここで要求を止める）。
+    /// （閉じるボタンは無効にできないので、ここで要求を止める）。ユーザーの答えを
+    /// 待っているモーダル（ログイン・取り込み確認など）が出ている間も閉じない
+    /// （終了確認を重ねない。ログイン中はサイト側の同意や SSO が途中で切れる）。
     pub fn handle_window_close_request(&mut self, cx: &mut Context<Self>) -> bool {
         if self.exit_uploading {
+            return false;
+        }
+        // 起動時の Drive 復元確認が出ている間は、そのまま閉じる（Drive 側のバックアップを
+        // ローカル（旧/空）で上書きしないため、アップロード確認は出さない）。
+        if self.restore_prompt_active() {
+            AppState::global(cx)
+                .exit_checked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return true;
+        }
+        // モーダルが出ている間は閉じさせない（終了確認を重ねない）。
+        self.sync_modals(cx);
+        if let Some(kind) = crate::app_state::active_modal(cx) {
+            crate::app_state::set_toast_kind(
+                cx,
+                crate::app_state::ToastKind::Info,
+                format!("{}が終わるまで閉じられません", kind.label()),
+            );
             return false;
         }
         if AppState::global(cx)
@@ -966,11 +1021,6 @@ impl Workspace {
         AppState::global(cx)
             .exit_checked
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // 起動時の Drive 復元確認が出ている間は、そのまま閉じる（Drive 側のバックアップを
-        // ローカル（旧/空）で上書きしないため、アップロード確認は出さない）。
-        if self.restore_prompt_active() {
-            return true;
-        }
         self.request_exit_upload_check(cx);
         false
     }
@@ -994,6 +1044,16 @@ impl Workspace {
                 .exit_checked
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             cx.quit();
+            return;
+        }
+        // 他のモーダルが出ている間は終了確認を重ねない（閉じるボタンと同じ扱い）。
+        self.sync_modals(cx);
+        if let Some(kind) = crate::app_state::active_modal(cx) {
+            crate::app_state::set_toast_kind(
+                cx,
+                crate::app_state::ToastKind::Info,
+                format!("{}が終わるまで閉じられません", kind.label()),
+            );
             return;
         }
         self.request_exit_upload_check(cx);
@@ -1527,6 +1587,12 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         let handle = cx.entity();
 
+        // モーダルの登録簿を更新し、**優先度が最も高い 1 つだけ**を描く。
+        // 負けた側は状態を保持したまま描かれないので、勝者が閉じれば自然に出る
+        // （実機で「終了確認」と「同期の続き通知」が同時に出ていたのを防ぐ）。
+        self.sync_modals(cx);
+        let modal = crate::app_state::active_modal(cx);
+
         // メッセージは gpui-kit の Notification（右上のトースト）で出す。
         // 自前のバーは廃止した（自動で消える・種別ごとに色が付く・履歴が残る）。
         let (toast, toast_kind, toast_generation, toast_autohide, toast_progress) = {
@@ -1721,7 +1787,7 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
-            .child(if self.show_auth {
+            .child(if self.show_auth && modal == Some(crate::app_state::ModalKind::Login) {
                 let dialog = self.auth_dialog.clone();
                 gpui_kit::deferred(
                     div()
@@ -1866,7 +1932,10 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
-            .child(if self.exit_upload_prompt && !self.show_restore_prompt {
+            .child(if self.exit_upload_prompt
+                && !self.show_restore_prompt
+                && modal == Some(crate::app_state::ModalKind::ExitConfirm)
+            {
                 let handle = cx.entity();
                 let uploading = self.exit_uploading;
                 let content = dialog_surface(cx)
@@ -3210,6 +3279,107 @@ mod tests {
         assert!(
             ws.read_with(cx, |w, _| w.exit_upload_prompt),
             "終了でアップロード確認が表示されること"
+        );
+    }
+
+    /// ログイン（WebView）モーダルが出ている間は、ウィンドウを閉じさせない。
+    ///
+    /// ログイン中に閉じるとサイト側の同意・SSO の途中でセッションが中途半端になる。
+    #[gpui_kit::test]
+    async fn close_request_is_rejected_while_logging_in(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        ws.update(cx, |ws, cx| {
+            ws.open_auth(cx, crate::views::auth::AuthProvider::Dlsite);
+        });
+        cx.run_until_parked();
+
+        let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
+        assert!(!allowed, "ログイン中は閉じられてはいけない");
+        assert!(
+            !ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
+            "ログイン中に終了確認ダイアログを重ねてはいけない"
+        );
+    }
+
+    /// 取り込み確認（分割取り込みの選択）が出ている間も閉じさせない。
+    ///
+    /// 終了確認を重ねると 2 つのモーダルが同時に出て、取り込みが答え待ちのまま残る。
+    #[gpui_kit::test]
+    async fn close_request_is_rejected_while_an_import_prompt_is_open(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        ws.update(cx, |ws, cx| {
+            // 取り込み確認は本棚画面のモーダル（表示中のときだけ閉じる要求を止める）
+            ws.active = NavTarget::Bookshelf;
+            let (reply, _rx) = std::sync::mpsc::channel();
+            ws.bookshelf.update(cx, |bookshelf, cx| {
+                bookshelf.request_pending_import(
+                    crate::views::bookshelf::PendingImport {
+                        database_id: "db-1".into(),
+                        title: "テスト本".into(),
+                        choices: Vec::new(),
+                        selected: 0,
+                        reply,
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
+        assert!(!allowed, "取り込み確認中は閉じられてはいけない");
+        assert!(
+            !ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
+            "取り込み確認に終了確認を重ねてはいけない"
+        );
+    }
+
+    /// 終了確認が出ている間は、同期の続き通知（後から立つ状態）が**勝者にならない**。
+    ///
+    /// 実機で「終了確認」と「同期の続き通知」が同時に出ていた。通知は状態を保持したまま
+    /// 描かれないので、終了確認を閉じれば自然に出る（破棄しない）。
+    #[gpui_kit::test]
+    async fn exit_confirm_wins_over_a_newer_sync_notice(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        ws.update(cx, |ws, cx| {
+            ws.active = NavTarget::Bookshelf;
+            ws.exit_upload_prompt = true;
+            ws.bookshelf.update(cx, |bookshelf, _| {
+                // 実機で重なっていた状態を再現する（98 件 / 全体 290 件 / あと 2 回）
+                bookshelf.pending_sync_notice = Some(crate::views::bookshelf::SyncNotice {
+                    site_id: "fanza",
+                    label: "FANZA",
+                    saved: 98,
+                    total_items: 290,
+                    remaining_runs: 2,
+                });
+            });
+            ws.sync_modals(cx);
+            assert_eq!(
+                crate::app_state::active_modal(cx),
+                Some(crate::app_state::ModalKind::ExitConfirm),
+                "終了確認が勝ち、続き通知は待つこと"
+            );
+            // 終了確認を閉じたら続き通知が繰り上がる（状態は残っている）
+            ws.exit_upload_prompt = false;
+            ws.sync_modals(cx);
+            assert_eq!(
+                crate::app_state::active_modal(cx),
+                Some(crate::app_state::ModalKind::SyncNotice),
+                "続き通知が破棄されている"
+            );
+        });
+    }
+
+    /// モーダルが無ければ、これまでどおり終了確認が出る（閉じる要求は拒否）。
+    #[gpui_kit::test]
+    async fn close_request_opens_the_exit_prompt_when_no_modal_is_open(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
+        assert!(!allowed, "確認を出すときは閉じない");
+        assert!(
+            ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
+            "モーダルが無いときは終了確認を出す"
         );
     }
 

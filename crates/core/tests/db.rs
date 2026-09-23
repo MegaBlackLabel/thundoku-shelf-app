@@ -1909,3 +1909,163 @@ fn book_contents_and_formats_roundtrip() {
             .is_empty()
     );
 }
+
+/// `is_drm` 列を直接入れるための最小行（移行のテスト用。FK があるので sites を先に作る）。
+fn seed_site(pool: &thundoku_core::db::SqlitePool, id: &str) {
+    let url = format!("https://{id}.example");
+    thundoku_core::db::block_on(async {
+        sqlx::query("INSERT OR IGNORE INTO sites (id, name, url) VALUES (?1, ?2, ?3)")
+            .bind(id)
+            .bind(id)
+            .bind(url)
+            .execute(pool)
+            .await
+    })
+    .unwrap();
+}
+
+fn seed_shelf_item(pool: &thundoku_core::db::SqlitePool, site: &str, id: &str, is_drm: i64) {
+    thundoku_core::db::block_on(async {
+        sqlx::query(
+            "INSERT INTO bookshelf_items (site_id, database_id, title, is_drm) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(site)
+        .bind(id)
+        .bind(format!("作品 {id}"))
+        .bind(is_drm)
+        .execute(pool)
+        .await
+    })
+    .unwrap();
+}
+
+fn seed_book(pool: &thundoku_core::db::SqlitePool, id: &str, is_drm: i64) {
+    thundoku_core::db::block_on(async {
+        sqlx::query(
+            "INSERT INTO books (id, title, file_name, file_size, opfs_path, is_drm) \
+             VALUES (?1, ?2, 'book.pdf', 1, ?3, ?4)",
+        )
+        .bind(id)
+        .bind(format!("本 {id}"))
+        .bind(format!("{id}.opfspack"))
+        .bind(is_drm)
+        .execute(pool)
+        .await
+    })
+    .unwrap();
+}
+
+fn shelf_is_drm(pool: &thundoku_core::db::SqlitePool, id: &str) -> i64 {
+    thundoku_core::db::block_on(async {
+        sqlx::query_scalar("SELECT is_drm FROM bookshelf_items WHERE database_id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+    })
+    .unwrap()
+}
+
+fn book_is_drm(pool: &thundoku_core::db::SqlitePool, id: &str) -> i64 {
+    thundoku_core::db::block_on(async {
+        sqlx::query_scalar("SELECT is_drm FROM books WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+    })
+    .unwrap()
+}
+
+/// `is_drm` は「0 = なし / 1 = あり / 2 = 不明」の 3 状態。旧データの `0` は
+/// 「未検証」の意味で書かれていたため、一度きりの移行で `2`（不明）へ移す。
+/// 移行後に書かれた `0`（＝確認できた「なし」）は壊さない。
+#[test]
+fn drm_status_migration_moves_legacy_zeros_to_unknown_once() {
+    let pool = memory_db();
+    seed_site(&pool, "dlsite");
+    seed_shelf_item(&pool, "dlsite", "RJ1", 0);
+    seed_shelf_item(&pool, "dlsite", "RJ2", 1);
+    seed_book(&pool, "book-1", 0);
+
+    assert!(
+        thundoku_core::db::migrate_drm_status_once(&pool).unwrap(),
+        "初回は移行する"
+    );
+    assert_eq!(shelf_is_drm(&pool, "RJ1"), 2, "未検証の 0 は不明（2）へ移す");
+    assert_eq!(shelf_is_drm(&pool, "RJ2"), 1, "確認済みの 1 は触らない");
+    assert_eq!(book_is_drm(&pool, "book-1"), 2, "books 側も移行する");
+
+    // 移行後に「確認できた なし」として書いた 0 を上書きしない
+    seed_site(&pool, "fanza");
+    seed_shelf_item(&pool, "fanza", "RJ3", 0);
+    assert!(
+        !thundoku_core::db::migrate_drm_status_once(&pool).unwrap(),
+        "2 回目は移行しない"
+    );
+    assert_eq!(
+        shelf_is_drm(&pool, "RJ3"),
+        0,
+        "移行後に書いた 0（確認できた「なし」）を不明へ上書きしている"
+    );
+}
+
+/// ダウンロード前判定（FANZA の詳細 API）の結果を本棚へ記録できる。
+/// 判定できたときだけ書き、行が無くてもエラーにしない（同期と競合しても実害なし）。
+#[test]
+fn set_drm_status_records_the_verified_result() {
+    let pool = memory_db();
+    seed_site(&pool, "fanza");
+    seed_shelf_item(&pool, "fanza", "RJ4", 2);
+
+    bookshelf::set_drm_status(&pool, "fanza", "RJ4", thundoku_core::drm::DrmStatus::NoDrm).unwrap();
+    assert_eq!(shelf_is_drm(&pool, "RJ4"), 0);
+    bookshelf::set_drm_status(
+        &pool,
+        "fanza",
+        "RJ4",
+        thundoku_core::drm::DrmStatus::Protected,
+    )
+    .unwrap();
+    assert_eq!(shelf_is_drm(&pool, "RJ4"), 1);
+    bookshelf::set_drm_status(&pool, "fanza", "missing", thundoku_core::drm::DrmStatus::NoDrm)
+        .unwrap();
+}
+
+/// 同期（`is_drm` = 不明）は、判定済みの値を**上書きしない**。
+///
+/// FANZA のダウンロード前判定で記録した「なし / あり」が、次の同期（判定材料を
+/// 持たないので不明を送る）で消えると、メタデータがまた嘘になる。
+/// 既知の値を持ってきたときだけ上書きする（`author` / `tags_json` と同じ扱い）。
+#[test]
+fn sync_does_not_clobber_a_verified_drm_status() {
+    use thundoku_core::drm::DrmStatus;
+
+    let pool = memory_db();
+    seed_site(&pool, "fanza");
+    seed_shelf_item(&pool, "fanza", "RJ5", DrmStatus::NoDrm.as_db());
+    seed_shelf_item(&pool, "fanza", "RJ6", DrmStatus::Protected.as_db());
+
+    // 同期は「不明」を送ってくる
+    let items = bookshelf::list(&pool, "fanza").unwrap();
+    let mut no_drm = items
+        .iter()
+        .find(|item| item.database_id == "RJ5")
+        .expect("RJ5")
+        .clone();
+    let mut protected = items
+        .iter()
+        .find(|item| item.database_id == "RJ6")
+        .expect("RJ6")
+        .clone();
+    no_drm.is_drm = DrmStatus::Unknown.as_db();
+    protected.is_drm = DrmStatus::Unknown.as_db();
+    bookshelf::upsert(&pool, &no_drm).unwrap();
+    bookshelf::upsert(&pool, &protected).unwrap();
+
+    assert_eq!(shelf_is_drm(&pool, "RJ5"), 0, "判定済みの「なし」が消えた");
+    assert_eq!(shelf_is_drm(&pool, "RJ6"), 1, "判定済みの「あり」が消えた");
+
+    // 判定できた値を送ってきたときは上書きする
+    no_drm.is_drm = DrmStatus::Protected.as_db();
+    bookshelf::upsert(&pool, &no_drm).unwrap();
+    assert_eq!(shelf_is_drm(&pool, "RJ5"), 1, "新しい判定結果を反映していない");
+}

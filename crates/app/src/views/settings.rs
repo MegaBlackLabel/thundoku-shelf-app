@@ -2007,6 +2007,14 @@ fn dir_size(path: &std::path::Path) -> u64 {
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 設定の確認ダイアログもモーダル登録簿へ入れる（終了確認などと重ならないようにする）。
+        crate::app_state::set_modal(
+            cx,
+            crate::app_state::ModalKind::SettingsConfirm,
+            self.confirm_delete || self.confirm_data_dir || self.confirm_clear_sync,
+        );
+        let modal = crate::app_state::active_modal(cx);
+        let settings_confirm = modal == Some(crate::app_state::ModalKind::SettingsConfirm);
         // チェックリスト定期取得間隔の編集入力を確保（初回のみ生成・購読）
         self.ensure_poll_interval_input(_window, cx);
         // 表示に使う状態（冊数・非表示リスト・同期情報）は `reload`（画面に入ったとき /
@@ -2027,8 +2035,8 @@ impl Render for SettingsView {
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
         let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
         let data_dir = AppState::global(cx).data_dir.clone();
-        let confirm_data_dir = self.confirm_data_dir;
-        let confirm_clear_sync = self.confirm_clear_sync;
+        let confirm_data_dir = settings_confirm && self.confirm_data_dir;
+        let confirm_clear_sync = settings_confirm && self.confirm_clear_sync;
         let pending_data_dir = self.pending_data_dir.clone();
         let drive_enabled = self.drive_enabled;
         let drive_last_sync = self
@@ -2049,7 +2057,7 @@ impl Render for SettingsView {
         let drive_file_count = self.drive_file_count;
         let drive_total_bytes = self.drive_total_bytes;
         let storage_bytes = self.storage_bytes;
-        let confirm_delete = self.confirm_delete;
+        let confirm_delete = settings_confirm && self.confirm_delete;
         let tbf_viewer_mode = self.tbf_viewer_mode.clone();
         let tbf_page_turn = self.tbf_page_turn.clone();
         let booth_viewer_mode = self.booth_viewer_mode.clone();

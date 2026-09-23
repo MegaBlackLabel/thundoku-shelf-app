@@ -803,13 +803,21 @@ fn load_content_entries(db: &thundoku_core::db::SqlitePool, book_id: &str) -> Ve
 impl Render for ReaderView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_note_draft(window, cx);
+        // 付箋の入力もモーダル登録簿へ入れる（終了確認などと重ならないようにする）。
+        crate::app_state::set_modal(
+            cx,
+            crate::app_state::ModalKind::NoteDialog,
+            self.note_draft.is_some(),
+        );
+        let note_modal = crate::app_state::active_modal(cx)
+            == Some(crate::app_state::ModalKind::NoteDialog);
         let handle = cx.entity();
         div()
             .size_full()
             .bg(cx.theme().background)
             .child(self.viewer.clone())
             // 付箋ダイアログ（ページ右上のアイコンから開く）
-            .child(if let Some(draft) = self.note_draft.as_ref() {
+            .child(if note_modal && let Some(draft) = self.note_draft.as_ref() {
                 let input = draft.input.clone();
                 let page = draft.page;
                 {

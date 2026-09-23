@@ -176,10 +176,13 @@ fn old_backup_does_not_null_out_newer_columns() {
     );
 }
 
-/// 古いバックアップが NOT NULL 列（is_drm 等）を含まなくても、DEFAULT で
-/// 補われて復元が失敗しないこと。
+/// 古いバックアップが NOT NULL 列（`is_drm` 等）を含まなくても復元が失敗しないこと。
+///
+/// `is_drm` は 3 状態（0 = なし / 1 = あり / 2 = 不明）で、列の DEFAULT は `0`。
+/// 旧バックアップ（列を足す前に取ったもの）を DEFAULT のまま復元すると
+/// 「DRM なしと確認済み」という**嘘のメタ**になるので、「不明（2）」として補う。
 #[test]
-fn old_backup_missing_not_null_column_still_imports() {
+fn old_backup_missing_is_drm_restores_as_unknown() {
     let src = thundoku_core::db::test_pool();
     books::insert(&src, &book("b1")).unwrap();
     let mut json: serde_json::Value =
@@ -190,9 +193,13 @@ fn old_backup_missing_not_null_column_still_imports() {
     let old_json = serde_json::to_string(&json).unwrap();
 
     let dst = thundoku_core::db::test_pool();
-    backup::import_json(&dst, &old_json).expect("old backup should import with DEFAULT");
+    backup::import_json(&dst, &old_json).expect("old backup should import");
     let after = books::get(&dst, "b1").unwrap().unwrap();
-    assert_eq!(after.is_drm, 0, "DEFAULT 値で復元されること");
+    assert_eq!(
+        after.is_drm,
+        thundoku_core::drm::DrmStatus::Unknown.as_db(),
+        "列の DEFAULT（0 = 確認済みの「なし」）ではなく「不明」として復元すること"
+    );
 }
 
 /// 途中で失敗した復元は全体が巻き戻り、部分復元が残らないこと。

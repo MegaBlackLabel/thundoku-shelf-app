@@ -422,6 +422,21 @@ async fn upsert_rows(
         let Some(obj) = row.as_object() else {
             continue;
         };
+        // 旧バックアップ（`is_drm` 列を足す前に取ったもの）は、そのまま復元すると
+        // スキーマの DEFAULT（0 = 「DRM なしと確認済み」）になり**嘘のメタ**になる。
+        // 欠落しているときは「不明」として補う。
+        let with_drm_default;
+        let obj = if matches!(table, "books" | "bookshelf_items") && !obj.contains_key("is_drm") {
+            let mut owned = obj.clone();
+            owned.insert(
+                "is_drm".to_string(),
+                Value::Number(Number::from(crate::drm::DrmStatus::Unknown.as_db())),
+            );
+            with_drm_default = owned;
+            &with_drm_default
+        } else {
+            obj
+        };
         // PK / 競合判定列が欠けている行は INSERT しない（NULL を作らない）
         if let Some(missing) = pk
             .iter()

@@ -119,7 +119,8 @@ pub fn save_bookshelf(
                 updated_at: timestamp.clone(),
                 media_category: None,
                 ai_type: None,
-                is_drm: 0,
+                // 技術書典は DRM の情報を返さない（「不明」として保存する）。
+                is_drm: crate::drm::DrmStatus::Unknown.as_db(),
                 release_date: None,
                 description: None,
                 theme: None,

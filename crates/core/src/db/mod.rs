@@ -486,6 +486,37 @@ pub fn clear_owner_model_if_first_run(
     Ok(true)
 }
 
+/// `is_drm` の旧データを 3 状態の意味へ移す（一度きり）。
+///
+/// 以前の同期は `is_drm = 0` を「未検証」の意味で書いていた（[`crate::drm::DrmStatus`]
+/// の doc 参照）。そのままだと本棚が「DRM なしと確認済み」と嘘をつくので、**一度だけ**
+/// `0` → `2`（不明）へ移す。移行後に記録される `0` は「確認できた なし」なので
+/// 上書きしない（フラグで 2 回目以降は何もしない）。
+///
+/// 戻り値: 移行したら `true`。
+pub fn migrate_drm_status_once(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let key = "drm.status.unknown_migrated";
+    let migrated: i64 = block_on(async {
+        sqlx::query_scalar("SELECT COUNT(*) FROM app_settings WHERE key = ?1")
+            .bind(key)
+            .fetch_one(pool)
+            .await
+    })?;
+    if migrated > 0 {
+        return Ok(false);
+    }
+    block_on(async {
+        for table in ["bookshelf_items", "books"] {
+            sqlx::query(&format!("UPDATE {table} SET is_drm = 2 WHERE is_drm = 0"))
+                .execute(pool)
+                .await?;
+        }
+        Ok::<_, sqlx::Error>(())
+    })?;
+    settings::set(pool, key, "1")?;
+    Ok(true)
+}
+
 /// テスト用のインメモリプール（1 接続固定で同一メモリを共有）＋マイグレーション適用。
 pub fn test_pool() -> SqlitePool {
     let pool = block_on(async {

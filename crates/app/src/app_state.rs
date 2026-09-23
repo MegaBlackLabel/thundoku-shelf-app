@@ -144,7 +144,77 @@ pub struct AppState {
     pub auth_open_requested: Arc<AtomicBool>,
     /// auth_open_requested 時の認証プロバイダ。
     pub auth_open_provider: Arc<Mutex<Option<crate::views::auth::AuthProvider>>>,
+    /// いま表示中のモーダル（ダイアログ）の登録簿。
+    ///
+    /// 各ビューは自分の状態を独立に持っているため、**同じ画面に 2 つ出てしまう**
+    /// （実機: 終了確認と取り込み確認 / 終了確認と同期の続き通知）。描画のたびに
+    /// 所有者が自分の状態を登録し、[`active_modal`] が優先度で 1 つだけを勝者にする。
+    /// 負けた側は**状態を保持したまま描かない**ので、勝者が閉じれば自然に出る
+    /// （取り込み確認のように worker が答えを待つものも、破棄せずに待たせられる）。
+    pub modals: Arc<Mutex<std::collections::BTreeSet<ModalKind>>>,
 }
+
+/// ユーザーの答えを待つモーダル（ダイアログ）の種別。
+///
+/// **宣言順が優先度**（後ろほど強い）。同じ画面に 2 つ出さないため、[`active_modal`] が
+/// 最も強い 1 つを選ぶ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModalKind {
+    /// 同期の続き通知（情報 + 「続きを取り込む」）。状態は保持されるので後から出せる。
+    SyncNotice,
+    /// 終了確認（アップロードの確認）。
+    ExitConfirm,
+    /// ダウンロード中止の確認。
+    DownloadCancel,
+    /// 未ダウンロード本のダウンロード確認（はい / いいえ）。
+    DownloadConfirm,
+    /// 取り込み（分割取り込み）の確認。worker が答えを待っているので必ず出す。
+    Import,
+    /// ログイン（WebView / 同意）。途中で閉じるとサイト側のセッションが壊れる。
+    Login,
+    /// 設定の確認（全削除 / 保存先変更 / 同期情報のクリア）。
+    SettingsConfirm,
+    /// リーダーの付箋入力（リーダー画面のダイアログ）。
+    NoteDialog,
+}
+
+impl ModalKind {
+    /// トースト・ログ用の短い日本語（「◯◯が終わるまで閉じられません」に使う）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SyncNotice => "同期の続きの確認",
+            Self::ExitConfirm => "終了の確認",
+            Self::DownloadCancel => "ダウンロードの中止の確認",
+            Self::DownloadConfirm => "ダウンロードの確認",
+            Self::Import => "取り込みの確認",
+            Self::Login => "ログイン",
+            Self::SettingsConfirm => "設定の確認",
+            Self::NoteDialog => "付箋の入力",
+        }
+    }
+}
+
+/// 表示中のモーダルを登録する（描画のたびに所有者が呼ぶ。`false` で解除）。
+pub fn set_modal(cx: &App, kind: ModalKind, showing: bool) {
+    let modals = AppState::global(cx).modals.clone();
+    let mut modals = modals.lock();
+    if showing {
+        modals.insert(kind);
+    } else {
+        modals.remove(&kind);
+    }
+}
+
+/// いま描くべきモーダル（優先度が最も強い 1 つ）。無ければ `None`。
+pub fn active_modal(cx: &App) -> Option<ModalKind> {
+    AppState::global(cx).modals.lock().iter().next_back().copied()
+}
+
+/// 何かのモーダルが表示中か（ウィンドウを閉じてよいかの判定に使う）。
+pub fn any_modal_active(cx: &App) -> bool {
+    !AppState::global(cx).modals.lock().is_empty()
+}
+
 
 // WebView2（wry）の呼び出しのうち、Windows のメッセージループを回して gpui の窓更新と
 // 衝突し得るのは**生成**と **`cookies_for_url`** だけで、どちらも App の借用の外から
@@ -242,6 +312,12 @@ impl AppState {
         // P4: 初回起動（新旧モデル移行）で既存データをクリアして新モデルで開始する。
         let _ =
             db::clear_owner_model_if_first_run(&db_pool, &packs_dir, &data_dir.join("thumbnails"));
+        // is_drm の旧データ（同期が「未検証」の意味で書いた 0）を「不明（2）」へ一度だけ移す。
+        match db::migrate_drm_status_once(&db_pool) {
+            Ok(true) => log::info!("drm status: 旧データを「不明」へ移行しました"),
+            Ok(false) => {}
+            Err(error) => log::warn!("drm status: 移行に失敗（次回起動で再試行）: {error}"),
+        }
 
         let secrets = SecretStore::new();
         let mut tbf = TbfClient::new();
@@ -394,6 +470,7 @@ impl AppState {
             google_logout_done: Arc::new(AtomicBool::new(false)),
             auth_open_requested: Arc::new(AtomicBool::new(false)),
             auth_open_provider: Arc::new(Mutex::new(None)),
+            modals: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         });
         // Zenn タグを起動時に 1 回だけ取得する（取り込み時のネットワーク待ちをなくす）
         std::thread::spawn(|| {
@@ -476,6 +553,7 @@ impl AppState {
             google_logout_done: Arc::new(AtomicBool::new(false)),
             auth_open_requested: Arc::new(AtomicBool::new(false)),
             auth_open_provider: Arc::new(Mutex::new(None)),
+            modals: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         });
     }
 }
@@ -909,6 +987,47 @@ pub fn load_window_bounds(cx: &App) -> Option<WindowBounds> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// モーダルは**優先度で 1 つだけ**が選ばれる（同じ画面に 2 つ出さない）。
+    ///
+    /// 負けた側は登録を残したまま描かれないので、勝者が閉じれば自然に繰り上がる
+    /// （取り込み確認のように worker が答えを待つものも、破棄せずに待たせられる）。
+    #[gpui_kit::test]
+    async fn only_the_highest_priority_modal_is_active(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            assert_eq!(active_modal(cx), None, "初期状態はモーダル無し");
+            set_modal(cx, ModalKind::SyncNotice, true);
+            assert_eq!(active_modal(cx), Some(ModalKind::SyncNotice));
+
+            set_modal(cx, ModalKind::ExitConfirm, true);
+            assert_eq!(
+                active_modal(cx),
+                Some(ModalKind::ExitConfirm),
+                "終了確認が勝ち、同期の続き通知は待つ（実機で重なっていた組み合わせ）"
+            );
+
+            set_modal(cx, ModalKind::Login, true);
+            assert_eq!(
+                active_modal(cx),
+                Some(ModalKind::Login),
+                "ログイン中は他を出さない"
+            );
+            assert!(any_modal_active(cx));
+
+            set_modal(cx, ModalKind::Login, false);
+            assert_eq!(
+                active_modal(cx),
+                Some(ModalKind::ExitConfirm),
+                "消えたら次が繰り上がる"
+            );
+            set_modal(cx, ModalKind::ExitConfirm, false);
+            set_modal(cx, ModalKind::SyncNotice, false);
+            assert_eq!(active_modal(cx), None);
+            assert!(!any_modal_active(cx));
+        });
+    }
 
     /// メモリバックエンドはプロセス内で共有されるため、`USER_GITHUB` スロットを使う
     /// テストはこの Mutex で直列化する（並列だと保存と削除が競合する）。

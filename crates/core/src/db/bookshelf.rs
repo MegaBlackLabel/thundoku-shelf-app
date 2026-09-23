@@ -60,6 +60,8 @@ const COLUMNS: &str = "site_id, database_id, title, circle_name, author, thumbna
 /// 既存値を保持する（`is_favorite` / `is_hidden` と同じ扱い）。
 pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
+        // 「不明」は同期の既定値なので、それを送ってきたときは既存の判定結果を残す。
+        let unknown = crate::drm::DrmStatus::Unknown.as_db();
         sqlx::query(&format!(
             "INSERT INTO bookshelf_items ({COLUMNS}) VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
@@ -92,7 +94,11 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
                updated_at = excluded.updated_at,
                media_category = excluded.media_category,
                ai_type = excluded.ai_type,
-               is_drm = excluded.is_drm,
+               -- 同期は DRM を判定できない（不明を送る）ので、判定済みの値は保持する
+               is_drm = CASE
+                 WHEN excluded.is_drm = {unknown} THEN bookshelf_items.is_drm
+                 ELSE excluded.is_drm
+               END,
                release_date = excluded.release_date,
                description = excluded.description,
                theme = excluded.theme,
@@ -320,6 +326,31 @@ pub fn set_favorite(
              WHERE site_id = ?2 AND database_id = ?3",
         )
         .bind(favorite as i64)
+        .bind(site_id)
+        .bind(database_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+}
+
+/// DRM の判定結果を記録する（ダウンロード前判定を通ったときだけ呼ぶ）。
+///
+/// 同期は DRM を見ないので既定は「不明」([`crate::drm::DrmStatus::Unknown`])。
+/// 実際に判定できた結果（詳細 API の `drm`）をここで上書きする。行が無くても
+/// エラーにしない（同期と競合しても実害が無い）。
+pub fn set_drm_status(
+    pool: &SqlitePool,
+    site_id: &str,
+    database_id: &str,
+    status: crate::drm::DrmStatus,
+) -> Result<(), sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query(
+            "UPDATE bookshelf_items SET is_drm = ?1, updated_at = CURRENT_TIMESTAMP \
+             WHERE site_id = ?2 AND database_id = ?3",
+        )
+        .bind(status.as_db())
         .bind(site_id)
         .bind(database_id)
         .execute(pool)

@@ -237,9 +237,11 @@ fn save_purchase(
         updated_at: ts,
         media_category: Some(media_to_str(cfg.media).into()),
         ai_type: Some(ai_to_str(cfg.ai).into()),
-        // 同期では DRM を判定できない（実データではなく既定値）。DRM 付きは
-        // 取り込み時に読める形式でなければ失敗する（`ImportError::NotAReadableWork`）。
-        is_drm: 0,
+        // 同期では DRM を判定できない。**「なし」ではなく「不明」**として保存する
+        // （以前は 0 固定だったため、本棚が「DRM なしと確認済み」と嘘をついていた）。
+        // FANZA は取り込み直前に詳細 API で判定し、その結果を `set_drm_status` で上書きする
+        // （`bookshelf.rs` の `detail.is_drm`）。
+        is_drm: crate::drm::DrmStatus::Unknown.as_db(),
         release_date: meta.and_then(|m| m.regist_date.clone()),
         description: None,
         theme: None,
