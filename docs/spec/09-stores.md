@@ -20,8 +20,10 @@ JSON バックアップから復元でき、改変したバックアップを復
 | ストア | 検証点 | 許可（ホスト / パス） |
 |---|---|---|
 | BOOTH | `download_with_progress`（Cookie 付与の前） | `booth.pm` + `/downloadables/`（完全一致） |
-| DLsite | `down_url` と 302 の `Location` | `*.dlsite.com`（Cookie のスコープに一致） |
-| FANZA | proxy URL と 302 の `Location` | `*.dmm.co.jp`（実測 CDN は `doujin.contents.doujin.dmm.co.jp`） |
+| DLsite | `down_url` | `www.dlsite.com`（完全一致） |
+| DLsite | 302 の `Location`（CDN） | `*.dlsite.com`（Cookie のスコープに一致。実測は `download.dlsite.com`） |
+| FANZA | proxy URL | `*.dmm.co.jp`（実測は `www.dmm.co.jp`。`downloadLinks` が絶対 URL を返す場合があるため据え置き） |
+| FANZA | 302 の `Location`（CDN） | `*.dmm.co.jp`（実測 CDN は `doujin.contents.doujin.dmm.co.jp`） |
 | 技術書典 | `resolve_download_url` の入力 | `techbookfest.org`（完全一致） |
 | 技術書典 | `download_with_progress`（本体） | `techbookfest.org` + `/api/product-dlc/`、`storage.googleapis.com` + `/tbf-tokyo-product-dlc/` |
 
@@ -34,10 +36,11 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 収集元すべてを 1 本にまとめる API（`HostScopedCookies::header()` /
 `FanzaSession::cookie_header()` / `DlsiteSession::cookie_header()`）は**削除済み**で、
 まとめ送りは再発しない。宛先が収集元（とその子ドメイン）でなければ Cookie は空になる
-（`crates/core/src/session_cookies.rs:34-47`, `:71-81` / `crates/core/src/fanza/client.rs:366-378` /
-`crates/core/src/dlsite/client.rs:301-313`）。
-残る候補は **proxy 許可ホストの exact 化**（現状は `*.dlsite.com` / `*.dmm.co.jp`。実測 proxy は
-`www`）と、Cookie の `Domain` / `Path` 属性を保存する Cookie Jar 化。
+（`crates/core/src/session_cookies.rs:34-47`, `:63-69` / `crates/core/src/download_url.rs:48-63` /
+`crates/core/src/fanza/client.rs:366-378` / `crates/core/src/dlsite/client.rs:301-313`）。
+残る候補は **FANZA proxy 許可ホストの exact 化**（現状は `*.dmm.co.jp`。`downloadLinks` が
+絶対 URL を返し得るため、実測ログを見てから狭める）と、Cookie の `Domain` / `Path` 属性を
+保存する Cookie Jar 化。
 なお待機は **DLsite のみ**（`PAGE_INTERVAL = 10 s`、`crates/core/src/dlsite/sync.rs:90`, `:129-131`）
 で、FANZA の一覧取得に待機は無い（1 回 = 5 ページ × 20 件、`crates/core/src/fanza/sync.rs`）。
 

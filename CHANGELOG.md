@@ -6,6 +6,19 @@
 
 ### Fixed
 
+- **ダウンロードの宛先をさらに絞り、ログイン完了判定のホスト検証を直す**: DLsite の
+  ダウンロード（`down_url`）は `*.dlsite.com` を許していたため、改変したバックアップで
+  `dl.dlsite.com` のような別サブドメインを指されると（Cookie は宛先別で空になるものの）
+  **未認証のリクエストが飛んでいた**。実測の `down_url` は `www.dlsite.com` なので
+  完全一致に絞る（fail-closed）。FANZA は `downloadLinks` が絶対 URL を返し得るため
+  据え置き、代わりに proxy / CDN のホストをログに残す（許可リストを実測値まで
+  狭めるための材料）。あわせて、BOOTH / 技術書典のログイン完了判定が
+  `host.ends_with("booth.pm")` だったため **`evilbooth.pm` でも完了扱い**になっていた点を、
+  ラベル境界を見る `download_url::host_within` に寄せて直した（Cookie の収集元判定も
+  同じ実装を使うようになり、判定の食い違いが起きない）。
+  `crates/core/src/download_url.rs`、`crates/core/src/{dlsite,fanza}/client.rs`、
+  `crates/core/src/session_cookies.rs`、`crates/app/src/views/{booth_login,tbf_login,mod}.rs`
+
 - **ダウンロード経路へ送る Cookie を宛先ホスト別に絞る**: セッション Cookie は収集元
   ホスト（`www.dmm.co.jp` / `accounts.dmm.co.jp`、`www.dlsite.com` / `login.dlsite.com`）別に
   持っているのに、**ダウンロード proxy（`downloadLinks` / `down_url`）へ送るときだけは全収集元を
