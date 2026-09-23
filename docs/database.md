@@ -10,18 +10,18 @@
 
 ### sites
 
-技術書典・BOOTH などのサイト情報。
+技術書典・BOOTH・FANZA同人・DLsite のサイト情報。
 
 | カラム | 型 | 説明 |
 |---|---|---|
-| id | TEXT PK | サイト ID（`techbookfest` / `booth`） |
+| id | TEXT PK | サイト ID（`techbookfest` / `booth` / `fanza` / `dlsite`） |
 | name | TEXT | 表示名 |
 | url | TEXT | サイト URL |
 | display_order | INTEGER | 表示順 |
 | is_visible | INTEGER | 表示フラグ |
 | created_at / updated_at | TEXT | 作成・更新日時 |
 
-初期データ: `techbookfest`（技術書典）、`booth`（BOOTH）。
+初期データ: `techbookfest`（技術書典）、`booth`（BOOTH）は `schema.sql` の INSERT。`fanza`（FANZA同人、`display_order` = 2）と `dlsite`（DLsite、`display_order` = 3）は `migrate()` のプログラム的追加（`crates/core/src/db/mod.rs`）。
 
 ### app_settings
 
@@ -79,7 +79,7 @@ Drive 同期設定など）。
 
 ### bookshelf_items
 
-技術書典・BOOTH の本棚（同期データのスナップショット）。
+技術書典・BOOTH・FANZA同人・DLsite の本棚（同期データのスナップショット）。
 
 | カラム | 型 | 説明 |
 |---|---|---|
@@ -320,7 +320,7 @@ Google Drive との同期状態（pack ごと）。
 
 ## データの流れ
 
-1. 技術書典 / BOOTH の同期 → `bookshelf_items` / `tbf_events` / `checked_items` / `product_sample_pages`
+1. 技術書典 / BOOTH / FANZA同人 / DLsite の同期 → `bookshelf_items` / `tbf_events` / `checked_items` / `product_sample_pages`
 2. ダウンロード → `books` + `imported_documents` + `document_images`（.opfspack 作成）
 3. 読み取り → `reading_progress` / `view_history`
 4. タグ → `book_tags` / `favorite_tags` / `zenn_tag_metadata`

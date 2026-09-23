@@ -2,7 +2,7 @@
 
 > **AI 向けの詳細設計仕様書は `docs/spec/README.md`（索引）**を参照。実装を別言語へ移植する／Web 版に戻すための、数値・定数・アルゴリズムまで書いたリファレンス。
 
-Thundoku Shelf Desktop は、技術書典・BOOTH で購入した本の閲覧を目的とした
+Thundoku Shelf Desktop は、技術書典・BOOTH・FANZA同人・DLsite で購入した本の閲覧を目的とした
 デスクトップアプリケーション（macOS / Windows）です。Web 版
 （https://thundoku-shelf-staging.megablacklabel.workers.dev/）の機能をローカルで
 再現し、追加でデスクトップ固有の機能を備えています。
@@ -47,7 +47,7 @@ Thundoku Shelf Desktop は、技術書典・BOOTH で購入した本の閲覧を
 
 | ライブラリ | 用途 |
 |---|---|
-| `ureq` | 技術書典・BOOTH・Google API への HTTP 通信（rustls / json） |
+| `ureq` | 技術書典・BOOTH・FANZA同人・DLsite・Google / GitHub API への HTTP 通信（rustls / json） |
 | `keyring` | OS キーチェーンへのトークン永続化（macOS: `apple-native` / Windows: `windows-native`） |
 | `url` | URL 処理（リダイレクト先など） |
 | `percent-encoding` | API パラメータのエンコード |
@@ -237,7 +237,7 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
   - 行のクリックは本文（タイトル等）と同じ経路（ローカル本は開く / 未取得は取り込む）。
     カルーセル内のクリックは `stop_propagation` で行クリックへ伝播させない
 - **フィルタ**:
-  - サイト（すべて / 技術書典 / BOOTH）
+  - サイト（すべての本 / 技術書典 / BOOTH / FANZA同人 / DLsite。ログイン中のストアの行だけ出る）
   - 検索（タイトル・サークル名・著者名）
   - タグ（OR 条件）、イベント、読了状態（未読 / 読んでいる途中 / 既読 / お気に入り）
   - **イベントフィルタは技術書典の本棚のときだけ出す**（それ以外のサイトでは概念が無いため
@@ -286,7 +286,7 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
     `Enter` で選択カードを開く、`Backspace` で選択中の本の**ダウンロード中止**。
     選択タイルは背景色 + 枠線でハイライトされ、選択に合わせてスクロールが追従する
 - **ダウンロード / 取り込み**:
-  - 技術書典・BOOTH の同期ボタン（専用スレッド + タイムアウト付き）
+  - 技術書典・BOOTH・FANZA同人・DLsite の同期ボタン（専用スレッド + タイムアウト付き）
   - **サイトのログイン直後は、そのサイトを自動で同期する**: ログインの完了イベント
     （`BoothLoginDone` など）で同期を要求し（`AppState.login_sync_requested` にサイト id を
     置く）、`Workspace` の監視タスクが**1 回だけ**消費して `BookshelfView::sync_site` を呼ぶ。
