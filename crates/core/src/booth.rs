@@ -98,10 +98,15 @@ pub struct BoothClient {
     agent: ureq::Agent,
 }
 
-/// BOOTH もブラウザ UA を送ってきた（DLsite / FANZA と同じ流儀）。非ブラウザ UA が
-/// 弾かれるかは実測していないので現状のまま。`THUNDOKU_BOOTH_UA` に自認 UA を入れて
-/// 起動すれば実機で試せる（`crate::ua`）。
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+/// ストアへ送る UA。**クライアントを名乗る**。以前は Mac の Chrome を名乗っていたが、
+/// 購入ライブラリ（`accounts.booth.pm/library`）が自認 UA でも 200 で返ることを実機で
+/// 確認した。弾かれるようになったら `THUNDOKU_BOOTH_UA` でブラウザ UA に戻せる
+/// （`crate::ua`）。
+const USER_AGENT: &str = concat!(
+    "ThundokuShelf/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/MegaBlackLabel/thundoku-shelf-app)"
+);
 
 /// 送る UA。既定は上の定数（`THUNDOKU_BOOTH_UA` で差し替えられる → `crate::ua`）。
 fn user_agent() -> String {

@@ -17,12 +17,15 @@ pub const LIBRARY_BASE: &str = "https://www.dmm.co.jp/dc/doujin/api/mylibraries/
 /// jar 等の参照メタ列は一覧 API では返さない（`details` / 商品ページで取得）。
 pub const PAGE_LIMIT: usize = 20;
 
-/// FANZA同人 は**非ブラウザの User-Agent を 403 で弾く**ため、ブラウザ UA + Referer を
-/// 送る（BoothClient と同じ流儀）。DLsite は自認 UA でも購入履歴が取れることを実測して
-/// 切り替えたが、**FANZA はまだ実測できていない**ので現状のまま。
-/// `THUNDOKU_FANZA_UA` に自認 UA を入れて起動すれば、切り替えた場合の挙動を実機で試せる
-/// （`crate::ua`）。
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+/// ストアへ送る UA。**クライアントを名乗る**。以前は「非ブラウザ UA を 403 で弾く」観測が
+/// あったため Mac の Chrome を名乗っていたが、購入一覧 API が自認 UA でも 200 を返すことを
+/// 実機で確認した（未ログインでは UA に関わらず 401）。
+/// 弾かれるようになったら `THUNDOKU_FANZA_UA` でブラウザ UA に戻せる（`crate::ua`）。
+const USER_AGENT: &str = concat!(
+    "ThundokuShelf/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/MegaBlackLabel/thundoku-shelf-app)"
+);
 
 /// 送る UA。既定は上の定数（`THUNDOKU_FANZA_UA` で差し替えられる → `crate::ua`）。
 fn user_agent() -> String {
