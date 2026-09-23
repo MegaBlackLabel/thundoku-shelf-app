@@ -237,6 +237,11 @@ impl DlsiteClient {
             "https://www.dlsite.com/{store}/mypage/userbuy/=/type/all/start/all/sort/1/order/1/page/{page}"
         );
         let html = self.get_html(&url)?;
+        // セッションが切れているとログインページが **200 で**返る（HTTP では気づけない）。
+        // 「購入 0 件」と取り違えると、何も取り込まないまま「同期完了」になってしまう。
+        if is_login_page(&html) {
+            return Err(DlsiteError::SessionExpired);
+        }
         let (items, last_page) = parse_userbuy_page(&html);
         Ok(DlsitePurchasesPage { items, last_page })
     }
@@ -399,7 +404,18 @@ impl DlsiteClient {
     }
 }
 
-/// 購入履歴ページ HTML から作品行 + 最終ページ番号を解析する。
+/// 購入履歴の HTML が**ログイン（会員登録）ページ**か。
+///
+/// DLsite はセッションが切れていると `login.dlsite.com/register?user=self` を **200 で**
+/// 返す（＝HTTP ステータスでは気づけない）。これを「購入履歴 0 件」と取り違えると、
+/// 何も取り込まないまま「同期完了（0 件）」と表示してしまう。
+///
+/// viviON ID の SSO 画面にだけ出るクラス名で判定する（ストアの購入履歴ページには
+/// `#buy_history_this` があり、こちらは出ない）。
+fn is_login_page(html: &str) -> bool {
+    html.contains("contentLoginRegist") || html.contains("contentLoginLogin")
+}
+
 /// 戻り値: `(作品行のベクタ, 最終ページ番号)`。
 pub fn parse_userbuy_page(html: &str) -> (Vec<DlsitePurchase>, Option<usize>) {
     let mut rows = Vec::new();
@@ -597,6 +613,27 @@ mod tests {
 <td class="re_dl"><a href="https://www.dlsite.com/maniax/download/=/product_id/{content_id}.html">DL</a></td>
 <td class="work_price">440円</td></tr>"#
         )
+    }
+
+    /// セッションが切れているとログインページが **200 で**返る。0 件と取り違えないこと。
+    ///
+    /// マーカーは実物（`login.dlsite.com/register?user=self` を保存した 20,770 バイト）から
+    /// 採っている。
+    #[test]
+    fn login_page_is_not_mistaken_for_an_empty_library() {
+        let login = r#"<title>ユーザー登録 - ユーザー登録</title>
+<div class="contentLoginRegist-item"><p class="contentLoginLogin-text">viviON IDに登録済みの方はこちらから</p></div>"#;
+        assert!(
+            is_login_page(login),
+            "viviON ID のログインページを検知できない"
+        );
+
+        let empty_library =
+            r#"<div id="buy_history_this"><table class="work_list_main"></table></div>"#;
+        assert!(
+            !is_login_page(empty_library),
+            "購入 0 件のページをログインページと誤判定した"
+        );
     }
 
     /// 購入履歴ページから作品行と最終ページ番号を抽出する。

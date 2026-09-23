@@ -4,18 +4,34 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **DLsite のセッション切れを「購入 0 件」と取り違えない**: セッションが切れていると
+  DLsite は購入履歴の代わりに **`login.dlsite.com/register?user=self` を 200 で**返す
+  （HTTP ステータスでは気づけない）。これを 0 件として扱っていたため、何も取り込まない
+  まま「同期完了（0 件）」と表示され、利用者は同期できたと思い込んでいた。viviON ID の
+  SSO 画面にだけ出るクラス名でログインページを検知し、`SessionExpired`（既存の
+  「セッション切れ・未ログイン」＝再ログインへ誘導する経路）として返すようにした。
+  FANZA は未ログインで 401 を返し（黙って 0 件にならない）、BOOTH は同じ検知を既に
+  持っているので、穴が空いていたのは DLsite だけだった。
+
 ### Changed
 
-- **DLsite へ送る `User-Agent` をブラウザのなりすましから自認に変える**: DLsite と表紙取得は
+- **DLsite の購入履歴を `robots.txt` の `Crawl-delay: 10` に合わせて辿る**: ページ間の
+  待機が無く、分割同期の「続き」を連打すれば無間隔でページを叩けた。ページ間隔
+  （`PAGE_INTERVAL = 10 秒`）を入れて、自動で購入履歴を辿るときは `robots.txt` の指定を
+  守るようにした（間隔は引数で受けるので、テストは 0 を渡して待たない）。
+
+- **ストアへ送る `User-Agent` をブラウザのなりすましから自認に変える**: DLsite・FANZA・BOOTH と表紙取得は
   `Chrome/126.0.0.0` をハードコードしていた（FANZA・BOOTH は **Mac** の Chrome を名乗っていた）。
   各サービスの規約は「技術的手段を利用して本サービスを不正に操作する行為」（DLsite 第17条10号）や
   「本来のサービス提供目的とは異なる目的での利用」（DMM会員規約 第12条1項10号）を禁じており、
   非ブラウザを弾くサイトの判定を**なりすましで回避している**状態だった。DLsite の購入履歴が
   `ThundokuShelf/<version> (+リポジトリ URL)` でも 200 で返ることは実機で確認済みなので
   そちらに切り替える（表紙取得の CDN は UA を見ていないことも実測済み）。
-  **FANZA と BOOTH は「非ブラウザ UA を 403 で弾く」観測があるため未変更**で、環境変数
-  （`THUNDOKU_FANZA_UA` / `THUNDOKU_BOOTH_UA`）で実機確認できたら切り替える。DLsite を
-  戻したいときは `THUNDOKU_DLSITE_UA`、表紙は `THUNDOKU_COVER_UA` にブラウザ UA を入れる。
+  **3 ストアとも実機で 200 を確認済み**（DLsite は購入履歴、FANZA は購入一覧 API、BOOTH は
+  購入ライブラリ）。戻したいときは `THUNDOKU_DLSITE_UA` / `THUNDOKU_FANZA_UA` /
+  `THUNDOKU_BOOTH_UA`、表紙は `THUNDOKU_COVER_UA` にブラウザ UA を入れる。
 
 - **Drive 同期の説明を実装に合わせる**: README と「このアプリについて」「設定」画面は
   Google Drive のバックアップ内容を「本棚の DB と画像」と書いていたが、実装は

@@ -3664,6 +3664,7 @@ impl BookshelfView {
                     owner.as_deref(),
                     cursor,
                     thundoku_core::dlsite::sync::PURCHASE_PAGES_PER_RUN,
+                    thundoku_core::dlsite::sync::PAGE_INTERVAL,
                 )
                 .map_err(|e| e.to_string())
             })();

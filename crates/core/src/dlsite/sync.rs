@@ -85,6 +85,10 @@ pub struct PurchaseBatch {
     pub remaining_runs: usize,
 }
 
+/// ページ間の待機。DLsite の `robots.txt` は `Crawl-delay: 10` を指定しているので、
+/// 自動で購入履歴を辿るときはそれを守る。
+pub const PAGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 購入一覧を `pages` ページ分だけ取り込み、続きの位置と残り回数を返す。
 ///
 /// 1 回で全ページ取ると、購入数の多いアカウントでは 1 操作で大量のリクエストになる。
@@ -97,6 +101,7 @@ pub fn save_purchases_batch(
     owner: Option<&str>,
     cursor: PurchaseCursor,
     pages: usize,
+    page_interval: std::time::Duration,
 ) -> Result<PurchaseBatch, DlsiteError> {
     let pages = pages.max(1);
     let mut cursor = cursor;
@@ -117,6 +122,12 @@ pub fn save_purchases_batch(
         if cursor.last_pages[cursor.store_index].is_some_and(|last| cursor.page > last) {
             cursor.store_index += 1;
             continue;
+        }
+        // 2 ページ目以降は間隔をあける。DLsite の `robots.txt` は `Crawl-delay: 10` を
+        // 指定しているので、自動で購入履歴を辿るときはそれを守る
+        // （`fanza::sync::TAG_FETCH_INTERVAL` と同じ流儀で、テストからは 0 を渡せる）。
+        if fetched_pages > 0 && !page_interval.is_zero() {
+            std::thread::sleep(page_interval);
         }
         let page = client.purchased_page(STORES[cursor.store_index], cursor.page)?;
         fetched_pages += 1;
@@ -420,6 +431,104 @@ mod tests {
         serde_json::to_vec(&serde_json::Value::Object(m)).unwrap()
     }
 
+    /// ページ間の待機が入ること（DLsite の `robots.txt` は `Crawl-delay: 10` を指定して
+    /// いる）。実時間を測るので、待機を消すと落ちる。閾値は sleep の粒度ぶん緩めてある。
+    #[test]
+    fn waits_between_pages() {
+        let pool = crate::db::test_pool();
+        let times: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>> = Default::default();
+        let recorder = times.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                if spec.url.contains("/mypage/userbuy/") {
+                    recorder.lock().unwrap().push(std::time::Instant::now());
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![],
+                        body: empty_page().into_bytes(),
+                    })
+                } else {
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![],
+                        body: b"{}".to_vec(),
+                    })
+                }
+            }),
+        };
+        let session = DlsiteSession::from_site_cookies(BTreeMap::from([(
+            "__DLsite_SID".to_string(),
+            "abc".to_string(),
+        )]));
+        let mut client = DlsiteClient::with_transport(Box::new(transport), session);
+
+        save_purchases_batch(
+            &pool,
+            &mut client,
+            None,
+            PurchaseCursor::default(),
+            2,
+            std::time::Duration::from_millis(60),
+        )
+        .unwrap();
+
+        let times = times.lock().unwrap();
+        assert!(times.len() >= 2, "2 ページ叩いていない: {}", times.len());
+        let gap = times[1].duration_since(times[0]);
+        assert!(
+            gap >= std::time::Duration::from_millis(40),
+            "ページ間の待機が入っていない: {gap:?}"
+        );
+    }
+
+    /// セッションが切れている（購入履歴がログインページを返す）ときは、**0 件で成功に
+    /// しない**。黙って何も取り込まないまま「同期完了（0 件）」に見えるのが一番まずく、
+    /// 利用者は同期できたと思い込む。
+    ///
+    /// マーカーは実物（`login.dlsite.com/register?user=self`）から採っている。
+    #[test]
+    fn expired_session_is_reported_instead_of_saved_as_zero_items() {
+        let pool = crate::db::test_pool();
+        let transport = MockTransport {
+            handler: Box::new(|spec: RequestSpec| {
+                if spec.url.contains("/mypage/userbuy/") {
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![],
+                        body: r#"<div class="contentLoginRegist-item"><p class="contentLoginLogin-text">viviON IDに登録済みの方はこちらから</p></div>"#
+                            .as_bytes()
+                            .to_vec(),
+                    })
+                } else {
+                    Ok(ResponseSpec {
+                        status: 404,
+                        headers: vec![],
+                        body: vec![],
+                    })
+                }
+            }),
+        };
+        let session = DlsiteSession::from_site_cookies(BTreeMap::from([(
+            "__DLsite_SID".to_string(),
+            "abc".to_string(),
+        )]));
+        let mut client = DlsiteClient::with_transport(Box::new(transport), session);
+
+        let error = save_purchases_batch(
+            &pool,
+            &mut client,
+            None,
+            PurchaseCursor::default(),
+            20,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("セッション切れを 0 件の成功にしてはいけない");
+        assert!(
+            matches!(error, DlsiteError::SessionExpired),
+            "セッション切れとして返っていない: {error}"
+        );
+    }
+
     /// 画像系（漫画 / CG・AI 含む）だけ保存され、ボイス / ゲーム / ノベル / 動画 /
     /// Webtoon は保存されないこと、および 2 軸分類（media_category / ai_type）と
     /// リッチメタ（release_date / maker_id / age_rating / series_name / tags_json）が
@@ -463,8 +572,15 @@ mod tests {
         )]));
         let mut client = DlsiteClient::with_transport(Box::new(transport), session);
 
-        let batch =
-            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 20).unwrap();
+        let batch = save_purchases_batch(
+            &pool,
+            &mut client,
+            None,
+            PurchaseCursor::default(),
+            20,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
         assert_eq!(batch.saved, 4);
 
         let rows = bookshelf::list(&pool, SITE_ID_DLSITE).unwrap();
@@ -575,8 +691,15 @@ mod tests {
         let transport = paged_transport(calls.clone(), 2);
         let mut client = DlsiteClient::with_transport(Box::new(transport), session());
 
-        let batch =
-            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 5).unwrap();
+        let batch = save_purchases_batch(
+            &pool,
+            &mut client,
+            None,
+            PurchaseCursor::default(),
+            5,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
         // 4 ストアの 1 ページ目 + maniax の 2 ページ目 = 5 ページ
         assert_eq!(batch.fetched_pages, 5);
         assert_eq!(calls.lock().len(), 5, "5 ページだけ叩く");
@@ -589,7 +712,9 @@ mod tests {
         assert_eq!(batch.remaining_runs, 1, "残り 3 ページ = あと 1 回");
 
         // 続きから再開すると各ストアの 2 ページ目を取って完了する
-        let rest = save_purchases_batch(&pool, &mut client, None, next, 5).unwrap();
+        let rest =
+            save_purchases_batch(&pool, &mut client, None, next, 5, std::time::Duration::ZERO)
+                .unwrap();
         assert_eq!(rest.fetched_pages, 3);
         assert_eq!(rest.pages_left, 0);
         assert_eq!(rest.next, None);
@@ -605,8 +730,15 @@ mod tests {
         let transport = paged_transport(calls.clone(), 1);
         let mut client = DlsiteClient::with_transport(Box::new(transport), session());
 
-        let batch =
-            save_purchases_batch(&pool, &mut client, None, PurchaseCursor::default(), 5).unwrap();
+        let batch = save_purchases_batch(
+            &pool,
+            &mut client,
+            None,
+            PurchaseCursor::default(),
+            5,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
         assert_eq!(batch.fetched_pages, 4, "4 ストア × 1 ページ");
         assert_eq!(batch.pages_left, 0);
         assert_eq!(batch.next, None);
