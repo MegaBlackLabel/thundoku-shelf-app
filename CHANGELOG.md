@@ -43,6 +43,23 @@
 
 ### Changed
 
+- **Cookie の宛先を完全一致にし、BOOTH も収集元ホスト別に持つ**: セッション Cookie は
+  収集元（`www.dmm.co.jp` / `accounts.dmm.co.jp`、`www.dlsite.com` / `login.dlsite.com`）別に
+  持っていたが、宛先の判定が「収集元 **or そのサブドメイン**」だったため、host-only な
+  Cookie を収集元のサブドメインへ送る余地が残っていた（実際の送信先は収集元か CDN なので
+  挙動は変わらないが、`header_for` を**完全一致**にして塞いだ）。
+  BOOTH は `booth.pm` と `accounts.booth.pm` の Cookie を 1 つのマップに統合して
+  **両ホストへ同じヘッダを送っていた**ため、`BoothSession` を他ストアと同じ
+  `HostScopedCookies` に変え、宛先 URL ごとに絞るようにした（保存形式が変わるので
+  **BOOTH は 1 回再ログイン**が必要）。
+  あわせて**ダウンロードの許可ホストを実測値まで狭めた**（実機ログ 2026-09-23:
+  DLsite proxy = `www.dlsite.com` / CDN = `download.dlsite.com`、FANZA proxy = `www.dmm.co.jp` /
+  CDN = `doujin03.contents.doujin.dmm.co.jp`）。FANZA の CDN だけは観測が 2 種類
+  （`doujin.contents…` / `doujin03.contents…`）あるためサブドメイン許可のまま。
+  `crates/core/src/session_cookies.rs`、`crates/core/src/booth.rs`、
+  `crates/core/src/{dlsite,fanza}/client.rs`、
+  `crates/app/src/views/booth_login.rs`、`crates/app/src/app_state.rs`
+
 - **DLsite の購入履歴を `robots.txt` の `Crawl-delay: 10` に合わせて辿る**: ページ間の
   待機が無く、分割同期の「続き」を連打すれば無間隔でページを叩けた。ページ間隔
   （`PAGE_INTERVAL = 10 秒`）を入れて、自動で購入履歴を辿るときは `robots.txt` の指定を

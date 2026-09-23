@@ -57,7 +57,7 @@
 | 認証情報は **技術書典 / Google / DB 鍵 / セッション鍵 = OS keyring**、**BOOTH / FANZA / DLsite のセッション = DB（keyring の鍵で AES-256-GCM）** | keyring の値長上限（2560 UTF-16 文字）にセッションが収まらないため DB に置くが、DB のコピーからセッションを復元されないよう鍵だけを keyring に置いて暗号化する（`crates/core/src/session_store.rs`） |
 | 同期は**全件 UPSERT**（技術書典 / DLsite / FANZA）、**Drive のみ md5 + 更新時刻で差分** | ストア側 API に差分が無い。Drive はファイル転送コストが高い |
 | ログインはストアごとに**専用 WebView** を開き、URL 遷移を監視してセッションを保存 | 各ストアのログイン方式（Cookie / メールログイン / OAuth）が異なる |
-| **Cookie は収集元ホストごとに持ち、宛先ごとに絞って送る**（`DlsiteSession::cookie_header_for`） | 収集元（`www` / `login`）を 1 つに潰すと、片方にしか送るべきでない Cookie がもう片方へ飛ぶ。とくにダウンロードの CDN は別システムなので、302 で受け取る署名 `jwt` だけを送る（www のセッション Cookie は送らない） |
+| **Cookie は収集元ホストごとに持ち、宛先ごとに絞って送る**（`FanzaSession` / `DlsiteSession` / `BoothSession` の `cookie_header_for`） | 収集元（`www` / `accounts`、`www` / `login`、`booth.pm` / `accounts.booth.pm`）を 1 つに潰すと、片方にしか送るべきでない Cookie がもう片方へ飛ぶ。とくにダウンロードの CDN は別システムなので、302 で受け取る署名 `jwt` / `CloudFront-*` だけを送る（www のセッション Cookie は送らない）。宛先は**完全一致**（サブドメインへは送らない） |
 | WebView を監視するタスクは**弱参照**でビューを持つ | 監視タスクがアプリ寿命で動き続けるため、強参照だと閉じても WebView ごと残る |
 | 複数 Google アカウントを切替えてもデータが消えない | データを `owner_sub` で**属性付け**して保持し、ログイン切替では削除しない（`crates/core/src/owner.rs`。設計は `docs/account-switch.md`） |
 

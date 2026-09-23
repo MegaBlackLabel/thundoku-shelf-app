@@ -21,9 +21,9 @@ JSON バックアップから復元でき、改変したバックアップを復
 |---|---|---|
 | BOOTH | `download_with_progress`（Cookie 付与の前） | `booth.pm` + `/downloadables/`（完全一致） |
 | DLsite | `down_url` | `www.dlsite.com`（完全一致） |
-| DLsite | 302 の `Location`（CDN） | `*.dlsite.com`（Cookie のスコープに一致。実測は `download.dlsite.com`） |
-| FANZA | proxy URL | `*.dmm.co.jp`（実測は `www.dmm.co.jp`。`downloadLinks` が絶対 URL を返す場合があるため据え置き） |
-| FANZA | 302 の `Location`（CDN） | `*.dmm.co.jp`（実測 CDN は `doujin.contents.doujin.dmm.co.jp`） |
+| DLsite | 302 の `Location`（CDN） | `*.dlsite.com`（Cookie のスコープに一致。実測 `download.dlsite.com`） |
+| FANZA | proxy URL | `www.dmm.co.jp`（完全一致。実測 2026-09-23） |
+| FANZA | 302 の `Location`（CDN） | `*.dmm.co.jp`（実測は **2 種類**: `doujin.contents.doujin.dmm.co.jp` / `doujin03.contents.doujin.dmm.co.jp`） |
 | 技術書典 | `resolve_download_url` の入力 | `techbookfest.org`（完全一致） |
 | 技術書典 | `download_with_progress`（本体） | `techbookfest.org` + `/api/product-dlc/`、`storage.googleapis.com` + `/tbf-tokyo-product-dlc/` |
 
@@ -38,9 +38,10 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 まとめ送りは再発しない。宛先が収集元（とその子ドメイン）でなければ Cookie は空になる
 （`crates/core/src/session_cookies.rs:34-47`, `:63-69` / `crates/core/src/download_url.rs:48-63` /
 `crates/core/src/fanza/client.rs:366-378` / `crates/core/src/dlsite/client.rs:301-313`）。
-残る候補は **FANZA proxy 許可ホストの exact 化**（現状は `*.dmm.co.jp`。`downloadLinks` が
-絶対 URL を返し得るため、実測ログを見てから狭める）と、Cookie の `Domain` / `Path` 属性を
-保存する Cookie Jar 化。
+宛先が収集元でなければ Cookie は空になり、**許可リストも実測値まで狭めた**
+（DLsite / BOOTH / 技術書典 = 完全一致、FANZA proxy = `www.dmm.co.jp` 完全一致。
+FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のまま）。
+残る候補は Cookie の `Domain` / `Path` 属性を保存する Cookie Jar 化。
 なお待機は **DLsite のみ**（`PAGE_INTERVAL = 10 s`、`crates/core/src/dlsite/sync.rs:90`, `:129-131`）
 で、FANZA の一覧取得に待機は無い（1 回 = 5 ページ × 20 件、`crates/core/src/fanza/sync.rs`）。
 
@@ -106,7 +107,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 5. `site_id` = meta の `site_id`、無ければ一覧 HTML 由来の `p.site_id`。`crates/core/src/dlsite/sync.rs:31-34`
 6. `age_category = meta.and_then(|m| m.age_category)`（meta 無しは `None`）。`crates/core/src/dlsite/sync.rs:35`
 7. `classify(&p.work_type, &p.genre_icons, site_id, age_category)` で 2 軸分類＋年齢。`crates/core/src/dlsite/sync.rs:36`
-8. `is_viewable_included(&cfg, true)`（**drm_ok は常に `true` 固定**）が false なら `continue`（= upsert しない）。`crates/core/src/dlsite/sync.rs:37-38`
+8. `is_viewable_included(&cfg)`（**DRM は同期では見ない**＝判定材料が無い）が false なら `continue`（= upsert しない）。`crates/core/src/dlsite/sync.rs:189-191`
 9. `ts = now()`（UTC 文字列）を 1 度だけ作る。`crates/core/src/dlsite/sync.rs:39`
 10. `tags_json` = `custom_genres` が空なら `None`、そうでなければ `serde_json::to_string(&custom_genres)`（失敗時 `None`）。`crates/core/src/dlsite/sync.rs:41-47`
 11. `thumbnail_url` の優先順位: (a) `meta.work_image` → (b) `p.thumbnail_url`（`data:` 始まりを除外）→ `//` 始まりは `https:` 前置に正規化。`crates/core/src/dlsite/sync.rs:48-58`
@@ -168,7 +169,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 | `synced_at` / `created_at` / `updated_at` | すべて同一の `now()`（UTC `%Y-%m-%d %H:%M:%S`） | `crates/core/src/dlsite/sync.rs:83-85` |
 | `media_category` | `media_to_str(cfg.media)`（`comic`/`cg`/…） | `crates/core/src/dlsite/sync.rs:86` |
 | `ai_type` | `ai_to_str(cfg.ai)`（`none`/`partial`/`full`） | `crates/core/src/dlsite/sync.rs:87` |
-| `is_drm` | `0` 固定 | `crates/core/src/dlsite/sync.rs:88` |
+| `is_drm` | `0` 固定（**実データではなく同期が入れる既定値**。DRM は取り込み時に判定する: 読める形式でなければ `ImportError::NotAReadableWork`） | `crates/core/src/dlsite/sync.rs:240-242` |
 | `release_date` | meta の `regist_date`（形式例 `2025-06-17 16:00:00`、DLsite は唯一 release_date を取得するサイト） | `crates/core/src/dlsite/sync.rs:89`, `docs/features.md:209` |
 | `description` / `theme` / `page_count` | `None` | `crates/core/src/dlsite/sync.rs:90-92` |
 | `maker_id` | meta の `maker_id`（`RG\d+`） | `crates/core/src/dlsite/sync.rs:93` |
@@ -285,7 +286,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 | メモリ側 | `AppState.dlsite_session: Arc<Mutex<Option<DlsiteSession>>>` と `dlsite_logged_in: Arc<Mutex<bool>>` を同時更新 | `crates/app/src/app_state.rs:100-101`, `:407-408` |
 | 削除タイミング 1 | 設定画面のログアウト `SettingsView::logout_dlsite`（`clear_dlsite_session` を呼び、失敗時はトーストで通知） | `crates/app/src/views/settings.rs:895-900` |
 | 削除タイミング 2 | `clear_dlsite_session(cx)`（メモリクリア + DB 行削除。削除に失敗したら `Err`） | `crates/app/src/app_state.rs:878-887` |
-| Cookie ヘッダ生成 | `cookie_header_for(host)` = **その宛先ホスト向けに収集した Cookie だけ**を連結（収集元と一致 or その子ドメイン。**大文字小文字は区別しない**）。全収集元をまとめる API は持たない（削除済み） | `crates/core/src/dlsite/client.rs:125-132`, `crates/core/src/session_cookies.rs:34-47` |
+| Cookie ヘッダ生成 | `cookie_header_for(host)` = **その宛先ホスト向けに収集した Cookie だけ**を連結（収集元と**完全一致**。大文字小文字は区別しない）。全収集元をまとめる API は持たない（削除済み） | `crates/core/src/dlsite/client.rs:125-132`, `crates/core/src/session_cookies.rs:34-52` |
 | Cookie ヘッダ生成（送信先別の適用） | `cookie_headers_for(host)` — 購入履歴 / 作品ページ / メタ API = `SITE_HOST`、proxy（`down_url`）= **検証済み URL の host**、CDN = `cdn.host` | `crates/core/src/dlsite/client.rs:195-214`, `:262`, `:310`, `:339` |
 | `jwt` の扱い | 302 応答の `Set-Cookie` から `jwt` のみ拾い、既存ヘッダに `jwt=` が無いときだけ追記。`self.session` には書き戻さない（＝永続化されない）。CDN へは `cookie_header_for(cdn.host)` + `jwt` を送るので、**通常は Cookie ヘッダが `jwt=…` だけ**になる（**実アカウントでログイン → ダウンロードできることを確認済み**: 2026-09-22） | `crates/core/src/dlsite/client.rs:334-343` |
 
@@ -392,7 +393,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 1. `client.purchased_page(page)?` を最大 `pages`（= `PURCHASE_PAGES_PER_RUN`）回呼ぶ。`hasNext` が false、または そのページまでで `total` に届いたら打ち切る（`crates/core/src/fanza/sync.rs:100-117`）。
 2. 各ページの `Vec<FanzaPurchase>` を先頭から順に処理する（**並列度 1**）。`crates/core/src/fanza/sync.rs:105-110`
 3. 各作品を `classify(&p.image_src, &p.genre)` で 2 軸分類（media / ai）する（`crates/core/src/fanza/sync.rs:55`、`crates/core/src/fanza/mod.rs:79`）。
-4. `is_viewable_included(&meta, true)` が `false` なら **upsert せず次へ**（`crates/core/src/fanza/sync.rs:56-58`）。第 2 引数 `drm_ok` は**常に `true` 固定**（同期時は DRM を見ない。`crates/core/src/fanza/mod.rs:91-93` の定義上、media が `Comic`/`Cg` のときだけ保存される）。
+4. `is_viewable_included(&meta)` が `false` なら **upsert せず次へ**（`crates/core/src/fanza/sync.rs:160-162`）。判定は media（`Comic` / `Cg` のみ）で、**DRM は同期では見ない**（削除した `drm_ok` 引数は常に `true` だった = 判定材料が無い。`crates/core/src/fanza/mod.rs:89-96`）。
 5. `now()` でタイムスタンプ文字列を 1 件ごとに生成: UTC `"%Y-%m-%d %H:%M:%S"`（`crates/core/src/fanza/sync.rs:15-17`、呼び出し `:59`）。
 6. `BookshelfItem` を構築（全 35 カラム。→ §1.5 の表）。
 7. `bookshelf::upsert(pool, &item)?` を **1 件ごとに** 実行（`crates/core/src/fanza/sync.rs:97`、実装 `crates/core/src/db/bookshelf.rs:61`）。
@@ -468,7 +469,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 | `synced_at` / `created_at` / `updated_at` | すべて同じ `now()` 文字列（UTC `YYYY-MM-DD HH:MM:SS`）。`created_at` は DO UPDATE に含まれないため初回値が残る | `crates/core/src/fanza/sync.rs:83-85`、`crates/core/src/db/bookshelf.rs:88-89` |
 | `media_category` | `media_to_str(meta.media)` = `"comic"` / `"cg"`（保存対象はこの 2 値のみ） | `crates/core/src/fanza/sync.rs:86`, `crates/core/src/fanza/mod.rs:96-105` |
 | `ai_type` | `ai_to_str(meta.ai)` = `"none"` / `"partial"` / `"full"` | `crates/core/src/fanza/sync.rs:87`, `crates/core/src/fanza/mod.rs:107-115` |
-| `is_drm` | `0` 固定（DRM は同期時に判定しない。ダウンロード時に `detail().is_drm` で判定） | `crates/core/src/fanza/sync.rs:88`、`crates/app/src/views/bookshelf.rs:2804-2808` |
+| `is_drm` | `0` 固定（**実データではなく同期が入れる既定値**。DRM は取り込み直前に `detail().is_drm` で判定し、付きは拒否する） | `crates/core/src/fanza/sync.rs:192-194`、`crates/app/src/views/bookshelf.rs:3921-3925` |
 | `release_date` / `description` / `theme` / `maker_id` / `page_count` / `age_rating` / `series_name` | すべて `None`（FANZA では未使用。一覧 API が返さない） | `crates/core/src/fanza/sync.rs:89-95` |
 
 - 列・テーブルは DB 起動時に冪等 DDL で追加される（`bookshelf_items` と `books` の両方に `media_category` / `ai_type` / `is_drm` / `release_date` / `description` / `theme` / `maker_id` / `page_count` / `age_rating` / `series_name`）: `crates/core/src/db/mod.rs:360-381`。
@@ -544,11 +545,11 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 |---|---|---|
 | Cookie 名 | **特定名に依存しない**。`www.dmm.co.jp` と `accounts.dmm.co.jp` の全 Cookie を無差別に保存 | `crates/app/src/views/fanza_login.rs:117-128` |
 | 収集元オリジン | `https://www.dmm.co.jp`、`https://accounts.dmm.co.jp`（この 2 つのみ） | `crates/app/src/views/fanza_login.rs:117` |
-| 型 | `HashMap<String, String>`（Cookie 名 → 値） | `crates/core/src/fanza/client.rs:49-51` |
+| 型 | `origins: HostScopedCookies`（収集元ホスト → Cookie 名 → 値。`serde(transparent)` なので保存 JSON は `{"origins":{"www.dmm.co.jp":{…},"accounts.dmm.co.jp":{…}}}`） | `crates/core/src/fanza/client.rs:84-91`, `crates/core/src/session_cookies.rs:12-21` |
 | テストで使う Cookie 名 | `login_id`（実値の例示ではなくテスト用モック） | `crates/core/src/fanza/client.rs:479-484`, `crates/core/src/fanza/sync.rs:194` |
-| `logged_in()` 判定 | `!self.cookies.is_empty()`（**空でないかだけ**。サーバー検証はしない） | `crates/core/src/fanza/client.rs:58-60` |
-| Cookie ヘッダ生成 | `k=v` を `"; "` 連結（順序不定） | `crates/core/src/fanza/client.rs:62-68` |
-| Cookie 数 | `cookies_count()` = `self.cookies.len()` | `crates/core/src/fanza/client.rs:70-72` |
+| `logged_in()` 判定 | `!self.origins.is_empty()`（**Cookie が 1 つでもあるかだけ**。サーバー検証はしない） | `crates/core/src/fanza/client.rs:107-109` |
+| Cookie ヘッダ生成 | `cookie_header_for(host)` = **その宛先ホスト向けに収集した Cookie だけ**を `k=v` で `"; "` 連結（`BTreeMap` 順で安定。**完全一致**、大小文字は区別しない） | `crates/core/src/fanza/client.rs:116-123`, `crates/core/src/session_cookies.rs:34-52` |
+| Cookie 数 | `cookies_count()` = 全収集元の合計（`HostScopedCookies::count`） | `crates/core/src/fanza/client.rs:123-127`, `crates/core/src/session_cookies.rs:59-61` |
 | サーバー側検証 | 一覧/詳細 API の `error_code != 0` を `SessionExpired` として検出（Cookie 検証 API は無い） | `crates/core/src/fanza/client.rs:180-182` |
 | 追加認証（メールログイン / OTP / 2FA）の分岐 | **コード上に存在しない**。すべて WebView 内のユーザー操作に委ねる | `crates/app/src/views/fanza_login.rs` 全体 |
 | ログアウト時のサーバー側セッション破棄 | **無い**（`docs/logout.md` は技術書典・BOOTH のみを対象。FANZA はローカルクリアのみ） | `docs/logout.md:1`, `:16`, `crates/app/src/views/settings.rs:720-733` |
@@ -605,7 +606,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 | 同期 UI ポーリング | 120 ms 間隔 `try_recv` | `crates/app/src/views/bookshelf.rs:2521-2523` |
 | ログイン URL 監視 | 1 秒間隔 `timer` | `crates/app/src/views/fanza_login.rs:75-77` |
 | ダウンロード進捗 | `on_progress: &mut dyn FnMut(u64, u64)`（downloaded, total）。UI は `downloaded/total` を fraction（`total > 0` のときのみ。0 なら 0.0）にして `DownloadState::Downloading` を送る | `crates/core/src/fanza/client.rs:357-366`, `crates/app/src/views/bookshelf.rs:2817-2828` |
-| ダウンロードのヘッダ（proxy） | `Cookie`（= `cookie_header_for(proxy.host)` = **proxy ホスト向けに収集したものだけ**。宛先は `downloadLinks` の URL で、`*.dmm.co.jp` のみ許可）/ `User-Agent` / `Referer: https://www.dmm.co.jp/`。**Cookie を付ける前に `download_url::check` で検証**し、その `ParsedUrl.host` を Cookie の絞り込みに使う | `crates/core/src/fanza/client.rs:364-378`, `:42-46` |
+| ダウンロードのヘッダ（proxy） | `Cookie`（= `cookie_header_for(proxy.host)` = **proxy ホスト向けに収集したものだけ**。宛先は `downloadLinks` の URL で、`www.dmm.co.jp` のみ許可）/ `User-Agent` / `Referer: https://www.dmm.co.jp/`。**Cookie を付ける前に `download_url::check` で検証**し、その `ParsedUrl.host` を Cookie の絞り込みに使う | `crates/core/src/fanza/client.rs:366-380`, `:40-48` |
 | ダウンロードのヘッダ（CDN） | CDN 向け Cookie（`cookie_header_for(cdn.host)` + 署名 `CloudFront-*`）+ `User-Agent` + `Referer: https://www.dmm.co.jp/` + `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: cross-site` / `Upgrade-Insecure-Requests: 1` | `crates/core/src/fanza/client.rs:407-437` |
 | 署名 Cookie の取得 | proxy の 302 応答 `Set-Cookie` のうち `CloudFront-` 接頭辞のみを、未含有なら（宛先ホスト向けの）Cookie 文字列へ追記 | `crates/core/src/fanza/client.rs:407-416`（コメント `:401-406`） |
 | ZIP 判定 | 本文が `<!doctype` または `<html` で始まる場合は `FanzaError::Parse("HTML response (not a file)")` | `crates/core/src/fanza/client.rs:446-448` |
@@ -716,7 +717,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 |---|---|---|
 | 同期ボタンの入口（ディスパッチ） | `pub fn sync_all(&mut self, cx: &mut Context<Self>)` | `crates/app/src/views/bookshelf.rs:2229` |
 | BOOTH 同期本体 | `pub fn sync_booth(&mut self, cx: &mut Context<Self>)` | `crates/app/src/views/bookshelf.rs:2253` |
-| HTTP クライアント生成 | `pub fn new(session: &BoothSession) -> Self` | `crates/core/src/booth.rs:88` |
+| HTTP クライアント生成 | `pub fn new(session: &BoothSession) -> Self` | `crates/core/src/booth.rs:172` |
 | ライブラリ全ページ取得 | `pub fn library(&self) -> Result<Vec<BoothLibraryItem>, BoothError>` | `crates/core/src/booth.rs:200` |
 | 購入履歴全ページ取得 | `pub fn orders(&self) -> Result<Vec<BoothOrder>, BoothError>` | `crates/core/src/booth.rs:266` |
 | 商品詳細（表紙） | `pub fn item_detail(&self, item_id: u64) -> Result<BoothItemDetail, BoothError>` | `crates/core/src/booth.rs:360` |
@@ -756,7 +757,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 
 #### 1.3 HTTP リクエスト一覧
 
-共通ヘッダ（`BoothClient::get`）: `User-Agent`（固定、下記定数）、`Accept`（呼び出し側指定）、`Accept-Language: ja,en-US;q=0.9,en;q=0.8`、`Cookies` は `cookie_header` が空でなければ `Cookie: name=value; ...` を付与 — `crates/core/src/booth.rs:171-179`。
+共通ヘッダ（`BoothClient::get`）: `User-Agent`（固定、下記定数）、`Accept`（呼び出し側指定）、`Accept-Language: ja,en-US;q=0.9,en;q=0.8`、`Cookie` は**宛先 URL のホスト向けに収集したもの**（`cookie_for(url)` → `cookie_header_for(host)`。`booth.pm` と `accounts.booth.pm` の Cookie を混ぜない）が空でなければ付与 — `crates/core/src/booth.rs:172-191`, `:269-278`。
 
 | # | 用途 | メソッド + URL | Accept / 追加ヘッダ | 実装 |
 |---|---|---|---|---|
@@ -907,7 +908,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 - 成否判定は **URL ベースのみ**: 「ホストが `booth.pm` で終わる」かつ「URL に `/users/sign_in` を含まない」 → セッション確立とみなす `crates/app/src/views/booth_login.rs:113-122`。
 - 追加条件: 収集した Cookie が 0 件なら `log::warn!` して false（未完了扱い、WebView は開いたまま） `crates/app/src/views/booth_login.rs:140-143`。
 - **サーバーへの検証リクエストは行わない**（`accounts.booth.pm/library` を叩いて 200 を確認する等はしない）。実際の検証は次の同期時の `NotLoggedIn` 判定で行われる `crates/core/src/booth.rs:183`,`:227-237`。
-- Cookie は `cookies_for_url(url)` の戻り（`raw()` 経由）から `name()` / `value()` を取り出して `HashMap<String,String>` に詰める `crates/app/src/views/booth_login.rs:128-138`。
+- Cookie は `cookies_for_url(url)` の戻り（`raw()` 経由）から `name()` / `value()` を取り出し、**収集元ホストごとの `BTreeMap<String, BTreeMap<String,String>>`**（`booth.pm` / `accounts.booth.pm`）へ詰める。1 つに潰さないのは、`accounts` 側にしか送るべきでない Cookie（`_plaza_session_*`）を `booth.pm` や画像 CDN へ流さないため `crates/app/src/views/booth_login.rs:134-159`。
 - 取得する Cookie 名は**ハードコードされていない**（ドメインに紐づく全 Cookie を無条件で保存）。
 - コード/ドキュメント上で名前が出てくる Cookie:
   - `_plaza_session_*`（`accounts.booth.pm` の pixiv セッション。ログアウトに必要） — `crates/app/src/views/booth_login.rs:124`、`docs/logout.md:39`、`crates/core/src/booth.rs:102-103`。
@@ -920,7 +921,7 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 | 項目 | 事実 | アンカー |
 |---|---|---|
 | 保存先 | SQLite の `app_settings` テーブル、キー `"booth.session"` | `crates/app/src/app_state.rs:392`、`crates/core/src/db/schema.sql:25-30` |
-| 形式 | `BoothSession` を `serde_json` 化したものを暗号化した文字列（`enc:v2:` + base64）を `value` 列へ。**平文 JSON では保存しない** | `crates/core/src/session_store.rs:33`、`crates/app/src/views/booth_login.rs:162` |
+| 形式 | `BoothSession` を `serde_json` 化したものを暗号化した文字列（`enc:v2:` + base64）を `value` 列へ。**平文 JSON では保存しない**。`BoothSession` は `origins: HostScopedCookies` 1 フィールドなので実体は `{"origins":{"booth.pm":{"<name>":"<value>", …},"accounts.booth.pm":{…}}}`（**収集元ホストごと**。旧 `{"cookies":{…}}` 形式は復元できず再ログインになる） | `crates/core/src/session_store.rs:33`、`crates/app/src/views/booth_login.rs:160-166` |
 | 暗号化 | **keyring の鍵（`thundoku-shelf.session-key`）で AES-256-GCM**（AAD に用途名・形式版）。保存値は `enc:v2:` + base64(IV ‖ 暗号文 ‖ tag)。復号できない値（旧 `enc:v1`・平文・改ざん・別鍵）は未ログインとして破棄し、**平文へは戻さない**。**保存から 7 日**を過ぎた値も行ごと破棄する | `crates/core/src/session_store.rs:7-11`, `:33`, `:38`, `:107-200` |
 | keyring を使わない理由（コメント） | セッション Cookie は Windows Credential Manager の上限（**2560 UTF-16 文字**）を超えることがあるため DB 保存 | `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |
 | 実行時キャッシュ | `AppState.booth_session: Arc<parking_lot::Mutex<Option<BoothSession>>>` と `booth_logged_in: Arc<Mutex<bool>>` | `crates/app/src/app_state.rs` |
