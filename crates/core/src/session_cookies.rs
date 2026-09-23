@@ -32,16 +32,21 @@ impl HostScopedCookies {
     }
 
     /// 宛先ホスト向けの `Cookie` ヘッダ。**そのホスト向けに収集したものだけ**を返す
-    /// （収集元と一致するか、その収集元の子ドメイン）。収集元でなければ空。
+    /// （収集元と**完全一致**。大小文字は区別しない）。収集元でなければ空。
     ///
     /// 収集元すべてを 1 本にまとめる API は**持たない**: まとめると、片方にしか送るべきでない
     /// Cookie（`accounts.dmm.co.jp` / `login.dlsite.com` のもの）が、宛先が不定の
     /// ダウンロード proxy や CDN へ飛ぶ。宛先が既知なら必ずこの関数を使う。
+    ///
+    /// サブドメインを許さないのは、収集元にしか送るべきでない Cookie（host-only）を
+    /// 別ホストへ出さないため。収集はブラウザの `cookies_for_url(<収集元>)` で行うので、
+    /// ドメイン全体に有効な Cookie は**その名前で各収集元のバケツに入る**（＝そのホストへ
+    /// 送るべき集合と一致する）。
     pub fn header_for(&self, host: &str) -> String {
         join(
             self.origins
                 .iter()
-                .filter(|(origin, _)| is_origin_of(origin, host))
+                .filter(|(origin, _)| origin.eq_ignore_ascii_case(host))
                 .flat_map(|(_, cookies)| cookies.iter()),
         )
     }
@@ -58,14 +63,6 @@ impl HostScopedCookies {
     pub fn is_empty(&self) -> bool {
         self.count() == 0
     }
-}
-
-/// `host` が収集元 `origin` そのもの、またはその子ドメインか。
-///
-/// 判定は `download_url::host_within` と**同じ実装**を使う（大小文字の扱いが
-/// URL 検証側と食い違うと、検証は通るのに Cookie が空になって黙って未認証になる）。
-fn is_origin_of(origin: &str, host: &str) -> bool {
-    crate::download_url::host_within(host, origin)
 }
 
 /// Cookie 名と値の組を `Cookie` ヘッダの形に連結する（順序は BTreeMap 順で安定）。
@@ -94,7 +91,7 @@ mod tests {
     }
 
     /// 宛先が収集元でなければ 1 つも送らない（CDN がこれに当たる）。
-    /// 収集元そのもの / その子ドメインには送る。
+    /// **完全一致**なので、収集元のサブドメインにも送らない。
     #[test]
     fn header_for_is_scoped_to_the_destination_host() {
         let cookies = bag();
@@ -102,9 +99,11 @@ mod tests {
         assert_eq!(cookies.header_for("doujin.contents.doujin.dmm.co.jp"), "");
         assert_eq!(cookies.header_for("download.dlsite.com"), "");
         assert_eq!(cookies.header_for("evil.example.com"), "");
+        // 収集元のサブドメインにも送らない（host-only な Cookie を別ホストへ出さない）
+        assert_eq!(cookies.header_for("sub.www.dmm.co.jp"), "");
+        assert_eq!(cookies.header_for("accounts.dmm.co.jp.evil.example.com"), "");
 
         assert_eq!(cookies.header_for("www.dmm.co.jp"), "login_id=abc");
-        assert_eq!(cookies.header_for("sub.www.dmm.co.jp"), "login_id=abc");
         assert_eq!(cookies.header_for("accounts.dmm.co.jp"), "acct=1");
     }
 
@@ -116,9 +115,10 @@ mod tests {
         let cookies = bag();
 
         assert_eq!(cookies.header_for("WWW.DMM.CO.JP"), "login_id=abc");
-        assert_eq!(cookies.header_for("Sub.WWW.dmm.CO.jp"), "login_id=abc");
         assert_eq!(cookies.header_for("ACCOUNTS.DMM.CO.JP"), "acct=1");
         assert_eq!(cookies.header_for("DOUJIN.CONTENTS.DOUJIN.DMM.CO.JP"), "");
+        // 大小文字だけの違いは同一ホスト（サブドメインは完全一致でも送らない）
+        assert_eq!(cookies.header_for("SUB.WWW.DMM.CO.JP"), "");
     }
 
     /// 値の取り出しは収集元をまたがない。

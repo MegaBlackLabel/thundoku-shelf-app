@@ -133,8 +133,13 @@ impl BoothLoginView {
         let _pumping = crate::app_state::WebviewPumpGuard::enter();
         // booth.pm と accounts.booth.pm のセッション Cookie を取得する
         //（accounts.booth.pm の _plaza_session_* はログアウトに必要）
-        let mut cookie_pairs: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        //
+        // 収集元ホストごとに分けて持つ（1 つに潰すと、accounts 側にしか送るべきでない
+        // Cookie が booth.pm や画像 CDN へ飛ぶ）。
+        let mut origins: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, String>,
+        > = std::collections::BTreeMap::new();
         for url in ["https://booth.pm", "https://accounts.booth.pm"] {
             let cookies = webview
                 .read(cx)
@@ -142,20 +147,22 @@ impl BoothLoginView {
                 .cookies_for_url(url)
                 .unwrap_or_default();
             log::debug!("booth login: cookies_for_url({url}) -> {}", cookies.len());
+            let Ok(parsed) = thundoku_core::download_url::parse(url) else {
+                continue;
+            };
+            let entry = origins.entry(parsed.host.to_string()).or_default();
             for cookie in cookies {
-                let name = cookie.name().to_string();
-                let value = cookie.value().to_string();
-                cookie_pairs.entry(name).or_insert(value);
+                entry
+                    .entry(cookie.name().to_string())
+                    .or_insert_with(|| cookie.value().to_string());
             }
         }
-        if cookie_pairs.is_empty() {
+        let session = thundoku_core::booth::BoothSession::new(origins);
+        if !session.logged_in() {
             log::warn!("booth login: セッション Cookie を取得できませんでした");
             return false;
         }
-        let session = thundoku_core::booth::BoothSession {
-            cookies: cookie_pairs,
-        };
-        log::info!("booth login: {} cookies captured", session.cookies.len());
+        log::info!("booth login: {} cookies captured", session.cookies_count());
         crate::app_state::save_booth_session(cx, &session);
         // WebView を隠して完了を通知する
         if let Some(webview) = &self.webview {

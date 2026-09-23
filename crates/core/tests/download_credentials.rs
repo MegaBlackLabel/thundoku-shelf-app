@@ -6,7 +6,7 @@
 //! ことを、送信を記録するモックで確認する。
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use thundoku_core::booth::{BoothClient, BoothError, BoothSession};
@@ -50,8 +50,8 @@ impl Transport for Recording {
     }
 }
 
-fn session_cookies() -> HashMap<String, String> {
-    HashMap::from([("session".to_string(), "secret-cookie".to_string())])
+fn session_cookies() -> BTreeMap<String, String> {
+    BTreeMap::from([("session".to_string(), "secret-cookie".to_string())])
 }
 
 fn sent_urls(log: &Log) -> Vec<String> {
@@ -61,9 +61,10 @@ fn sent_urls(log: &Log) -> Vec<String> {
 /// BOOTH: `booth.pm/downloadables/` 以外へは（Cookie を付ける前に）拒否する。
 #[test]
 fn booth_never_attaches_the_session_outside_the_allowlist() {
-    let session = BoothSession {
-        cookies: session_cookies(),
-    };
+    let session = BoothSession::new(BTreeMap::from([(
+        "booth.pm".to_string(),
+        session_cookies(),
+    )]));
     let client = BoothClient::new(&session);
 
     for url in [
@@ -84,7 +85,7 @@ fn dlsite_rejects_a_foreign_saved_url_without_sending() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let mut client = DlsiteClient::with_transport(
         Box::new(Recording::new(&log, None)),
-        DlsiteSession::from_site_cookies(session_cookies().into_iter().collect()),
+        DlsiteSession::from_site_cookies(session_cookies()),
     );
 
     let error = client
@@ -103,7 +104,7 @@ fn dlsite_rejects_a_redirect_to_an_unlisted_host() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let mut client = DlsiteClient::with_transport(
         Box::new(Recording::new(&log, Some("https://evil.example.com/zip"))),
-        DlsiteSession::from_site_cookies(session_cookies().into_iter().collect()),
+        DlsiteSession::from_site_cookies(session_cookies()),
     );
 
     let error = client
@@ -126,7 +127,7 @@ fn fanza_rejects_a_foreign_proxy_url_without_sending() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let mut client = FanzaClient::with_transport(
         Box::new(Recording::new(&log, None)),
-        FanzaSession::from_site_cookies(session_cookies().into_iter().collect()),
+        FanzaSession::from_site_cookies(session_cookies()),
     );
 
     let error = client
@@ -142,7 +143,7 @@ fn fanza_rejects_a_redirect_to_an_unlisted_host() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let mut client = FanzaClient::with_transport(
         Box::new(Recording::new(&log, Some("https://evil.example.com/zip"))),
-        FanzaSession::from_site_cookies(session_cookies().into_iter().collect()),
+        FanzaSession::from_site_cookies(session_cookies()),
     );
 
     let error = client

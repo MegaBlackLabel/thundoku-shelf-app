@@ -364,7 +364,10 @@ impl AppState {
             if booth_logged_in {
                 format!(
                     "ログイン済み（cookies={}）",
-                    booth_session.as_ref().map(|s| s.cookies.len()).unwrap_or(0)
+                    booth_session
+                        .as_ref()
+                        .map(BoothSession::cookies_count)
+                        .unwrap_or(0)
                 )
             } else {
                 "未ログイン".to_string()

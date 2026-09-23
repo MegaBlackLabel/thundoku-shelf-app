@@ -989,13 +989,9 @@ mod tests {
         // 宛先が収集元でなければ 1 つも送らない（CDN はこれに当たる）
         assert_eq!(session.cookie_header_for("download.dlsite.com"), "");
         assert_eq!(session.cookie_header_for("evil.example.com"), "");
-        // 収集元そのもの / その子ドメインには送る
+        // 収集元は完全一致（サブドメインへは送らない）
         assert_eq!(session.cookie_header_for(SITE_HOST), "__DLsite_SID=shop");
-        assert!(
-            session
-                .cookie_header_for("sub.www.dlsite.com")
-                .contains("__DLsite_SID=shop")
-        );
+        assert_eq!(session.cookie_header_for("sub.www.dlsite.com"), "");
         assert_eq!(session.cookie_header_for(LOGIN_HOST), "login_ticket=t");
 
         // 収集元をまたいだ取り出し（認証判定用）

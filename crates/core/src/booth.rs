@@ -4,30 +4,42 @@
 //! 取得した booth.pm のセッション Cookie を保持・永続化する。
 //! 購入品一覧はライブラリページ、購入日は購入履歴ページから取得する。
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-/// BOOTH のセッション（booth.pm ドメインの Cookie 群）。
+use crate::session_cookies::HostScopedCookies;
+
+/// BOOTH のセッション（`booth.pm` / `accounts.booth.pm` の Cookie 群）。
+///
+/// Cookie は**収集元ホストごと**に持つ。1 つに潰すと、片方にしか送るべきでない Cookie が
+/// もう片方（pixiv 側の `accounts`）や別システム（画像 CDN / 一時 S3）へ飛ぶ。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct BoothSession {
-    /// booth.pm のセッション Cookie（name → value）
-    pub cookies: HashMap<String, String>,
+    origins: HostScopedCookies,
 }
 
 impl BoothSession {
-    /// ログイン済みか（booth.pm の Cookie が 1 つ以上ある）。
-    pub fn logged_in(&self) -> bool {
-        !self.cookies.is_empty()
+    pub fn new(origins: BTreeMap<String, BTreeMap<String, String>>) -> Self {
+        Self {
+            origins: HostScopedCookies::new(origins),
+        }
     }
 
-    /// HTTP リクエスト用の `Cookie: name=value; ...` ヘッダー値。
-    pub fn cookie_header(&self) -> String {
-        self.cookies
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("; ")
+    /// ログイン済みか（Cookie が 1 つ以上ある）。
+    pub fn logged_in(&self) -> bool {
+        !self.origins.is_empty()
+    }
+
+    /// 宛先ホスト向けの `Cookie: name=value; ...` ヘッダー値。
+    ///
+    /// **そのホスト向けに収集したものだけ**を返す（収集元と完全一致。大小文字は区別しない）。
+    pub fn cookie_header_for(&self, host: &str) -> String {
+        self.origins.header_for(host)
+    }
+
+    pub fn cookies_count(&self) -> usize {
+        self.origins.count()
     }
 }
 
@@ -94,7 +106,7 @@ pub struct BoothItemDetail {
 
 /// BOOTH の購入品取得クライアント（ログイン済みセッションを使用）。
 pub struct BoothClient {
-    cookie_header: String,
+    session: BoothSession,
     agent: ureq::Agent,
 }
 
@@ -159,11 +171,22 @@ fn remove_html_dumps() {
 impl BoothClient {
     pub fn new(session: &BoothSession) -> Self {
         Self {
-            cookie_header: session.cookie_header(),
+            session: session.clone(),
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(std::time::Duration::from_secs(5))
                 .timeout_read(std::time::Duration::from_secs(15))
                 .build(),
+        }
+    }
+
+    /// 宛先 URL 向けの `Cookie` ヘッダー値。**そのホスト向けに収集したものだけ**を返す。
+    ///
+    /// URL が解釈できない（`https` でない等）ときは空にする（fail-closed。
+    /// 送信先が確定できないリクエストに資格情報を載せない）。
+    fn cookie_for(&self, url: &str) -> String {
+        match crate::download_url::parse(url) {
+            Ok(parsed) => self.session.cookie_header_for(parsed.host),
+            Err(_) => String::new(),
         }
     }
 
@@ -180,7 +203,8 @@ impl BoothClient {
         let page = self.get("https://booth.pm/ja", "text/html; charset=utf-8")?;
         let csrf = extract_csrf_token(&page)
             .ok_or_else(|| BoothError::Network("csrf token not found in page".into()))?;
-        let cookie_ok = !self.cookie_header.is_empty();
+        let booth_cookie = self.cookie_for("https://booth.pm/ja");
+        let plaza_cookie = self.cookie_for("https://accounts.booth.pm/");
 
         // 1) plaza（pixiv アカウント）側のセッション破棄。失敗しても続行する
         //    （booth.pm 側だけでもログアウトとして機能するため）。
@@ -193,8 +217,8 @@ impl BoothClient {
                 .set("X-CSRF-Token", &csrf)
                 .set("Referer", "https://accounts.booth.pm")
                 .set("Origin", "https://accounts.booth.pm");
-            if cookie_ok {
-                request = request.set("Cookie", &self.cookie_header);
+            if !plaza_cookie.is_empty() {
+                request = request.set("Cookie", &plaza_cookie);
             }
             match request.send_form(&[("_method", "delete")]) {
                 Ok(response) => {
@@ -219,8 +243,8 @@ impl BoothClient {
             .set("X-CSRF-Token", &csrf)
             .set("Referer", "https://booth.pm/ja")
             .set("Origin", "https://booth.pm");
-        if cookie_ok {
-            request = request.set("Cookie", &self.cookie_header);
+        if !booth_cookie.is_empty() {
+            request = request.set("Cookie", &booth_cookie);
         }
         let response = request
             .send_form(&[("_method", "delete")])
@@ -248,8 +272,9 @@ impl BoothClient {
             .set("User-Agent", &user_agent())
             .set("Accept", accept)
             .set("Accept-Language", "ja,en-US;q=0.9,en;q=0.8");
-        if !self.cookie_header.is_empty() {
-            request = request.set("Cookie", &self.cookie_header);
+        let cookie = self.cookie_for(url);
+        if !cookie.is_empty() {
+            request = request.set("Cookie", &cookie);
         }
         let response = request.call().map_err(|e| match e {
             // Cloudflare のクリアランス（cf_clearance）失効やセッション切れは
@@ -386,8 +411,9 @@ impl BoothClient {
             .get(download_url)
             .set("User-Agent", &user_agent())
             .set("Accept", "application/octet-stream, */*");
-        if !self.cookie_header.is_empty() {
-            request = request.set("Cookie", &self.cookie_header);
+        let cookie = self.cookie_for(download_url);
+        if !cookie.is_empty() {
+            request = request.set("Cookie", &cookie);
         }
         let response = request
             .call()
@@ -709,29 +735,58 @@ mod tests {
         assert!(!path.exists(), "既定で HTML ダンプを書いてはいけない");
     }
 
+    /// 収集元が 2 つ（booth.pm / accounts.booth.pm）のセッション。
+    fn two_origin_session() -> BoothSession {
+        BoothSession::new(BTreeMap::from([
+            (
+                "booth.pm".to_string(),
+                BTreeMap::from([("_booth_session".to_string(), "abc123".to_string())]),
+            ),
+            (
+                "accounts.booth.pm".to_string(),
+                BTreeMap::from([("_plaza_session".to_string(), "xyz".to_string())]),
+            ),
+        ]))
+    }
+
     #[test]
     fn session_logged_in_and_cookie_header() {
         let session = BoothSession::default();
         assert!(!session.logged_in(), "empty session is not logged in");
-        assert_eq!(session.cookie_header(), "");
+        assert_eq!(session.cookie_header_for("booth.pm"), "");
 
-        let session = BoothSession {
-            cookies: HashMap::from([
-                ("_booth_session".to_string(), "abc123".to_string()),
-                ("locale".to_string(), "ja".to_string()),
-            ]),
-        };
+        let session = two_origin_session();
         assert!(session.logged_in());
-        let header = session.cookie_header();
-        assert!(header.contains("_booth_session=abc123"));
-        assert!(header.contains("locale=ja"));
+        assert_eq!(session.cookie_header_for("booth.pm"), "_booth_session=abc123");
+        assert_eq!(
+            session.cookie_header_for("accounts.booth.pm"),
+            "_plaza_session=xyz"
+        );
+    }
+
+    /// Cookie は宛先ホスト別に送る。**完全一致**なので、収集元のサブドメインや
+    /// 別システム（画像 CDN など）へは送らない。
+    #[test]
+    fn session_cookie_header_is_scoped_to_the_destination_host() {
+        let session = two_origin_session();
+
+        for host in [
+            "example.com",
+            "booth.pximg.net",
+            "sub.booth.pm",
+            "evilbooth.pm",
+            "BOOTH.PM.EVIL.EXAMPLE.COM",
+        ] {
+            assert_eq!(session.cookie_header_for(host), "", "{host}");
+        }
+        // 大小文字だけの違いは同一ホスト
+        assert_eq!(session.cookie_header_for("BOOTH.PM"), "_booth_session=abc123");
+        assert_eq!(session.cookies_count(), 2);
     }
 
     #[test]
     fn session_roundtrips_via_json() {
-        let session = BoothSession {
-            cookies: HashMap::from([("_booth_session".to_string(), "abc".to_string())]),
-        };
+        let session = two_origin_session();
         let json = serde_json::to_string(&session).unwrap();
         let restored: BoothSession = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, session);
