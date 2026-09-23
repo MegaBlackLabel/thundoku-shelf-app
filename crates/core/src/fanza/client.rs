@@ -37,16 +37,22 @@ pub const SITE_HOST: &str = "www.dmm.co.jp";
 /// アカウント（`accounts.dmm.co.jp`）。ログインの Cookie はここでも発行される。
 pub const ACCOUNT_HOST: &str = "accounts.dmm.co.jp";
 
-/// ダウンロード proxy（詳細 API の `downloadLinks`）を叩いてよいホスト。
-/// Cookie は `domain=.dmm.co.jp` で発行されるため、その範囲だけを許可する。
+/// ダウンロード proxy（詳細 API の `downloadLinks`）を叩いてよいホスト（**完全一致**）。
+///
+/// `downloadLinks["1"]` は相対パスで返り `https://www.dmm.co.jp` を前置する（絶対 URL の場合も
+/// そのまま使う）。実機の観測は `https://www.dmm.co.jp/dc/-/proxy/...`（2026-09-23、
+/// ダウンロード時のログ行 `fanza download: proxy=… cdn=…`）。同じ `*.dmm.co.jp` でも
+/// サブドメインは許可しない（Cookie は宛先別に絞ってあるので漏れはしないが、
+/// 未認証のリクエストも飛ばさない）。
 const FANZA_DOWNLOAD_RULES: &[crate::download_url::HostRule] =
-    &[crate::download_url::HostRule::with_subdomains(
-        "dmm.co.jp",
-        None,
-    )];
+    &[crate::download_url::HostRule::exact("www.dmm.co.jp", None)];
 
-/// 302 の転送先（CloudFront 署名 Cookie を送る先）。
-/// 実測の CDN は `doujin.contents.doujin.dmm.co.jp`（`dmm.co.jp` のサブドメイン）。
+/// 302 の転送先（CloudFront 署名 Cookie を送る先）。署名 Cookie は `domain=dmm.co.jp` で
+/// 発行されるため、その範囲だけを許可する。
+///
+/// 実測の CDN は **複数ある**: `doujin.contents.doujin.dmm.co.jp`（テスト・初期の観測）と
+/// `doujin03.contents.doujin.dmm.co.jp`（2026-09-23 の実機観測）。ホスト名が固定できないため
+/// サブドメイン許可のままにする（送るのは 302 で受け取った署名 Cookie だけ）。
 const FANZA_CDN_RULES: &[crate::download_url::HostRule] =
     &[crate::download_url::HostRule::with_subdomains(
         "dmm.co.jp",
@@ -155,7 +161,7 @@ pub struct FanzaDetail {
 }
 
 impl FanzaDetail {
-    /// 詳細メタを 2 軸分類して `is_viewable_included` 判定（DRM 込み）。
+    /// 詳細メタを 2 軸分類して `is_viewable_included` 判定（DRM は見ない。同期では判定できない）。
     pub fn meta(&self) -> crate::fanza::FanzaMeta {
         classify("", &self.genre)
     }
@@ -858,6 +864,40 @@ mod tests {
             "CDN へは署名 Cookie だけを送る"
         );
         assert!(spec.redirects == 3);
+    }
+
+    /// proxy が `www.dmm.co.jp` 以外（同じ `*.dmm.co.jp` のサブドメインでも）なら、
+    /// **リクエストを送らずに**拒否する。実機の proxy は `https://www.dmm.co.jp/dc/-/proxy/...`
+    /// （2026-09-23 観測。`crates/core/src/fanza/client.rs` のログ行）。
+    #[test]
+    fn download_proxy_on_another_subdomain_is_blocked_without_sending() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls2 = calls.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |_spec: RequestSpec| {
+                *calls2.lock() += 1;
+                Ok(ResponseSpec {
+                    status: 302,
+                    headers: vec![(
+                        "location".into(),
+                        "https://doujin03.contents.doujin.dmm.co.jp/x.zip".into(),
+                    )],
+                    body: vec![],
+                })
+            }),
+        };
+        let mut client = FanzaClient::with_transport(Box::new(transport), session());
+        let mut on = |_: u64, _: u64| true;
+        let err = client
+            .download_with_progress("https://dl.dmm.co.jp/dc/-/proxy/=/x/", &mut on)
+            .unwrap_err();
+        assert!(
+            matches!(err, FanzaError::BlockedUrl(_)),
+            "拒否されていない: {err:?}"
+        );
+        assert_eq!(*calls.lock(), 0, "拒否したのにリクエストを送っている");
     }
 
     /// 作品ページ HTML からジャンルタグ（genreTag__txt）を抽出する。
