@@ -2,7 +2,7 @@
 
 > **AI 向けの詳細設計仕様書は `docs/spec/README.md`（索引）**を参照。実装を別言語へ移植する／Web 版に戻すための、数値・定数・アルゴリズムまで書いたリファレンス。
 
-Thundoku Shelf Desktop は、技術書典・BOOTH で購入した本の管理・閲覧を目的とした
+Thundoku Shelf Desktop は、技術書典・BOOTH で購入した本の閲覧を目的とした
 デスクトップアプリケーション（macOS / Windows）です。Web 版
 （https://thundoku-shelf-staging.megablacklabel.workers.dev/）の機能をローカルで
 再現し、追加でデスクトップ固有の機能を備えています。
