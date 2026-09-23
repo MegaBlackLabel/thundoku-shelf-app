@@ -2579,13 +2579,6 @@ impl BookshelfView {
                 });
             };
             loop {
-                // WebView2 がメッセージループを回している間は適用しない（次の周回に回す）。
-                if crate::app_state::webview_pumping() > 0 {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(50))
-                        .await;
-                    continue;
-                }
                 match rx.try_recv() {
                     Ok(update) => {
                         batch.push(update);
@@ -3388,8 +3381,6 @@ impl BookshelfView {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(_) => {
-                        // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
-                        crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                         handle.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(120))
@@ -3481,8 +3472,6 @@ impl BookshelfView {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(_) => {
-                        // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
-                        crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                         handle.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(120))
@@ -3588,8 +3577,6 @@ impl BookshelfView {
             let Some(outcome) = outcome else {
                 return;
             };
-            // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
-            crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
             handle.update(cx, |this, cx| {
                 if let Some(notice) = tag_fetch_notice(&outcome) {
                     log::info!(
@@ -3673,8 +3660,6 @@ impl BookshelfView {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(_) => {
-                        // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
-                        crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                         handle.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(120))
@@ -3767,8 +3752,6 @@ impl BookshelfView {
                 match rx.try_recv() {
                     Ok(result) => break result,
                     Err(_) => {
-                        // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
-                        crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
                         handle.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(120))
@@ -4298,13 +4281,6 @@ impl BookshelfView {
             let mut last_label: Option<&'static str> = None;
             let mut disconnected = false;
             while !disconnected {
-                // WebView2 がメッセージループを回している間は更新しない（次の周回に回す）。
-                if crate::app_state::webview_pumping() > 0 {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(16))
-                        .await;
-                    continue;
-                }
                 // Drain the channel, keeping only the latest state per poll.
                 loop {
                     match progress_rx.try_recv() {

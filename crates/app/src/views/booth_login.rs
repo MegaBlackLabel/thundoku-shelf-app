@@ -6,11 +6,14 @@
 
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::{
-    Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    App, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_wry::WebView;
-use thundoku_core::session_cookies::CookieEntry;
+
+/// セッション Cookie を集める起点（`accounts.booth.pm` の `_plaza_session_*` は
+/// ログアウトにも必要なので両方集める）。
+const SESSION_ORIGINS: [&str; 2] = ["https://booth.pm", "https://accounts.booth.pm"];
 
 /// ログイン完了イベント（Cookie を取得して永続化した後に発行）。
 pub struct BoothLoginDone;
@@ -78,15 +81,22 @@ impl BoothLoginView {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                // WebView2 がメッセージループを回している間は待つ（借用が衝突するため）。
-                crate::app_state::wait_while_webview_pumping(cx.background_executor()).await;
-                let Ok(done) = handle.update(cx, |this, cx| {
-                    if this.check_generation != generation {
-                        return true; // 新しい監視が始まっている
-                    }
-                    this.check_login(cx)
-                }) else {
+                // (a) 借用内: 世代・URL の確認とハンドルの取得（**wry を触らない = pump しない**）
+                let tick = match handle.update(cx, |this, cx| this.begin_check(generation, cx)) {
+                    Ok(super::CheckStep::Collect(tick)) => tick,
+                    Ok(super::CheckStep::Wait) => continue,
+                    Ok(super::CheckStep::Stop) => break,
                     // Err = ビューが drop された（監視する相手がいない）
+                    Err(_) => break,
+                };
+                // (b) 借用の外: Cookie 収集（`cookies_for_url` がメッセージループを回す）
+                let cookies =
+                    super::collect_session_cookies(&tick.webview, &SESSION_ORIGINS, "booth");
+                drop(tick); // 親ウィンドウより長生きさせない（tick 内で解放）
+                // (c) 借用内: 収集結果を反映（**wry を触らない**）
+                let Ok(done) =
+                    handle.update(cx, |this, cx| this.finish_check(generation, cookies, cx))
+                else {
                     break;
                 };
                 if done {
@@ -97,15 +107,20 @@ impl BoothLoginView {
         .detach();
     }
 
-    /// 現在の URL が booth.pm に戻っていたら Cookie を取得して保存する。
-    /// ログイン完了で true を返す。
-    fn check_login(&mut self, cx: &mut Context<Self>) -> bool {
+    /// tick の前半（借用内・**wry を触らない**）。
+    ///
+    /// `booth.pm` に戻り、かつログインページでなくなったら収集する。
+    fn begin_check(&self, generation: u64, cx: &App) -> super::CheckStep {
+        if self.check_generation != generation {
+            return super::CheckStep::Stop;
+        }
         let Some(webview) = self.webview.as_ref() else {
             // WebView なし（テスト環境）ではログインを試みない
-            return false;
+            return super::CheckStep::Wait;
         };
-        let Ok(url) = webview.read(cx).raw().url() else {
-            return false;
+        let webview = webview.read(cx);
+        let Ok(url) = webview.raw().url() else {
+            return super::CheckStep::Wait;
         };
         // URL のクエリ/フラグメントには認可コードやトークンが載り得るため落とす。
         log::debug!(
@@ -117,37 +132,28 @@ impl BoothLoginView {
         // booth.pm に戻り、かつログインページでなければセッション確立とみなす。
         let on_sign_in = url.contains("/users/sign_in");
         if !is_booth || on_sign_in {
-            return false;
+            return super::CheckStep::Wait;
         }
-        // Cookie 取得も内部でメッセージループを回す（理由は `crate::app_state::webview_pumping()` のドキュメント参照）。
-        let _pumping = crate::app_state::WebviewPumpGuard::enter();
-        // booth.pm と accounts.booth.pm のセッション Cookie を取得する
-        //（accounts.booth.pm の _plaza_session_* はログアウトに必要）
-        //
-        // 収集元ホストごとに分けて持つ（1 つに潰すと、accounts 側にしか送るべきでない
-        // Cookie が booth.pm や画像 CDN へ飛ぶ）。
-        let mut origins: std::collections::BTreeMap<
-            String,
-            std::collections::BTreeMap<String, CookieEntry>,
-        > = std::collections::BTreeMap::new();
-        for url in ["https://booth.pm", "https://accounts.booth.pm"] {
-            let cookies = webview
-                .read(cx)
-                .raw()
-                .cookies_for_url(url)
-                .unwrap_or_default();
-            log::debug!("booth login: cookies_for_url({url}) -> {}", cookies.len());
-            let Ok(parsed) = thundoku_core::download_url::parse(url) else {
-                continue;
-            };
-            let entry = origins.entry(parsed.host.to_string()).or_default();
-            for cookie in cookies {
-                entry
-                    .entry(cookie.name().to_string())
-                    .or_insert_with(|| super::cookie_entry(&cookie));
-            }
+        super::CheckStep::Collect(super::CheckTick {
+            webview: webview.handle(),
+        })
+    }
+
+    /// tick の後半（借用内・**wry を触らない**）。収集結果を解釈して保存・通知する。
+    ///
+    /// `booth.pm` と `accounts.booth.pm` の Cookie を**収集元ホストごとに分けて**持つ
+    /// （1 つに潰すと、`accounts` 側にしか送るべきでない Cookie が `booth.pm` や画像 CDN へ飛ぶ）。
+    fn finish_check(
+        &mut self,
+        generation: u64,
+        collected: super::CollectedCookies,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.check_generation != generation {
+            // 収集中に閉じ直された。この tick の結果は捨てる。
+            return true;
         }
-        let session = thundoku_core::booth::BoothSession::new(origins);
+        let session = thundoku_core::booth::BoothSession::new(collected);
         if !session.logged_in() {
             log::warn!("booth login: セッション Cookie を取得できませんでした");
             return false;
@@ -165,12 +171,18 @@ impl BoothLoginView {
 
     /// WebView を表示する（ログインモーダルを開く）。
     pub fn show(&mut self, cx: &mut Context<Self>) {
+        // `AuthDialog::render` から**描画のたび**に呼ばれる。表示中に監視を再起動すると
+        // tick の 1 秒タイマーが毎回リセットされ、URL チェックが永久に走らない
+        // （＝ログインできてもモーダルが閉じない）。表示状態が変わったときだけ起動する。
+        let was_visible = self.visible;
         self.visible = true;
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| view.show());
         }
-        self.check_generation += 1;
-        self.start_url_check(cx);
+        if !was_visible {
+            self.check_generation += 1;
+            self.start_url_check(cx);
+        }
     }
 
     /// キャンセル/閉じる。
@@ -190,32 +202,22 @@ impl BoothLoginView {
         let Some(webview) = &self.webview else {
             return;
         };
-        let bounds = {
-            let window_bounds = window.bounds();
-            let width = 480_f32;
-            let height = 640_f32;
-            let left = (window_bounds.size.width.as_f32() - width) / 2.0;
-            let top = (window_bounds.size.height.as_f32() - height) / 2.0;
-            gpui_kit::bounds(
-                gpui_kit::Point {
-                    x: px(left),
-                    y: px(top),
-                },
-                gpui_kit::Size {
-                    width: px(width),
-                    height: px(height),
-                },
-            )
-        };
+        let window_bounds = window.bounds();
+        let geometry = super::login_modal_geometry(
+            window_bounds.size.width.as_f32(),
+            window_bounds.size.height.as_f32(),
+            480.0,
+            640.0,
+        );
         webview.update(cx, |view, _| {
             let _ = view.raw().set_bounds(lb_wry::Rect {
                 position: lb_wry::dpi::Position::Physical(lb_wry::dpi::PhysicalPosition::new(
-                    bounds.origin.x.as_f32() as i32,
-                    bounds.origin.y.as_f32() as i32,
+                    geometry.webview_left as i32,
+                    geometry.webview_top as i32,
                 )),
                 size: lb_wry::dpi::Size::Physical(lb_wry::dpi::PhysicalSize::new(
-                    bounds.size.width.as_f32() as u32,
-                    bounds.size.height.as_f32() as u32,
+                    geometry.webview_width as u32,
+                    geometry.webview_height as u32,
                 )),
             });
         });
@@ -227,6 +229,18 @@ impl EventEmitter<BoothLoginCancelled> for BoothLoginView {}
 
 impl Render for BoothLoginView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 閉じるボタンは WebView の右上・すぐ外側（技術書典のログインモーダルと同じ位置）。
+        // WebView（native 子ウィンドウ）は GPUI 要素より常に最前面に描画されるため、
+        // ボタンをモーダル領域の中に置くと隠れる。
+        let geometry = {
+            let window_bounds = window.bounds();
+            super::login_modal_geometry(
+                window_bounds.size.width.as_f32(),
+                window_bounds.size.height.as_f32(),
+                480.0,
+                640.0,
+            )
+        };
         self.apply_webview_bounds(window, cx);
 div()
             .id("booth-login-backdrop")
@@ -241,10 +255,10 @@ div()
                 div()
                     .id("booth-login-cancel")
                     .absolute()
-                    .top_3()
-                    .right_3()
-                    .w(px(36.0))
-                    .h(px(36.0))
+                    .left(px(geometry.close_left))
+                    .top(px(geometry.close_top))
+                    .w(px(geometry.close_size))
+                    .h(px(geometry.close_size))
                     .flex()
                     .items_center()
                     .justify_center()

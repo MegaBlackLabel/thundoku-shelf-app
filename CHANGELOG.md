@@ -6,6 +6,15 @@
 
 ### Fixed
 
+- **描画のたびに呼ばれる `show()` で URL 監視を再起動しない（ログイン後にモーダルが閉じない）**:
+  `AuthDialog::render` は表示中のログインビューへ**描画のたび** `show()` を呼ぶ。`show()` が
+  毎回 `check_generation` を進めて監視タスクを起こし直していたため、**描画が 1 秒より速い間は
+  tick のタイマーが毎回リセットされ、URL チェックが一度も走らなかった**（実測: DLsite ログイン
+  後の同期中に描画が増えたタイミングで FANZA / BOOTH / 技術書典がログイン完了を検知できず、
+  モーダルが閉じなかった）。表示状態が**変わったときだけ**監視を起動するようにした。
+  あわせて WebView の生成が無言で失敗し得る経路（`update_in` の失敗）と添付完了をログに残す。
+  `crates/app/src/views/{dlsite_login,fanza_login,booth_login,tbf_login,mod}.rs`
+
 - **`Domain` 属性つき Cookie を 1 つも送らない不具合を直す（ログイン後に「セッション切れ・未ログイン」になる）**:
   Cookie を属性つきで保存するようにした際、`Domain` に先頭ドットが無いものを **host-only**
   と解釈していた。しかし RFC 6265 では `Domain` のドットは有無に関わらずサブドメインに適用され、
@@ -85,6 +94,28 @@
   持っているので、穴が空いていたのは DLsite だけだった。
 
 ### Changed
+
+- **ログインモーダルの閉じるボタンの位置を 4 ストアで揃える**: 技術書典だけがモーダルの
+  右上・すぐ外側に置いていた（他はウィンドウ右上＝アプリの閉じるボタン付近）。WebView
+  （native 子ウィンドウ）は GPUI 要素より常に最前面なので、閉じるボタンは**モーダルの
+  外側**に置く必要がある。位置計算を `views::login_modal_geometry` に共通化し、4 ストアとも
+  「右上・すぐ外側（右に収まらないときは左外側）」に統一した（単体テスト付き）。
+  `crates/app/src/views/{mod,dlsite_login,fanza_login,booth_login,tbf_login}.rs`
+
+- **借用中に WebView2 を呼ばないようにし、ポンプ待ちの仕組みを撤去する**: 残っていた
+  `RefCell already borrowed`（ログイン成功の tick に 2 行）は、**App を借用したまま
+  WebView2 にメッセージループを回させている**ことが原因だった（その間に gpui の窓更新が走り、
+  `AsyncApp::update_window` の `try_borrow_mut()` が失敗して ERROR 記録される）。WebView2 を
+  触る呼び出しのうち pump するのは**生成**と **`cookies_for_url`** だけで、生成は既に借用外へ
+  出してある。残る Cookie 収集を `gpui_wry::WebViewHandle`（`Rc<wry::WebView>` の Clone
+  可能なハンドル）で**借用の外**から呼ぶ形に変えた（`begin_check` = 借用内で世代・URL 確認と
+  ハンドル取得 / **借用外で収集** / `finish_check` = 借用内で保存・通知）。借用中に pump する
+  経路が無くなったので、`WebviewPumpGuard` / `webview_pumping()` / `wait_while_webview_pumping()`
+  と 15 か所の待ちを削除した。ハンドルは 1 tick の同期区間だけ保持する（gpui-wry の
+  「親ウィンドウを壊す前に全ハンドルを drop」を守る）。
+  `crates/app/src/views/{mod,dlsite_login,fanza_login,booth_login,tbf_login}.rs`、
+  `crates/app/src/app_state.rs`、
+  `crates/app/src/{workspace,views/bookshelf,components/image_viewer/mod}.rs`
 
 - **Cookie を値だけでなく属性つきで保持する（Cookie Jar 化）**: 保存していたのは
   `ホスト → Cookie 名 → 値` だけで、ブラウザ本来の `Domain` / `Path` / `Secure` /

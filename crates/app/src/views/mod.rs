@@ -16,9 +16,12 @@ pub mod settings;
 pub mod tag_edit;
 pub mod tbf_login;
 
+use std::collections::BTreeMap;
+
 use gpui_kit::AppContext as _;
 use gpui_kit::gpui::{App, Context, Entity, Window};
-use gpui_wry::WebView;
+use gpui_wry::{WebView, WebViewHandle};
+use thundoku_core::session_cookies::CookieEntry;
 
 /// ホバー中の背景色。
 ///
@@ -133,10 +136,14 @@ pub(crate) fn create_login_webview<T: 'static>(
                     return;
                 }
             };
-            let _ = weak.update_in(cx, |this, window, cx| {
+            let attached = weak.update_in(cx, |this, window, cx| {
                 let entity = attach_webview(webview, initial_url, window, cx);
                 on_ready(this, entity, window, cx);
             });
+            if attached.is_err() {
+                // ビューが既に破棄されている（モーダルを閉じた等）。ここで WebView は drop される。
+                log::debug!("webview: 生成したがビューが無いため破棄しました（{initial_url}）");
+            }
         })
         .detach();
     }
@@ -171,7 +178,103 @@ fn attach_webview(
         view.load_url(initial_url);
         view.hide();
     });
+    log::debug!("webview: 添付完了（initial_url={initial_url}）");
     entity
+}
+
+/// ログインモーダル（WebView）と閉じるボタンのレイアウト。
+///
+/// WebView（wry）は native の子ウィンドウで、GPUI の要素より**常に最前面**に描画される。
+/// 閉じるボタンをモーダル領域の中に置くと WebView に隠れるため、**モーダルの右上・すぐ
+/// 外側**へ出す（右に収まらないときは左外側へ回す）。4 ストアで同じ位置に揃える。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LoginModalGeometry {
+    /// WebView を置く矩形（画面中央）。
+    pub(crate) webview_left: f32,
+    pub(crate) webview_top: f32,
+    pub(crate) webview_width: f32,
+    pub(crate) webview_height: f32,
+    /// 閉じるボタンの左上座標と一辺。
+    pub(crate) close_left: f32,
+    pub(crate) close_top: f32,
+    pub(crate) close_size: f32,
+}
+
+/// 閉じるボタンの一辺。
+pub(crate) const LOGIN_CLOSE_SIZE: f32 = 36.0;
+
+/// モーダル領域と閉じるボタンの間隔。
+pub(crate) const LOGIN_CLOSE_GAP: f32 = 10.0;
+
+/// 中央モーダルと閉じるボタンの座標を計算する（`window_*` はウィンドウのサイズ）。
+pub(crate) fn login_modal_geometry(
+    window_width: f32,
+    window_height: f32,
+    modal_width: f32,
+    modal_height: f32,
+) -> LoginModalGeometry {
+    let webview_left = (window_width - modal_width) / 2.0;
+    let webview_top = (window_height - modal_height) / 2.0;
+    let mut close_left = webview_left + modal_width + LOGIN_CLOSE_GAP;
+    if close_left + LOGIN_CLOSE_SIZE > window_width {
+        close_left = webview_left - LOGIN_CLOSE_GAP - LOGIN_CLOSE_SIZE;
+    }
+    LoginModalGeometry {
+        webview_left,
+        webview_top,
+        webview_width: modal_width,
+        webview_height: modal_height,
+        close_left,
+        close_top: webview_top + LOGIN_CLOSE_GAP,
+        close_size: LOGIN_CLOSE_SIZE,
+    }
+}
+
+/// 収集した Cookie（収集元ホスト → 名前 → 属性つき Cookie）。
+pub(crate) type CollectedCookies = BTreeMap<String, BTreeMap<String, CookieEntry>>;
+
+/// URL 監視ループ 1 tick 分の指示（`begin_check` の戻り値）。
+pub(crate) enum CheckStep {
+    /// 監視を終了する（世代が変わった = 閉じ直された）。
+    Stop,
+    /// まだ収集しない（WebView 未生成 / URL が対象外）→ 次の tick へ。
+    Wait,
+    /// **借用の外**で Cookie を集めてから `finish_check` を呼ぶ。
+    Collect(CheckTick),
+}
+
+/// 借用の外で Cookie を集めるための材料。
+pub(crate) struct CheckTick {
+    /// cloneable な wry ハンドル（`gpui_wry::WebViewHandle`）。借用を取らずに wry を触れる。
+    pub(crate) webview: WebViewHandle,
+}
+
+/// WebView から収集元ごとに Cookie を集める。**必ず gpui の借用の外から呼ぶ。**
+///
+/// `cookies_for_url` は内部で `webview2_com::wait_with_pump` を呼び、**Windows のメッセージ
+/// ループを回す**。その間に gpui は窓更新・前景タスクを走らせるため、借用を持ったまま呼ぶと
+/// `RefCell already borrowed` で落ちる（`AsyncApp::update_window` が `try_borrow_mut()` に
+/// 失敗する）。`WebViewHandle` をタスクへ渡し、**借用の外**で呼ぶことでこれを避ける。
+pub(crate) fn collect_session_cookies(
+    webview: &WebViewHandle,
+    origins: &[&str],
+    site: &str,
+) -> CollectedCookies {
+    let mut collected: CollectedCookies = BTreeMap::new();
+    for url in origins {
+        let cookies = webview.raw().cookies_for_url(url).unwrap_or_default();
+        log::debug!("{site} login: cookies_for_url({url}) -> {}", cookies.len());
+        let Ok(parsed) = thundoku_core::download_url::parse(url) else {
+            continue;
+        };
+        let entry = collected.entry(parsed.host.to_string()).or_default();
+        for cookie in cookies {
+            entry
+                .entry(cookie.name().to_string())
+                .or_insert_with(|| cookie_entry(&cookie));
+        }
+    }
+    collected
 }
 
 /// WebView（wry）の Cookie を、属性つきの保存用 Cookie へ変換する。
@@ -201,6 +304,34 @@ pub(crate) fn cookie_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 閉じるボタンは**モーダルの右上・すぐ外側**（技術書典のログインモーダルと同じ位置）。
+    ///
+    /// WebView は native の子ウィンドウで GPUI 要素より常に最前面に描かれるため、閉じるボタンを
+    /// モーダル領域の中に置くと隠れる。右に収まらないときは左外側へ回す。
+    #[test]
+    fn login_modal_geometry_places_the_close_button_outside_the_modal() {
+        let g = login_modal_geometry(1920.0, 1080.0, 640.0, 480.0);
+        assert_eq!((g.webview_left, g.webview_top), (640.0, 300.0));
+        assert_eq!(g.close_left, 640.0 + 640.0 + LOGIN_CLOSE_GAP);
+        assert_eq!(g.close_top, 300.0 + LOGIN_CLOSE_GAP);
+        assert!(
+            g.close_left >= g.webview_left + g.webview_width,
+            "閉じるボタンがモーダルの外側にない（WebView に隠れる）"
+        );
+
+        // 右に収まらないときは左外側へ回す（技術書典の実装と同じ）
+        let g = login_modal_geometry(700.0, 800.0, 640.0, 480.0);
+        assert!(
+            g.close_left < g.webview_left,
+            "右に収まらないのに右へ置いている（画面外になる）"
+        );
+        assert_eq!(
+            g.close_left + g.close_size + LOGIN_CLOSE_GAP,
+            g.webview_left,
+            "モーダルのすぐ外側に接していない"
+        );
+    }
 
     /// ログイン完了判定はラベル境界を見る（`evilbooth.pm` / `eviltechbookfest.org` を通さない）。
     #[test]
