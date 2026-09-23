@@ -28,10 +28,23 @@ JSON バックアップから復元でき、改変したバックアップを復
 検証に失敗したら**リクエストを送らずに** `BlockedUrl` を返す
 （`crates/core/tests/download_credentials.rs` で「1 件も送らないこと」を確認している）。
 
+**Cookie の宛先スコープ（2026-09-23 修正済み）**: 送信先が実行時に決まる経路（ダウンロード
+**proxy** = `downloadLinks` / `down_url`、302 の **CDN**）も、**宛先ホスト向けに収集した
+Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証結果の `ParsedUrl.host` を使う）。
+収集元すべてを 1 本にまとめる API（`HostScopedCookies::header()` /
+`FanzaSession::cookie_header()` / `DlsiteSession::cookie_header()`）は**削除済み**で、
+まとめ送りは再発しない。宛先が収集元（とその子ドメイン）でなければ Cookie は空になる
+（`crates/core/src/session_cookies.rs:34-47`, `:71-81` / `crates/core/src/fanza/client.rs:366-378` /
+`crates/core/src/dlsite/client.rs:301-313`）。
+残る候補は **proxy 許可ホストの exact 化**（現状は `*.dlsite.com` / `*.dmm.co.jp`。実測 proxy は
+`www`）と、Cookie の `Domain` / `Path` 属性を保存する Cookie Jar 化。
+なお待機は **DLsite のみ**（`PAGE_INTERVAL = 10 s`、`crates/core/src/dlsite/sync.rs:90`, `:129-131`）
+で、FANZA の一覧取得に待機は無い（1 回 = 5 ページ × 20 件、`crates/core/src/fanza/sync.rs`）。
+
 | ストア | site_id | 同期エントリポイント | 取得対象 | ログイン方式 | セッション保存先 / 保護 | 差分判定 |
 |---|---|---|---|---|---|---|
-| DLsite | `"dlsite"` `crates/core/src/dlsite/sync.rs:13` | `dlsite::sync::save_purchases_batch` `crates/core/src/dlsite/sync.rs:94`（アプリ側は `BookshelfView::sync_dlsite` `crates/app/src/views/bookshelf.rs`） | 購入済み一覧。走査フロア `["maniax","home","books","ai"]` `crates/core/src/dlsite/client.rs:15`、`RJ\d+` のみ採用。1 ページ = `purchased_page(store, page)` `crates/core/src/dlsite/client.rs:213` | アプリ内 WebView（DLsite ログイン → `www` + `login` の Cookie 収集）`crates/app/src/views/dlsite_login.rs:114-146` | `app_settings["dlsite.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:439-441` | なし（1 回 = 5 ページずつ取り込み、続きはカーソルに持ち越す。全件 UPSERT、削除なし）`crates/core/src/dlsite/sync.rs:94-163` |
-| FANZA同人 | `"fanza"` `crates/core/src/fanza/sync.rs:13` | `fanza::sync::save_purchases_batch` `crates/core/src/fanza/sync.rs:85` | mylibrary API。`PAGE_LIMIT = 20` 件/ページ `crates/core/src/fanza/client.rs:17`。1 ページ = `purchased_page(page)` `crates/core/src/fanza/client.rs:249`（安全弁だった 2000 件の一括取得は廃止） | アプリ内 WebView（購入済み作品ページ → 年齢確認）`crates/app/src/views/fanza_login.rs:3` | `app_settings["fanza.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:419-421` | なし（1 回 = 5 ページずつ取り込み、続きはカーソルに持ち越す。全件 UPSERT）`crates/core/src/fanza/sync.rs:85-150` |
+| DLsite | `"dlsite"` `crates/core/src/dlsite/sync.rs:15` | `dlsite::sync::save_purchases_batch` `crates/core/src/dlsite/sync.rs:98`（アプリ側は `BookshelfView::sync_dlsite` `crates/app/src/views/bookshelf.rs:3625`） | 購入済み一覧。走査フロア `["maniax","home","books","ai"]` `crates/core/src/dlsite/client.rs:16`、`RJ\d+` のみ採用。1 ページ = `purchased_page(store, page)` `crates/core/src/dlsite/client.rs:231` | アプリ内 WebView（DLsite ログイン → `www` + `login` の Cookie 収集）`crates/app/src/views/dlsite_login.rs:122-158` | `app_settings["dlsite.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:867-878` | なし（1 回 = 5 ページずつ取り込み、続きはカーソルに持ち越す。全件 UPSERT、削除なし）`crates/core/src/dlsite/sync.rs:98-167` |
+| FANZA同人 | `"fanza"` `crates/core/src/fanza/sync.rs:13` | `fanza::sync::save_purchases_batch` `crates/core/src/fanza/sync.rs:85` | mylibrary API。`PAGE_LIMIT = 20` 件/ページ `crates/core/src/fanza/client.rs:18`。1 ページ = `purchased_page(page)` `crates/core/src/fanza/client.rs:260`（安全弁だった 2000 件の一括取得は廃止） | アプリ内 WebView（購入済み作品ページ → 年齢確認）`crates/app/src/views/fanza_login.rs:68` | `app_settings["fanza.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:847-853` | なし（1 回 = 5 ページずつ取り込み、続きはカーソルに持ち越す。全件 UPSERT）`crates/core/src/fanza/sync.rs:85-150` |
 | BOOTH | `"booth"` 固定 `crates/app/src/views/bookshelf.rs:2341` | **core に同期エンジンが無くアプリ層** `BookshelfView::sync_booth` `crates/app/src/views/bookshelf.rs:2253` | `BoothClient::library()`（`accounts.booth.pm/library`）と `BoothClient::orders()`（`accounts.booth.pm/orders`）`crates/core/src/booth.rs:200`, `:266` | アプリ内 WebView（incognito）+ 1 秒間隔の URL 監視 `crates/app/src/views/booth_login.rs:46`, `:83` | `app_settings["booth.session"]`（**keyring の鍵で暗号化**）`crates/app/src/app_state.rs:394-396` | 全件 UPSERT + 集合差 DELETE 3 種 `crates/app/src/views/bookshelf.rs:2383-2430` |
 | 技術書典 | `"techbookfest"` `crates/core/src/tbf/mod.rs:22` | `tbf::sync::save_bookshelf` `crates/core/src/tbf/sync.rs:70` / `save_events` `:130` / `refresh_checklist` `:244` | GraphQL。本棚・チェックリスト・イベント。`first: 100` + `endCursor` カーソル `crates/core/src/tbf/mod.rs:289-327` | アプリ内 WebView（`techbookfest.org/user/signin`）+ 1 秒間隔の URL 監視 | **OS keyring**（`techbookfest`）に `TbfSession` JSON `crates/core/src/secrets.rs:10` | `refresh_checklist` が `SyncPollOutcome.changed` を返す `crates/core/src/tbf/sync.rs:211-244` |
 
@@ -113,20 +126,20 @@ JSON バックアップから復元でき、改変したバックアップを復
 - 重複排除: 全ストア横断で `HashSet<String>` に `content_id` を入れ、**初出のみ**採用（`STORES` の並び順＝ maniax が優先）。`crates/core/src/dlsite/client.rs:197`, `:169-173`
 - 取得失敗時: `get_html` の `?` で即 `Err`（1 ページでも失敗すると全体失敗、部分結果は返らない）。`crates/core/src/dlsite/client.rs:207`
 - 1 ページあたりの件数: コード上の明示定数 **なし**（`MAX_PAGES_PER_STORE` のコメントは「1 ページあたりの行数境界」だが実際は最大ページ数として使用）。`crates/core/src/dlsite/client.rs:16-17`
-- HTTP ヘッダ（HTML 取得 = `cookie_headers()`）: `Cookie` / `User-Agent` / `Referer: https://www.dlsite.com/` / `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: same-origin` / `Upgrade-Insecure-Requests: 1`。`crates/core/src/dlsite/client.rs:162-179`
-- User-Agent 実値（1 行定数）: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36`。`crates/core/src/dlsite/client.rs:20`
-- メソッドは GET、ボディは `None`、`redirects: 3`。`crates/core/src/dlsite/client.rs:355-367`
+- HTTP ヘッダ（HTML 取得 = `cookie_headers_for(SITE_HOST)`）: `Cookie`（**その宛先ホスト向けに収集したものだけ**）/ `User-Agent` / `Referer: https://www.dlsite.com/` / `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: same-origin` / `Upgrade-Insecure-Requests: 1`。`crates/core/src/dlsite/client.rs:195-214`
+- User-Agent 実値（**自認 UA**。`ThundokuShelf/<version> (+https://github.com/MegaBlackLabel/thundoku-shelf-app)`、`THUNDOKU_DLSITE_UA` で差し替え可）: ブラウザ偽装はしていない。`crates/core/src/dlsite/client.rs:22-39`
+- メソッドは GET、ボディは `None`、`redirects: 3`。`crates/core/src/dlsite/client.rs:386-401`
 
 #### 1.4 `product_info()`（作品メタ）の詳細
 
-- シグネチャ: `pub fn product_info(&mut self, ids: &[&str]) -> Result<HashMap<String, DlsiteWorkMeta>, DlsiteError>`。`crates/core/src/dlsite/client.rs:230-233`
-- チャンク: `ids.chunks(20)` = **20 件/リクエスト**、`product_id` クエリにカンマ区切りで連結。`crates/core/src/dlsite/client.rs:235-238`
-- URL: `GET https://www.dlsite.com/maniax/product/info/ajax?product_id={joined}`（**ストアは maniax 固定**。作品 ID はフロアを跨いで解決されるとのコメント）。`crates/core/src/dlsite/client.rs:237-238`
-- ヘッダ: `ajax_headers()` = `cookie_headers()` の `Accept` を `application/json` に置換し `X-Requested-With: XMLHttpRequest` を追加。`crates/core/src/dlsite/client.rs:181-188`
-- メソッド GET / body `None` / `redirects: 3`。`crates/core/src/dlsite/client.rs:241-246`
-- ステータス判定: `401|403` → `DlsiteError::Unauthorized(status)`、`200` 以外 → `DlsiteError::Http(status)`、200 → `String::from_utf8_lossy` で JSON 化。`crates/core/src/dlsite/client.rs:249-256`
-- レスポンス JSON のキー = 作品 ID、値オブジェクトのフィールド: `site_id` / `work_type` / `maker_id` / `work_name` / `regist_date` / `price`(i64) / `down_url` / `custom_genres`(文字列配列) / `options` / `age_category`(i64) / `title_name` / `work_image`。`crates/core/src/dlsite/client.rs:465-487`
-- JSON パース失敗時は `Value::Null` 扱い＝ **空マップ**（エラーにしない）。`crates/core/src/dlsite/client.rs:466-467`
+- シグネチャ: `pub fn product_info(&mut self, ids: &[&str]) -> Result<HashMap<String, DlsiteWorkMeta>, DlsiteError>`。`crates/core/src/dlsite/client.rs:250-254`
+- チャンク: `ids.chunks(20)` = **20 件/リクエスト**、`product_id` クエリにカンマ区切りで連結。`crates/core/src/dlsite/client.rs:256-258`
+- URL: `GET https://www.dlsite.com/maniax/product/info/ajax?product_id={joined}`（**ストアは maniax 固定**。作品 ID はフロアを跨いで解決されるとのコメント）。`crates/core/src/dlsite/client.rs:257-258`
+- ヘッダ: `ajax_headers()` = `cookie_headers()` の `Accept` を `application/json` に置換し `X-Requested-With: XMLHttpRequest` を追加。`crates/core/src/dlsite/client.rs:218-225`
+- メソッド GET / body `None` / `redirects: 3`。`crates/core/src/dlsite/client.rs:255-268`
+- ステータス判定: `401|403` → `DlsiteError::Unauthorized(status)`、`200` 以外 → `DlsiteError::Http(status)`、200 → `String::from_utf8_lossy` で JSON 化。`crates/core/src/dlsite/client.rs:269-277`
+- レスポンス JSON のキー = 作品 ID、値オブジェクトのフィールド: `site_id` / `work_type` / `maker_id` / `work_name` / `regist_date` / `price`(i64) / `down_url` / `custom_genres`(文字列配列) / `options` / `age_category`(i64) / `title_name` / `work_image`。`crates/core/src/dlsite/client.rs:508-524`
+- JSON パース失敗時は `Value::Null` 扱い＝ **空マップ**（エラーにしない）。`crates/core/src/dlsite/client.rs:509-510`
 
 #### 1.5 `bookshelf::upsert` へ渡す値（DLsite 固定値つき）
 
@@ -261,17 +274,17 @@ JSON バックアップから復元でき、改変したバックアップを復
 | 項目 | 事実 | アンカー |
 |---|---|---|
 | 保存先 | `app_settings` テーブル（key-value） | `crates/core/src/db/schema.sql:25-30`, `crates/core/src/db/settings.rs:11-28` |
-| 保存キー | `"dlsite.session"` | `crates/app/src/app_state.rs:222`, `:438`, `:447` |
-| 保存値の形式 | `serde_json::to_string(&DlsiteSession)` の JSON 文字列。`DlsiteSession` は `origins: BTreeMap<String, BTreeMap<String,String>>` 1 フィールドなので実体は `{"origins":{"www.dlsite.com":{"<name>":"<value>", …},"login.dlsite.com":{…}}}`（**収集元ホストごと**） | `crates/app/src/app_state.rs:437-439`, `crates/core/src/dlsite/client.rs:77-81` |
-| 保護 | **AES-256-GCM で暗号化**（SEC-01）。値は `enc:v1:` + base64 で `app_settings.value` に入る。鍵は keyring の専用スロット（`thundoku-shelf.session-key`）にあり、**DB のコピーだけでは復元できない**。復号できない値（旧平文・改ざん）は未ログインとして破棄する | `crates/core/src/session_store.rs`, `crates/app/src/app_state.rs:764-775` |
+| 保存キー | `"dlsite.session"` | `crates/app/src/app_state.rs:222`, `:867`, `:878` |
+| 保存値の形式 | `serde_json::to_string(&DlsiteSession)` の JSON 文字列。`DlsiteSession` は `origins: HostScopedCookies` 1 フィールドで、`HostScopedCookies` は `#[serde(transparent)]` なので実体は `{"origins":{"www.dlsite.com":{"<name>":"<value>", …},"login.dlsite.com":{…}}}`（**収集元ホストごと**） | `crates/app/src/app_state.rs:867-877`, `crates/core/src/dlsite/client.rs:97-100` |
+| 保護 | **AES-256-GCM で暗号化**。値は `enc:v2:` + base64 で `app_settings.value` に入る。鍵は keyring の専用スロット（`thundoku-shelf.session-key`）にあり、**DB のコピーだけでは復元できない**。復号できない値（旧 `enc:v1`・平文・改ざん・別鍵）は未ログインとして破棄する。**保存から 7 日**（`SESSION_MAX_AGE_SECONDS`）を過ぎた値も行ごと破棄する（保存時刻は暗号文の中にあり、DB を書き換えても期限は延ばせない）。keyring の鍵が取れない環境では**保存しない**（平文へフォールバックしない） | `crates/core/src/session_store.rs:7-11`, `:37-38`, `:175-183` |
 | keyring に Cookie を直接置かない理由 | Cookie が巨大で keyring の値長上限（2560 UTF-16 文字）を超えるため、**鍵だけ**を keyring に置いて DB 側を暗号化する（BOOTH / FANZA と同流儀） | `crates/core/src/session_store.rs`, `crates/app/src/app_state.rs:433-434` |
-| 書き込みタイミング | ログイン完了直後（`save_dlsite_session`）のみ | `crates/app/src/views/dlsite_login.rs:165` |
-| メモリ側 | `AppState.dlsite_session: Arc<Mutex<Option<DlsiteSession>>>` と `dlsite_logged_in: Arc<Mutex<bool>>` を同時更新 | `crates/app/src/app_state.rs:57-59`, `:440-441` |
-| 削除タイミング 1 | 設定画面のログアウト `SettingsView::logout_dlsite`（`background_spawn` で `db::settings::delete`） | `crates/app/src/views/settings.rs:737-752` |
-| 削除タイミング 2 | `clear_dlsite_session(cx)`（同期側の破棄 API。呼び出し箇所は `logout_dlsite` が直接 delete する実装） | `crates/app/src/app_state.rs:445-450` |
-| Cookie ヘッダ生成（サイト内） | `cookie_header()` = 全収集元を `{k}={v}` の `"; "` で連結。`BTreeMap` 順なので**安定** | `crates/core/src/dlsite/client.rs:105-109` |
-| Cookie ヘッダ生成（宛先指定） | `cookie_header_for(host)` = **そのホスト向けに収集した Cookie だけ**を連結（収集元と一致 or その子ドメイン）。CDN のような別システムへセッション Cookie を流さないために使う | `crates/core/src/dlsite/client.rs:111-122` |
-| `jwt` の扱い | 302 応答の `Set-Cookie` から `jwt` のみ拾い、既存ヘッダに `jwt=` が無いときだけ追記。`self.session` には書き戻さない（＝永続化されない）。CDN へは `cookie_header_for(cdn.host)` + `jwt` を送るので、**通常は Cookie ヘッダが `jwt=…` だけ**になる（**実アカウントでログイン → ダウンロードできることを確認済み**: 2026-09-22） | `crates/core/src/dlsite/client.rs:336-361` |
+| 書き込みタイミング | ログイン完了直後（`save_dlsite_session`）のみ | `crates/app/src/views/dlsite_login.rs:177` |
+| メモリ側 | `AppState.dlsite_session: Arc<Mutex<Option<DlsiteSession>>>` と `dlsite_logged_in: Arc<Mutex<bool>>` を同時更新 | `crates/app/src/app_state.rs:100-101`, `:407-408` |
+| 削除タイミング 1 | 設定画面のログアウト `SettingsView::logout_dlsite`（`clear_dlsite_session` を呼び、失敗時はトーストで通知） | `crates/app/src/views/settings.rs:895-900` |
+| 削除タイミング 2 | `clear_dlsite_session(cx)`（メモリクリア + DB 行削除。削除に失敗したら `Err`） | `crates/app/src/app_state.rs:878-887` |
+| Cookie ヘッダ生成 | `cookie_header_for(host)` = **その宛先ホスト向けに収集した Cookie だけ**を連結（収集元と一致 or その子ドメイン。**大文字小文字は区別しない**）。全収集元をまとめる API は持たない（削除済み） | `crates/core/src/dlsite/client.rs:125-132`, `crates/core/src/session_cookies.rs:34-47` |
+| Cookie ヘッダ生成（送信先別の適用） | `cookie_headers_for(host)` — 購入履歴 / 作品ページ / メタ API = `SITE_HOST`、proxy（`down_url`）= **検証済み URL の host**、CDN = `cdn.host` | `crates/core/src/dlsite/client.rs:195-214`, `:262`, `:310`, `:339` |
+| `jwt` の扱い | 302 応答の `Set-Cookie` から `jwt` のみ拾い、既存ヘッダに `jwt=` が無いときだけ追記。`self.session` には書き戻さない（＝永続化されない）。CDN へは `cookie_header_for(cdn.host)` + `jwt` を送るので、**通常は Cookie ヘッダが `jwt=…` だけ**になる（**実アカウントでログイン → ダウンロードできることを確認済み**: 2026-09-22） | `crates/core/src/dlsite/client.rs:334-343` |
 
 ---
 
@@ -387,19 +400,19 @@ JSON バックアップから復元でき、改変したバックアップを復
 
 | 項目 | 実値 | アンカー |
 |---|---|---|
-| ベース URL 定数 | `pub const LIBRARY_BASE: &str = "https://www.dmm.co.jp/dc/doujin/api/mylibraries/";` | `crates/core/src/fanza/client.rs:15` |
-| 1 ページ件数 | `pub const PAGE_LIMIT: usize = 20;`（= 20 件） | `crates/core/src/fanza/client.rs:17` |
-| メソッド | `GET` | `crates/core/src/fanza/client.rs:171` |
-| URL 組み立て | `{LIBRARY_BASE}?page={page}&sort=purchasedate_desc&genre=all&limit={PAGE_LIMIT}` | `crates/core/src/fanza/client.rs:191-193` |
-| クエリ `sort` | `purchasedate_desc`（購入日降順） | `crates/core/src/fanza/client.rs:192` |
-| クエリ `genre` | `all`（全ジャンル） | `crates/core/src/fanza/client.rs:192` |
-| リクエストヘッダ | `Cookie: {cookie_header()}` / `Accept: application/json` / `User-Agent: {USER_AGENT}` | `crates/core/src/fanza/client.rs:151-157`（生成）、`:173`（適用） |
-| User-Agent 実値 | `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36` | `crates/core/src/fanza/client.rs:21` |
-| リダイレクト追跡 | `redirects: 3`（一覧/詳細 API） | `crates/core/src/fanza/client.rs:175` |
-| Cookie 送信形式 | 全 Cookie を `name=value` 形式で `"; "` 連結（並び順は `HashMap` の反復順＝**不定**） | `crates/core/src/fanza/client.rs:62-68` |
+| ベース URL 定数 | `pub const LIBRARY_BASE: &str = "https://www.dmm.co.jp/dc/doujin/api/mylibraries/";` | `crates/core/src/fanza/client.rs:16` |
+| 1 ページ件数 | `pub const PAGE_LIMIT: usize = 20;`（= 20 件） | `crates/core/src/fanza/client.rs:18` |
+| メソッド | `GET` | `crates/core/src/fanza/client.rs:239-246` |
+| URL 組み立て | `{LIBRARY_BASE}?page={page}&sort=purchasedate_desc&genre=all&limit={PAGE_LIMIT}` | `crates/core/src/fanza/client.rs:261-263` |
+| クエリ `sort` | `purchasedate_desc`（購入日降順） | `crates/core/src/fanza/client.rs:261-263` |
+| クエリ `genre` | `all`（全ジャンル） | `crates/core/src/fanza/client.rs:261-263` |
+| リクエストヘッダ | `Cookie: {cookie_header_for(SITE_HOST)}` / `Accept: application/json` / `User-Agent: {USER_AGENT}` | `crates/core/src/fanza/client.rs:221-227`（生成）、`:243`（適用） |
+| User-Agent 実値（**自認 UA**。`THUNDOKU_FANZA_UA` で差し替え可） | `ThundokuShelf/<version> (+https://github.com/MegaBlackLabel/thundoku-shelf-app)`。ブラウザ偽装はしていない | `crates/core/src/fanza/client.rs:24-33` |
+| リダイレクト追跡 | `redirects: 3`（一覧/詳細 API） | `crates/core/src/fanza/client.rs:245` |
+| Cookie 送信形式 | 宛先ホスト向けの Cookie を `name=value` 形式で `"; "` 連結（`BTreeMap` 順なので**安定**）。収集元（www / accounts）をまとめた和集合は送らない | `crates/core/src/session_cookies.rs:70-77` |
 | CSRF | 送らない（コメント「GET に CSRF 不要」） | `crates/core/src/fanza/client.rs:3-4` |
 
-- User-Agent を固定する理由（コメント）: 「DMM/FANZA は非ブラウザの User-Agent を 403 で弾くため」（`crates/core/src/fanza/client.rs:19-21`）。
+- User-Agent の扱い（コメント）: 「以前は『DMM/FANZA は非ブラウザ UA を 403 で弾く』という観測から Mac の Chrome を名乗っていたが、購入一覧 API が**自認 UA でも 200** を返すことを実機で確認した（未ログインでは UA に関わらず 401）」。弾かれるようになったら `THUNDOKU_FANZA_UA` で差し替える（`crates/core/src/ua.rs`）。`crates/core/src/fanza/client.rs:19-33`。
 
 #### 1.4 ページング（1 ページ件数 / 総件数 / 終了条件）
 
@@ -554,24 +567,24 @@ JSON バックアップから復元でき、改変したバックアップを復
 
 | 項目 | 実値 | アンカー |
 |---|---|---|
-| 保存先 | **DB（`app_settings` テーブル）**。keyring は**使わない** | `crates/app/src/app_state.rs:414-419` |
-| 保存キー | `"fanza.session"`（`app_settings.key` の 1 行） | `crates/app/src/app_state.rs:418` |
-| 形式 | `serde_json::to_string(&FanzaSession)` → `{"cookies":{"<name>":"<value>",…}}`（`FanzaSession` は `#[derive(Serialize, Deserialize)]`、フィールド名そのまま） | `crates/core/src/fanza/client.rs:48-51`, `crates/app/src/app_state.rs:417` |
-| 暗号化 | **なし（平文）**。`app_settings.value` は TEXT で、暗号化・難読化のコードは存在しない | `crates/core/src/db/settings.rs:17-28`, `crates/core/src/db/schema.sql:25-29` |
-| keyring を使わない理由（コメント） | 「セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を超えることがあるため」 | `crates/app/src/app_state.rs:191-192`, `:412-413` |
-| keyring の FANZA 定数 | **存在しない**（`crates/core/src/secrets.rs` には `techbookfest` / `google` / `booth` / `thundoku-shelf.db-key` のみ） | `crates/core/src/secrets.rs:9-14` |
-| 書き込み API | `db::settings::set(pool, "fanza.session", &json)` = `INSERT … ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP` | `crates/core/src/db/settings.rs:17-28` |
-| 保存時のメモリ更新 | `*state.fanza_session.lock() = Some(session.clone())`、`*state.fanza_logged_in.lock() = logged_in` | `crates/app/src/app_state.rs:420-421` |
-| 保存呼び出し元 | `crates/app/src/views/fanza_login.rs:136` のみ | `crates/app/src/views/fanza_login.rs:136` |
-| 起動時復元 | `db::settings::get(db, "fanza.session")` → `serde_json::from_str` → `.filter(|s: &FanzaSession| s.logged_in())`（空 Cookie なら破棄）。`fanza_logged_in = fanza_session.is_some()` | `crates/app/src/app_state.rs:211-218`, `:243-244` |
-| テスト初期化 | `fanza_session = None` / `fanza_logged_in = false`（DB はメモリ） | `crates/app/src/app_state.rs:302-303`, `:265-268` |
-| 削除タイミング | 設定画面のログアウト操作時のみ: `SettingsView::logout_fanza` が `*fanza_session.lock() = None` / `*fanza_logged_in.lock() = false` → `cx.background_spawn` で `db::settings::delete(&db, "fanza.session")` | `crates/app/src/views/settings.rs:720-733` |
-| ログアウト後のトースト | `"FANZA からログアウトしました"`（サーバー側セッションは残る旨の注記なし＝FANZA はサーバー破棄しない） | `crates/app/src/views/settings.rs:732` |
-| 削除の別経路 | `clear_fanza_session(cx)`（`delete` + メモリクリア）が定義されているが**呼び出し元なし** | `crates/app/src/app_state.rs:424-430` |
-| メモリ上の保持 | `Arc<Mutex<Option<FanzaSession>>>`（`parking_lot::Mutex`、`.lock()` が `Result` を返さない）。`fanza_logged_in: Arc<Mutex<bool>>` | `crates/app/src/app_state.rs:55-56` |
-| WebView 側の Cookie | incognito のため非永続。アプリ再起動・WebView 破棄で消える | `crates/app/src/views/fanza_login.rs:38-40` |
+| 保存先 | **DB（`app_settings` テーブル）**。keyring に置くのは**暗号鍵だけ**（Cookie 本体は keyring の値長上限を超えるため） | `crates/app/src/app_state.rs:847-856` |
+| 保存キー | `"fanza.session"`（`app_settings.key` の 1 行。`StoreSession::Fanza.settings_key()`） | `crates/core/src/session_store.rs:78-83` |
+| 形式 | `serde_json::to_string(&FanzaSession)` → `{"origins":{"www.dmm.co.jp":{"<name>":"<value>",…},"accounts.dmm.co.jp":{…}}}`（`FanzaSession` は `origins: HostScopedCookies` 1 フィールド、`HostScopedCookies` は `#[serde(transparent)]`）。**平文 JSON のままでは保存しない**（暗号化してから `app_settings.value` へ） | `crates/core/src/fanza/client.rs:86-91`, `crates/app/src/app_state.rs:847-856` |
+| 暗号化 | **AES-256-GCM**（AAD に用途名・形式版）。値は `enc:v2:` + base64(IV ‖ 暗号文 ‖ tag)。鍵は keyring の専用スロット `thundoku-shelf.session-key`（`USER_SESSION_KEY`。DB 鍵とは**別**）。復号できない値（旧 `enc:v1`・平文・改ざん・別鍵）は未ログインとして破棄し、**保存から 7 日**（`SESSION_MAX_AGE_SECONDS`）を過ぎた値も行ごと破棄する（保存時刻は暗号文の中にあり、DB を書き換えても期限は延ばせない）。keyring の鍵が取れない環境では**保存しない**（平文へフォールバックしない） | `crates/core/src/session_store.rs:7-11`, `:33`, `:38`, `:107-200` |
+| keyring を使わない理由（コメント） | 「セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を超えることがあるため」DB に置き、**鍵だけ**を keyring へ | `crates/app/src/app_state.rs:340-346` |
+| keyring の FANZA 定数 | **FANZA 専用の定数は無い**。暗号鍵はストア共通の `USER_SESSION_KEY`（`thundoku-shelf.session-key`）。`secrets.rs` には `techbookfest` / `google` / `google-profile` / `github` / `booth` / `thundoku-shelf.db-key` / `thundoku-shelf.session-key` がある | `crates/core/src/secrets.rs:55-71` |
+| 書き込み API | `SessionVault::save` → `db::settings::set(pool, StoreSession::Fanza.settings_key(), &enc)` = `INSERT … ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP` | `crates/app/src/app_state.rs:817-829`, `crates/core/src/db/settings.rs:17-28` |
+| 保存時のメモリ更新 | `*state.fanza_session.lock() = Some(session.clone())`、`*state.fanza_logged_in.lock() = logged_in` | `crates/app/src/app_state.rs:847-856` |
+| 保存呼び出し元 | `crates/app/src/views/fanza_login.rs:161` のみ | `crates/app/src/views/fanza_login.rs:161` |
+| 起動時復元 | `state.session_vault.load::<FanzaSession>(&db_pool, StoreSession::Fanza)`（復号 → JSON parse）→ `.filter(FanzaSession::logged_in)`（空 Cookie なら破棄）。`fanza_logged_in = fanza_session.is_some()`。**復号できない値・期限切れは未ログイン扱いで行ごと削除** | `crates/app/src/app_state.rs:374-378` |
+| テスト初期化 | `fanza_session = None` / `fanza_logged_in = false`（DB はメモリ、`session_vault` はメモリ keyring で作る） | `crates/app/src/app_state.rs:434-500`（`:487-488`） |
+| 削除タイミング | 設定画面のログアウト操作時のみ: `SettingsView::logout_fanza` → `clear_fanza_session`（メモリを即時クリア → DB 行削除。失敗時は `Err` をトーストで通知） | `crates/app/src/views/settings.rs:887-893` |
+| ログアウト後のトースト | `"FANZA からログアウトしました"`（サーバー側セッションは残る旨の注記なし＝FANZA はサーバー破棄しない）。削除に失敗した場合は「端末に保存したセッション情報を削除できませんでした…」を出す | `crates/app/src/views/settings.rs:905-925` |
+| 削除の別経路 | `clear_fanza_session(cx)`（`logout_fanza` から呼ばれる本体。メモリクリア + DB 行削除） | `crates/app/src/app_state.rs:858-864` |
+| メモリ上の保持 | `Arc<Mutex<Option<FanzaSession>>>`（`parking_lot::Mutex`、`.lock()` が `Result` を返さない）。`fanza_logged_in: Arc<Mutex<bool>>` | `crates/app/src/app_state.rs:97-98` |
+| WebView 側の Cookie | incognito のため非永続。アプリ再起動・WebView 破棄で消える | `crates/app/src/views/fanza_login.rs:38-43` |
 | セッション失効時の扱い | API エラーをトーストで通知し認証モーダルを開くのみ。**DB のセッション行は自動削除しない** | `crates/app/src/views/bookshelf.rs:2542-2549` |
-| バックアップ / 初期リセットでの扱い | JSON バックアップが除外するのは環境依存設定（`drive.*` / `api.last_sync_at` 等）のみで、`fanza.session` は**含まれる**。owner_sub 移行時の全削除でも `app_settings` では `drive.*` の 3 キーだけが消され、`fanza.session` は残る | `crates/core/src/db/backup.rs:5-7`, `crates/core/src/db/mod.rs:436-453` |
+| バックアップ / 初期リセットでの扱い | JSON バックアップは `app_settings` を**含まない**（`TABLES` に無い）ため、`fanza.session` は Drive にアップロードされない。owner_sub 移行時の全削除でも `app_settings` は残し、消すのは `drive.*` 系 4 キーのみ | `crates/core/src/db/backup.rs:13-30`, `crates/core/src/db/mod.rs:459-486` |
 
 ---
 
@@ -584,16 +597,16 @@ JSON バックアップから復元でき、改変したバックアップを復
 | リトライ | **なし（0 回）**。バックオフもなし | `crates/core/src/fanza/client.rs:169-186`, `crates/core/src/fanza/sync.rs:51-101` |
 | 並列度 | **1**（`purchased` は逐次ループ、`save_purchases` は逐次 for） | `crates/core/src/fanza/client.rs:189-216`, `crates/core/src/fanza/sync.rs:54-99` |
 | リクエストタイムアウト | FanzaClient 自身は設定しない。`UreqTransport` の agent 既定 = **connect 5 s / read 15 s** | `crates/core/src/tbf/transport.rs:94-106` |
-| リダイレクト上限 | JSON API / 作品ページ = `redirects: 3`（`:175`, `:274`）。CDN ダウンロード = `redirects: 3`（`:356`）。proxy は `redirects: 0`（`:304`、手動 302 追跡） | `crates/core/src/fanza/client.rs:175`, `:274`, `:304`, `:356` |
-| User-Agent | 固定 1 種（§1.3） | `crates/core/src/fanza/client.rs:21` |
+| リダイレクト上限 | JSON API = `redirects: 3`（`:245`）、作品ページ = `redirects: 3`（`:343`）。CDN ダウンロード = `redirects: 3`（`:439`）。proxy は `redirects: 0`（`:378`、手動 302 追跡） | `crates/core/src/fanza/client.rs:245`, `:343`, `:378`, `:439` |
+| User-Agent | 固定 1 種（自認 UA。§1.3） | `crates/core/src/fanza/client.rs:24-33` |
 | 同期 UI ポーリング | 120 ms 間隔 `try_recv` | `crates/app/src/views/bookshelf.rs:2521-2523` |
 | ログイン URL 監視 | 1 秒間隔 `timer` | `crates/app/src/views/fanza_login.rs:75-77` |
-| ダウンロード進捗 | `on_progress: &mut dyn FnMut(u64, u64)`（downloaded, total）。UI は `downloaded/total` を fraction（`total > 0` のときのみ。0 なら 0.0）にして `DownloadState::Downloading` を送る | `crates/core/src/fanza/client.rs:288-291`, `crates/app/src/views/bookshelf.rs:2817-2828` |
-| ダウンロードのヘッダ（proxy） | `Cookie` / `User-Agent` / `Referer: https://www.dmm.co.jp/` | `crates/core/src/fanza/client.rs:294-298` |
-| ダウンロードのヘッダ（CDN） | 上記 + 署名 Cookie（`CloudFront-*`）+ `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: cross-site` / `Upgrade-Insecure-Requests: 1` | `crates/core/src/fanza/client.rs:337-349` |
-| 署名 Cookie の取得 | proxy の 302 応答 `Set-Cookie` のうち `CloudFront-` 接頭辞のみを、未含有ならセッション Cookie 文字列へ追記 | `crates/core/src/fanza/client.rs:328-335`（コメント `:324-327`） |
-| ZIP 判定 | 本文が `<!doctype` または `<html` で始まる場合は `FanzaError::Parse("HTML response (not a file)")` | `crates/core/src/fanza/client.rs:363-364` |
-| proxy の status 分岐 | 302 → `Location` 必須（無ければ `Parse("プロキシ応答に location がありません")`） / 401・403 → `Unauthorized` / それ以外 → `Http` | `crates/core/src/fanza/client.rs:310-323` |
+| ダウンロード進捗 | `on_progress: &mut dyn FnMut(u64, u64)`（downloaded, total）。UI は `downloaded/total` を fraction（`total > 0` のときのみ。0 なら 0.0）にして `DownloadState::Downloading` を送る | `crates/core/src/fanza/client.rs:357-366`, `crates/app/src/views/bookshelf.rs:2817-2828` |
+| ダウンロードのヘッダ（proxy） | `Cookie`（= `cookie_header_for(proxy.host)` = **proxy ホスト向けに収集したものだけ**。宛先は `downloadLinks` の URL で、`*.dmm.co.jp` のみ許可）/ `User-Agent` / `Referer: https://www.dmm.co.jp/`。**Cookie を付ける前に `download_url::check` で検証**し、その `ParsedUrl.host` を Cookie の絞り込みに使う | `crates/core/src/fanza/client.rs:364-378`, `:42-46` |
+| ダウンロードのヘッダ（CDN） | CDN 向け Cookie（`cookie_header_for(cdn.host)` + 署名 `CloudFront-*`）+ `User-Agent` + `Referer: https://www.dmm.co.jp/` + `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: cross-site` / `Upgrade-Insecure-Requests: 1` | `crates/core/src/fanza/client.rs:407-437` |
+| 署名 Cookie の取得 | proxy の 302 応答 `Set-Cookie` のうち `CloudFront-` 接頭辞のみを、未含有なら（宛先ホスト向けの）Cookie 文字列へ追記 | `crates/core/src/fanza/client.rs:407-416`（コメント `:401-406`） |
+| ZIP 判定 | 本文が `<!doctype` または `<html` で始まる場合は `FanzaError::Parse("HTML response (not a file)")` | `crates/core/src/fanza/client.rs:446-448` |
+| proxy の status 分岐 | 302 → `Location` 必須（無ければ `Parse("プロキシ応答に location がありません")`） / 401・403 → `Unauthorized` / それ以外 → `Http` | `crates/core/src/fanza/client.rs:384-397` |
 | サムネイル取得（表紙） | `cover_url_candidates("fanza", url)` = `[原寸 URL, 保存 URL]`（原寸が失敗すれば保存 URL に戻す） | `crates/app/src/views/bookshelf.rs:6682-6691` |
 
 ---
@@ -753,7 +766,7 @@ JSON バックアップから復元でき、改変したバックアップを復
 | 7 | pixiv セッション破棄 | `POST https://accounts.booth.pm/users/sign_out`、body `_method=delete`（form） | `Accept: */*`, `X-CSRF-Token`, `Referer`/`Origin: https://accounts.booth.pm`、`Cookie` | `crates/core/src/booth.rs:117-127` |
 | 8 | booth.pm セッション破棄 | `POST https://booth.pm/users/sign_out`、body `_method=delete`（form） | `Accept: */*`, `X-CSRF-Token`, `Referer: https://booth.pm/ja`, `Origin: https://booth.pm`、`Cookie` | `crates/core/src/booth.rs:143-154` |
 
-- 固定 User-Agent（BOOTH 用）: `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36` — `crates/core/src/booth.rs:85`。
+- User-Agent（BOOTH 用。**自認 UA**、`THUNDOKU_BOOTH_UA` で差し替え可）: `ThundokuShelf/<version> (+https://github.com/MegaBlackLabel/thundoku-shelf-app)` — `crates/core/src/booth.rs:105-109`。
 - リダイレクトは明示設定なし（ureq 2.8.0 の既定 = 最大 5 回、`ureq-2.8.0/src/agent.rs:262`）。`GET https://booth.pm/downloadables/{id}` は 302 → 署名付き一時 S3 URL（**180 秒有効**）へ自動追従してファイル本体が返る — `crates/core/src/booth.rs:300-302`。
 - 同期（1〜4）はすべて Cookie 付き GET のみ。POST はログアウト時のみ。
 - `crates/core/src/booth.rs` に**テスト専用**モックは無い（`#[cfg(test)]` はパーサ単体テストのみ、`:627-751`）。
@@ -904,8 +917,8 @@ JSON バックアップから復元でき、改変したバックアップを復
 | 項目 | 事実 | アンカー |
 |---|---|---|
 | 保存先 | SQLite の `app_settings` テーブル、キー `"booth.session"` | `crates/app/src/app_state.rs:392`、`crates/core/src/db/schema.sql:25-30` |
-| 形式 | `BoothSession` を `serde_json` 化したものを暗号化した文字列（`enc:v1:` + base64）を `value` 列へ。**平文 JSON では保存しない** | `crates/core/src/session_store.rs`、`crates/app/src/views/booth_login.rs:144-148` |
-| 暗号化 | **keyring の鍵（`thundoku-shelf.session-key`）で AES-256-GCM**（AAD に用途名・形式版）。保存値は `enc:v1:` + base64(IV ‖ 暗号文 ‖ tag)。復号できない値（旧平文・改ざん・別鍵）は未ログインとして破棄し、**平文へは戻さない** | `crates/core/src/session_store.rs` |
+| 形式 | `BoothSession` を `serde_json` 化したものを暗号化した文字列（`enc:v2:` + base64）を `value` 列へ。**平文 JSON では保存しない** | `crates/core/src/session_store.rs:33`、`crates/app/src/views/booth_login.rs:162` |
+| 暗号化 | **keyring の鍵（`thundoku-shelf.session-key`）で AES-256-GCM**（AAD に用途名・形式版）。保存値は `enc:v2:` + base64(IV ‖ 暗号文 ‖ tag)。復号できない値（旧 `enc:v1`・平文・改ざん・別鍵）は未ログインとして破棄し、**平文へは戻さない**。**保存から 7 日**を過ぎた値も行ごと破棄する | `crates/core/src/session_store.rs:7-11`, `:33`, `:38`, `:107-200` |
 | keyring を使わない理由（コメント） | セッション Cookie は Windows Credential Manager の上限（**2560 UTF-16 文字**）を超えることがあるため DB 保存 | `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |
 | 実行時キャッシュ | `AppState.booth_session: Arc<parking_lot::Mutex<Option<BoothSession>>>` と `booth_logged_in: Arc<Mutex<bool>>` | `crates/app/src/app_state.rs` |
 | 保存関数 | `pub fn save_booth_session(cx: &App, session: &BoothSession)` → `SessionVault::save`。**鍵が無ければ保存しない**（平文へフォールバックしない）。失敗時はログのみで、メモリ状態は更新する | `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |

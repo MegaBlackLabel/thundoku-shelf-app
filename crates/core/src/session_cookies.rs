@@ -31,15 +31,12 @@ impl HostScopedCookies {
         }
     }
 
-    /// サイト内（収集元そのもの）向けの `Cookie` ヘッダ。収集元すべてを 1 本にまとめる。
-    ///
-    /// **CDN など別システムへは使わない**（宛先ごとに絞る `header_for` を使う）。
-    pub fn header(&self) -> String {
-        join(self.origins.values().flat_map(BTreeMap::iter))
-    }
-
     /// 宛先ホスト向けの `Cookie` ヘッダ。**そのホスト向けに収集したものだけ**を返す
     /// （収集元と一致するか、その収集元の子ドメイン）。収集元でなければ空。
+    ///
+    /// 収集元すべてを 1 本にまとめる API は**持たない**: まとめると、片方にしか送るべきでない
+    /// Cookie（`accounts.dmm.co.jp` / `login.dlsite.com` のもの）が、宛先が不定の
+    /// ダウンロード proxy や CDN へ飛ぶ。宛先が既知なら必ずこの関数を使う。
     pub fn header_for(&self, host: &str) -> String {
         join(
             self.origins
@@ -64,8 +61,21 @@ impl HostScopedCookies {
 }
 
 /// `host` が収集元 `origin` そのもの、またはその子ドメインか。
+///
+/// 大文字小文字は区別しない（URL 検証側 `download_url::host_matches` と揃える）。
+/// 区別すると、302 の `Location` が `HTTPS://WWW.DLsite.COM/...` のような URL を返したときに
+/// 検証は通るのに Cookie が空になり、**黙って未認証で叩く**ことになる。
 fn is_origin_of(origin: &str, host: &str) -> bool {
-    host == origin || host.ends_with(&format!(".{origin}"))
+    let (origin, host) = (origin.as_bytes(), host.as_bytes());
+    if host.len() == origin.len() {
+        return host.eq_ignore_ascii_case(origin);
+    }
+    if host.len() < origin.len() {
+        return false;
+    }
+    // `<something>.origin` の形だけを許す（`evilhost` のような部分一致は不可）。
+    host[host.len() - origin.len() - 1] == b'.'
+        && host[host.len() - origin.len()..].eq_ignore_ascii_case(origin)
 }
 
 /// Cookie 名と値の組を `Cookie` ヘッダの形に連結する（順序は BTreeMap 順で安定）。
@@ -108,13 +118,17 @@ mod tests {
         assert_eq!(cookies.header_for("accounts.dmm.co.jp"), "acct=1");
     }
 
-    /// サイト内向けは収集元すべてを 1 本にまとめる（従来どおりの挙動）。
+    /// 宛先ホストの大文字小文字は区別しない（URL 検証側 `download_url::host_matches` と揃える）。
+    /// 区別すると、`Location` が `HTTPS://WWW.DLsite.COM/...` のような URL を返したときに
+    /// 検証は通るのに Cookie が空になる（＝黙って未認証になる）。
     #[test]
-    fn header_joins_every_origin() {
+    fn header_for_ignores_host_case() {
         let cookies = bag();
-        let all = cookies.header();
-        assert!(all.contains("login_id=abc"), "{all}");
-        assert!(all.contains("acct=1"), "{all}");
+
+        assert_eq!(cookies.header_for("WWW.DMM.CO.JP"), "login_id=abc");
+        assert_eq!(cookies.header_for("Sub.WWW.dmm.CO.jp"), "login_id=abc");
+        assert_eq!(cookies.header_for("ACCOUNTS.DMM.CO.JP"), "acct=1");
+        assert_eq!(cookies.header_for("DOUJIN.CONTENTS.DOUJIN.DMM.CO.JP"), "");
     }
 
     /// 値の取り出しは収集元をまたがない。

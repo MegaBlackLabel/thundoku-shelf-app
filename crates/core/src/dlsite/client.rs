@@ -122,15 +122,11 @@ impl DlsiteSession {
         self.origins.value(host, name)
     }
 
-    /// サイト内（`www.dlsite.com`）向けの Cookie ヘッダ。収集元すべてを 1 本にまとめる。
-    ///
-    /// **CDN など別システムへは使わない**（宛先ごとに絞る `cookie_header_for` を使う）。
-    pub fn cookie_header(&self) -> String {
-        self.origins.header()
-    }
-
     /// 宛先ホスト向けの Cookie ヘッダ。**そのホスト向けに収集したものだけ**を返す
     /// （収集元と一致するか、その収集元の子ドメイン）。
+    ///
+    /// 収集元すべてをまとめる API は**持たない**: `down_url` の proxy のように宛先が実行時に
+    /// 決まる送信先へ、片方の収集元にしか送るべきでない Cookie を載せないため。
     pub fn cookie_header_for(&self, host: &str) -> String {
         self.origins.header_for(host)
     }
@@ -196,9 +192,11 @@ impl DlsiteClient {
         Self { transport, session }
     }
 
-    fn cookie_headers(&self) -> Vec<(String, String)> {
+    /// 宛先ホスト向けのヘッダ。`Cookie` は**そのホスト向けに収集したものだけ**を載せる
+    /// （収集元をまたいで 1 本にまとめない）。
+    fn cookie_headers_for(&self, host: &str) -> Vec<(String, String)> {
         vec![
-            ("Cookie".to_string(), self.session.cookie_header()),
+            ("Cookie".to_string(), self.session.cookie_header_for(host)),
             ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dlsite.com/".to_string()),
             // DLsite は non-browser リクエストをアプリ認証で弾く（Sec-Fetch / Accept が
@@ -215,8 +213,8 @@ impl DlsiteClient {
         ]
     }
 
-    fn ajax_headers(&self) -> Vec<(String, String)> {
-        let mut h = self.cookie_headers();
+    fn ajax_headers_for(&self, host: &str) -> Vec<(String, String)> {
+        let mut h = self.cookie_headers_for(host);
         if let Some((_, v)) = h.iter_mut().find(|(k, _)| k == "Accept") {
             *v = "application/json".to_string();
         }
@@ -261,7 +259,7 @@ impl DlsiteClient {
                 .send(RequestSpec {
                     method: "GET".into(),
                     url,
-                    headers: self.ajax_headers(),
+                    headers: self.ajax_headers_for(SITE_HOST),
                     body: None,
                     redirects: 3,
                 })
@@ -300,12 +298,14 @@ impl DlsiteClient {
         //
         // 送信先は `bookshelf_items.download_url`（改変バックアップ由来もあり得る）と
         // その 302 の `Location`。Cookie を付ける前に双方を検証する。
-        crate::download_url::check(down_url, DLSITE_DOWNLOAD_RULES)
+        let proxy = crate::download_url::check(down_url, DLSITE_DOWNLOAD_RULES)
             .map_err(|error| DlsiteError::BlockedUrl(format!("{down_url}: {error}")))?;
+        // proxy へは**宛先ホスト向けに収集した Cookie だけ**を送る。www と login を 1 本に
+        // まとめると、`down_url` が別サブドメインを指したときにもう片方の収集元の Cookie まで飛ぶ。
         let proxy_spec = RequestSpec {
             method: "GET".into(),
             url: down_url.into(),
-            headers: self.cookie_headers(),
+            headers: self.cookie_headers_for(proxy.host),
             body: None,
             redirects: 0,
         };
@@ -382,14 +382,15 @@ impl DlsiteClient {
         Ok(resp.body)
     }
 
-    /// HTML ページを取得する（購入履歴）。
+    /// HTML ページを取得する（購入履歴・作品ページ）。いずれも `www.dlsite.com` なので
+    /// 宛先は `SITE_HOST`（login の Cookie は載せない）。
     fn get_html(&mut self, url: &str) -> Result<String, DlsiteError> {
         let resp = self
             .transport
             .send(RequestSpec {
                 method: "GET".into(),
                 url: url.into(),
-                headers: self.cookie_headers(),
+                headers: self.cookie_headers_for(SITE_HOST),
                 body: None,
                 redirects: 3,
             })
@@ -844,6 +845,122 @@ mod tests {
         assert_eq!(cookie_of(&proxy), "__DLsite_SID=abc");
     }
 
+    /// 宛先が違う Cookie は送らない（www と login の 2 収集元を持つセッション）。
+    fn two_origin_session() -> DlsiteSession {
+        DlsiteSession::new(BTreeMap::from([
+            (
+                SITE_HOST.to_string(),
+                BTreeMap::from([("__DLsite_SID".to_string(), "shop".to_string())]),
+            ),
+            (
+                LOGIN_HOST.to_string(),
+                BTreeMap::from([("login_ticket".to_string(), "t".to_string())]),
+            ),
+        ]))
+    }
+
+    /// `down_url` を叩くトランスポート。proxy のリクエストを記録し、302 + 署名 `jwt` を返す。
+    /// CDN（`download.dlsite.com`）は 200 + ZIP を返す。
+    fn download_transport() -> (
+        MockTransport,
+        std::sync::Arc<parking_lot::Mutex<Option<RequestSpec>>>,
+    ) {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let proxy_spec = Arc::new(Mutex::new(None::<RequestSpec>));
+        let proxy_spec2 = proxy_spec.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                if spec.url.contains("/download/") {
+                    *proxy_spec2.lock() = Some(spec);
+                    Ok(ResponseSpec {
+                        status: 302,
+                        headers: vec![
+                            (
+                                "location".into(),
+                                "https://download.dlsite.com/get/=/type/work/file/RJ01234567.zip"
+                                    .into(),
+                            ),
+                            (
+                                "set-cookie".into(),
+                                "jwt=sig; path=/; domain=dlsite.com; secure".into(),
+                            ),
+                        ],
+                        body: vec![],
+                    })
+                } else {
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/zip".into())],
+                        body: b"PK\x03\x04zip".to_vec(),
+                    })
+                }
+            }),
+        };
+        (transport, proxy_spec)
+    }
+
+    /// ダウンロード proxy（`down_url`）へは、宛先ホスト向けの Cookie だけを送る。
+    /// www の認証セッションに login の Cookie を混ぜない。
+    #[test]
+    fn download_proxy_sends_only_destination_cookies() {
+        let (transport, proxy_spec) = download_transport();
+        let mut client = DlsiteClient::with_transport(Box::new(transport), two_origin_session());
+        let mut on = |_: u64, _: u64| true;
+        client
+            .download_with_progress(
+                "https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html",
+                &mut on,
+            )
+            .unwrap();
+        let proxy = proxy_spec.lock().clone().expect("proxy request made");
+        assert_eq!(cookie_of(&proxy), "__DLsite_SID=shop");
+    }
+
+    /// proxy が収集元以外のホストを指す場合、セッション Cookie は 1 つも送らない
+    /// （fail-closed。ダウンロード用の署名 `jwt` は 302 応答で受け取ってから CDN へ送る）。
+    #[test]
+    fn download_proxy_on_unknown_subdomain_sends_no_session_cookies() {
+        let (transport, proxy_spec) = download_transport();
+        let mut client = DlsiteClient::with_transport(Box::new(transport), two_origin_session());
+        let mut on = |_: u64, _: u64| true;
+        client
+            .download_with_progress(
+                "https://dl.dlsite.com/maniax/download/=/product_id/RJ01234567.html",
+                &mut on,
+            )
+            .unwrap();
+        let proxy = proxy_spec.lock().clone().expect("proxy request made");
+        assert_eq!(
+            cookie_of(&proxy),
+            "",
+            "セッション Cookie を送ってはいけない"
+        );
+    }
+
+    /// 購入履歴（www）への送信に login の Cookie を混ぜない。
+    #[test]
+    fn site_requests_send_only_site_cookies() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let spec = Arc::new(Mutex::new(None::<RequestSpec>));
+        let spec2 = spec.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |s: RequestSpec| {
+                *spec2.lock() = Some(s);
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: b"<div id=\"buy_history_this\"><table class=\"work_list_main\"></table></div>".to_vec(),
+                })
+            }),
+        };
+        let mut client = DlsiteClient::with_transport(Box::new(transport), two_origin_session());
+        client.purchased_page("maniax", 1).unwrap();
+        let sent = spec.lock().clone().expect("request made");
+        assert_eq!(cookie_of(&sent), "__DLsite_SID=shop");
+    }
+
     /// Cookie は収集元ホストごとに持ち、宛先が違う Cookie は送らない。
     ///
     /// 収集元（`www` / `login`）を潰すと、片方にしか送るべきでない Cookie がもう片方や
@@ -860,11 +977,6 @@ mod tests {
                 BTreeMap::from([("login_ticket".to_string(), "t".to_string())]),
             ),
         ]));
-
-        // サイト内のリクエストは従来どおり全収集元を 1 本にまとめる
-        let all = session.cookie_header();
-        assert!(all.contains("__DLsite_SID=shop"), "{all}");
-        assert!(all.contains("login_ticket=t"), "{all}");
 
         // 宛先が収集元でなければ 1 つも送らない（CDN はこれに当たる）
         assert_eq!(session.cookie_header_for("download.dlsite.com"), "");

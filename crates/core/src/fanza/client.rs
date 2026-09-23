@@ -113,15 +113,11 @@ impl FanzaSession {
         self.origins.value(host, name)
     }
 
-    /// サイト内（`www.dmm.co.jp`）向けの Cookie ヘッダ。収集元すべてを 1 本にまとめる。
-    ///
-    /// **CDN など別システムへは使わない**（宛先ごとに絞る `cookie_header_for` を使う）。
-    pub fn cookie_header(&self) -> String {
-        self.origins.header()
-    }
-
     /// 宛先ホスト向けの Cookie ヘッダ。**そのホスト向けに収集したものだけ**を返す
     /// （収集元と一致するか、その収集元の子ドメイン）。
+    ///
+    /// 収集元すべてをまとめる API は**持たない**: `downloadLinks` の proxy のように宛先が
+    /// 実行時に決まる送信先へ、片方の収集元にしか送るべきでない Cookie を載せないため。
     pub fn cookie_header_for(&self, host: &str) -> String {
         self.origins.header_for(host)
     }
@@ -218,9 +214,9 @@ impl FanzaClient {
         Self { transport, session }
     }
 
-    fn cookie_headers(&self) -> Vec<(String, String)> {
+    fn cookie_headers_for(&self, host: &str) -> Vec<(String, String)> {
         vec![
-            ("Cookie".to_string(), self.session.cookie_header()),
+            ("Cookie".to_string(), self.session.cookie_header_for(host)),
             ("Accept".to_string(), "application/json".to_string()),
             ("User-Agent".to_string(), user_agent()),
         ]
@@ -240,7 +236,7 @@ impl FanzaClient {
         let spec = RequestSpec {
             method: "GET".into(),
             url: url.into(),
-            headers: self.cookie_headers(),
+            headers: self.cookie_headers_for(SITE_HOST),
             body: None,
             redirects: 3,
         };
@@ -338,7 +334,7 @@ impl FanzaClient {
         let spec = RequestSpec {
             method: "GET".into(),
             url,
-            headers: self.cookie_headers(),
+            headers: self.cookie_headers_for(SITE_HOST),
             body: None,
             redirects: 3,
         };
@@ -363,10 +359,16 @@ impl FanzaClient {
         //
         // Cookie（セッション / 署名）を付ける前に送信先を検証する。proxy URL と
         // その 302 の `Location` のどちらも外部ホストを指し得る。
-        crate::download_url::check(download_url, FANZA_DOWNLOAD_RULES)
+        let proxy = crate::download_url::check(download_url, FANZA_DOWNLOAD_RULES)
             .map_err(|error| FanzaError::BlockedUrl(format!("{download_url}: {error}")))?;
+        // proxy へは**宛先ホスト向けに収集した Cookie だけ**を送る。www と accounts を
+        // 1 本にまとめると、`downloadLinks` が別サブドメインを指したときに
+        // もう片方の収集元の Cookie まで飛ぶ（宛先は許可リスト内でも別システム）。
         let proxy_headers = vec![
-            ("Cookie".to_string(), self.session.cookie_header()),
+            (
+                "Cookie".to_string(),
+                self.session.cookie_header_for(proxy.host),
+            ),
             ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
         ];
@@ -542,6 +544,84 @@ mod tests {
             "login_id".to_string(),
             "abc".to_string(),
         )]))
+    }
+
+    /// www と accounts の 2 収集元を持つセッション（宛先ごとに絞ることを検証する用）。
+    fn two_origin_session() -> FanzaSession {
+        FanzaSession::new(BTreeMap::from([
+            (
+                SITE_HOST.to_string(),
+                BTreeMap::from([("login_id".to_string(), "abc".to_string())]),
+            ),
+            (
+                ACCOUNT_HOST.to_string(),
+                BTreeMap::from([("acct".to_string(), "1".to_string())]),
+            ),
+        ]))
+    }
+
+    /// 一覧 API（www）へ accounts の Cookie を混ぜない。
+    #[test]
+    fn purchased_page_sends_only_site_cookies() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let spec = Arc::new(Mutex::new(None::<RequestSpec>));
+        let spec2 = spec.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |s: RequestSpec| {
+                *spec2.lock() = Some(s);
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: json_body(page_json(vec![], false, 0)),
+                })
+            }),
+        };
+        let mut client = FanzaClient::with_transport(Box::new(transport), two_origin_session());
+        client.purchased_page(1).unwrap();
+        let sent = spec.lock().clone().expect("request made");
+        assert_eq!(cookie_of(&sent), "login_id=abc");
+    }
+
+    /// ダウンロード proxy へは、宛先ホスト向けの Cookie だけを送る。
+    /// www の認証セッションに accounts の Cookie を混ぜない。
+    #[test]
+    fn download_proxy_sends_only_destination_cookies() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let proxy_spec = Arc::new(Mutex::new(None::<RequestSpec>));
+        let proxy_spec2 = proxy_spec.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                if spec.url.contains("/dc/-/proxy/") {
+                    *proxy_spec2.lock() = Some(spec);
+                    Ok(ResponseSpec {
+                        status: 302,
+                        headers: vec![(
+                            "location".into(),
+                            "https://doujin.contents.doujin.dmm.co.jp/bb/dm_comic/x.zip".into(),
+                        )],
+                        body: vec![],
+                    })
+                } else {
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/zip".into())],
+                        body: b"PK\x03\x04zip".to_vec(),
+                    })
+                }
+            }),
+        };
+        let mut client = FanzaClient::with_transport(Box::new(transport), two_origin_session());
+        let mut on = |_: u64, _: u64| true;
+        client
+            .download_with_progress(
+                "https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=x/",
+                &mut on,
+            )
+            .unwrap();
+        let proxy = proxy_spec.lock().clone().expect("proxy request made");
+        assert_eq!(cookie_of(&proxy), "login_id=abc");
     }
 
     /// スクリプト化されたトランスポート。URL で応答を分岐する（tbf::sync の MockTransport と同流儀）。

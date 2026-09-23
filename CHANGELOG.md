@@ -6,6 +6,19 @@
 
 ### Fixed
 
+- **ダウンロード経路へ送る Cookie を宛先ホスト別に絞る**: セッション Cookie は収集元
+  ホスト（`www.dmm.co.jp` / `accounts.dmm.co.jp`、`www.dlsite.com` / `login.dlsite.com`）別に
+  持っているのに、**ダウンロード proxy（`downloadLinks` / `down_url`）へ送るときだけは全収集元を
+  1 本にまとめていた**。proxy の宛先は FANZA / DLsite の応答が返す URL 次第で `www` 以外の
+  サブドメインにもなり得るため、片方にしか送るべきでない Cookie（例: `accounts` 側の Cookie）が
+  同じリクエストに載る余地があった（`download_url` は Drive の改変バックアップから復元され得る）。
+  宛先は既に許可リストで検証していたので外部ホストへは送っていないが、**送信先ホスト向けに収集した
+  Cookie だけ**を載せるよう統一し、収集元をまとめて送る API 自体を削除して再発しないようにした
+  （proxy は検証結果の `ParsedUrl.host`、CDN は `cdn.host` を使う）。
+  併せて収集元ホストの照合を**大文字小文字を区別しない**比較にそろえた（`Location` が
+  `HTTPS://WWW.DLsite.COM/...` のような URL を返すと、URL 検証は通るのに Cookie が空になり、
+  黙って未認証で叩いていた）。`crates/core/src/session_cookies.rs`、`fanza/client.rs`、`dlsite/client.rs`
+
 - **DLsite のセッション切れを「購入 0 件」と取り違えない**: セッションが切れていると
   DLsite は購入履歴の代わりに **`login.dlsite.com/register?user=self` を 200 で**返す
   （HTTP ステータスでは気づけない）。これを 0 件として扱っていたため、何も取り込まない
