@@ -70,6 +70,9 @@ const BOOTH_DOWNLOAD_RULES: &[crate::download_url::HostRule] =
         Some("/downloadables/"),
     )];
 
+/// ダウンロードで追うリダイレクトの上限（各ホップは [`BOOTH_DOWNLOAD_RULES`] で検証する）。
+const BOOTH_REDIRECT_LIMIT: usize = 5;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BoothError {
     #[error("network error: {0}")]
@@ -124,6 +127,8 @@ pub struct BoothItemDetail {
 pub struct BoothClient {
     session: BoothSession,
     agent: ureq::Agent,
+    /// ダウンロード用（`redirects(0)`）。302 は自前で追い、**各ホップを検証**する。
+    download_agent: ureq::Agent,
 }
 
 /// ストアへ送る UA。**クライアントを名乗る**。以前は Mac の Chrome を名乗っていたが、
@@ -186,12 +191,17 @@ fn remove_html_dumps() {
 
 impl BoothClient {
     pub fn new(session: &BoothSession) -> Self {
-        Self {
-            session: session.clone(),
-            agent: ureq::AgentBuilder::new()
+        let build_agent = |redirects: u32| {
+            ureq::AgentBuilder::new()
+                .redirects(redirects)
                 .timeout_connect(std::time::Duration::from_secs(5))
                 .timeout_read(std::time::Duration::from_secs(15))
-                .build(),
+                .build()
+        };
+        Self {
+            session: session.clone(),
+            agent: build_agent(5),
+            download_agent: build_agent(0),
         }
     }
 
@@ -417,20 +427,55 @@ impl BoothClient {
     ) -> Result<Vec<u8>, BoothError> {
         // 認証（Cookie）を付ける前に送信先を検証する。保存 URL はバックアップ由来も
         // あり得るため、外部ホストへセッションを渡さない。
-        crate::download_url::check(download_url, BOOTH_DOWNLOAD_RULES)
+        let parsed = crate::download_url::check(download_url, BOOTH_DOWNLOAD_RULES)
             .map_err(|error| BoothError::BlockedUrl(format!("{download_url}: {error}")))?;
-        let mut request = self
-            .agent
-            .get(download_url)
-            .set("User-Agent", &user_agent())
-            .set("Accept", "application/octet-stream, */*");
-        let cookie = self.cookie_for(download_url);
-        if !cookie.is_empty() {
-            request = request.set("Cookie", &cookie);
-        }
-        let response = request
-            .call()
-            .map_err(|e| BoothError::Network(e.to_string()))?;
+        // 302（署名付き S3 URL）は自前で追い、**各ホップを検証**して Cookie を宛先ごとに
+        // 組み立て直す。`ureq` の自動追跡任せだと各ホップの検証ができず、資格情報以外の
+        // ヘッダが許可外ホストへ残る。
+        let mut current = parsed.url;
+        let mut remaining = BOOTH_REDIRECT_LIMIT;
+        let response = loop {
+            let mut request = self
+                .download_agent
+                .get(current.as_str())
+                .set("User-Agent", &user_agent())
+                .set("Accept", "application/octet-stream, */*");
+            // Cookie は許可リスト内のホスト向けだけを載せる
+            // （署名付き S3 は配布先であって、こちらのセッションの宛先ではない）。
+            if crate::download_url::check_url(&current, BOOTH_DOWNLOAD_RULES).is_ok() {
+                let cookie = self.cookie_for(current.as_str());
+                if !cookie.is_empty() {
+                    request = request.set("Cookie", &cookie);
+                }
+            }
+            let response = request
+                .call()
+                .map_err(|e| BoothError::Network(e.to_string()))?;
+            let status = response.status();
+            if !(300..400).contains(&status) {
+                break response;
+            }
+            let Some(location) = response.header("Location").map(str::to_string) else {
+                // `Location` の無い 3xx はそのまま返す（下の content-type 検査に任せる）。
+                break response;
+            };
+            if remaining == 0 {
+                return Err(BoothError::BlockedUrl(format!(
+                    "リダイレクトが上限（{BOOTH_REDIRECT_LIMIT} 回）を超えました: {current}"
+                )));
+            }
+            remaining -= 1;
+            let next = current.join(&location).map_err(|_| {
+                BoothError::Network(format!("Location を解釈できない: {location}"))
+            })?;
+            // ダウングレード（`https` 以外）へは転送しない。
+            if next.scheme() != "https" {
+                return Err(BoothError::BlockedUrl(format!(
+                    "https 以外へは転送しない: {next}"
+                )));
+            }
+            current = next;
+        };
         let content_type = response
             .header("content-type")
             .map(|v| v.to_string())

@@ -67,6 +67,9 @@ const FANZA_CDN_RULES: &[crate::download_url::HostRule] =
         None,
     )];
 
+/// CDN 取得で追うリダイレクトの上限（各ホップは [`FANZA_CDN_RULES`] で検証する）。
+const FANZA_REDIRECT_LIMIT: usize = 3;
+
 #[derive(Debug, thiserror::Error)]
 pub enum FanzaError {
     #[error("セッション切れ・未ログイン")]
@@ -392,14 +395,15 @@ impl FanzaClient {
         let proxy_headers = vec![
             (
                 "Cookie".to_string(),
-                self.session.cookie_header_for_url(download_url),
+                self.session.cookie_header_for_url(proxy.url.as_str()),
             ),
             ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
         ];
         let proxy_spec = RequestSpec {
             method: "GET".into(),
-            url: download_url.into(),
+            // 検証した URL（正規化済み）をそのまま送る（検証した宛先 = 送る宛先）
+            url: proxy.url.as_str().into(),
             headers: proxy_headers,
             body: None,
             redirects: 0,
@@ -431,20 +435,20 @@ impl FanzaClient {
         // 2) CDN へ直接（署名 Cookie のみのフルブラウザヘッダ付き）
         //    署名 Cookie（CloudFront-*）はログイン時ではなく、このダウンロード proxy の
         //    応答（Set-Cookie）で lazy に発行されるため、ここで取って CDN へ送る。
-        //    （ureq をリダイレクトに任せるとクロスホストで Cookie が落ちるので手動追跡）
+        //
+        //    転送は**各ホップ検証**して自前で追う（`ureq` に任せると `Cookie` は落ちても
+        //    他のヘッダをそのまま残すため、`Location` の差し替えで許可外ホストへ飛び得る）。
+        //    資格情報はホップごとに「その宛先向けに収集した Cookie + 署名 Cookie」を
+        //    組み立て直す（許可外のホストには載せない）。
         //
         //    www / accounts の**セッション Cookie は CDN へ送らない**（別システムなので
         //    要らない）。宛先ホスト向けに収集した Cookie だけを載せる。
-        let mut cookie = self.session.cookie_header_for_url(&cd_url);
-        for (k, v) in proxy_resp.set_cookies() {
-            if k.starts_with("CloudFront-") && !cookie.contains(&format!("{k}=")) {
-                if !cookie.is_empty() {
-                    cookie.push_str("; ");
-                }
-                cookie.push_str(&format!("{k}={v}"));
-            }
-        }
-        let mut headers = vec![
+        let cloudfront: Vec<(String, String)> = proxy_resp
+            .set_cookies()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("CloudFront-"))
+            .collect();
+        let headers = vec![
             ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dmm.co.jp/".to_string()),
             (
@@ -457,21 +461,39 @@ impl FanzaClient {
             ("Sec-Fetch-Site".to_string(), "cross-site".to_string()),
             ("Upgrade-Insecure-Requests".to_string(), "1".to_string()),
         ];
-        // Cookie が 1 つも無ければヘッダを付けない（空の Cookie は送らない）。
-        if !cookie.is_empty() {
-            headers.insert(0, ("Cookie".to_string(), cookie));
-        }
-        let spec = RequestSpec {
-            method: "GET".into(),
-            url: cd_url,
-            headers,
-            body: None,
-            redirects: 3,
+        let session = &self.session;
+        let mut credentials = |destination: &url::Url| {
+            let mut cookie = session.cookie_header_for_url(destination.as_str());
+            for (name, value) in &cloudfront {
+                if !cookie.contains(&format!("{name}=")) {
+                    if !cookie.is_empty() {
+                        cookie.push_str("; ");
+                    }
+                    cookie.push_str(&format!("{name}={value}"));
+                }
+            }
+            // Cookie が 1 つも無ければヘッダを付けない（空の Cookie は送らない）。
+            if cookie.is_empty() {
+                Vec::new()
+            } else {
+                vec![("Cookie".to_string(), cookie)]
+            }
         };
-        let resp = self
-            .transport
-            .send_download(spec, on_progress)
-            .map_err(FanzaError::Transport)?;
+        let resp = crate::tbf::redirect::send_with_validated_redirects(
+            self.transport.as_mut(),
+            RequestSpec {
+                method: "GET".into(),
+                url: cdn.url.as_str().into(),
+                headers,
+                body: None,
+                redirects: 0,
+            },
+            FANZA_REDIRECT_LIMIT,
+            FANZA_CDN_RULES,
+            &mut credentials,
+            on_progress,
+        )
+        .map_err(FanzaError::Transport)?;
         self.check_status(&resp)?;
         if resp.body.starts_with(b"<!doctype") || resp.body.starts_with(b"<html") {
             return Err(FanzaError::Parse("HTML response (not a file)".into()));
@@ -882,7 +904,93 @@ mod tests {
             "CloudFront-Signature=abc; CloudFront-Key-Pair-Id=K123",
             "CDN へは署名 Cookie だけを送る"
         );
-        assert!(spec.redirects == 3);
+    }
+
+    /// CDN が許可外ホストへ 302 しても、**署名 Cookie を載せずに**追う（資格情報を渡さない）。
+    #[test]
+    fn download_follows_a_cdn_redirect_without_credentials_outside_the_allowlist() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let seen = Arc::new(Mutex::new(Vec::<RequestSpec>::new()));
+        let seen2 = seen.clone();
+        let transport = MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                seen2.lock().push(spec.clone());
+                if spec.url.contains("/dc/-/proxy/") {
+                    Ok(ResponseSpec {
+                        status: 302,
+                        headers: vec![
+                            (
+                                "location".into(),
+                                "https://doujin.contents.doujin.dmm.co.jp/x.zip".into(),
+                            ),
+                            (
+                                "set-cookie".into(),
+                                "CloudFront-Signature=abc; path=/; domain=dmm.co.jp; secure; httponly"
+                                    .into(),
+                            ),
+                        ],
+                        body: vec![],
+                    })
+                } else if spec.url.contains("contents.doujin.dmm.co.jp") {
+                    Ok(ResponseSpec {
+                        status: 302,
+                        headers: vec![(
+                            "location".into(),
+                            "https://audit.invalid/x.zip".into(),
+                        )],
+                        body: vec![],
+                    })
+                } else {
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/zip".into())],
+                        body: b"PK\x03\x04zipdata".to_vec(),
+                    })
+                }
+            }),
+        };
+        let mut client = FanzaClient::with_transport(
+            Box::new(transport),
+            FanzaSession::from_site_cookies(BTreeMap::from([(
+                "login_id".to_string(),
+                "abc".to_string(),
+            )])),
+        );
+        let mut on = |_: u64, _: u64| true;
+        let bytes = client
+            .download_with_progress("https://www.dmm.co.jp/dc/-/proxy/=/x/", &mut on)
+            .unwrap();
+        assert_eq!(bytes, b"PK\x03\x04zipdata");
+
+        let requests = seen.lock().clone();
+        // 許可外のホストへは Cookie を 1 つも載せない
+        let cookies: Vec<String> = requests
+            .iter()
+            .filter(|spec| spec.url.contains("audit.invalid"))
+            .flat_map(|spec| {
+                spec.headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.clone())
+            })
+            .collect();
+        assert!(
+            cookies.is_empty(),
+            "許可外ホストへ資格情報を送っている: {cookies:?}"
+        );
+        // 許可リスト内の CDN には署名 Cookie を載せる
+        let cdn_cookies: Vec<String> = requests
+            .iter()
+            .filter(|spec| spec.url.contains("contents.doujin.dmm.co.jp"))
+            .flat_map(|spec| {
+                spec.headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.clone())
+            })
+            .collect();
+        assert_eq!(cdn_cookies, vec!["CloudFront-Signature=abc".to_string()]);
     }
 
     /// proxy が `www.dmm.co.jp` 以外（同じ `*.dmm.co.jp` のサブドメインでも）なら、

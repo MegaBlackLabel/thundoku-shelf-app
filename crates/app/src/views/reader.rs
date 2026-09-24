@@ -92,7 +92,8 @@ impl ReaderView {
         let state = AppState::global(cx);
         let db = state.db_pool.clone();
         let packs_dir = state.packs_dir.clone();
-        let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+        // v3: pack の復号鍵は解決済みのルート鍵（PRK）から冊ごとに導出する
+        let pack_root_key = state.pack_root_key();
         let images = db::documents::images_for_selection(
             &db,
             &book_id,
@@ -107,12 +108,8 @@ impl ReaderView {
             images,
             packs_dir,
             db: db.clone(),
-            identity: google_sub.map(|sub| opfspack::Identity {
-                sub,
-                pack_id: book_id.to_string(),
-            }),
+            pack_root_key,
             pack_bytes: std::sync::OnceLock::new(),
-            pack_key: std::sync::OnceLock::new(),
         });
         // レンディション未指定なら、そのコンテンツの先頭を実際の選択として記録する
         let resolved_format = match &format_id {
@@ -177,7 +174,8 @@ impl ReaderView {
         let state = AppState::global(cx);
         let db = state.db_pool.clone();
         let packs_dir = state.packs_dir.clone();
-        let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+        // v3: pack の復号鍵は解決済みのルート鍵（PRK）から冊ごとに導出する
+        let pack_root_key = state.pack_root_key();
 
         let (title, images, progress, site_id, selection) = {
             let book = db::books::get(&db, &book_id).ok().flatten();
@@ -206,18 +204,13 @@ impl ReaderView {
             (title, images, progress, site_id, selection)
         };
 
-        let identity = google_sub.map(|sub| opfspack::Identity {
-            sub,
-            pack_id: book_id.clone(),
-        });
         let contents = load_content_entries(&db, &book_id);
         let loader = Arc::new(PackPageLoader {
             images,
             packs_dir,
             db,
-            identity,
+            pack_root_key,
             pack_bytes: std::sync::OnceLock::new(),
-            pack_key: std::sync::OnceLock::new(),
         });
         let initial_page = progress
             .as_ref()
@@ -449,11 +442,8 @@ impl ReaderView {
         let state = AppState::global(cx);
         let db = state.db_pool.clone();
         let packs_dir = state.packs_dir.clone();
-        let sub = state
-            .google_profile
-            .lock()
-            .as_ref()
-            .map(|profile| profile.sub.clone());
+        // v3: pack の復号鍵は解決済みのルート鍵（PRK）から冊ごとに導出する
+        let pack_root_key = state.pack_root_key();
         let book_id = book_id.to_string();
         let content_id = content_id.to_string();
         let display_name = display_name.to_string();
@@ -464,7 +454,7 @@ impl ReaderView {
                 rewrite_pack_content_name_sync(
                     &db,
                     &packs_dir,
-                    sub,
+                    pack_root_key,
                     &book_id,
                     &content_id,
                     &display_name,
@@ -710,7 +700,7 @@ impl ReaderView {
 fn rewrite_pack_content_name_sync(
     db: &thundoku_core::db::SqlitePool,
     packs_dir: &std::path::Path,
-    sub: Option<String>,
+    root_key: Option<opfspack::PackRootKey>,
     book_id: &str,
     content_id: &str,
     display_name: &str,
@@ -728,16 +718,13 @@ fn rewrite_pack_content_name_sync(
     let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
-    // 読み出しと同じ identity（`PackPageLoader` と同じ pack_id = book_id）で復号する
-    let identity = sub.map(|sub| opfspack::Identity {
-        sub,
-        pack_id: book_id.to_string(),
-    });
+    // 読み出しと同じ鍵（`PackPageLoader` と同じく book id から pack 鍵を導出）で復号する
     match thundoku_core::import::rename_content_in_pack(
         &bytes,
+        book_id,
         content_id,
         display_name,
-        identity.as_ref(),
+        root_key.as_ref(),
     ) {
         Ok(Some(rewritten)) => {
             if let Err(error) = std::fs::write(&path, &rewritten) {

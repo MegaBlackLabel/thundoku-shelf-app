@@ -19,12 +19,13 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Theme, ThemeMode, WindowExt as _};
 use gpui_kit::{
-    AnyView, App, Context, Entity, FontWeight, IntoElement, Menu, MenuItem, ParentElement, Render,
-    SharedString, Window, div, px,
+    AnyView, App, Context, Entity, Focusable as _, FontWeight, IntoElement, Menu, MenuItem,
+    ParentElement, Render, SharedString, Window, div, px,
 };
 #[cfg(windows)]
 use raw_window_handle::HasWindowHandle;
@@ -159,6 +160,17 @@ pub struct Workspace {
     exit_upload_prompt: bool,
     /// 終了時のバックアップアップロード実行中か。
     exit_uploading: bool,
+    /// 解錠ダイアログで尋ねられているか。
+    ///
+    /// `AppState::pack_key_prompt` の要求に追随する（背景タスクが要求を積み、
+    /// 監視タスクが気づいてここへ反映する）。
+    pack_key_pending: bool,
+    /// 解錠ダイアログの入力欄（初回表示時に生成）。
+    pack_key_input: Option<Entity<InputState>>,
+    /// 入力欄を空にしてフォーカスする要求（ダイアログを出した直後に 1 回だけ）。
+    pack_key_input_reset: bool,
+    /// 解錠ダイアログに出す案内（直前のパスフレーズが違ったとき）。
+    pack_key_error: Option<String>,
 }
 
 /// いずれかのサイト（技術書典 / BOOTH / FANZA同人 / DLsite）にログイン済みか。
@@ -300,6 +312,10 @@ impl Workspace {
             theme_mode_name: "system".to_string(),
             exit_upload_prompt: false,
             exit_uploading: false,
+            pack_key_pending: false,
+            pack_key_input: None,
+            pack_key_input_reset: false,
+            pack_key_error: None,
         };
         this.register_actions(cx);
         this.refresh_unread_count(cx);
@@ -331,6 +347,7 @@ impl Workspace {
         let logout_flag = AppState::global(cx).google_logout_done.clone();
         let auth_open = AppState::global(cx).auth_open_requested.clone();
         let auth_provider = AppState::global(cx).auth_open_provider.clone();
+        let pack_key_prompt = AppState::global(cx).pack_key_prompt.clone();
         let db = AppState::global(cx).db_pool.clone();
         // 技術書典のログイン状態（メニューの「チェックリスト」の可否に効く）
         let tbf_logged_in = AppState::global(cx).tbf_logged_in.clone();
@@ -378,6 +395,11 @@ impl Workspace {
                         // ログイン状態が変わったので本棚を再フィルタ（owner モデル）。
                         this.bookshelf.update(cx, |b, bx| b.reload(bx));
                     });
+                    // ログインできたら pack の鍵（v3 の PRK）を背景で解決する
+                    // （keyring → Drive の bundle。パスフレーズがあれば解錠ダイアログ）。
+                    let _ = handle.update(cx, |this, cx| {
+                        this.start_pack_key_unlock("ログイン", cx);
+                    });
                     // cx.notify() は RefCell already borrowed を起こすため、
                     // AsyncApp::refresh()（&self）で再描画を要求する。
                     cx.refresh();
@@ -416,6 +438,22 @@ impl Workspace {
                 // サイトのログインが完了していたら、そのサイトの同期を始める
                 // （要求は `AuthDialog` が立て、ここで 1 回だけ消費する）。
                 let _ = handle.update(cx, |this, cx| this.handle_login_sync_request(cx));
+                // pack の鍵（v3 の PRK）の解錠要求（背景タスク → モーダル）。
+                // 要求が現れたら再描画して解錠ダイアログを出す（背景側は答えを待っている）。
+                let request = pack_key_prompt.pending();
+                let pending = request.is_some();
+                let error = request.and_then(|request| request.error);
+                let _ = handle.update(cx, |this, cx| {
+                    if this.pack_key_pending != pending {
+                        this.pack_key_pending = pending;
+                        if pending {
+                            // 新しい要求なので入力欄を空にしてフォーカスし直す
+                            this.pack_key_input_reset = true;
+                        }
+                        cx.notify();
+                    }
+                    this.pack_key_error = error;
+                });
             }
         })
         .detach();
@@ -879,9 +917,95 @@ impl Workspace {
         self.bookshelf.read(cx).has_pending_import()
     }
 
+    /// pack の鍵（v3 の PRK）を解決すべきか（未ログイン・解決済みなら不要）。
+    fn needs_pack_key_unlock(&self, cx: &App) -> bool {
+        let state = AppState::global(cx);
+        if state.pack_root_key().is_some() {
+            return false;
+        }
+        state
+            .google_profile
+            .lock()
+            .as_ref()
+            .is_some_and(|profile| !profile.sub.trim().is_empty())
+    }
+
+    /// pack の鍵（v3 の PRK）を背景で解決する（必要なら解錠ダイアログを出す）。
+    ///
+    /// 鍵が要る処理（本を開く・同期・取り込み）の前に呼ぶ。解決できなかった場合は
+    /// トーストで理由を知らせる（`Unavailable` = 復元の案内は core の文言に入っている）。
+    fn start_pack_key_unlock(&mut self, purpose: &str, cx: &mut Context<Self>) {
+        let task = crate::pack_keys::unlock_task(cx, purpose);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |_this, cx| {
+                if let Err(error) = result {
+                    log::warn!("pack key unlock failed: {error}");
+                    crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Error, error);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 解錠ダイアログの入力欄を遅延生成する（初回表示のみ）。
+    fn ensure_pack_key_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = self.pack_key_input.clone() {
+            return input;
+        }
+        // 肩越しに読まれないようマスクする（値は `value()` で取れる）
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("パスフレーズ")
+        });
+        self.pack_key_input = Some(input.clone());
+        input
+    }
+
+    /// 解錠ダイアログの答えを背景タスクへ返す（答えが要る側は待っている）。
+    fn answer_pack_key_prompt(
+        &mut self,
+        answer: crate::pack_keys::PassphraseAnswer,
+        cx: &mut Context<Self>,
+    ) {
+        AppState::global(cx).pack_key_prompt.answer(answer);
+        self.pack_key_pending = false;
+        self.pack_key_input_reset = true;
+        cx.notify();
+    }
+
     /// リーダーを開く（本棚・チェックリストからの委譲）。
     pub fn open_reader(&mut self, cx: &mut Context<Self>, book_id: String) {
         if self.reader_blocked_by_import_confirm(cx) {
+            return;
+        }
+        // 鍵（v3 の PRK）が未解決なら先に解決する。鍵が無いまま開くと暗号化 pack を
+        // 読めないため、解錠（必要ならパスフレーズ入力）してから開く。
+        if self.needs_pack_key_unlock(cx) {
+            let task = crate::pack_keys::unlock_task(cx, "本を開く");
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Err(error) = result {
+                        log::warn!("pack key unlock failed: {error}");
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            crate::app_state::ToastKind::Error,
+                            error,
+                        );
+                    }
+                    let reader = cx.new(|cx| ReaderView::for_book(cx, book_id));
+                    this.reader = Some(reader);
+                    cx.notify();
+                });
+            })
+            .detach();
             return;
         }
         let reader = cx.new(|cx| ReaderView::for_book(cx, book_id));
@@ -899,6 +1023,28 @@ impl Workspace {
         side: Option<thundoku_core::db::notes::SpreadSide>,
     ) {
         if self.reader_blocked_by_import_confirm(cx) {
+            return;
+        }
+        if self.needs_pack_key_unlock(cx) {
+            let task = crate::pack_keys::unlock_task(cx, "本を開く");
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Err(error) = result {
+                        log::warn!("pack key unlock failed: {error}");
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            crate::app_state::ToastKind::Error,
+                            error,
+                        );
+                    }
+                    let reader =
+                        cx.new(|cx| ReaderView::for_book_at(cx, book_id, page, content_id, side));
+                    this.reader = Some(reader);
+                    cx.notify();
+                });
+            })
+            .detach();
             return;
         }
         let reader = cx.new(|cx| ReaderView::for_book_at(cx, book_id, page, content_id, side));
@@ -957,6 +1103,13 @@ impl Workspace {
         use crate::app_state::{ModalKind, set_modal};
         set_modal(cx, ModalKind::Login, self.show_auth);
         set_modal(cx, ModalKind::ExitConfirm, self.exit_upload_prompt);
+        // 鍵（v3 の PRK）の解錠は背景タスクが答えを待っているので、どの画面でも出す
+        // （要求は `AppState::pack_key_prompt` が持つ）。
+        set_modal(
+            cx,
+            ModalKind::PackPassphrase,
+            AppState::global(cx).pack_key_prompt.pending().is_some(),
+        );
         // 本棚のモーダルは**本棚が表示されているときだけ**登録する。表示されていない
         // （他画面にいる）間は登録を外し、見えないモーダルで「閉じる」を塞がないようにする。
         let bookshelf_active = matches!(self.active, NavTarget::Bookshelf | NavTarget::Favorites);
@@ -1145,6 +1298,8 @@ impl Workspace {
         let db_path = state.data_dir.join("thundoku-shelf.db");
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
         let db_key = state.secrets.db_key().ok();
+        // pack の鍵（v3 の PRK）の解決に要るもの（背景スレッドへ move する）
+        let keys = crate::pack_keys::KeyContext::from_state(state);
         let task: gpui_kit::Task<Result<(), String>> = cx.background_executor().spawn(async move {
             let folder_id = db::settings::get(&db, "drive.sync.folder_id")
                 .ok()
@@ -1159,17 +1314,30 @@ impl Workspace {
                 Box::new(thundoku_core::tbf::UreqTransport::new()),
                 token,
             );
+            // 鍵（v3 の PRK）を用意する。無ければ暗号化 pack は上げられない
+            // （必要なら解錠ダイアログが出る。終了処理なので失敗しても終了はする）。
+            let pack_root_key = keys.unlock("終了時のバックアップ").unwrap_or_else(|error| {
+                log::warn!("exit upload: 鍵を解決できない: {error}");
+                None
+            });
             let _ = thundoku_core::drive::sync::sync(thundoku_core::drive::sync::SyncRequest {
                 pool: &db,
                 drive: &mut drive,
                 packs_dir: &packs_dir,
                 downloads_dir: &downloads_dir,
                 identity_sub: google_sub.as_deref(),
+                pack_root_key: pack_root_key.as_ref(),
                 owner_key: db_key.as_ref(),
                 folder_id: &folder_id,
                 db_path: Some(&db_path),
             })
             .map_err(|e| e.to_string())?;
+            // 未アップロードの鍵 bundle があれば上げ直す（仕様 §5.1）
+            match keys.retry_pending_upload() {
+                Ok(true) => log::info!("exit upload: 鍵 bundle の再アップロードに成功"),
+                Ok(false) => {}
+                Err(error) => log::warn!("exit upload: 鍵 bundle を上げられない: {error}"),
+            }
             Ok(())
         });
         cx.spawn(async move |_window, cx| {
@@ -1995,6 +2163,98 @@ impl Render for Workspace {
                     );
                 fade_dialog(window, cx, self.exit_upload_prompt, content).into_any_element()
                 .into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.pack_key_pending
+                && modal == Some(crate::app_state::ModalKind::PackPassphrase)
+            {
+                let handle = cx.entity();
+                let input = self.ensure_pack_key_input(window, cx);
+                if self.pack_key_input_reset {
+                    self.pack_key_input_reset = false;
+                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                    let focus = input.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                }
+                let request = AppState::global(cx).pack_key_prompt.pending();
+                let purpose = request
+                    .as_ref()
+                    .map(|request| request.purpose.clone())
+                    .unwrap_or_default();
+                let error = self.pack_key_error.clone();
+                let danger = cx.theme().danger;
+                let mut content = dialog_surface(cx)
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("本の鍵を解錠"),
+                    )
+                    .child(div().text_sm().child(format!(
+                        "{purpose}には本の鍵が必要ですが、この端末に鍵がありません。\
+                         別端末で設定したパスフレーズを入力すると復元できます（次回からは尋ねません）。"
+                    )))
+                    .child(Input::new(&input).cursor_text().w_full());
+                if let Some(error) = error {
+                    content = content.child(div().text_sm().text_color(danger).child(error));
+                }
+                let content = content.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            // スキップ = Google ログインの鍵（sub ラップ）だけで解く。
+                            // 「スキップしたときだけ」sub ラップへ落ちる（仕様 §4.1 手順 3）。
+                            dialog_button("pack-key-skip", "スキップ")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| {
+                                            this.answer_pack_key_prompt(
+                                                crate::pack_keys::PassphraseAnswer::Skipped,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("pack-key-unlock")
+                                .cursor_pointer()
+                                .primary()
+                                .label("解錠")
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| {
+                                            let value = this
+                                                .pack_key_input
+                                                .as_ref()
+                                                .map(|input| {
+                                                    input.read(cx).value().trim().to_string()
+                                                })
+                                                .unwrap_or_default();
+                                            if value.is_empty() {
+                                                this.pack_key_error = Some(
+                                                    "パスフレーズを入力してください".to_string(),
+                                                );
+                                                cx.notify();
+                                                return;
+                                            }
+                                            this.answer_pack_key_prompt(
+                                                crate::pack_keys::PassphraseAnswer::Passphrase(value),
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                        ),
+                );
+                fade_dialog(window, cx, true, content).into_any_element()
             } else {
                 div().into_any_element()
             })

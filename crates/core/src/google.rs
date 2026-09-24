@@ -45,10 +45,10 @@ pub struct GoogleProfile {
 
 /// ログ用のラベル。**`sub` を含めない**。
 ///
-/// pack の master key は `sub` から導出される（`opfspack::crypto::master_key`）ため、
-/// `sub` は実質の復号秘密であり、ログに書くと pack を入手した第三者へ復号材料を
-/// 渡すことになる（Windows は `%TEMP%/thundoku-shelf/thundoku.log` に既定 debug
-/// レベルで残る）。有無だけを伝える。
+/// v3 の pack の鍵は乱数のルート鍵（PRK）で、`sub` は PRK のラップを解く材料
+/// （`KEK_sub` と `owner_id`）なので実質の復号秘密である。ログに書くと pack と
+/// `thundoku-keys.json` を入手した第三者へ復号材料を渡すことになる（Windows は
+/// `%TEMP%/thundoku-shelf/thundoku.log` に既定 debug レベルで残る）。有無だけを伝える。
 pub fn profile_log_label(profile: Option<&GoogleProfile>) -> &'static str {
     if profile.is_some() {
         "あり"
@@ -195,6 +195,41 @@ pub fn parse_token_response(body: &[u8]) -> Result<OAuthTokens, GoogleError> {
         access_token,
         refresh_token,
         expires_at,
+    })
+}
+
+/// Parse the `userinfo` endpoint response.
+///
+/// `sub` は必須（欠落 / 空 / 文字列でない値は認証エラー）。`sub` は
+/// `books.owner_sub` の判定と、PRK のラップを解く鍵（`KEK_sub`）・`owner_id`
+/// （keyring のスロット名）に使う実質の秘密であり、空文字を成功として通すと
+/// 自分の鍵を引けない組み合わせができる（`docs/spec/10-pack-keys.md` §4）。
+/// 表示に使う `email` / `name` は欠けても空文字で埋める。
+pub fn parse_userinfo(body: &[u8]) -> Result<GoogleProfile, GoogleError> {
+    let payload: Value = serde_json::from_slice(body)
+        .map_err(|e| GoogleError::Auth(format!("invalid userinfo JSON: {e}")))?;
+    let sub = payload
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|sub| !sub.trim().is_empty())
+        .ok_or_else(|| GoogleError::Auth("userinfo response has no sub".into()))?
+        .to_string();
+    Ok(GoogleProfile {
+        sub,
+        email: payload
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        name: payload
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        picture: payload
+            .get("picture")
+            .and_then(Value::as_str)
+            .map(String::from),
     })
 }
 
@@ -721,29 +756,7 @@ impl GoogleClient {
                 response.status
             )));
         }
-        let payload: Value = serde_json::from_slice(&response.body)
-            .map_err(|e| GoogleError::Auth(format!("invalid userinfo JSON: {e}")))?;
-        Ok(GoogleProfile {
-            sub: payload
-                .get("sub")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            email: payload
-                .get("email")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            name: payload
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            picture: payload
-                .get("picture")
-                .and_then(Value::as_str)
-                .map(String::from),
-        })
+        parse_userinfo(&response.body)
     }
 
     fn post_token_form(&mut self, form: &str) -> Result<ResponseSpec, GoogleError> {
@@ -799,6 +812,68 @@ mod tests {
             "ログ用ラベルに sub が入っている: {label}"
         );
         assert_ne!(profile_log_label(None), label);
+    }
+
+    /// `sub` は `books.owner_sub` と pack の鍵（PRK のラップ）に使う秘密なので、
+    /// 欠落した userinfo 応答を「sub = 空文字」の成功として通さない。
+    #[test]
+    fn parse_userinfo_rejects_missing_sub() {
+        let error = parse_userinfo(br#"{"email":"u@example.com","name":"n"}"#)
+            .expect_err("sub が無い応答は認証エラー");
+        assert!(matches!(error, GoogleError::Auth(_)), "{error:?}");
+    }
+
+    /// 空文字・空白だけ・null の `sub` も通さない（欠落と同じ扱い）。
+    #[test]
+    fn parse_userinfo_rejects_empty_sub() {
+        for body in [
+            &br#"{"sub":"","email":"u@example.com"}"#[..],
+            &br#"{"sub":"   "}"#[..],
+            &br#"{"sub":null}"#[..],
+            &br#"{"sub":12345}"#[..],
+        ] {
+            assert!(
+                parse_userinfo(body).is_err(),
+                "空の sub を通してはいけない: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_userinfo_maps_fields() {
+        let profile =
+            parse_userinfo(br#"{"sub":"s-1","email":"e@example.com","name":"N"}"#).unwrap();
+        assert_eq!(profile.sub, "s-1");
+        assert_eq!(profile.email, "e@example.com");
+        assert_eq!(profile.name, "N");
+        assert_eq!(profile.picture, None);
+    }
+
+    /// userinfo 応答の経路全体（`profile()`）でも空 sub はエラーになること。
+    #[test]
+    fn profile_endpoint_without_sub_is_an_auth_error() {
+        /// `sub` を含まない userinfo を返す transport。
+        struct NoSubTransport;
+
+        impl Transport for NoSubTransport {
+            fn send(&mut self, _req: RequestSpec) -> Result<ResponseSpec, TbfError> {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: br#"{"email":"u@example.com","name":"n"}"#.to_vec(),
+                })
+            }
+        }
+
+        let mut client = GoogleClient::with_transport(Box::new(NoSubTransport), "cid", None);
+        client.restore_tokens(OAuthTokens {
+            access_token: "acc-1".to_string(),
+            refresh_token: None,
+            expires_at: 4_102_444_800,
+        });
+        let error = client.profile().expect_err("sub が無い userinfo はエラー");
+        assert!(matches!(error, GoogleError::Auth(_)), "{error:?}");
     }
 
     /// メモリバックエンド（`SecretStore`）はプロセス内で共有されるため、

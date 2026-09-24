@@ -6071,14 +6071,18 @@ name = "opfspack"
 version = "0.2.8"
 dependencies = [
  "aes-gcm",
+ "base64",
  "crc32fast",
  "flate2",
  "hex",
  "hkdf",
  "pbkdf2",
  "rand 0.8.7",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -8978,6 +8982,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "ureq",
+ "url",
  "uuid",
  "webp",
  "windows-sys 0.61.2",

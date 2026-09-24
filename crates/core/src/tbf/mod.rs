@@ -7,6 +7,7 @@
 //! techbookfest.org directly instead of going through the Workers.
 
 pub mod queries;
+pub mod redirect;
 pub mod sync;
 pub mod transport;
 
@@ -138,23 +139,20 @@ pub struct SamplePage {
 /// セッション Cookie の収集元。**このホスト（とそのサブドメイン）宛にだけ**資格情報を付ける。
 pub const SITE_HOST: &str = "techbookfest.org";
 
-/// ダウンロード要求のヘッダ。
+/// **宛先ごとの資格情報ヘッダー**（ダウンロード本体とリダイレクトの各ホップで使う）。
 ///
-/// Cookie（と `X-XSRF-TOKEN`）は**収集元ホスト宛のときだけ**付ける。技術書典の本体は
-/// `storage.googleapis.com`（`/tbf-tokyo-product-dlc/`）から落ちるため、無条件に付けると
-/// 別システム（Google）へセッション Cookie が飛ぶ。URL を解釈できないときは付けない
-/// （fail-closed。`User-Agent` だけは常に付ける）。
-fn download_headers(
+/// 収集元ホスト（[`SITE_HOST`] とそのサブドメイン）宛のときだけ Cookie と
+/// `X-XSRF-TOKEN` を返す。GCS など別システムへは空を返す（fail-closed）。
+fn download_credential_headers(
     cookie_header: &str,
     xsrf_token: Option<&str>,
     url: &str,
 ) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> =
-        vec![("User-Agent".to_string(), USER_AGENT.to_string())];
+    let mut headers: Vec<(String, String)> = Vec::new();
     let Ok(parsed) = crate::download_url::parse(url) else {
         return headers;
     };
-    if !crate::download_url::host_within(parsed.host, SITE_HOST) {
+    if !crate::download_url::host_within(&parsed.host, SITE_HOST) {
         return headers;
     }
     if !cookie_header.is_empty() {
@@ -174,10 +172,14 @@ fn download_headers(
 const TBF_RESOLVE_RULES: &[crate::download_url::HostRule] =
     &[crate::download_url::HostRule::exact(SITE_HOST, None)];
 
+/// 本体ダウンロードで追うリダイレクトの上限（各ホップは [`TBF_DOWNLOAD_RULES`] で検証する）。
+const TBF_REDIRECT_LIMIT: usize = 5;
+
 /// 解決後のファイル本体を取得してよいホスト（`validate_download_url` と同じ範囲）。
 ///
-/// **許可 = Cookie を付ける、ではない**: 本体が GCS のときは [`download_headers`] が
-/// Cookie を外す（`storage.googleapis.com` は配布先であって、こちらのセッションの宛先ではない）。
+/// **許可 = Cookie を付ける、ではない**: 本体が GCS のときは
+/// [`download_credential_headers`] が Cookie を外す（`storage.googleapis.com` は配布先で
+/// あって、こちらのセッションの宛先ではない）。
 const TBF_DOWNLOAD_RULES: &[crate::download_url::HostRule] = &[
     crate::download_url::HostRule::exact(SITE_HOST, Some("/api/product-dlc/")),
     crate::download_url::HostRule::exact("storage.googleapis.com", Some("/tbf-tokyo-product-dlc/")),
@@ -622,19 +624,32 @@ impl TbfClient {
         url: &str,
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, TbfError> {
-        // 本体取得も認証付き。送信先を検証してから Cookie を付ける
-        // （リダイレクト追跡はライブラリ任せだが、起点を許可ホストに限る）。
-        crate::download_url::check(url, TBF_DOWNLOAD_RULES)
+        // 本体取得も認証付き。起点を検証し、リダイレクトは**各ホップ検証**して追う
+        // （許可外ホストへ Cookie / XSRF トークンを残さない）。
+        let parsed = crate::download_url::check(url, TBF_DOWNLOAD_RULES)
             .map_err(|error| TbfError::BlockedUrl(format!("{url}: {error}")))?;
-        let headers = download_headers(&self.cookie_header(), self.xsrf_token.as_deref(), url);
-        let response = self.transport.send_download(
+        let cookie_header = self.cookie_header();
+        let xsrf_token = self.xsrf_token.clone();
+        let mut credentials = |destination: &url::Url| {
+            download_credential_headers(
+                &cookie_header,
+                xsrf_token.as_deref(),
+                destination.as_str(),
+            )
+        };
+        let response = crate::tbf::redirect::send_with_validated_redirects(
+            self.transport.as_mut(),
             RequestSpec {
                 method: "GET".to_string(),
-                url: url.to_string(),
-                headers,
+                url: parsed.url.as_str().to_string(),
+                // 資格情報はホップごとに `credentials` が足す
+                headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
                 body: None,
-                redirects: 5,
+                redirects: 0,
             },
+            TBF_REDIRECT_LIMIT,
+            TBF_DOWNLOAD_RULES,
+            &mut credentials,
             on_progress,
         )?;
         if !(200..300).contains(&response.status) {
@@ -1220,8 +1235,14 @@ mod tests {
     #[test]
     fn download_headers_send_cookies_only_to_the_site_host() {
         let cookies = "session=sess-123";
+        // 本番と同じ組み立て（`User-Agent` は常に付け、資格情報は宛先ごとに足す）
+        let build = |cookie: &str, token: Option<&str>, url: &str| {
+            let mut headers = vec![("User-Agent".to_string(), USER_AGENT.to_string())];
+            headers.extend(download_credential_headers(cookie, token, url));
+            headers
+        };
         // 本体（GCS）へは付けない
-        let gcs = download_headers(
+        let gcs = build(
             cookies,
             Some("tok"),
             "https://storage.googleapis.com/tbf-tokyo-product-dlc/x.zip",
@@ -1241,7 +1262,7 @@ mod tests {
         );
 
         // サイト自身（API 経由の本体）へは従来どおり付ける
-        let site = download_headers(
+        let site = build(
             cookies,
             Some("tok"),
             "https://techbookfest.org/api/product-dlc/xyz",
@@ -1258,7 +1279,7 @@ mod tests {
         );
 
         // URL を解釈できないときは付けない（fail-closed）
-        let broken = download_headers(cookies, Some("tok"), "not-a-url");
+        let broken = build(cookies, Some("tok"), "not-a-url");
         assert!(
             !broken.iter().any(|(name, _)| name == "Cookie"),
             "解釈できない URL へ Cookie を送っている: {broken:?}"

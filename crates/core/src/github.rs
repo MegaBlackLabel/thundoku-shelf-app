@@ -7,7 +7,12 @@
 //!   `POST https://github.com/login/oauth/access_token`
 //! - Issue 作成: `POST https://api.github.com/repos/{owner}/{repo}/issues`
 //! - 画像添付: `POST https://uploads.github.com/user-attachments/assets`
-//!   （対象リポジトリへの write 権限が必要。失敗時は本文のみで投稿する）
+//!   （対象リポジトリへの write 権限が必要）
+//!
+//! レポートは [`GithubClient::submit_report`] が「リポジトリ ID → 添付 →
+//! Issue」の順で送る。画像は選択しただけでは上げず（[`read_attachment`]）、
+//! 利用者が送信を押したときに初めて外部へ出る。アップロードに失敗したら Issue は
+//! 作らない（fail-closed）。
 
 use crate::tbf::{RequestSpec, ResponseSpec, TbfError, Transport, UreqTransport};
 
@@ -30,6 +35,13 @@ const MAX_TEMPLATE_BYTES: usize = 256 * 1024;
 
 /// 取り込むテンプレートの最大件数（転送量の上限）。
 const MAX_TEMPLATE_FILES: usize = 20;
+
+/// 添付できる画像の拡張子（`rfd` のフィルタと MIME 判定で同じ並びを使う）。
+pub const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+/// 添付できる画像 1 枚の上限サイズ。GitHub 側の上限（10MB）に合わせて手前で弾く
+/// （送信までローカルに持つので、読む前に大きさを見る）。
+pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// keyring に保存するアクセストークン。
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -142,6 +154,124 @@ pub struct IssueTemplate {
     pub title: Option<String>,
     pub labels: Vec<String>,
     pub fields: Vec<TemplateField>,
+}
+
+/// Issue に添付する画像 1 件。
+///
+/// 実体は**送信するときまで GitHub へ上げない**（選択しただけで
+/// user-attachments へ送らない）。`url` は一度アップロードできたら保持し、
+/// 再試行で上げ直さない（失敗のたびに同じ画像が増えるのを防ぐ）。
+pub struct IssueAttachment {
+    /// 選択したファイルの名前（表示と alt に使う）。
+    pub file_name: String,
+    /// アップロード時に送る MIME（拡張子から決める）。
+    pub content_type: String,
+    /// 画像の実体。
+    pub bytes: Vec<u8>,
+    /// アップロードできた URL（`None` は未アップロード）。
+    pub url: Option<String>,
+}
+
+impl std::fmt::Debug for IssueAttachment {
+    /// `bytes` は出さない。画像 1 枚を丸ごとログに載せない（トークンと同じ理由）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssueAttachment")
+            .field("file_name", &self.file_name)
+            .field("content_type", &self.content_type)
+            .field("bytes", &format_args!("{} バイト", self.bytes.len()))
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+impl IssueAttachment {
+    /// ファイル名から MIME を決めて添付を作る（未アップロードの状態）。
+    pub fn new(file_name: String, bytes: Vec<u8>) -> Self {
+        Self {
+            content_type: image_content_type(&file_name).to_string(),
+            file_name,
+            bytes,
+            url: None,
+        }
+    }
+}
+
+/// 選択された画像をローカルに読み、送信まで保持する添付を作る。
+///
+/// **HTTP はしない**（読むだけ）。大きすぎるファイルは読む前に弾く（実体を
+/// そのままメモリに載せるため）。`Err` はそのまま画面に出せる日本語。
+pub fn read_attachment(path: &std::path::Path, max_bytes: u64) -> Result<IssueAttachment, String> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| format!("ファイル名が取得できません: {}", path.display()))?;
+    // metadata が取れないときは read のエラーにする（存在しないなどを 1 本にまとめる）。
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.len() > max_bytes
+    {
+        return Err(format!(
+            "{file_name} は大きすぎます（上限 {}MB）",
+            max_bytes / (1024 * 1024)
+        ));
+    }
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("{file_name} を読めませんでした: {error}"))?;
+    Ok(IssueAttachment::new(file_name, bytes))
+}
+
+/// 拡張子から画像の MIME を決める（`IMAGE_EXTENSIONS` 以外は PNG として送る）。
+fn image_content_type(file_name: &str) -> &'static str {
+    match std::path::Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some(extension)
+            if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") =>
+        {
+            "image/jpeg"
+        }
+        Some(extension) if extension.eq_ignore_ascii_case("gif") => "image/gif",
+        Some(extension) if extension.eq_ignore_ascii_case("webp") => "image/webp",
+        _ => "image/png",
+    }
+}
+
+/// 本文に貼る alt テキストを作る。
+///
+/// ファイル名はローカル FS 由来の任意文字列で、`]` `)` などが入ると Markdown の
+/// リンク構造を壊し、外部 URL を本文に紛れ込ませられる（テンプレート文面を
+/// そのまま流し込むのと同じ理由で、そのままは使わない）。
+fn markdown_alt(file_name: &str) -> String {
+    let cleaned: String = file_name
+        .chars()
+        .filter(|c| !matches!(c, '[' | ']' | '(' | ')' | '\\' | '\n' | '\r'))
+        .take(80)
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "画像".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// 本文の末尾へ、アップロードできた添付を選択順に `![alt](url)` として足す。
+fn body_with_attachments(body: &str, attachments: &[IssueAttachment]) -> String {
+    let mut text = body.trim_end().to_string();
+    for attachment in attachments {
+        // まだ上がっていない添付は貼らない（壊れたリンクを本文に残さない）。
+        let Some(url) = attachment.url.as_deref() else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!(
+            "![{}]({url})",
+            markdown_alt(&attachment.file_name)
+        ));
+    }
+    text
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -690,6 +820,45 @@ impl GithubClient {
         }
     }
 
+    /// レポートを送る: リポジトリ ID → 添付のアップロード → Issue 作成。
+    ///
+    /// 添付は**この時点で初めて** GitHub へ上げる（選択しただけでは送らない）。
+    /// 途中で失敗したら Issue は作らない（利用者が押していない本文だけの Issue を
+    /// 勝手に立てない）。既にアップロードできた添付は `url` を残すので、再試行で
+    /// 上げ直さない（同じ画像が user-attachments に増えない）。
+    pub fn submit_report(
+        &mut self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+        attachments: &mut [IssueAttachment],
+    ) -> Result<IssueRef, GithubError> {
+        // 上げるものがあるときだけ repository_id を取る（添付ごとに取り直さない。
+        // 添付が無い送信に余計な要求を足さない）。
+        if attachments
+            .iter()
+            .any(|attachment| attachment.url.is_none())
+        {
+            let repo_id = self.repository_id(owner, repo)?;
+            for attachment in attachments.iter_mut() {
+                if attachment.url.is_some() {
+                    continue;
+                }
+                let url = self.upload_asset(
+                    repo_id,
+                    &attachment.file_name,
+                    &attachment.content_type,
+                    &attachment.bytes,
+                )?;
+                attachment.url = Some(url);
+            }
+        }
+        let body = body_with_attachments(body, attachments);
+        self.create_issue(owner, repo, title, &body, labels)
+    }
+
     /// `.github/ISSUE_TEMPLATE` の issue form を取得する（`config.yml` は除く）。
     pub fn list_issue_templates(
         &mut self,
@@ -846,6 +1015,20 @@ mod tests {
 
     fn body_text(req: &RequestSpec) -> String {
         String::from_utf8(req.body.clone().expect("body が無い")).unwrap()
+    }
+
+    /// テスト用の一時ディレクトリ（画像の読み込みを確かめるためだけに使う）。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("thundoku-attach-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// まだアップロードしていない添付（`url` は未確定）。
+    fn attachment(file_name: &str) -> IssueAttachment {
+        IssueAttachment::new(file_name.to_string(), b"\x89PNG".to_vec())
     }
 
     #[test]
@@ -1219,5 +1402,318 @@ body:
             client.create_issue("o", "r", "t", "b", &[]),
             Err(GithubError::Forbidden(_))
         ));
+    }
+
+    /// 拡張子から MIME を決めること（未知の拡張子は PNG として送る）。
+    #[test]
+    fn attachment_content_type_follows_the_extension() {
+        let cases = [
+            ("shot.png", "image/png"),
+            ("shot.PNG", "image/png"),
+            ("shot.jpg", "image/jpeg"),
+            ("shot.jpeg", "image/jpeg"),
+            ("anime.gif", "image/gif"),
+            ("shot.webp", "image/webp"),
+            // 受け付けない拡張子は既定（PNG）として送る
+            ("shot.bmp", "image/png"),
+            ("shot", "image/png"),
+        ];
+
+        for (file_name, expected) in cases {
+            assert_eq!(attachment(file_name).content_type, expected, "{file_name}");
+        }
+    }
+
+    /// ファイル名をそのまま alt に使わないこと（Markdown のリンク構造を壊せると、
+    /// 本文へ外部 URL を紛れ込ませられる）。
+    #[test]
+    fn markdown_alt_strips_link_breaking_characters() {
+        assert_eq!(markdown_alt("shot [1](x).png"), "shot 1x.png");
+        // 改行も落とす（本文の構造を崩す）。
+        assert_eq!(markdown_alt("a\nb]c.png"), "abc.png");
+        // 何も残らないときは既定の文言を使う（空の `![]()` を作らない）。
+        assert_eq!(markdown_alt("[]()"), "画像");
+        // 長すぎる名前は alt を膨らませるだけなので切る。
+        assert_eq!(markdown_alt(&"あ".repeat(100)).chars().count(), 80);
+    }
+
+    /// 本文の末尾へ、アップロードできた添付だけを選択順に足すこと。
+    #[test]
+    fn body_with_attachments_appends_only_uploaded_images() {
+        let mut uploaded = attachment("a.png");
+        uploaded.url = Some("https://github.com/user-attachments/assets/1".to_string());
+        let pending = attachment("b.png");
+
+        assert_eq!(
+            body_with_attachments("## 概要\n\n", &[uploaded, pending]),
+            "## 概要\n\n![a.png](https://github.com/user-attachments/assets/1)"
+        );
+
+        // 本文が空なら画像だけになる。
+        let mut only = attachment("c.png");
+        only.url = Some("https://github.com/user-attachments/assets/3".to_string());
+        assert_eq!(
+            body_with_attachments("", &[only]),
+            "![c.png](https://github.com/user-attachments/assets/3)"
+        );
+    }
+
+    /// 選択はローカルに読むだけであること。上限を超えるファイルも読めないファイルも
+    /// 同じで、この段階では 1 件も送らない（送信は `submit_report`）。
+    #[test]
+    fn read_attachment_stays_local_and_rejects_oversized_or_unreadable_files() {
+        // モックの transport を用意して、選択〜読み込みで 1 件も送らないことを見る
+        // （応答を 1 つも積まないので、送れば必ず失敗する）。
+        let (_client, captured) = logged_in(Vec::new());
+        let dir = temp_dir("read");
+        // 中身は書かずサイズだけ作る（読み込む前に弾くことを確かめるテストなので）。
+        let huge = dir.join("huge.png");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES + 1)
+            .unwrap();
+
+        let error = read_attachment(&huge, MAX_IMAGE_BYTES).expect_err("上限を超える");
+        assert!(error.contains("huge.png"), "{error}");
+        assert!(error.contains("大きすぎます"), "{error}");
+
+        let missing = dir.join("missing.png");
+        let error = read_attachment(&missing, MAX_IMAGE_BYTES).expect_err("読めない");
+        assert!(error.contains("missing.png"), "{error}");
+
+        let path = dir.join("shot.jpg");
+        std::fs::write(&path, b"\xff\xd8\xff").unwrap();
+        let attachment = read_attachment(&path, MAX_IMAGE_BYTES).expect("読める");
+        assert_eq!(attachment.file_name, "shot.jpg");
+        assert_eq!(attachment.content_type, "image/jpeg");
+        assert_eq!(attachment.bytes, b"\xff\xd8\xff");
+        assert!(
+            attachment.url.is_none(),
+            "選択しただけでアップロードしている"
+        );
+        // キャンセル（`rfd` が `None` を返す）もアプリ側で終わり、ここへ来ない。
+        // サイズ超過・読込失敗・読めた場合のどれでも要求は 1 件も出ない。
+        let requests = captured.lock().clone();
+        assert!(
+            requests.is_empty(),
+            "画像の選択で HTTP を出している: {requests:?}"
+        );
+    }
+
+    /// 選択しただけでは送らず、送信時に選択順で 1 件ずつアップロードすること。
+    #[test]
+    fn submit_report_uploads_selected_images_in_order_at_submit_time() {
+        let dir = temp_dir("submit");
+        let first = dir.join("shot [1].png");
+        // Windows で使える文字だけで、Markdown のリンク構造を壊せる名前を作る
+        // （`:` や `/` はファイル名に使えない）。
+        let second = dir.join("evil](x).png");
+        std::fs::write(&first, b"\x89PNG-first").unwrap();
+        std::fs::write(&second, b"\x89PNG-second").unwrap();
+
+        let (mut client, captured) = logged_in(vec![
+            json(200, r#"{"id":42,"full_name":"o/r"}"#),
+            json(
+                201,
+                r#"{"url":"https://github.com/user-attachments/assets/1"}"#,
+            ),
+            json(
+                201,
+                r#"{"url":"https://github.com/user-attachments/assets/2"}"#,
+            ),
+            json(
+                201,
+                r#"{"number":7,"html_url":"https://github.com/o/r/issues/7"}"#,
+            ),
+        ]);
+
+        let mut attachments = vec![
+            read_attachment(&first, MAX_IMAGE_BYTES).expect("1 件目"),
+            read_attachment(&second, MAX_IMAGE_BYTES).expect("2 件目"),
+        ];
+        // 選択しただけの時点では 1 件も送っていない（送信を押すまで外部へ出さない）。
+        assert!(captured.lock().is_empty(), "選択だけで HTTP を出している");
+        // 本文に貼るのは送信時なので、この時点の本文は素のまま。
+        assert_eq!(body_with_attachments("## 概要", &attachments), "## 概要");
+
+        let issue = client
+            .submit_report("o", "r", "タイトル", "## 概要", &[], &mut attachments)
+            .expect("submit");
+        assert_eq!(issue.number, 7);
+
+        let reqs = captured.lock().clone();
+        assert_eq!(reqs.len(), 4, "要求の数が違う");
+        // repository_id は 1 回だけ取る（添付ごとに取り直さない）。
+        assert_eq!(reqs[0].url, "https://api.github.com/repos/o/r");
+        // 添付は選択順（中身で見分ける）。
+        assert!(
+            reqs[1].url.starts_with(GITHUB_UPLOAD_URL),
+            "{}",
+            reqs[1].url
+        );
+        assert!(reqs[1].url.contains("repository_id=42"), "{}", reqs[1].url);
+        assert_eq!(reqs[1].body.clone().unwrap(), b"\x89PNG-first");
+        assert_eq!(reqs[2].body.clone().unwrap(), b"\x89PNG-second");
+        assert_eq!(reqs[3].url, "https://api.github.com/repos/o/r/issues");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&reqs[3].body.clone().unwrap()).unwrap();
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.starts_with("## 概要\n\n"), "{body}");
+        let first_at = body.find("assets/1").expect("1 件目の URL が本文に無い");
+        let second_at = body.find("assets/2").expect("2 件目の URL が本文に無い");
+        assert!(first_at < second_at, "選択順に入っていない: {body}");
+        assert!(
+            body.contains("![shot 1.png](https://github.com/user-attachments/assets/1)"),
+            "{body}"
+        );
+        assert!(
+            body.contains("![evilx.png](https://github.com/user-attachments/assets/2)"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("](x)"),
+            "ファイル名で Markdown を壊せている: {body}"
+        );
+    }
+
+    /// 2 件目のアップロードに失敗したら Issue は作らず、1 件目の URL は保持して
+    /// 再試行で上げ直さないこと。
+    #[test]
+    fn submit_report_is_fail_closed_and_does_not_reupload_after_a_failure() {
+        let mut attachments = vec![attachment("a.png"), attachment("b.png")];
+        let (mut client, captured) = logged_in(vec![
+            json(200, r#"{"id":42}"#),
+            json(
+                201,
+                r#"{"url":"https://github.com/user-attachments/assets/1"}"#,
+            ),
+            json(500, r#"{"message":"boom"}"#),
+        ]);
+
+        let error = client
+            .submit_report("o", "r", "タイトル", "本文", &[], &mut attachments)
+            .expect_err("2 件目は失敗する");
+        assert!(
+            matches!(error, GithubError::InvalidResponse(_)),
+            "{error:?}"
+        );
+
+        let reqs = captured.lock().clone();
+        assert_eq!(
+            reqs.len(),
+            3,
+            "アップロードの途中で止まっていない: {reqs:?}"
+        );
+        assert!(
+            !reqs.iter().any(|req| req.url.ends_with("/issues")),
+            "アップロードに失敗したのに Issue を作っている"
+        );
+        assert_eq!(
+            attachments[0].url.as_deref(),
+            Some("https://github.com/user-attachments/assets/1"),
+            "上げられた分の URL を捨てている"
+        );
+        assert!(attachments[1].url.is_none());
+
+        // 再試行: 未アップロードの 2 件目だけを上げて Issue を作る。
+        let (mut client, retry) = logged_in(vec![
+            json(200, r#"{"id":42}"#),
+            json(
+                201,
+                r#"{"url":"https://github.com/user-attachments/assets/2"}"#,
+            ),
+            json(
+                201,
+                r#"{"number":9,"html_url":"https://github.com/o/r/issues/9"}"#,
+            ),
+        ]);
+        let issue = client
+            .submit_report("o", "r", "タイトル", "本文", &[], &mut attachments)
+            .expect("再試行");
+        assert_eq!(issue.number, 9);
+
+        let reqs = retry.lock().clone();
+        let uploads: Vec<&RequestSpec> = reqs
+            .iter()
+            .filter(|req| req.url.starts_with(GITHUB_UPLOAD_URL))
+            .collect();
+        assert_eq!(uploads.len(), 1, "確定済みの添付を上げ直している: {reqs:?}");
+        assert!(uploads[0].url.contains("name=b.png"), "{}", uploads[0].url);
+    }
+
+    /// Issue の作成に失敗したときも、確定済みの添付は再アップロードしないこと。
+    #[test]
+    fn submit_report_does_not_reupload_when_the_issue_call_fails() {
+        let mut attachments = vec![attachment("a.png")];
+        let (mut client, _) = logged_in(vec![
+            json(200, r#"{"id":42}"#),
+            json(
+                201,
+                r#"{"url":"https://github.com/user-attachments/assets/1"}"#,
+            ),
+            json(422, r#"{"message":"Validation Failed"}"#),
+        ]);
+
+        assert!(
+            client
+                .submit_report("o", "r", "タイトル", "本文", &[], &mut attachments)
+                .is_err()
+        );
+        assert!(attachments[0].url.is_some());
+
+        // 再試行は Issue の作成だけ（添付は上げ直さない）。
+        let (mut client, captured) = logged_in(vec![json(
+            201,
+            r#"{"number":9,"html_url":"https://github.com/o/r/issues/9"}"#,
+        )]);
+        let issue = client
+            .submit_report("o", "r", "タイトル", "本文", &[], &mut attachments)
+            .expect("再試行");
+
+        assert_eq!(issue.number, 9);
+        let reqs = captured.lock().clone();
+        assert_eq!(reqs.len(), 1, "添付を上げ直している: {reqs:?}");
+        assert_eq!(reqs[0].url, "https://api.github.com/repos/o/r/issues");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&reqs[0].body.clone().unwrap()).unwrap();
+        assert!(
+            payload["body"]
+                .as_str()
+                .unwrap()
+                .contains("https://github.com/user-attachments/assets/1"),
+            "{}",
+            payload["body"]
+        );
+    }
+
+    /// 添付が無いときは余計な要求（repository_id の取得）をしないこと。
+    #[test]
+    fn submit_report_without_attachments_creates_the_issue_directly() {
+        let (mut client, captured) = logged_in(vec![json(
+            201,
+            r#"{"number":7,"html_url":"https://github.com/o/r/issues/7"}"#,
+        )]);
+
+        let mut attachments: Vec<IssueAttachment> = Vec::new();
+        let issue = client
+            .submit_report(
+                "o",
+                "r",
+                "タイトル",
+                "本文",
+                &["bug".to_string()],
+                &mut attachments,
+            )
+            .expect("submit");
+
+        assert_eq!(issue.number, 7);
+        let reqs = captured.lock().clone();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "添付が無いのに余計な要求を出している: {reqs:?}"
+        );
+        assert_eq!(reqs[0].url, "https://api.github.com/repos/o/r/issues");
     }
 }

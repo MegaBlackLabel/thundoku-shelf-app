@@ -6,10 +6,14 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 pbkdf2 = "0.12"
 hkdf = "0.12"
 sha2.workspace = true
 aes-gcm = "0.10"
+base64 = "0.22"
+unicode-normalization = "0.1"
 flate2 = "1"
 crc32fast = "1"
 rand = "0.8"

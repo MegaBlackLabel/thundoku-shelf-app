@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::io::Write;
 
 use crate::{
-    FORMAT_VERSION, Identity, PackError, entry_flags,
+    FORMAT_VERSION, PackError, PackKey, entry_flags,
     format::{WireEntry, align8, index_entry_size, serialize_header, serialize_index_entry},
     pack_flags,
 };
@@ -52,18 +52,14 @@ impl PackBuilder {
 
     /// Build the pack. `compress` sets the pack-level flag (and is the TS
     /// global default); per-entry compression comes from `add_entry`.
-    /// `identity` enables identity binding: every entry is AES-256-GCM
-    /// encrypted with the key derived from `sub` + `pack_id`.
-    pub fn build(self, identity: Option<&Identity>, compress: bool) -> Result<Vec<u8>, PackError> {
+    /// `key` is the pack key derived from the account root key
+    /// ([`crate::PackRootKey::derive_pack_key`]): when given, every entry is
+    /// AES-256-GCM encrypted with it. v3 packs carry no identity material.
+    pub fn build(self, key: Option<&PackKey>, compress: bool) -> Result<Vec<u8>, PackError> {
         // Sort by path using UTF-16 code unit comparison — identical to the
         // JS string `<`/`>` used by builder.ts.
         let mut entries = self.entries;
         entries.sort_by(|a, b| utf16_cmp(&a.path, &b.path));
-
-        let key = identity.map(|id| {
-            let master = crate::crypto::master_key(&id.sub);
-            crate::crypto::pack_key(&master, &id.pack_id)
-        });
 
         let mut processed = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -76,11 +72,11 @@ impl PackBuilder {
                 flags |= entry_flags::COMPRESSED;
             }
             let mut iv = [0u8; 12];
-            if let Some(key) = &key {
-                let (entry_iv, encrypted) = crate::crypto::encrypt(&data, key);
+            if let Some(key) = key {
+                let (entry_iv, encrypted) = crate::crypto::encrypt(&data, key.as_bytes());
                 data = encrypted;
                 iv = entry_iv;
-                flags |= entry_flags::ENCRYPTED | entry_flags::IDENTITY_BOUND;
+                flags |= entry_flags::ENCRYPTED;
             }
             let compressed_size = data.len() as u64;
             processed.push(ProcessedEntry {
@@ -112,7 +108,7 @@ impl PackBuilder {
             pack_flags::COMPRESSED
         } else {
             pack_flags::NONE
-        } | if identity.is_some() {
+        } | if key.is_some() {
             pack_flags::ENCRYPTED
         } else {
             pack_flags::NONE

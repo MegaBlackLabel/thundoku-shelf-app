@@ -14,10 +14,11 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use opfspack::{Identity, PackBuilder};
+use opfspack::{PackBuilder, PackRootKey};
 use sha2::{Digest, Sha256};
 
 use crate::db::{SqlitePool, books, contents, documents, tags as tags_repo};
+use crate::google::GoogleProfile;
 
 #[derive(Debug)]
 pub struct ImportedBook {
@@ -51,6 +52,50 @@ pub enum ImportError {
     /// アプリ側が出し分けるための識別子（文言は UI が決める。§11.2 R3）。
     #[error("not a readable work")]
     NotAReadableWork,
+    /// Google にログイン済みなのに pack の鍵（v3 のルート鍵 = PRK）を用意できない。
+    ///
+    /// v3 の鍵材料は乱数のルート鍵で、端末の keyring と Drive の
+    /// `thundoku-keys.json`（`sub` / パスフレーズでラップして保管）にしか無い。
+    /// この状態で取り込みを続けると平文 pack ができ、`owner_sub` 付きの本が
+    /// 復号できない pack（＝ログイン中の閲覧で開けない本）を指す不整合になる。
+    /// データを壊すより取り込みを失敗させる（fail-closed）。文言はそのまま画面に出る。
+    #[error(
+        "Google にログイン済みですが、本を復号する鍵を取得できません。鍵を持つ端末でパスフレーズを設定し、この端末で入力して復元してください（鍵がどこにも無い場合は、ストアから取り込み直す必要があります）"
+    )]
+    IdentityKeyUnavailable,
+    /// 入力されたパスフレーズが違う（`sub` ラップへ**黙って落ちない** — 仕様 §4.1）。
+    #[error("パスフレーズが違います。もう一度入力してください")]
+    PassphraseFailed,
+    /// 鍵 bundle / keyring の入出力に失敗した（Drive の通信・壊れた bundle など）。
+    #[error("本の鍵を取得できませんでした: {0}")]
+    KeyStore(String),
+    /// ログイン済みプロフィールの `sub` が空（userinfo の欠落・保存値の破損）。
+    ///
+    /// v3 では `sub` から `owner_id`（keyring のスロット名・ラップの AAD）と
+    /// `sub` ラップの KEK を作るため、空のままでは自分の鍵を引けない。
+    /// 空文字は通さない。
+    #[error(
+        "Google アカウントの識別子（sub）を取得できません。設定画面からログインし直してください"
+    )]
+    IdentitySubMissing,
+}
+
+/// [`crate::pack_keys::PackKeysError`] を利用者に伝わる取り込みエラーにする。
+///
+/// 呼び出し側（アプリ）は「鍵が無い」「パスフレーズが違う」を区別して
+/// 案内を出し分けられる（前者は復元の案内、後者は再入力）。
+impl From<crate::pack_keys::PackKeysError> for ImportError {
+    fn from(value: crate::pack_keys::PackKeysError) -> Self {
+        use crate::pack_keys::PackKeysError;
+        match value {
+            PackKeysError::Unavailable => ImportError::IdentityKeyUnavailable,
+            PackKeysError::PassphraseFailed => ImportError::PassphraseFailed,
+            other => {
+                log::warn!("import: 本の鍵の取得に失敗: {other}");
+                ImportError::KeyStore(other.to_string())
+            }
+        }
+    }
 }
 
 fn now() -> String {
@@ -163,14 +208,45 @@ fn render_page_images(pages: &[(String, Vec<u8>)]) -> Vec<RenderedPage> {
         .collect()
 }
 
-fn book_id_for(identity: Option<&Identity>, reuse_book_id: Option<&str>) -> String {
-    // 再ダウンロード時は既存本を再利用して重複を防ぐ（未ログイン＝identity None でも）。
-    if let Some(reuse) = reuse_book_id {
-        return reuse.to_string();
-    }
-    identity
-        .map(|i| i.pack_id.clone())
+/// 取り込み先の book id（= pack id）を決める。
+///
+/// 再ダウンロード時は既存本の id を再利用して重複を防ぐ。無ければ UUIDv4 を振る。
+/// v3 の pack 鍵は **この id から導出する**（`PRK.derive_pack_key(book_id)`）ので、
+/// id を決めてから鍵を作る順序になる。
+fn book_id_for(reuse_book_id: Option<&str>) -> String {
+    reuse_book_id
+        .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// 取り込みで pack を作る鍵（v3 の PRK）を決める（**fail-closed**）。
+///
+/// - 未ログイン（`profile` = `None`）: 平文 pack を許可する（`Ok(None)`）。
+///   これは現行の正規経路（`owner_sub` を持たない本として保存する）。
+/// - ログイン済み + 鍵あり: `Ok(Some(prk))`。実際の pack 鍵は冊ごとに
+///   `prk.derive_pack_key(&book_id)` で導出する（`finish_import` が行う）。
+/// - ログイン済み + 鍵なし: **平文に落とさずエラー**。ログイン中の閲覧は暗号化
+///   pack 前提（`reader.rs`）なので、平文で作ると `owner_sub` 付きの行が
+///   「開けない本」を指す。Drive 同期で平文がクラウドへ上がる危険もある。
+/// - ログイン済みでも `sub` が空: エラー（`sub` は `owner_id` とラップの材料なので、
+///   空のままでは自分の鍵を引けない）。
+///
+/// `resolve_root` は PRK の解決（keyring → Drive の `thundoku-keys.json` → 必要なら
+/// パスフレーズ入力・新規作成）を行う。core の [`crate::pack_keys::PackKeyStore`] を
+/// 呼ぶのが想定経路で、UI（パスフレーズの入力）は呼び出し側が用意する。
+pub fn pack_root_key_for_import(
+    profile: Option<&GoogleProfile>,
+    resolve_root: impl FnOnce(&str) -> Result<PackRootKey, ImportError>,
+) -> Result<Option<PackRootKey>, ImportError> {
+    let Some(profile) = profile else {
+        // 未ログインは平文 pack（従来どおり）
+        return Ok(None);
+    };
+    let sub = profile.sub.trim();
+    if sub.is_empty() {
+        return Err(ImportError::IdentitySubMissing);
+    }
+    Ok(Some(resolve_root(sub)?))
 }
 
 /// ZIP エントリパスからファイル名部分を取り出す（`dir/book.pdf` → `book.pdf`）。
@@ -742,12 +818,15 @@ fn metadata_entry(
 /// JSON が壊れている）。元の pack は変更しない。
 pub fn rename_content_in_pack(
     pack_bytes: &[u8],
+    pack_id: &str,
     content_id: &str,
     display_name: &str,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
 ) -> Result<Option<Vec<u8>>, ImportError> {
     let reader = opfspack::PackReader::open(pack_bytes)?;
-    let Ok(raw) = reader.read_entry("metadata.json", identity) else {
+    // v3 の pack 鍵は pack id（= book id）から導出する。
+    let pack_key = root_key.map(|root| root.derive_pack_key(pack_id));
+    let Ok(raw) = reader.read_entry("metadata.json", pack_key.as_ref()) else {
         return Ok(None);
     };
     let Ok(mut metadata) = serde_json::from_slice::<serde_json::Value>(&raw) else {
@@ -779,14 +858,14 @@ pub fn rename_content_in_pack(
         let data = if entry.path == "metadata.json" {
             serde_json::to_vec(&metadata).map_err(|e| ImportError::Image(e.to_string()))?
         } else {
-            reader.read_entry(&entry.path, identity)?
+            reader.read_entry(&entry.path, pack_key.as_ref())?
         };
         let compress = entry.flags & opfspack::entry_flags::COMPRESSED != 0;
         builder.add_entry(&entry.path, data, &entry.mime_type, compress);
     }
-    let identity = if encrypted { identity } else { None };
+    let pack_key = if encrypted { pack_key } else { None };
     Ok(Some(builder.build(
-        identity,
+        pack_key.as_ref(),
         header.flags & opfspack::pack_flags::COMPRESSED != 0,
     )?))
 }
@@ -866,13 +945,13 @@ struct PageRow {
 fn finish_import(
     pool: &SqlitePool,
     packs_dir: &Path,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
     file_name: &str,
     source_bytes_len: i64,
     spec: PackSpec,
     reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
-    let book_id = book_id_for(identity, reuse_book_id);
+    let book_id = book_id_for(reuse_book_id);
     let title = base_title(file_name);
     let timestamp = now();
     log::info!("finish_import: 開始（{} ページ）", spec.total_pages);
@@ -924,7 +1003,10 @@ fn finish_import(
     for (path, data, mime, compress) in &spec.entries {
         builder.add_entry(path, data.clone(), mime, *compress);
     }
-    let pack_bytes = builder.build(identity, true)?;
+    // v3 の pack 鍵は book id から導出する（冊ごとに別鍵）。
+    // `root_key` が無い（未ログイン）ときは平文 pack。
+    let pack_key = root_key.map(|root| root.derive_pack_key(&book_id));
+    let pack_bytes = builder.build(pack_key.as_ref(), true)?;
     std::fs::create_dir_all(packs_dir)?;
     // 書き出し先は保存領域内に収まることを検証する（`book_id` は再利用 id や
     // 復元 id 由来でも同じ検査を通す）。
@@ -1170,7 +1252,7 @@ pub fn import_file(
     pool: &SqlitePool,
     source_path: &Path,
     packs_dir: &Path,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
 ) -> Result<ImportedBook, ImportError> {
     let file_name = source_path
@@ -1186,11 +1268,11 @@ pub fn import_file(
     let bytes = std::fs::read(source_path)?;
     match extension.as_str() {
         "pdf" => import_pdf_bytes(
-            pool, &file_name, &bytes, packs_dir, identity, progress, None,
+            pool, &file_name, &bytes, packs_dir, root_key, progress, None,
         ),
-        "epub" => import_epub_bytes(pool, &file_name, &bytes, packs_dir, identity, None),
+        "epub" => import_epub_bytes(pool, &file_name, &bytes, packs_dir, root_key, None),
         "zip" => import_zip_bytes(
-            pool, &file_name, &bytes, packs_dir, identity, progress, None,
+            pool, &file_name, &bytes, packs_dir, root_key, progress, None,
         ),
         _ => Err(ImportError::UnsupportedType(extension)),
     }
@@ -1202,7 +1284,7 @@ pub fn import_pdf_bytes(
     file_name: &str,
     bytes: &[u8],
     packs_dir: &Path,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
@@ -1213,7 +1295,7 @@ pub fn import_pdf_bytes(
         bytes.len() as i64,
         pages,
         packs_dir,
-        identity,
+        root_key,
         reuse_book_id,
     )
 }
@@ -1227,7 +1309,7 @@ pub fn import_rendered_pdf_pages(
     file_size: i64,
     pages: Vec<pdf::PageImage>,
     packs_dir: &Path,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
     reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     if pages.is_empty() {
@@ -1277,7 +1359,7 @@ pub fn import_rendered_pdf_pages(
     finish_import(
         pool,
         packs_dir,
-        identity,
+        root_key,
         file_name,
         file_size,
         PackSpec {
@@ -1299,14 +1381,14 @@ pub fn import_epub_bytes(
     file_name: &str,
     bytes: &[u8],
     packs_dir: &Path,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
     reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     let entry_path = file_name.to_string();
     finish_import(
         pool,
         packs_dir,
-        identity,
+        root_key,
         file_name,
         bytes.len() as i64,
         PackSpec {
@@ -1476,7 +1558,7 @@ pub fn commit_zip(
     file_name: &str,
     bytes: &[u8],
     packs_dir: &Path,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
     plan: &ImportPlan,
@@ -1686,7 +1768,7 @@ pub fn commit_zip(
     finish_import(
         pool,
         packs_dir,
-        identity,
+        root_key,
         &book_file_name,
         bytes.len() as i64,
         PackSpec {
@@ -1708,7 +1790,7 @@ pub fn import_zip_bytes(
     file_name: &str,
     bytes: &[u8],
     packs_dir: &Path,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
@@ -1718,7 +1800,7 @@ pub fn import_zip_bytes(
         file_name,
         bytes,
         packs_dir,
-        identity,
+        root_key,
         progress,
         reuse_book_id,
         &plan,
@@ -1737,18 +1819,20 @@ pub fn rebuild_from_pack(
     pool: &SqlitePool,
     pack_id: &str,
     pack_bytes: &[u8],
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
 ) -> Result<bool, ImportError> {
     if documents::get_document_by_book_id(pool, pack_id)?.is_some() {
         return Ok(false);
     }
     let reader = opfspack::PackReader::open(pack_bytes)?;
+    // v3 の pack 鍵は pack id（= book id）から導出する。
+    let pack_key = root_key.map(|root| root.derive_pack_key(pack_id));
     let timestamp = now();
     let entry_paths: Vec<String> = reader.entries().iter().map(|e| e.path.clone()).collect();
 
     // metadata.json から題名と構造を読む
     let metadata: Option<serde_json::Value> = reader
-        .read_entry("metadata.json", identity)
+        .read_entry("metadata.json", pack_key.as_ref())
         .ok()
         .and_then(|data| serde_json::from_slice(&data).ok());
     let title = metadata
@@ -1784,7 +1868,7 @@ pub fn rebuild_from_pack(
         if path == "metadata.json" {
             continue;
         }
-        let Ok(data) = reader.read_entry(path, identity) else {
+        let Ok(data) = reader.read_entry(path, pack_key.as_ref()) else {
             continue;
         };
         let (width, height) = image_dimensions(&data);
@@ -2073,7 +2157,7 @@ pub fn import_image_bytes(
     file_name: &str,
     bytes: &[u8],
     packs_dir: &Path,
-    identity: Option<&Identity>,
+    root_key: Option<&PackRootKey>,
     reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
     let decoded = image::load_from_memory(bytes).map_err(|e| ImportError::Image(e.to_string()))?;
@@ -2088,7 +2172,7 @@ pub fn import_image_bytes(
     finish_import(
         pool,
         packs_dir,
-        identity,
+        root_key,
         file_name,
         bytes.len() as i64,
         PackSpec {
@@ -2153,5 +2237,79 @@ mod natural_sort_tests {
                 (false, ".jpg".into())
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod pack_root_key_tests {
+    use super::{ImportError, pack_root_key_for_import};
+    use crate::google::GoogleProfile;
+    use opfspack::PackRootKey;
+
+    fn profile(sub: &str) -> GoogleProfile {
+        GoogleProfile {
+            sub: sub.to_string(),
+            email: "u@example.com".to_string(),
+            name: "ユーザー".to_string(),
+            picture: None,
+        }
+    }
+
+    /// ログイン中の取り込みは PRK を解決して暗号化する（冊ごとの鍵は book id から導出）。
+    #[test]
+    fn logged_in_resolves_the_root_key() {
+        let owner = profile("sub-1");
+        let root = PackRootKey::generate();
+        let expected = root.clone();
+        let resolved = pack_root_key_for_import(Some(&owner), move |sub| {
+            assert_eq!(sub, "sub-1", "解決には本人の sub を渡す");
+            Ok(root)
+        })
+        .expect("鍵があるので暗号化できる")
+        .expect("ログイン中は PRK あり");
+
+        assert_eq!(resolved.as_bytes(), expected.as_bytes());
+    }
+
+    /// ログイン済みなのに鍵が取れない場合は**平文に落とさず**取り込みを失敗させる。
+    #[test]
+    fn logged_in_without_key_fails_instead_of_plaintext() {
+        let owner = profile("sub-1");
+        let error = pack_root_key_for_import(Some(&owner), |_| {
+            Err(ImportError::IdentityKeyUnavailable)
+        })
+        .expect_err("鍵が無いなら平文にしない");
+
+        // 利用者に伝わる文言（内部型名や空文字を出さない）。
+        // 「旧形式のため再取り込みが必要」（v2 pack の案内）とは別の、復元を促す文言。
+        let message = error.to_string();
+        assert!(
+            matches!(error, ImportError::IdentityKeyUnavailable),
+            "{error:?}"
+        );
+        assert!(message.contains("鍵"), "{message}");
+        assert!(!message.contains("旧形式"), "{message}");
+        assert!(!message.contains("ImportError"), "{message}");
+    }
+
+    /// 未ログインは従来どおり平文 pack（`root_key = None`）を作れる。
+    #[test]
+    fn logged_out_stays_plaintext() {
+        let root = pack_root_key_for_import(None, |_| panic!("未ログインでは解決しない"))
+            .expect("未ログインの平文取り込みは従来どおり許可する");
+        assert!(root.is_none());
+    }
+
+    /// 空の `sub` では暗号化しない（`owner_id` と `sub` ラップの材料が空になる）。
+    #[test]
+    fn empty_sub_is_rejected() {
+        for sub in ["", "   "] {
+            let broken = profile(sub);
+            let error = pack_root_key_for_import(Some(&broken), |_| {
+                panic!("空の sub では鍵を解決しない")
+            })
+            .expect_err("空の sub で暗号化しない");
+            assert!(matches!(error, ImportError::IdentitySubMissing), "{error:?}");
+        }
     }
 }

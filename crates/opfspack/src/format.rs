@@ -92,9 +92,17 @@ pub(crate) fn deserialize_header(bytes: &[u8]) -> Result<PackHeader, PackError> 
             "header checksum mismatch: stored={stored}, computed={computed}"
         )));
     }
+    let flags = read_u32(bytes, 8)?;
+    // version 2 に無いビットは破損（CRC は攻撃者が計算できるため、フラグの
+    // 妥当性は別に見る必要がある）。
+    if flags & !crate::pack_flags::KNOWN_MASK != 0 {
+        return Err(PackError::Corrupted(format!(
+            "unknown pack flags: {flags:#x}"
+        )));
+    }
     Ok(PackHeader {
         version: read_u32(bytes, 4)?,
-        flags: read_u32(bytes, 8)?,
+        flags,
         index_offset: read_u64(bytes, 16)?,
         index_size: read_u64(bytes, 24)?,
         entry_count: read_u32(bytes, 32)?,

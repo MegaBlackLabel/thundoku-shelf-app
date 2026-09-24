@@ -543,8 +543,8 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
 - **デコード**: webp は **libwebp（C 実装）で直接 RGBA デコード**。
   image クレートの webp デコーダー（1000px で 1 秒以上）と比べて数十 ms に短縮
 - **pack キャッシュ**: .opfspack のバイト列を OnceLock で 1 回だけ読み込む
-- **キー導出のキャッシュ**: 暗号化 pack の PBKDF2（100k イテレーション）を
-  1 回だけ実行（`derived_pack_key` + `read_entry_with_key`）
+- **キー導出のキャッシュ**: 暗号化 pack の鍵導出（v3 は `HKDF(PRK, book_id)`）を
+  1 回だけ実行（`derive_pack_key` + `read_entry_with_key`）
 - **プリロード**: 現在ページ ±2 をバックグラウンドで並列ロード（**見開きは ±3**。
   表示が 2 ページ単位なので、次の見開きの 2 枚目まで先読みしないと送った直後に
   片方が未読のまま白い箱で描かれる）
@@ -672,7 +672,7 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
 - **競合時のルール**: Drive 側を優先取得。ローカルの旧 pack は
   `packs/{packId}.conflict-local.opfspack` に退避（以後同期対象外）。
   削除は両方向とも伝播しない
-- 暗号化 pack は Google の `sub` で復号（未ログインならログイン誘導）
+- 暗号化 pack はアカウントごとのルート鍵（v3 の PRK。keyring か Drive の `thundoku-keys.json` から解決。必要ならパスフレーズを尋ねる）で復号する。**鍵を用意できなければ平文として読まずに失敗**する（未ログインならログイン誘導）。旧形式（v2）の pack は開けないので、ストアから取り込み直す
 
 ### GitHub / レポート（Issue 投稿）
 
@@ -698,10 +698,19 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
   - GitHub 側に「テンプレートを適用して投稿する」API は無い（GraphQL `issueTemplate` は
     ラベル / 担当者のみで本文は埋まらない。実測では `.yml` は `NOT_FOUND`）ため、本文は
     クライアント側で組み立てる（`compose_body`）
-- **画像添付**: `POST https://uploads.github.com/user-attachments/assets`（`gh` CLI が使う
-  内部 API）で `https://github.com/user-attachments/assets/<uuid>` を得て、本文に
-  `![file](url)` を挿入する。**対象リポジトリへの write 権限が必要**（無いと 404）
-  - 失敗しても投稿は続けられる（「画像を添付できませんでした（本文のみで投稿できます）」）
+- **画像添付**: 画像は**選択した時点では何も送らない**（ファイル名・MIME・実体を
+  メモリに保持するだけ。上限 10MB は読む前に弾く）。送信時に
+  `POST https://uploads.github.com/user-attachments/assets`（`gh` CLI が使う内部 API）で
+  `https://github.com/user-attachments/assets/<uuid>` を得て、本文の末尾に `![file](url)` を
+  **選択順**に挿入し、そのあと Issue を 1 回作る（順序: `repository_id` を 1 回取得 →
+  添付を 1 件ずつアップロード → Issue 作成。`submit_report`）。ファイル名はそのまま alt に
+  使わない（`]` `)` で Markdown のリンク構造を壊せるため除去する）。
+  **対象リポジトリへの write 権限が必要**（無いと 404）
+  - アップロードに失敗したら **Issue は作らない**（fail-closed。利用者が押していない
+    本文だけの Issue を勝手に立てない）。下書きと添付は残るので、同じ画像を選び直さずに
+    再試行できる。**URL が確定した添付は再試行で上げ直さない**（同じ画像が
+    user-attachments に増えない）。画像なしで送りたい場合は「外す」で添付を外せば
+    本文だけで送れる
   - `data:` URI は GitHub の Markdown サニタイザで `src` ごと除去されるため使えない（実測）
 - **投稿先**: `MegaBlackLabel/thundoku-shelf-app` に**固定**（画面に「このリポジトリの Issue に
   投稿します（変更できません）」と表示する）。宛先を利用者が差し替えられると、誘導された

@@ -22,6 +22,7 @@
 | 07 | `docs/spec/07-decisions.md` | **なぜそうなっているか**（設計判断・代替案・実測に基づく再発防止・既知の制約） | 9KB |
 | 08 | `docs/spec/08-notifications-and-nonfunctional.md` | 通知（送出元一覧）/ 非機能（DB PRAGMA・並列度・メモリ上限・直列化・単一インスタンス）/ ログ / 不明点・推測 | 47KB |
 | 09 | `docs/spec/09-stores.md` | 技術書典 / BOOTH / FANZA / DLsite の同期手順（番号付き）と対象データ | 172KB |
+| 10 | `docs/spec/10-pack-keys.md` | **pack の鍵 v3（乱数ルート鍵 + ラップ）の仕様**（Rust 側は実装済み / Web 版は未対応）/ ラップ形式 / 解決順序 / Web 実装チェックリスト / テストベクタ | 17KB |
 
 > 全章を連結すると 1MB 近くになる（AI のコンテキストに収まらない）。**必要な章だけ読む**前提で分割している。
 
@@ -126,7 +127,7 @@ flowchart LR
 | 実装（未対応） | `ReadFilter::Unread` がローカル本のみ一致（未ダウンロード本は「未読」表示なのに未読フィルタに出ない） |
 | 実装（未対応） | 履歴一覧が非仮想化（全行描画） |
 | 実装（既知の制約） | Drive の保存先フォルダはアカウント別ではない（単一キー。`docs/account-switch.md` に明記済み） |
-| 実装（設計判断の残件） | pack の master key は `sub` 由来のまま（Web 版とのバイト互換を優先）。`sub` をログ・平文 DB に残さない対策のみ実施。ランダム鍵 + 端末間の鍵配送への移行は未着手（`docs/spec/03-import-and-pack.md` §4.5 の残るリスク） |
+| 実装（Web 版のみ未対応） | pack の鍵は **v3（乱数ルート鍵 + `sub`／パスフレーズのラップ）へ移行済み**（`docs/spec/03-import-and-pack.md` §4.5 / `docs/spec/10-pack-keys.md`）。**v2 の pack は読めない**（`PackError::Version(2)`）ので、旧 pack は再取り込みが要る。残るのは **Web 版（`thundoku-shelf` モノレポの `packages/opfspack`）の対応**（§10 §7 のチェックリスト。Web が書く v2 pack はデスクトップでは開けない） |
 | 運用（公開前の確認） | Google Cloud のクライアント種別・Web 版との secret 共用・同意画面の設定は**コードからは確認できない**。公開前に `docs/spec/06-sync-auth-drive.md` §2.5 の表で確認する |
 | 運用（継続） | macOS 配布物は **Developer ID で署名し、Apple の公証（Notarization）を受ける**（v0.2.6 以降。`release.yml` の Import signing certificate / Package (macOS)。鍵は GitHub Secrets から一時キーチェーンへ入れ、`if: always()` で必ず削除する）。**Windows の Authenticode 署名は証明書が要るため未実施**。配布物のハッシュは `release.yml` が発行する |
 | 運用（継続） | 依存の脆弱性は CI の `cargo audit` ジョブで確認する（2026-09-22 時点で**脆弱性 0 件**）。無視する例外は `.cargo/audit.toml` に理由と見直し時期つきで列挙（現在は `rsa` の 1 件のみ）。**脆弱性ではない警告 13 件**（未保守 11・unsound 2）は `docs/spec/07-decisions.md` §6.1 で「配布物に入るか」つきで分類済み。Actions はコミット SHA 固定、ビルド・テストは `--locked` |

@@ -75,6 +75,19 @@ pub struct AppState {
     pub google: Arc<Mutex<Option<GoogleClient>>>,
     pub secrets: SecretStore,
     pub google_profile: Arc<Mutex<Option<GoogleProfile>>>,
+    /// 解決済みの pack ルート鍵（v3 = PRK）。Google ログイン後に解決し、ログアウトで破棄する。
+    ///
+    /// pack の復号は冊ごとに `root.derive_pack_key(book_id)` で導出する鍵を使う
+    /// （仕様 `docs/spec/10-pack-keys.md` §2 / §6）。解決（keyring → Drive の
+    /// `thundoku-keys.json` → 必要ならパスフレーズ入力）は [`crate::pack_keys`] が行い、
+    /// ここは**解決済みの値**を読む側が取るための置き場。
+    pub pack_root_key: Arc<Mutex<Option<opfspack::PackRootKey>>>,
+    /// パスフレーズの解錠ダイアログ（背景スレッド → UI）の受け渡し。
+    ///
+    /// `PackKeyStore` の prompt コールバックは同期なので、背景タスクが
+    /// [`crate::pack_keys::PackKeyPrompt::ask`] で要求を積み、UI（`Workspace`）が
+    /// モーダルで答える。
+    pub pack_key_prompt: Arc<crate::pack_keys::PackKeyPrompt>,
     /// Google ログイン状態（keyring にトークンがあるか）。プロフィール未取得でも維持する。
     pub google_logged_in: Arc<Mutex<bool>>,
     /// モーダルなし Google ログインの直近のエラー（ログイン状態パネルに表示）
@@ -170,6 +183,8 @@ pub enum ModalKind {
     DownloadConfirm,
     /// 取り込み（分割取り込み）の確認。worker が答えを待っているので必ず出す。
     Import,
+    /// pack の鍵（パスフレーズ）の解錠。背景タスクが答えを待っているので必ず出す。
+    PackPassphrase,
     /// ログイン（WebView / 同意）。途中で閉じるとサイト側のセッションが壊れる。
     Login,
     /// 設定の確認（全削除 / 保存先変更 / 同期情報のクリア）。
@@ -187,6 +202,7 @@ impl ModalKind {
             Self::DownloadCancel => "ダウンロードの中止の確認",
             Self::DownloadConfirm => "ダウンロードの確認",
             Self::Import => "取り込みの確認",
+            Self::PackPassphrase => "鍵（パスフレーズ）の入力",
             Self::Login => "ログイン",
             Self::SettingsConfirm => "設定の確認",
             Self::NoteDialog => "付箋の入力",
@@ -430,6 +446,13 @@ impl AppState {
             .filter(DlsiteSession::logged_in);
         let dlsite_logged_in = dlsite_session.is_some();
 
+        // 起動時に keyring の PRK（pack のルート鍵）を読む。ネットワークは触らず、
+        // Drive の bundle からの復元（必要ならパスフレーズ入力）はログイン後 /
+        // 必要になった時点で背景タスクが行う（[`crate::pack_keys`]）。
+        let pack_root_key = google_profile
+            .as_ref()
+            .and_then(|profile| crate::pack_keys::keyring_root_key(&secrets, &profile.sub));
+
         cx.set_global(Self {
             data_dir,
             packs_dir,
@@ -439,6 +462,8 @@ impl AppState {
             google: Arc::new(Mutex::new(google)),
             secrets,
             google_profile: Arc::new(Mutex::new(google_profile)),
+            pack_root_key: Arc::new(Mutex::new(pack_root_key)),
+            pack_key_prompt: Arc::new(crate::pack_keys::PackKeyPrompt::default()),
             google_logged_in: Arc::new(Mutex::new(google_logged_in)),
             google_login_error: Arc::new(Mutex::new(None)),
             github: Arc::new(Mutex::new(Some(github))),
@@ -522,6 +547,8 @@ impl AppState {
             // 保存済みプロフィールを復元しない（復元すると所有者フィルタが全テストに
             // 波及する）。復元経路は init_with_data_dir（本番）で検証する。
             google_profile: Arc::new(Mutex::new(None)),
+            pack_root_key: Arc::new(Mutex::new(None)),
+            pack_key_prompt: Arc::new(crate::pack_keys::PackKeyPrompt::default()),
             google_logged_in: Arc::new(Mutex::new(false)),
             google_login_error: Arc::new(Mutex::new(None)),
             github: Arc::new(Mutex::new(Some(github))),
@@ -555,6 +582,15 @@ impl AppState {
             auth_open_provider: Arc::new(Mutex::new(None)),
             modals: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         });
+    }
+
+    /// 解決済みの pack ルート鍵（v3 = PRK）。未解決なら `None`。
+    ///
+    /// 読む側（リーダー・付箋のサムネイルなど）はここから取り、冊ごとの pack 鍵を
+    /// `root.derive_pack_key(book_id)` で導出する。解決（ログイン後の復元・
+    /// パスフレーズ入力）は [`crate::pack_keys`] が背景で行う。
+    pub fn pack_root_key(&self) -> Option<opfspack::PackRootKey> {
+        self.pack_root_key.lock().clone()
     }
 }
 
@@ -685,6 +721,16 @@ pub fn owner_token(state: &AppState) -> Option<String> {
 /// に既定 debug レベルで残る）へ書くと pack を取得した第三者に復号材料を渡すことになる。
 pub fn set_google_profile(cx: &App, profile: &thundoku_core::google::GoogleProfile) {
     let state = AppState::global(cx);
+    // アカウントが変わったら解決済みの pack ルート鍵は捨てる（鍵はアカウントごと — 仕様 §2）。
+    // 別アカウントの pack を前のアカウントの鍵で復号しようとしない。
+    let changed = state
+        .google_profile
+        .lock()
+        .as_ref()
+        .is_some_and(|current| current.sub != profile.sub);
+    if changed {
+        *state.pack_root_key.lock() = None;
+    }
     *state.google_profile.lock() = Some(profile.clone());
     *state.google_logged_in.lock() = true;
     *state.google_login_error.lock() = None;
@@ -707,6 +753,9 @@ pub fn save_google_profile(cx: &App, profile: &thundoku_core::google::GoogleProf
 pub fn clear_google_profile(cx: &App) {
     let state = AppState::global(cx);
     *state.google_profile.lock() = None;
+    // 解決済みの pack ルート鍵も捨てる（アカウントごとの鍵。別アカウントの pack を
+    // 前のアカウントの鍵で読もうとしない — 仕様 §2）。
+    *state.pack_root_key.lock() = None;
     *state.google_logged_in.lock() = false;
     log::info!("google profile: 状態をクリア");
 }
@@ -1016,7 +1065,19 @@ mod tests {
             );
             assert!(any_modal_active(cx));
 
+            // 鍵（v3 の PRK）の解錠は背景タスクが答えを待っているので、
+            // 取り込み確認などより強い（待たせたまま隠さない）
+            set_modal(cx, ModalKind::Import, true);
+            assert_eq!(active_modal(cx), Some(ModalKind::Login));
             set_modal(cx, ModalKind::Login, false);
+            set_modal(cx, ModalKind::PackPassphrase, true);
+            assert_eq!(
+                active_modal(cx),
+                Some(ModalKind::PackPassphrase),
+                "解錠は取り込み確認より先に出す（答えを待っている）"
+            );
+            set_modal(cx, ModalKind::PackPassphrase, false);
+            set_modal(cx, ModalKind::Import, false);
             assert_eq!(
                 active_modal(cx),
                 Some(ModalKind::ExitConfirm),

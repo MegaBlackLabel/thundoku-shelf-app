@@ -235,18 +235,11 @@ impl NotesView {
         let state = AppState::global(cx);
         let pool = state.db_pool.clone();
         let packs_dir = state.packs_dir.clone();
-        // ページ画像は pack の復号が要るため、リーダーと同じ identity を渡す
-        let identity = state
-            .google_profile
-            .lock()
-            .as_ref()
-            .map(|profile| opfspack::Identity {
-                sub: profile.sub.clone(),
-                pack_id: book_id.clone(),
-            });
+        // ページ画像は pack の復号が要るため、リーダーと同じルート鍵（v3 の PRK）を渡す
+        let pack_root_key = state.pack_root_key();
         // pack の復号 + 画像展開は重いので背景で回し、終わったら notify で描き直す
         let task = cx.background_executor().spawn(async move {
-            load_note_thumb(&pool, packs_dir, identity, &book_id, &content_id, page)
+            load_note_thumb(&pool, packs_dir, pack_root_key, &book_id, &content_id, page)
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
@@ -1063,7 +1056,7 @@ impl NotesView {
 fn load_note_thumb(
     pool: &db::SqlitePool,
     packs_dir: std::path::PathBuf,
-    identity: Option<opfspack::Identity>,
+    pack_root_key: Option<opfspack::PackRootKey>,
     book_id: &str,
     content_id: &str,
     page: i64,
@@ -1078,9 +1071,8 @@ fn load_note_thumb(
         images,
         packs_dir,
         db: pool.clone(),
-        identity,
+        pack_root_key,
         pack_bytes: std::sync::OnceLock::new(),
-        pack_key: std::sync::OnceLock::new(),
     };
     loader.load_thumb((page - 1).max(0) as usize)
 }

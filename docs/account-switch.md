@@ -27,9 +27,10 @@
 
 `books.owner_sub`（**暗号化済み**の所有者 sub、NULL = 未所属・未暗号化）
 
-- **暗号化は必須**：平文 sub を DB に置くと `pack key = PBKDF2(sub + APP_SALT) → HKDF(salt = pack_id)`
-  を導出できてしまう（`pack_id` は平文で `books` にある）。→ keyring のローカル鍵
-  （例 `thundoku-shelf.db-key`）で AES 暗号化して保存。
+- **暗号化は必須**：平文 sub を DB に置くと、`owner_id`（keyring のスロット名・ラップの AAD）と
+  `sub` ラップの KEK（`PBKDF2(sub + APP_SALT)`）を導出でき、鍵 bundle と pack を入手していれば
+  復号経路を渡すことになる（旧 v2 は `pack key = PBKDF2(sub + APP_SALT) → HKDF(salt = pack_id)`
+  を直接導出できた）。→ keyring のローカル鍵（例 `thundoku-shelf.db-key`）で AES 暗号化して保存。
 - `NULL` = 未ログイン時 DL（未暗号化 pack）→ **そのまま保有**
 - `値` = その sub で暗号化された pack（所有者）
 
@@ -130,16 +131,18 @@
 
 ## セキュリティ / リスク
 
-- `owner_sub` は暗号化して保存。**DB だけでは pack キーを導出できない**。
-- **`sub` はログに出さない**: pack の master key は `sub` から導出されるため、`sub` は
-  実質の復号秘密。ログ（Windows は `%TEMP%/thundoku-shelf/thundoku.log` に既定 debug
-  レベルで残る）へ書くと、pack を入手した第三者に復号材料を渡すことになる。
-  `google::profile_log_label` は有無だけを返し、値は含めない。
-  - 残るリスク（設計として許容）: pack 形式は Web 版とバイト互換で、
-    鍵導出は `PBKDF2(sub + APP_SALT)` のまま。`sub` を入手した相手は pack を復号できる。
-    「アカウントごとのランダム鍵 + 端末間の鍵配送」への移行は pack 形式の変更と
-    既存 pack の再暗号化・復旧手段の設計を伴うため、別途設計する。
-      （`docs/spec/03-import-and-pack.md` §4.5）
+- `owner_sub` は暗号化して保存。**DB だけでは pack キーを導出できない**（v3 の鍵材料は乱数）。
+- **`sub` はログに出さない**: v3 でも `sub` は `owner_id`（keyring のスロット名とラップの AAD）と
+  `sub` ラップの KEK の材料で、実質の復号経路。ログ（Windows は `%TEMP%/thundoku-shelf/thundoku.log`
+  に既定 debug レベルで残る）へ書くと、鍵 bundle と pack を入手した第三者に復号材料を渡すことに
+  なる。`google::profile_log_label` は有無だけを返し、値は含めない。
+- **v3 の鍵は乱数ルート鍵（PRK）+ ラップ**（`docs/spec/10-pack-keys.md`）: PRK は keyring と
+  Drive の `thundoku-keys.json`（`sub` / 任意のパスフレーズでラップ）に置く。したがって
+  **`sub` を知っているだけでは pack は解けない**（ラップの入った bundle が要る）。パスフレーズを
+  設定していれば、bundle が漏れてもパスフレーズを知らない相手には解けない。`sub` ラップは
+  仕様上は削除できる（`PackKeyBundle::remove_wrap`）が、core の `PackKeyStore` に公開操作はまだ無い。
+  **v2 の pack は読めない**（`unsupported pack version`。ストアから取り込み直す）。
+  （`docs/spec/03-import-and-pack.md` §4.5）
 - `owner_sub` が**唯一の所有者記録**（pack ファイルには sub が無い）。
   - **現在ログイン中のアカウント**の sub は保存済みプロフィール（keyring `google-profile`）から
     復元できるため、`owner_sub` 破損でも pack は復号できる。トークン（`USER_GOOGLE`）自体には

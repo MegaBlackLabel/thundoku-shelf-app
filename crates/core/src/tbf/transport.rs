@@ -168,7 +168,8 @@ fn read_body_capped(reader: &mut impl std::io::Read, limit: u64) -> BodyOutcome 
 ///   ダウンロード自体がストールする）
 /// - コールバックが `false` を返すと読み込みを中断する（途中まで読んだバイト列は
 ///   呼び出し側に渡さない。部分的な本文を取り込まない）
-/// - `total` が 0（Content-Length 無し）のときは進捗を通知しない
+/// - `total` が 0（Content-Length 無し）のときは **1MiB 刻み**で通知する
+///   （% は出せないが、キャンセルは効かせる。読み切ったら最後のサイズも一度通知する）
 /// - 読み出しが `limit` を超えたら `TooLarge`（**宣言サイズではなく実際に読めた
 ///   バイト数**で判定する）
 pub(crate) fn read_body_with_progress(
@@ -177,10 +178,14 @@ pub(crate) fn read_body_with_progress(
     limit: u64,
     on_progress: &mut dyn FnMut(u64, u64) -> bool,
 ) -> BodyOutcome {
+    /// Content-Length が無いときに進捗（＝キャンセル確認）を挟む間隔。
+    const UNKNOWN_TOTAL_STEP: u64 = 1024 * 1024;
+
     let mut out = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut downloaded = 0u64;
     let mut last_pct = u32::MAX;
+    let mut notified_at = 0u64;
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
@@ -190,13 +195,21 @@ pub(crate) fn read_body_with_progress(
                     return BodyOutcome::TooLarge(limit);
                 }
                 out.extend_from_slice(&buf[..n]);
-                if total > 0 {
+                let notify = if total > 0 {
                     let pct = (downloaded * 100).checked_div(total).unwrap_or(0) as u32;
                     if pct != last_pct {
                         last_pct = pct;
-                        if !on_progress(downloaded, total) {
-                            return BodyOutcome::Cancelled;
-                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    downloaded - notified_at >= UNKNOWN_TOTAL_STEP
+                };
+                if notify {
+                    notified_at = downloaded;
+                    if !on_progress(downloaded, total) {
+                        return BodyOutcome::Cancelled;
                     }
                 }
             }
@@ -205,6 +218,11 @@ pub(crate) fn read_body_with_progress(
             // ファイルを取り込まない）。
             Err(e) => return BodyOutcome::Io(e.to_string()),
         }
+    }
+    // Content-Length が無いときは、読み切ったサイズを最後に一度だけ通知する
+    // （UI が「完了」を出せるようにする。中止なら本文は返さない）。
+    if total == 0 && downloaded > 0 && downloaded != notified_at && !on_progress(downloaded, 0) {
+        return BodyOutcome::Cancelled;
     }
     BodyOutcome::Read(out)
 }
@@ -420,5 +438,57 @@ mod tests {
             matches!(outcome, BodyOutcome::TooLarge(limit) if limit == 64 * 1024),
             "上限超過が失敗として伝わっていない"
         );
+    }
+
+    /// `Content-Length` が無い応答でも進捗（＝中止）が効く。
+    ///
+    /// 以前は `total == 0` のときコールバックを一度も呼んでおらず、Content-Length を
+    /// 返さないサイトではキャンセルできなかった（読むしかない）。
+    #[test]
+    fn read_body_with_progress_notifies_without_content_length() {
+        let total = 4 * 1024 * 1024;
+        let mut reader = std::io::Cursor::new(vec![0u8; total]);
+        let mut calls: Vec<(u64, u64)> = Vec::new();
+        let outcome = read_body_with_progress(
+            &mut reader,
+            0,
+            MAX_DOWNLOAD_BODY_BYTES,
+            &mut |downloaded, reported_total| {
+                calls.push((downloaded, reported_total));
+                // 2 回目の通知で中止する
+                calls.len() < 2
+            },
+        );
+        assert!(
+            matches!(outcome, BodyOutcome::Cancelled),
+            "Content-Length 無しで中止できない"
+        );
+        assert_eq!(
+            calls,
+            vec![(1024 * 1024, 0), (2 * 1024 * 1024, 0)],
+            "1MiB 刻みで通知していない"
+        );
+    }
+
+    /// `Content-Length` が無くても、読み切ったら最後のサイズを一度通知する。
+    #[test]
+    fn read_body_with_progress_reports_the_final_size_without_content_length() {
+        let total = 1024 * 1024 + 4096;
+        let mut reader = std::io::Cursor::new(vec![0u8; total]);
+        let mut calls: Vec<(u64, u64)> = Vec::new();
+        let outcome = read_body_with_progress(
+            &mut reader,
+            0,
+            MAX_DOWNLOAD_BODY_BYTES,
+            &mut |downloaded, reported_total| {
+                calls.push((downloaded, reported_total));
+                true
+            },
+        );
+        let BodyOutcome::Read(body) = outcome else {
+            panic!("本文が読めていない");
+        };
+        assert_eq!(body.len(), total);
+        assert_eq!(calls, vec![(1024 * 1024, 0), (total as u64, 0)]);
     }
 }

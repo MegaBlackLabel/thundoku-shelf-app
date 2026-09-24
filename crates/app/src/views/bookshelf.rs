@@ -1449,7 +1449,8 @@ impl From<String> for ImportFailure {
 fn import_failure(error: thundoku_core::import::ImportError) -> ImportFailure {
     match error {
         thundoku_core::import::ImportError::NotAReadableWork => ImportFailure::NotAReadable,
-        other => ImportFailure::Message(other.to_string()),
+        // 鍵が無いときは復元（パスフレーズ入力）への導線を含む文言にする
+        other => ImportFailure::Message(crate::pack_keys::import_error_message(&other)),
     }
 }
 
@@ -3832,8 +3833,13 @@ impl BookshelfView {
         let tag_fetch_enabled = self.tag_fetch_enabled;
         // 所有者（owner_sub）の付け方: ログイン中なら現在 sub で暗号化した pack にして
         // owner_sub を記録する。未ログインなら未暗号化（owner_sub = NULL）。
-        let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
+        // pack の鍵（v3 の PRK）は未ログインなら平文 pack、ログイン中なら解決して
+        // 冊ごとに導出する（`crate::pack_keys::KeyContext::import_root_key`）。
+        let google_profile = state.google_profile.lock().clone();
+        let google_sub = google_profile.as_ref().map(|p| p.sub.clone());
         let db_key = state.secrets.db_key().ok();
+        // 鍵の解決に要るもの（背景スレッドへ move するので `AppState` は持っていかない）
+        let key_context = crate::pack_keys::KeyContext::from_state(state);
         // Progress is reported from the background task through a channel and
         // applied on the UI thread (the task itself must stay Send).
         // NOTE: sync_channel(64) はバッファが満杯になると send がブロックする。
@@ -3849,6 +3855,14 @@ impl BookshelfView {
             std::sync::mpsc::channel::<Result<ImportOutcome, ImportFailure>>();
         std::thread::spawn(move || {
             let result = (|| -> Result<ImportOutcome, ImportFailure> {
+                // pack の鍵（v3 の PRK）は**最初に**決める（fail-closed）。
+                // ログイン済みなのに鍵が取れない場合はここで失敗させ、平文 pack を
+                // 作らない（数分のダウンロードを無駄にしない意味でも先に判定する）。
+                // 鍵が無ければ作り（keyring → Drive の bundle → 必要ならパスフレーズ入力）、
+                // 冊ごとの pack 鍵は取り込み側が `PRK.derive_pack_key(book_id)` で導出する。
+                let root_key = key_context
+                    .import_root_key(google_profile.as_ref(), "本の取り込み")
+                    .map_err(import_failure)?;
                 // ダウンロード（サイトで分岐）:
                 // - BOOTH: セッション Cookie で downloadables/{id} を GET → 302 の
                 //   Location（署名付き S3 URL）を自動追跡してファイル本体を取得
@@ -4064,21 +4078,6 @@ impl BookshelfView {
                         ));
                     }
                 };
-                let identity = google_sub.as_deref().and_then(|sub| {
-                    let key = db_key.as_ref()?;
-                    // (source, owner) で既存の所属行を再利用（P5）。無ければ新規 UUID。
-                    let reuse_id =
-                        books::resolve_reuse_id(&db, key, &site_id, &product_id, Some(sub))
-                            .ok()
-                            .flatten();
-                    let pack_id = reuse_id
-                        .clone()
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    Some(opfspack::Identity {
-                        sub: sub.to_string(),
-                        pack_id,
-                    })
-                });
                 // 再ダウンロード防止: 同一 (site, product) の既存本（ログイン有無どちらも）
                 // の book_id を再利用する（identity が None＝未ログインでも重複を作らない）。
                 let reuse_book_id: Option<String> = {
@@ -4107,7 +4106,7 @@ impl BookshelfView {
                         bytes.len() as i64,
                         pages,
                         &packs_dir,
-                        identity.as_ref(),
+                        root_key.as_ref(),
                         reuse_book_id.as_deref(),
                     )
                     .map_err(import_failure)?;
@@ -4152,7 +4151,7 @@ impl BookshelfView {
                             &file_name,
                             &bytes,
                             &packs_dir,
-                            identity.as_ref(),
+                            root_key.as_ref(),
                             reuse_book_id.as_deref(),
                         ),
                         "zip" => {
@@ -4181,7 +4180,7 @@ impl BookshelfView {
                                 &file_name,
                                 &bytes,
                                 &packs_dir,
-                                identity.as_ref(),
+                                root_key.as_ref(),
                                 &mut on_import,
                                 reuse_book_id.as_deref(),
                                 &plan,
@@ -4194,7 +4193,7 @@ impl BookshelfView {
                                 &file_name,
                                 &bytes,
                                 &packs_dir,
-                                identity.as_ref(),
+                                root_key.as_ref(),
                                 reuse_book_id.as_deref(),
                             )
                         }

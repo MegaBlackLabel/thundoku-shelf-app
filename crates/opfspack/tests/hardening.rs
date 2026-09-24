@@ -5,7 +5,7 @@
 //! （ヘッダ + index CRC のみ）で数百 GB の事前確保を試みさせられる。
 //! `open` は index 長から導ける件数上限を先に検査し、確保を試みない。
 
-use opfspack::{PackError, PackReader};
+use opfspack::{FORMAT_VERSION, PackError, PackReader};
 
 fn crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
@@ -23,7 +23,7 @@ fn open_error(pack: &[u8]) -> PackError {
 fn crafted_pack(entry_count: u32, index_region: &[u8]) -> Vec<u8> {
     let mut header = vec![0u8; 64];
     header[0..4].copy_from_slice(b"OPFS");
-    header[4..8].copy_from_slice(&2u32.to_le_bytes());
+    header[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     header[16..24].copy_from_slice(&64u64.to_le_bytes());
     let index_size = index_region.len() as u64 + 4;
     header[24..32].copy_from_slice(&index_size.to_le_bytes());

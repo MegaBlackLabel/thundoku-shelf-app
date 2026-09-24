@@ -10,6 +10,7 @@ pub mod github;
 pub mod google;
 pub mod import;
 pub mod owner;
+pub mod pack_keys;
 pub mod pack_path;
 pub mod secrets;
 pub mod session_cookies;

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use opfspack::{Identity, PackBuilder};
+use opfspack::{PackBuilder, PackRootKey};
 use thundoku_core::db;
 use thundoku_core::drive::sync::{SyncError, sync};
 use thundoku_core::drive::{DriveApi, DriveError, DriveFile};
@@ -144,6 +144,20 @@ impl Drop for TestEnv {
     }
 }
 
+/// CRC-32 (IEEE)。v2 の pack を組み立てるためにテスト側で計算する
+/// （`opfspack` は v2 を書き出さないため）。
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 fn plain_pack(entry_path: &str, content: &[u8]) -> Vec<u8> {
     let mut builder = PackBuilder::new(1_700_000_000_000);
     builder.add_entry(
@@ -179,14 +193,12 @@ fn metadata_pack(title: &str, author: &str, circle: &str, purchase_date: &str) -
     builder.build(None, false).unwrap()
 }
 
-fn encrypted_pack(sub: &str, pack_id: &str, content: &[u8]) -> Vec<u8> {
+/// v3 の暗号化 pack（鍵は PRK から pack id 単位で導出する）。
+fn encrypted_pack(root: &PackRootKey, pack_id: &str, content: &[u8]) -> Vec<u8> {
     let mut builder = PackBuilder::new(1_700_000_000_000);
     builder.add_entry("pages/page_0001.webp", content.to_vec(), "image/webp", true);
-    let identity = Identity {
-        sub: sub.into(),
-        pack_id: pack_id.into(),
-    };
-    builder.build(Some(&identity), true).unwrap()
+    let key = root.derive_pack_key(pack_id);
+    builder.build(Some(&key), true).unwrap()
 }
 
 fn sync_env(
@@ -199,6 +211,7 @@ fn sync_env(
         packs_dir: &env.packs(),
         downloads_dir: &env.downloads(),
         identity_sub: None,
+        pack_root_key: None,
         owner_key: None,
         folder_id: "folder-1",
         db_path: None,
@@ -417,6 +430,7 @@ fn uploads_local_pack_without_state_row() {
         packs_dir: &env.packs(),
         downloads_dir: &env.downloads(),
         identity_sub: Some("test-sub"),
+        pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
         db_path: None,
@@ -466,6 +480,7 @@ fn reuploads_locally_modified_pack() {
         packs_dir: &env.packs(),
         downloads_dir: &env.downloads(),
         identity_sub: Some("test-sub"),
+        pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
         db_path: None,
@@ -532,35 +547,34 @@ fn malicious_drive_names_are_ignored() {
 }
 
 #[test]
-fn encrypted_pack_without_identity_is_rejected() {
+fn encrypted_pack_without_key_is_rejected() {
     let mut env = TestEnv::new("encrypted-no-id");
     let mut drive = FakeDrive::new();
-    let bytes = encrypted_pack("test-sub", "pack-e", b"SECRET");
+    let root = PackRootKey::generate();
+    let bytes = encrypted_pack(&root, "pack-e", b"SECRET");
     drive.seed("pack-e.opfspack", &bytes);
 
     let err = sync_env(&mut env, &mut drive).unwrap_err();
-    assert!(matches!(err, SyncError::IdentityRequired(ref id) if id == "pack-e"));
+    assert!(matches!(&err, SyncError::PackKeyRequired(id) if id == "pack-e"));
     // nothing imported
     assert!(db::books::get(&env.pool, "pack-e").unwrap().is_none());
 }
 
 #[test]
-fn encrypted_pack_imports_with_matching_identity() {
+fn encrypted_pack_imports_with_the_root_key() {
     let env = TestEnv::new("encrypted-with-id");
     let mut drive = FakeDrive::new();
-    let bytes = encrypted_pack("test-sub", "pack-e", b"SECRET");
+    let root = PackRootKey::generate();
+    let bytes = encrypted_pack(&root, "pack-e", b"SECRET");
     drive.seed("pack-e.opfspack", &bytes);
 
-    let identity = Identity {
-        sub: "test-sub".into(),
-        pack_id: "pack-e".into(),
-    };
     let outcome = sync(thundoku_core::drive::sync::SyncRequest {
         pool: &env.pool,
         drive: &mut drive,
         packs_dir: &env.packs(),
         downloads_dir: &env.downloads(),
         identity_sub: Some("test-sub"),
+        pack_root_key: Some(&root),
         owner_key: None,
         folder_id: "folder-1",
         db_path: None,
@@ -569,14 +583,123 @@ fn encrypted_pack_imports_with_matching_identity() {
     assert_eq!(outcome.downloaded, vec!["pack-e"]);
     let book = db::books::get(&env.pool, "pack-e").unwrap().unwrap();
     assert_eq!(book.title, "pack-e"); // no metadata.json in encrypted fixture
-    // decryption round-trip via opfspack reader
+    // decryption round-trip via opfspack reader (鍵は PRK + pack id から導出)
+    let key = root.derive_pack_key("pack-e");
     let local = std::fs::read(env.packs().join("pack-e.opfspack")).unwrap();
     let reader = opfspack::PackReader::open(&local).unwrap();
     assert_eq!(
         reader
-            .read_entry("pages/page_0001.webp", Some(&identity))
+            .read_entry("pages/page_0001.webp", Some(&key))
             .unwrap(),
         b"SECRET"
+    );
+}
+
+/// ログイン中（鍵あり）でも平文 pack はそのまま取り込める
+/// （暗号化の判定を `ENCRYPTED` にしたので、平文に鍵を要求しない）。
+#[test]
+fn plaintext_pack_downloads_while_logged_in() {
+    let env = TestEnv::new("plaintext-logged-in");
+    let mut drive = FakeDrive::new();
+    let bytes = metadata_pack("平文本", "著者X", "サークルY", "2026-08-21");
+    drive.seed("pack-plain.opfspack", &bytes);
+    let root = PackRootKey::generate();
+
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("test-sub"),
+        pack_root_key: Some(&root),
+        owner_key: None,
+        folder_id: "folder-1",
+        db_path: None,
+    })
+    .unwrap();
+    assert_eq!(outcome.downloaded, vec!["pack-plain"]);
+    let book = db::books::get(&env.pool, "pack-plain").unwrap().unwrap();
+    assert_eq!(book.title, "平文本");
+    assert_eq!(book.author, "著者X");
+}
+
+/// v2 以前の pack は v3 では開けない。**再取り込み**を促すメッセージで伝える
+/// （黙ってスキップして利用者に伝わらない、を避ける）。
+#[test]
+fn v2_pack_is_reported_as_unsupported() {
+    let mut env = TestEnv::new("v2-pack");
+    let mut drive = FakeDrive::new();
+    // v3 の pack の version フィールドだけを 2 にしたもの（header CRC は計算し直す）。
+    let mut bytes = plain_pack("pages/page_0001.webp", b"OLD-V2");
+    bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+    let crc = crc32(&bytes[..60]);
+    bytes[60..64].copy_from_slice(&crc.to_le_bytes());
+    drive.seed("pack-v2.opfspack", &bytes);
+
+    let err = sync_env(&mut env, &mut drive).unwrap_err();
+    match &err {
+        SyncError::UnsupportedPackVersion { pack_id, version } => {
+            assert_eq!(pack_id, "pack-v2");
+            assert_eq!(*version, 2);
+        }
+        other => panic!("旧形式は UnsupportedPackVersion として伝える: {other:?}"),
+    }
+    let message = err.to_string();
+    assert!(message.contains("取り込み直"), "{message}");
+    assert!(db::books::get(&env.pool, "pack-v2").unwrap().is_none());
+}
+
+/// 鍵 bundle の未アップロード（初回作成時に失敗）は同期の最後に再試行される。
+#[test]
+fn sync_retries_pending_key_bundle_upload() {
+    use thundoku_core::pack_keys::{KEY_BUNDLE_NAME, PENDING_UPLOAD_KEY};
+    use thundoku_core::secrets::SecretStore;
+
+    let env = TestEnv::new("pending-keys");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-drive-sync-pending";
+    let root = PackRootKey::generate();
+    SecretStore::use_memory_backend();
+    SecretStore::new()
+        .save_pack_root_key(&opfspack::derive_owner_id(sub), &root.to_base64())
+        .unwrap();
+    db::settings::set(
+        &env.pool,
+        PENDING_UPLOAD_KEY,
+        &opfspack::derive_owner_id(sub),
+    )
+    .unwrap();
+
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some(sub),
+        pack_root_key: Some(&root),
+        owner_key: None,
+        folder_id: "folder-1",
+        db_path: None,
+    })
+    .unwrap();
+    assert!(outcome.downloaded.is_empty());
+    // bundle が Drive に上がり、印が消える。
+    assert!(drive.files.contains_key(&format!("id-{KEY_BUNDLE_NAME}")));
+    assert!(
+        db::settings::get(&env.pool, PENDING_UPLOAD_KEY)
+            .unwrap()
+            .is_none(),
+        "再試行できたら印を消す"
+    );
+    let bytes = &drive
+        .files
+        .get(&format!("id-{KEY_BUNDLE_NAME}"))
+        .unwrap()
+        .bytes;
+    let bundle = opfspack::PackKeyBundle::from_json(bytes).unwrap();
+    assert_eq!(
+        bundle.unwrap_with_sub(sub).unwrap().as_bytes(),
+        root.as_bytes()
     );
 }
 
@@ -597,6 +720,7 @@ fn db_backup_is_not_replaced_when_owner_filter_is_unavailable() {
         packs_dir: &env.packs(),
         downloads_dir: &env.downloads(),
         identity_sub: None,
+        pack_root_key: None,
         owner_key: None,
         folder_id: "folder-1",
         db_path: Some(&db_path),
@@ -670,6 +794,7 @@ fn db_backup_is_uploaded_when_owner_filter_is_available() {
         packs_dir: &env.packs(),
         downloads_dir: &env.downloads(),
         identity_sub: Some("sub-1"),
+        pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
         db_path: Some(&db_path),
@@ -742,6 +867,7 @@ fn db_backup_upload_records_the_baseline_for_the_next_check() {
         packs_dir: &env.packs(),
         downloads_dir: &env.downloads(),
         identity_sub: Some("sub-1"),
+        pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
         db_path: Some(&db_path),

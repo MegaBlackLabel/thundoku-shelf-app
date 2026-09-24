@@ -69,6 +69,16 @@ pub const USER_DB_KEY: &str = "thundoku-shelf.db-key";
 /// ストアのセッション Cookie 暗号化用のローカル鍵（keyring）。
 /// `USER_DB_KEY` とは**別の鍵**にする（用途ごとに分離する）。
 pub const USER_SESSION_KEY: &str = "thundoku-shelf.session-key";
+/// pack のルート鍵（v3 = 方式 C の PRK）の keyring スロットの接頭辞。
+///
+/// user 名は `thundoku-shelf.pack-root-key:<owner_id>`（`docs/spec/10-pack-keys.md`
+/// §3.1）。PRK は**アカウントごと**なので `owner_id` をスロットに含める。
+pub const PACK_ROOT_KEY_PREFIX: &str = "thundoku-shelf.pack-root-key:";
+
+/// `owner_id` の pack ルート鍵スロット名（keyring の user 名）。
+pub fn pack_root_key_user(owner_id: &str) -> String {
+    format!("{PACK_ROOT_KEY_PREFIX}{owner_id}")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
@@ -186,6 +196,26 @@ impl SecretStore {
     pub fn session_key(&self) -> Result<[u8; 32], SecretError> {
         self.random_key(USER_SESSION_KEY)
     }
+
+    /// `owner_id` の pack ルート鍵（v3 の PRK。値は `PackRootKey::to_base64()`）を読む。
+    /// 無ければ `None`（＝この端末に鍵が無い。Drive の bundle から復元する経路がある）。
+    ///
+    /// DB 鍵（[`Self::db_key`]）・セッション鍵（[`Self::session_key`]）とは
+    /// **別スロット**に置く（用途分離。1 つの鍵を使い回さない）。
+    pub fn load_pack_root_key(&self, owner_id: &str) -> Result<Option<String>, SecretError> {
+        self.load(&pack_root_key_user(owner_id))
+    }
+
+    /// `owner_id` の pack ルート鍵（base64）を保存する。
+    pub fn save_pack_root_key(&self, owner_id: &str, value: &str) -> Result<(), SecretError> {
+        self.save(&pack_root_key_user(owner_id), value)
+    }
+
+    /// `owner_id` の pack ルート鍵を削除する（端末を切り離すとき。
+    /// 消しても Drive の bundle + `sub` / パスフレーズで復旧できる — 仕様 §5.2/§5.3）。
+    pub fn delete_pack_root_key(&self, owner_id: &str) -> Result<(), SecretError> {
+        self.delete(&pack_root_key_user(owner_id))
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +241,37 @@ mod tests {
         assert_eq!(store.db_key().unwrap(), key, "db_key が安定していること");
         store.delete("test-slot").unwrap();
         assert!(store.load("test-slot").unwrap().is_none());
+    }
+
+    /// pack のルート鍵（v3）は `owner_id` ごとの別スロットに保存し、
+    /// DB 鍵 / セッション鍵と同居させない（用途とアカウントの分離）。
+    #[test]
+    fn pack_root_key_uses_a_per_owner_slot() {
+        SecretStore::use_memory_backend();
+        let store = SecretStore::new();
+        let (owner_a, owner_b) = ("owner-a-slot-test", "owner-b-slot-test");
+        assert!(store.load_pack_root_key(owner_a).unwrap().is_none());
+        store.save_pack_root_key(owner_a, "AAA").unwrap();
+        store.save_pack_root_key(owner_b, "BBB").unwrap();
+        assert_eq!(
+            store.load_pack_root_key(owner_a).unwrap().as_deref(),
+            Some("AAA")
+        );
+        assert_eq!(
+            store.load_pack_root_key(owner_b).unwrap().as_deref(),
+            Some("BBB")
+        );
+        store.delete_pack_root_key(owner_a).unwrap();
+        assert!(store.load_pack_root_key(owner_a).unwrap().is_none());
+        assert_eq!(
+            store.load_pack_root_key(owner_b).unwrap().as_deref(),
+            Some("BBB"),
+            "他のアカウントの鍵を消さない"
+        );
+        // スロット名が用途ごとに別であること（同居させない）。
+        assert_ne!(pack_root_key_user(owner_a), USER_DB_KEY);
+        assert_ne!(pack_root_key_user(owner_a), USER_SESSION_KEY);
+        assert_ne!(pack_root_key_user(owner_a), pack_root_key_user(owner_b));
+        assert!(pack_root_key_user(owner_a).starts_with("thundoku-shelf.pack-root-key:"));
     }
 }

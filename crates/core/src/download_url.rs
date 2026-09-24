@@ -14,6 +14,8 @@
 
 use std::fmt;
 
+use url::Url;
+
 /// 許可する送信先。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostRule {
@@ -95,78 +97,133 @@ impl fmt::Display for UrlError {
     }
 }
 
-/// 検証済み URL の構成要素。
-#[derive(Debug, PartialEq, Eq)]
-pub struct ParsedUrl<'a> {
-    pub host: &'a str,
-    /// クエリ・フラグメントを除いたパス（先頭は `/`）。
-    pub path: &'a str,
+/// 検証済み URL。**送信にはこの `url` を使う**。
+///
+/// 検証と実送信で同じ `url::Url`（WHATWG）の正規化結果を共有するための型。
+/// 生の文字列をそのまま送ると、`ureq` が送信時にもう一度解釈し直すため、
+/// 「検証したホスト・パス」と「実際に送るホスト・パス」が食い違い得る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedUrl {
+    /// 正規化済みの URL（`url::Url::as_str()` を送信に使う）。
+    pub url: Url,
+    /// 小文字化済みのホスト（`url.host_str()` 由来）。
+    pub host: String,
+    /// クエリ・フラグメントを除き、ドットセグメントを解決したパス（先頭は `/`）。
+    pub path: String,
 }
 
-/// `https://host[:443]/path` として解析する。`/` を伴わない authority も許す。
-pub fn parse(url: &str) -> Result<ParsedUrl<'_>, UrlError> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("HTTPS://"))
-        .ok_or(UrlError::NotHttps)?;
-    // authority は最初の `/` `?` `#` まで
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    if authority.is_empty() || authority.contains('@') {
-        return Err(UrlError::Malformed);
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (authority, None),
+/// 生のパスに「パーサが解決してしまう」表現が無いか。
+///
+/// - 生の `.` / `..` セグメント（`/downloadables/../../x` は実送信で `/x` になる）
+/// - `%2e` 系の符号化ドット（同じく解決される）
+///
+/// 正規のダウンロード URL には現れないので、解決せず**拒否**する（fail-closed）。
+fn raw_path_looks_ambiguous(url: &str) -> bool {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+    let path = match rest.find('/') {
+        Some(index) => &rest[index..],
+        None => "",
     };
-    if host.is_empty() {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    if path.to_ascii_lowercase().contains("%2e") {
+        return true;
+    }
+    path.split('/')
+        .any(|segment| segment == "." || segment == "..")
+}
+
+/// `https://host[:443]/path` を `url::Url`（WHATWG）で解析し、正規化済みの URL を返す。
+///
+/// 検証を手動の文字列分割でやると実送信の解釈と食い違う。`https://audit.invalid\.allowed.example/x`
+/// は authority の終端が `\` なので実ホストは `audit.invalid` になり、符号化ドット
+/// （`%2e%2e`）は解決されて許可プレフィックスの外へ出る。ここで同じパーサを通し、
+/// **返した URL をそのまま送信に使う**ことで「検証した宛先 = 送る宛先」にする。
+pub fn parse(url: &str) -> Result<ParsedUrl, UrlError> {
+    // 生のバックスラッシュは URL に現れない（special URL では区切りの意味になる）。
+    if url.contains('\\') {
         return Err(UrlError::Malformed);
     }
-    if let Some(port) = port
-        && port != "443"
+    if !url
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return Err(UrlError::NotHttps);
+    }
+    if raw_path_looks_ambiguous(url) {
+        return Err(UrlError::Malformed);
+    }
+    let parsed = Url::parse(url).map_err(|_| UrlError::Malformed)?;
+    if parsed.scheme() != "https" {
+        return Err(UrlError::NotHttps);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(UrlError::Malformed);
+    }
+    // `:443` は既定ポートなので `port()` は `None` になる（明示も許す）。
+    if let Some(port) = parsed.port()
+        && port != 443
     {
         return Err(UrlError::UnexpectedPort(port.to_string()));
     }
-    // パス（クエリ・フラグメントは落とす）
-    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
-    let path = if tail.starts_with('/') {
-        &tail[..path_end]
-    } else {
-        "/"
-    };
-    // `.` / `..` のセグメントは解決せず**拒否**する（`&str` を借用で返すため解決後の形を
-    // 持てない）。生の接頭辞だけで判定すると `…/downloadables/../../x` が通り、実際に
-    // 送られるパス（URL パーサが解決する）は `/x` になる＝許可リストの迂回になる。
-    // 正規のダウンロード URL にドットセグメントは現れないので fail-closed で足りる。
-    if path.split('/').any(|segment| segment == "." || segment == "..") {
+    let host = parsed
+        .host_str()
+        .ok_or(UrlError::Malformed)?
+        .to_ascii_lowercase();
+    if host.is_empty() {
         return Err(UrlError::Malformed);
     }
-    Ok(ParsedUrl { host, path })
+    Ok(ParsedUrl {
+        path: parsed.path().to_string(),
+        url: parsed,
+        host,
+    })
 }
 
-/// 許可ルールに照らして検証する。通れば解析結果を返す。
+/// 解析済み URL を許可ルールに照らす（**リダイレクトの各ホップ**の検証に使う）。
+///
+/// 正規化済みの `url.path()` で判定するので、エンコードの違いで許可プレフィックスを
+/// 迂回することはない（検証したパス = 実際に送るパス）。
+pub fn check_url(url: &Url, rules: &[HostRule]) -> Result<(), UrlError> {
+    if url.scheme() != "https" {
+        return Err(UrlError::NotHttps);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(UrlError::Malformed);
+    }
+    if let Some(port) = url.port()
+        && port != 443
+    {
+        return Err(UrlError::UnexpectedPort(port.to_string()));
+    }
+    let host = url.host_str().ok_or(UrlError::Malformed)?;
+    let path = url.path();
+    let mut host_matched = false;
+    for rule in rules {
+        if !host_matches(rule, host) {
+            continue;
+        }
+        host_matched = true;
+        match rule.path_prefix {
+            Some(prefix) if !path.starts_with(prefix) => continue,
+            _ => return Ok(()),
+        }
+    }
+    if host_matched {
+        return Err(UrlError::PathNotAllowed(path.to_string()));
+    }
+    Err(UrlError::HostNotAllowed(host.to_string()))
+}
+
+/// 許可ルールに照らして検証する。通れば**正規化済み URL**を返す（送信にはこれを使う）。
 ///
 /// 同じホストに複数のルールを並べられる（DLsite のストア別のように、パスだけが違う
 /// ルール）。そのため**ホストが一致したルールを全部見て**、どれかのパスに一致すれば許可し、
 /// ホストは一致したのにパスがどれにも一致しないときだけ `PathNotAllowed` を返す
 /// （最初のホスト一致で確定させると、2 本目以降のパスが効かない）。
-pub fn check<'a>(url: &'a str, rules: &[HostRule]) -> Result<ParsedUrl<'a>, UrlError> {
+pub fn check(url: &str, rules: &[HostRule]) -> Result<ParsedUrl, UrlError> {
     let parsed = parse(url)?;
-    let mut host_matched = false;
-    for rule in rules {
-        if !host_matches(rule, parsed.host) {
-            continue;
-        }
-        host_matched = true;
-        match rule.path_prefix {
-            Some(prefix) if !parsed.path.starts_with(prefix) => continue,
-            _ => return Ok(parsed),
-        }
-    }
-    if host_matched {
-        return Err(UrlError::PathNotAllowed(parsed.path.to_string()));
-    }
-    Err(UrlError::HostNotAllowed(parsed.host.to_string()))
+    check_url(&parsed.url, rules)?;
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -296,6 +353,51 @@ mod tests {
         ));
         // 443 の明示は許す
         assert!(check("https://booth.pm:443/downloadables/1", RULES).is_ok());
+    }
+
+    /// 実送信は `url::Url`（WHATWG）で解釈されるため、検証も同じ解釈に合わせる。
+    /// バックスラッシュは special URL の authority 終端として扱われ、実ホストが変わる。
+    /// 手動分割では `audit.invalid\.contents.doujin.dmm.co.jp` が許可サブドメインに
+    /// 見えてしまう（＝実送信先 `audit.invalid` へ署名 Cookie が飛ぶ）。
+    #[test]
+    fn backslash_in_the_authority_is_not_a_subdomain_of_the_allowed_host() {
+        const CDN: &[HostRule] = &[HostRule::with_subdomains("contents.doujin.dmm.co.jp", None)];
+        let url = "https://audit.invalid\\.contents.doujin.dmm.co.jp/book.zip";
+        assert!(
+            matches!(
+                check(url, CDN),
+                Err(UrlError::Malformed) | Err(UrlError::HostNotAllowed(_))
+            ),
+            "バックスラッシュで許可ホストを偽装できている: {url}"
+        );
+    }
+
+    /// パーセント符号化されたドットセグメントは WHATWG が解決するため、正規化後の
+    /// パスは許可プレフィックスの外に出る（`/downloadables/%2e%2e/x` → `/x`）。
+    /// 生の接頭辞だけで見ると通ってしまうので fail-closed で拒否する。
+    #[test]
+    fn percent_encoded_dot_segments_in_the_path_are_rejected() {
+        for url in [
+            "https://booth.pm/downloadables/%2e%2e/audit-only",
+            "https://booth.pm/downloadables/%2E%2E/audit-only",
+            "https://booth.pm/downloadables/.%2e/audit-only",
+        ] {
+            assert!(
+                matches!(check(url, RULES), Err(UrlError::Malformed)),
+                "符号化ドットでパスの許可リストを迂回できている: {url}"
+            );
+        }
+    }
+
+    /// 検証結果は正規化済み URL を持ち、送信にはこれを使う（検証した宛先 = 送る宛先）。
+    #[test]
+    fn check_returns_the_canonical_url_that_must_be_sent() {
+        let parsed =
+            check("https://BOOTH.pm:443/downloadables/1?x=1", RULES).expect("許可されるはず");
+        // ホストの小文字化・既定ポートの除去が済んだ形（この文字列を送る）
+        assert_eq!(parsed.url.as_str(), "https://booth.pm/downloadables/1?x=1");
+        assert_eq!(parsed.host, "booth.pm");
+        assert_eq!(parsed.path, "/downloadables/1");
     }
 
     #[test]

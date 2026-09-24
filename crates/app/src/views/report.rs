@@ -5,15 +5,15 @@
 //! 利用者が差し替えられるのは、誘導された利用者に別のリポジトリへ文面（と
 //! スクリーンショット）を送らせる余地になるため。
 //! テンプレートは Contents API から取得し、[`compose_body`] で本文の下書きに展開する。
-//! 画像は user-attachments へ上げて本文の末尾に `![file](url)` を足す（失敗しても
-//! 本文だけで投稿できる）。
+//! 画像は選択時に**ローカルへ保持するだけ**にし（ファイル名・MIME・実体）、送信時に
+//! user-attachments へ上げて本文の末尾に `![file](url)` を足す（`submit_report`）。
+//! **送信を押すまで外部へ送らない**。アップロードに失敗したら Issue は作らず
+//! （本文だけの Issue を勝手に立てない）、下書きと添付を残して再試行できるようにする。
 //!
 //! ネットワークも `rfd` のファイル選択も UI スレッドでは実行しない。HTTP は
 //! `background_executor` に投げ、完了は `cx.spawn` で受ける。入力欄は `Window` が
 //! 要るため render の冒頭で遅延生成する（`new` は `cx.new(ReportView::new)` から
 //! 呼ばれるので `Window` を持てない）。
-
-use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Disableable as _;
@@ -30,9 +30,9 @@ use gpui_kit::{
     ParentElement, ReadGlobal as _, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Window, div, px,
 };
-use parking_lot::Mutex;
 use thundoku_core::github::{
-    GithubClient, GithubError, IssueTemplate, TemplateField, TemplateFieldKind,
+    GithubError, IMAGE_EXTENSIONS, IssueAttachment, IssueTemplate, MAX_IMAGE_BYTES, TemplateField,
+    TemplateFieldKind, read_attachment,
 };
 
 use crate::app_state::{
@@ -54,32 +54,6 @@ const LOGIN_REQUIRED: &str = "GitHub にログインするとレポートを送�
 
 /// 本文入力の高さ。これより長い本文は入力欄の中でスクロールする。
 const BODY_HEIGHT: f32 = 280.0;
-
-/// 添付できる画像の拡張子（`rfd` のフィルタと MIME 判定で同じ並びを使う）。
-const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
-
-/// 添付できる画像の上限サイズ。GitHub 側の上限（10MB）に合わせて手前で弾く。
-/// 大きいファイルを選んだまま無言でアップロードを始めないための確認でもある。
-const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
-
-/// 本文に貼る alt テキストを作る。
-///
-/// ファイル名はローカル FS 由来の任意文字列で、`]` `)` などが入ると Markdown の
-/// リンク構造を壊し、外部 URL を本文に紛れ込ませられる（テンプレート文面を
-/// そのまま流し込むのと同じ理由で、そのままは使わない）。
-fn markdown_alt(file_name: &str) -> String {
-    let cleaned: String = file_name
-        .chars()
-        .filter(|c| !matches!(c, '[' | ']' | '(' | ')' | '\\' | '\n' | '\r'))
-        .take(80)
-        .collect();
-    let cleaned = cleaned.trim();
-    if cleaned.is_empty() {
-        "画像".to_string()
-    } else {
-        cleaned.to_string()
-    }
-}
 
 /// 説明文を引用（blockquote）にして本文の下書きに載せる。
 fn quote(text: &str) -> String {
@@ -173,8 +147,12 @@ pub(crate) fn error_message(error: &GithubError) -> String {
         GithubError::IssuesDisabled(repo) => {
             format!("{repo} では Issue が無効になっています（投稿できません）")
         }
+        // 上げられないと Issue も作らない（fail-closed）。「外す」で添付を外せば
+        // 本文だけで送れるので、そこへ誘導する。
         GithubError::AssetUploadDenied => {
-            "画像を添付できませんでした（本文のみで投稿できます）".to_string()
+            "画像を添付できませんでした（対象リポジトリへの書き込み権限が必要です）。\
+             「外す」で添付を外すと本文だけで送れます"
+                .to_string()
         }
         // 投稿先は固定なので、404 は「アプリが古い（リポジトリが移動/改名された）」か
         // 「リポジトリが削除された」ことを意味する。設定を直しても解決しない。
@@ -194,103 +172,32 @@ pub(crate) fn error_message(error: &GithubError) -> String {
     }
 }
 
-/// 拡張子から画像の MIME を決める（`IMAGE_EXTENSIONS` 以外は PNG として送る）。
-fn image_content_type(path: &std::path::Path) -> &'static str {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") => {
-            "image/jpeg"
-        }
-        Some(ext) if ext.eq_ignore_ascii_case("gif") => "image/gif",
-        Some(ext) if ext.eq_ignore_ascii_case("webp") => "image/webp",
-        _ => "image/png",
-    }
-}
-
-/// 画像添付の結果（背景スレッド → UI）。
-enum AttachmentOutcome {
+/// 画像の選択の結果（背景スレッド → UI）。
+enum PickOutcome {
     /// ファイル選択がキャンセルされた（画面には何も出さない）。
     Cancelled,
-    /// アップロードできた（ファイル名と本文に貼る URL）。
-    Uploaded { file_name: String, url: String },
-    /// アップロード前に分かった問題（サイズ超過など）。GitHub 側の失敗と区別する。
+    /// 読み込めた（送信時にアップロードする）。
+    Picked(IssueAttachment),
+    /// 読み込めなかった理由（サイズ超過・読み取り失敗）。そのまま画面に出す。
     Rejected(String),
-    /// 失敗（理由は種別ごとに文言化する）。
-    Failed(GithubError),
 }
 
-/// 背景でファイルを選び、`user-attachments` へ上げて URL を返す。
+/// 背景でファイルを選び、送信までローカルに持つ（**この時点では GitHub へ送らない**）。
 ///
 /// ファイル選択ダイアログは UI スレッドをブロックしうるので、この関数ごと
 /// 背景で実行する（`Window` を触らないので UI 側と競合しない）。
-fn pick_and_upload(
-    github: &Arc<Mutex<Option<GithubClient>>>,
-    owner: &str,
-    repo: &str,
-) -> AttachmentOutcome {
+fn pick_image() -> PickOutcome {
     let Some(path) = rfd::FileDialog::new()
         .set_title("本文に添付する画像を選択")
         .add_filter("画像", &IMAGE_EXTENSIONS[..])
         .pick_file()
     else {
-        return AttachmentOutcome::Cancelled;
+        return PickOutcome::Cancelled;
     };
-    let Some(file_name) = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-    else {
-        return AttachmentOutcome::Failed(GithubError::InvalidResponse(
-            "ファイル名が取得できない".to_string(),
-        ));
-    };
-    let bytes = match std::fs::metadata(&path) {
-        Ok(meta) if meta.len() > MAX_IMAGE_BYTES => {
-            return AttachmentOutcome::Rejected(format!(
-                "{file_name} は大きすぎます（上限 {}MB）",
-                MAX_IMAGE_BYTES / (1024 * 1024)
-            ));
-        }
-        _ => match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return AttachmentOutcome::Failed(GithubError::Network(format!(
-                    "{file_name}: {error}"
-                )));
-            }
-        },
-    };
-    let mut guard = github.lock();
-    let Some(client) = guard.as_mut() else {
-        return AttachmentOutcome::Failed(GithubError::NotAuthorized);
-    };
-    let repo_id = match client.repository_id(owner, repo) {
-        Ok(repo_id) => repo_id,
-        Err(error) => return AttachmentOutcome::Failed(error),
-    };
-    let content_type = image_content_type(&path);
-    match client.upload_asset(repo_id, &file_name, content_type, &bytes) {
-        Ok(url) => AttachmentOutcome::Uploaded { file_name, url },
-        Err(error) => AttachmentOutcome::Failed(error),
+    match read_attachment(&path, MAX_IMAGE_BYTES) {
+        Ok(attachment) => PickOutcome::Picked(attachment),
+        Err(message) => PickOutcome::Rejected(message),
     }
-}
-
-/// 添付 1 件の表示（[`Attachment`] チップに載せる）。
-#[derive(Clone)]
-struct AttachmentView {
-    status: AttachmentStatus,
-    title: String,
-    /// 追加の説明（無いときは空文字。チップ側で出し分ける）。
-    description: String,
-}
-
-/// 背景タスクの完了時に溜める本文の更新。
-///
-/// [gpui_kit::component::input::InputState] の `set_value` は `Window` を要るが、
-/// 背景タスクの完了時には無いので、次の render で反映する。
-enum PendingBody {
-    /// 本文の末尾に足す（画像の添付）。
-    Append(String),
-    /// タイトルと本文を空にする（送信の成功）。
-    Clear,
 }
 
 /// 送信した時点の下書き（成功時に「まだ同じ内容か」を見るために持つ）。
@@ -326,12 +233,15 @@ pub struct ReportView {
     busy: bool,
     /// 送信した時点の下書き（成功時にクリアしてよいかの判定に使う）。
     snapshot: Option<SubmitSnapshot>,
-    /// 画像の添付中（二重実行防止）。
+    /// 画像の添付中（ファイル選択ダイアログを開いている。二重実行防止）。
     attaching: bool,
-    /// 直近の画像添付の状態（チップ表示）。
-    attachment: Option<AttachmentView>,
-    /// 背景タスクから受け取った本文の更新（次の render で反映する）。
-    pending_body: Option<PendingBody>,
+    /// 選択済みの画像（送信時にこの順でアップロードする）。
+    attachments: Vec<IssueAttachment>,
+    /// 送信が成功したので、次の render で入力欄を空にする。
+    ///
+    /// [gpui_kit::component::input::InputState] の `set_value` は `Window` を要るが、
+    /// 背景タスクの完了時には無いので、次の render で反映する。
+    clear_draft: bool,
     /// 画面に赤字で出す送信エラー。
     error: Option<String>,
 }
@@ -349,8 +259,8 @@ impl ReportView {
             busy: false,
             snapshot: None,
             attaching: false,
-            attachment: None,
-            pending_body: None,
+            attachments: Vec::new(),
+            clear_draft: false,
             error: None,
         }
     }
@@ -366,7 +276,7 @@ impl ReportView {
         if self.body_input.is_none() {
             let state = cx.new(|cx| {
                 TextareaState::new(window, cx).placeholder(
-                    "テンプレートを選ぶと下書きが入ります。画像は本文の末尾に足されます。",
+                    "テンプレートを選ぶと下書きが入ります。画像は送信時に本文の末尾へ足されます。",
                 )
             });
             self.body_input = Some(state);
@@ -451,9 +361,8 @@ impl ReportView {
         };
         self.selected_template = Some(template.file_name.clone());
         self.error = None;
-        // 本文を下書きで置き換えるので、前に足した画像の Markdown は消える。
-        // チップだけ残すと「添付したのに本文に無い」状態になるため一緒に消す。
-        self.attachment = None;
+        // 添付は本文とは別にローカルへ持っているので、テンプレートを選び直しても
+        // 消さない（本文へ貼るのは送信時）。
         let title = template.title.clone().unwrap_or_default();
         let body = compose_body(&template.fields);
         if let Some(input) = self.title_input.clone() {
@@ -465,10 +374,11 @@ impl ReportView {
         cx.notify();
     }
 
-    /// 「画像を添付」: 選んだ画像を上げて、本文の末尾に `![file](url)` を足す。
-    /// 失敗しても本文だけで投稿できる。
+    /// 「画像を添付」: 選んだ画像を送信までローカルに持つ。
+    ///
+    /// **ここでは GitHub へ送らない**（送信を押したときに `submit_report` が上げる）。
     fn attach_image(&mut self, cx: &mut Context<Self>) {
-        // 送信中に添付を始めると、本文へ足す処理と送信後のクリアが競合する。
+        // 送信中に選び始めると、送信へ渡した添付と画面の一覧が食い違う。
         if self.attaching || self.busy {
             return;
         }
@@ -477,72 +387,23 @@ impl ReportView {
             cx.notify();
             return;
         }
-        let (owner, repo) = (TARGET_REPO_OWNER.to_string(), TARGET_REPO_NAME.to_string());
         self.attaching = true;
         self.error = None;
-        self.attachment = Some(AttachmentView {
-            status: AttachmentStatus::Uploading,
-            title: "画像を選択しています…".to_string(),
-            description: String::new(),
-        });
         cx.notify();
-        let github = AppState::global(cx).github.clone();
         let handle = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move { pick_and_upload(&github, &owner, &repo) })
+                .spawn(async move { pick_image() })
                 .await;
             let _ = handle.update(cx, |this, cx| {
                 this.attaching = false;
                 match outcome {
-                    // キャンセルは失敗ではない（チップも残さない）。
-                    AttachmentOutcome::Cancelled => this.attachment = None,
-                    AttachmentOutcome::Uploaded { file_name, url } => {
-                        // ファイル名はそのまま alt に使わない（Markdown を壊せる）。
-                        this.pending_body = Some(PendingBody::Append(format!(
-                            "![{}]({url})",
-                            markdown_alt(&file_name)
-                        )));
-                        this.attachment = Some(AttachmentView {
-                            status: AttachmentStatus::Complete,
-                            title: format!("{file_name} を添付しました"),
-                            description: String::new(),
-                        });
-                    }
-                    AttachmentOutcome::Rejected(reason) => {
-                        this.attachment = Some(AttachmentView {
-                            status: AttachmentStatus::Failed,
-                            title: reason,
-                            description: "本文のみで投稿できます".to_string(),
-                        });
-                    }
-                    AttachmentOutcome::Failed(error) => {
-                        log::warn!("report: 画像を添付できませんでした: {error}");
-                        // 失効したトークンならログイン状態を解除して再ログインへ誘導する。
-                        if matches!(error, GithubError::Auth(_)) {
-                            // 失効したトークンは keyring からも消す。削除は OS の応答待ちで
-                            // 止まり得るので背景で行い、結果は待たない（メモリ上の状態は
-                            // すぐ落として再ログインできるようにする）。
-                            clear_github_session(cx);
-                            cx.background_executor()
-                                .spawn(async move {
-                                    let _ = delete_github_token_secret();
-                                })
-                                .detach();
-                        }
-                        // write 権限が無いだけの失敗は、それ以上の説明が無い。
-                        let detail = match error {
-                            GithubError::AssetUploadDenied => String::new(),
-                            other => error_message(&other),
-                        };
-                        this.attachment = Some(AttachmentView {
-                            status: AttachmentStatus::Failed,
-                            title: "画像を添付できませんでした（本文のみで投稿できます）"
-                                .to_string(),
-                            description: detail,
-                        });
-                    }
+                    // キャンセルは失敗ではない（画面には何も出さない）。
+                    PickOutcome::Cancelled => {}
+                    PickOutcome::Picked(attachment) => this.attachments.push(attachment),
+                    // 読めなかった理由をそのまま出す（選び直せばよい）。
+                    PickOutcome::Rejected(reason) => this.error = Some(reason),
                 }
                 cx.notify();
             });
@@ -550,9 +411,21 @@ impl ReportView {
         .detach();
     }
 
-    /// 「Issue を作成」: 背景で `create_issue` を呼び、成功したら通知してフォームを空にする。
+    /// 「外す」: 選択した添付を 1 件外す（ローカルで捨てるだけ。HTTP はしない）。
+    ///
+    /// アップロードできないまま送信が失敗し続けるときの出口でもある。
+    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.busy || index >= self.attachments.len() {
+            return;
+        }
+        self.attachments.remove(index);
+        cx.notify();
+    }
+
+    /// 「Issue を作成」: 背景で添付を上げて `create_issue` を呼び、成功したら
+    /// 通知してフォームを空にする。
     fn submit(&mut self, cx: &mut Context<Self>) {
-        // 添付中に送ると、本文へ足す処理と送信後のクリアが競合して内容が入れ替わる。
+        // 添付中に送ると、選択中の一覧が送信へ渡したものと食い違う。
         if self.busy || self.attaching {
             return;
         }
@@ -593,20 +466,33 @@ impl ReportView {
             .map(|template| template.labels.clone())
             .unwrap_or_default();
         let (owner, repo) = (owner.to_string(), repo.to_string());
+        // 添付は背景タスクへ渡し、完了時に戻す。失敗したときは URL が確定した分も
+        // そのまま返ってくるので、再試行で上げ直さない（渡している間は一覧を出さない）。
+        let mut attachments = std::mem::take(&mut self.attachments);
         self.busy = true;
         self.error = None;
         cx.notify();
         let github = AppState::global(cx).github.clone();
         let handle = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            let result = cx
+            let (result, attachments) = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut guard = github.lock();
-                    match guard.as_mut() {
-                        Some(client) => client.create_issue(&owner, &repo, &title, &body, &labels),
-                        None => Err(GithubError::NotAuthorized),
-                    }
+                    let result = {
+                        let mut guard = github.lock();
+                        match guard.as_mut() {
+                            Some(client) => client.submit_report(
+                                &owner,
+                                &repo,
+                                &title,
+                                &body,
+                                &labels,
+                                &mut attachments,
+                            ),
+                            None => Err(GithubError::NotAuthorized),
+                        }
+                    };
+                    (result, attachments)
                 })
                 .await;
             let _ = handle.update(cx, |this, cx| {
@@ -621,10 +507,12 @@ impl ReportView {
                             .take()
                             .is_some_and(|snapshot| draft_unchanged(&snapshot, &title, &body));
                         if unchanged {
-                            this.attachment = None;
                             this.selected_template = None;
-                            this.pending_body = Some(PendingBody::Clear);
+                            this.clear_draft = true;
                         }
+                        // 送った画像は Issue に付いている。次の下書きへ持ち越すと
+                        // 同じ画像を別の Issue にも貼ることになるので、ここで捨てる
+                        // （`attachments` は戻さない）。
                         set_toast_kind(
                             cx,
                             ToastKind::Success,
@@ -633,6 +521,8 @@ impl ReportView {
                     }
                     Err(error) => {
                         log::error!("report: Issue を作成できませんでした: {error}");
+                        // 失敗した分は画面へ戻す（下書きと添付を残して再試行できる）。
+                        this.attachments = attachments;
                         this.snapshot = None;
                         // トークンが失効/取り消しされている場合は、ログイン状態を解除して
                         // 再ログインできる状態に戻す（keyring からも消す）。そうしないと
@@ -672,35 +562,17 @@ impl ReportView {
         (title, body)
     }
 
-    /// 背景タスクから受け取った本文の更新を反映する（次の render で呼ぶ）。
-    fn apply_pending_body(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_body.take() else {
+    /// 送信の成功で入力欄を空にする（次の render で反映する）。
+    fn apply_clear_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.clear_draft {
             return;
-        };
-        match pending {
-            PendingBody::Append(markdown) => {
-                let Some(input) = self.body_input.clone() else {
-                    return;
-                };
-                input.update(cx, |state, cx| {
-                    let current = state.value();
-                    let current = current.trim_end();
-                    let value = if current.is_empty() {
-                        markdown
-                    } else {
-                        format!("{current}\n\n{markdown}")
-                    };
-                    state.set_value(value, window, cx);
-                });
-            }
-            PendingBody::Clear => {
-                if let Some(input) = self.title_input.clone() {
-                    input.update(cx, |state, cx| state.set_value("", window, cx));
-                }
-                if let Some(input) = self.body_input.clone() {
-                    input.update(cx, |state, cx| state.set_value("", window, cx));
-                }
-            }
+        }
+        self.clear_draft = false;
+        if let Some(input) = self.title_input.clone() {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        if let Some(input) = self.body_input.clone() {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
         }
     }
 
@@ -764,6 +636,51 @@ impl ReportView {
             .into_any_element()
     }
 
+    /// 選択済みの添付 1 件分の行（チップ + 外すボタン）。
+    fn attachment_row(
+        handle: Entity<Self>,
+        index: usize,
+        attachment: &IssueAttachment,
+        busy: bool,
+    ) -> gpui_kit::AnyElement {
+        // 送信で URL が確定したものは再試行でも上げ直さない（その旨を出す）。
+        let (status, description) = match attachment.url.is_some() {
+            true => (
+                AttachmentStatus::Complete,
+                "アップロード済み（再試行では再送しません）",
+            ),
+            false => (
+                AttachmentStatus::Pending,
+                "Issue 送信時にアップロードします",
+            ),
+        };
+        let file_name = SharedString::from(attachment.file_name.clone());
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                Attachment::new().status(status).content(
+                    AttachmentContent::new()
+                        .title(AttachmentTitle::new(file_name))
+                        .description(AttachmentDescription::new(description)),
+                ),
+            )
+            .child(
+                Button::new(SharedString::from(format!("report-attach-remove-{index}")))
+                    .outline()
+                    .cursor_pointer()
+                    .disabled(busy)
+                    .label("外す")
+                    .debug_selector(move || format!("report-attach-remove-{index}"))
+                    .on_click(move |_, _window, cx| {
+                        handle.update(cx, |this, cx| this.remove_attachment(index, cx));
+                    }),
+            )
+            .into_any_element()
+    }
+
     /// テンプレート 1 件分の選択行。
     fn template_row(
         handle: Entity<Self>,
@@ -816,7 +733,7 @@ impl ReportView {
 impl Render for ReportView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inputs(window, cx);
-        self.apply_pending_body(window, cx);
+        self.apply_clear_draft(window, cx);
         self.ensure_templates(cx);
 
         let logged_in = *AppState::global(cx).github_logged_in.lock();
@@ -825,7 +742,6 @@ impl Render for ReportView {
         let error = self.error.clone();
         let templates_error = self.templates_error.clone();
         let templates_loading = self.templates_loading;
-        let attachment = self.attachment.clone();
         let selected = self.selected_template.clone();
         let border = cx.theme().border;
         let muted_fg = cx.theme().muted_foreground;
@@ -848,6 +764,15 @@ impl Render for ReportView {
                     selected.as_deref() == Some(template.file_name.as_str()),
                     cx,
                 )
+            })
+            .collect();
+        // 選択済みの添付（送信時にこの順でアップロードする）。
+        let attachment_rows: Vec<gpui_kit::AnyElement> = self
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                Self::attachment_row(handle.clone(), index, attachment, busy)
             })
             .collect();
 
@@ -1028,6 +953,8 @@ impl Render for ReportView {
                                         Button::new("report-attach")
                                             .outline()
                                             .cursor_pointer()
+                                            // ダイアログを開いている間は押せない（二重に開かない）。
+                                            .loading(attaching)
                                             .disabled(attaching || busy || !logged_in)
                                             .label("画像を添付")
                                             .debug_selector(|| "report-attach".to_string())
@@ -1041,25 +968,12 @@ impl Render for ReportView {
                                             }),
                                     )
                                     .child(div().text_xs().text_color(muted_fg).child(
-                                        "画像は GitHub へアップロードし、本文の末尾へ貼ります",
+                                        "選択した画像は Issue 送信時にアップロードし、\
+                                         本文の末尾へ貼ります",
                                     )),
                             )
-                            // 添付の状態
-                            .child(if let Some(view) = attachment {
-                                let content = if view.description.is_empty() {
-                                    AttachmentContent::new().title(AttachmentTitle::new(view.title))
-                                } else {
-                                    AttachmentContent::new()
-                                        .title(AttachmentTitle::new(view.title))
-                                        .description(AttachmentDescription::new(view.description))
-                                };
-                                Attachment::new()
-                                    .status(view.status)
-                                    .content(content)
-                                    .into_any_element()
-                            } else {
-                                div().into_any_element()
-                            })
+                            // 選択済みの添付（送信時までローカルに持つ）
+                            .children(attachment_rows)
                             // 送信の失敗（赤字）
                             .child(if let Some(message) = error {
                                 div()

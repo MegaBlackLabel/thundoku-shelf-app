@@ -37,17 +37,42 @@ pub enum DriveError {
     Http(u16, String),
     #[error("invalid drive response: {0}")]
     InvalidResponse(String),
+    /// 進捗コールバックが中止を要求した（部分的な本文は取り込まない）。
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl From<TbfError> for DriveError {
     fn from(value: TbfError) -> Self {
-        DriveError::Network(value.to_string())
+        match value {
+            TbfError::Cancelled => DriveError::Cancelled,
+            other => DriveError::Network(other.to_string()),
+        }
     }
 }
 
 pub trait DriveApi {
     fn list_files(&mut self, folder_id: &str) -> Result<Vec<DriveFile>, DriveError>;
     fn download(&mut self, file_id: &str) -> Result<Vec<u8>, DriveError>;
+
+    /// 進捗つきの取得（pack / DB JSON のような**大きくなり得る本文**用）。
+    ///
+    /// 通常の API 応答は `Transport::send` の上限（16MiB）で打ち切られるが、この経路は
+    /// ダウンロード用の上限（2GiB）と進捗・キャンセルを使う。既定実装は
+    /// [`Self::download`] に委譲する（テストのモック用。本番は `DriveClient` が上書きする）。
+    fn download_with_progress(
+        &mut self,
+        file_id: &str,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<Vec<u8>, DriveError> {
+        let bytes = self.download(file_id)?;
+        let total = bytes.len() as u64;
+        if !on_progress(total, total) {
+            return Err(DriveError::Cancelled);
+        }
+        Ok(bytes)
+    }
+
     /// Returns the new file id.
     fn upload_multipart(
         &mut self,
@@ -170,8 +195,35 @@ impl DriveApi for DriveClient {
     }
 
     fn download(&mut self, file_id: &str) -> Result<Vec<u8>, DriveError> {
+        self.download_with_progress(file_id, &mut |_, _| true)
+    }
+
+    fn download_with_progress(
+        &mut self,
+        file_id: &str,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<Vec<u8>, DriveError> {
         let url = format!("{DRIVE_FILES_URL}/{file_id}?alt=media");
-        let response = self.request("GET", &url, &[], None, 5)?;
+        let headers = vec![(
+            "Authorization".to_string(),
+            format!("Bearer {}", self.access_token),
+        )];
+        // 通常 API（`send`）は応答本文を `MAX_API_BODY_BYTES`（16MiB）で打ち切るため、
+        // pack や DB JSON は「保存できたのに戻せない」状態になっていた。取得は
+        // ダウンロード用の経路（2GiB + 進捗 + キャンセル）を通す。
+        let response = self
+            .transport
+            .send_download(
+                RequestSpec {
+                    method: "GET".to_string(),
+                    url,
+                    headers,
+                    body: None,
+                    redirects: 5,
+                },
+                on_progress,
+            )
+            .map_err(DriveError::from)?;
         if !(200..300).contains(&response.status) {
             return Err(DriveError::Http(
                 response.status,
@@ -295,6 +347,8 @@ fn percent_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     #[test]
     fn parse_size_accepts_number_and_string() {
@@ -303,5 +357,77 @@ mod tests {
         assert_eq!(parse_size(&serde_json::json!("12345")), Some(12345));
         assert_eq!(parse_size(&serde_json::json!("abc")), None);
         assert_eq!(parse_size(&serde_json::json!(null)), None);
+    }
+
+    /// pack / DB JSON は 16MiB を超え得る。通常 API（`send`）は応答本文を
+    /// `MAX_API_BODY_BYTES`（16MiB）で打ち切るため、取得は**ダウンロード用の経路**
+    /// （2GiB + 進捗/キャンセル）を通すこと。
+    #[test]
+    fn download_uses_the_streaming_path_instead_of_the_api_cap() {
+        struct StreamingOnly {
+            api_calls: Arc<Mutex<usize>>,
+        }
+        impl Transport for StreamingOnly {
+            fn send(&mut self, _spec: RequestSpec) -> Result<ResponseSpec, TbfError> {
+                *self.api_calls.lock() += 1;
+                Err(TbfError::Upstream(
+                    "応答本文が上限（16777216 バイト）を超えました".into(),
+                ))
+            }
+
+            fn send_download(
+                &mut self,
+                _spec: RequestSpec,
+                on_progress: &mut dyn FnMut(u64, u64) -> bool,
+            ) -> Result<ResponseSpec, TbfError> {
+                let body = vec![7u8; 17 * 1024 * 1024];
+                if !on_progress(body.len() as u64, body.len() as u64) {
+                    return Err(TbfError::Cancelled);
+                }
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: Vec::new(),
+                    body,
+                })
+            }
+        }
+
+        let api_calls = Arc::new(Mutex::new(0usize));
+        let mut client = DriveClient::new(
+            Box::new(StreamingOnly {
+                api_calls: api_calls.clone(),
+            }),
+            "token",
+        );
+        let bytes = client
+            .download("file-1")
+            .expect("16MiB を超える pack が取得できるはず");
+        assert_eq!(bytes.len(), 17 * 1024 * 1024);
+        assert_eq!(
+            *api_calls.lock(),
+            0,
+            "通常 API（16MiB 上限）の経路を使っている"
+        );
+    }
+
+    /// 進捗コールバックが `false` を返したら中止する（部分的な本文を返さない）。
+    #[test]
+    fn download_with_progress_reports_cancellation() {
+        struct FixedBody(Vec<u8>);
+        impl Transport for FixedBody {
+            fn send(&mut self, _spec: RequestSpec) -> Result<ResponseSpec, TbfError> {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: self.0.clone(),
+                })
+            }
+        }
+
+        let mut client = DriveClient::new(Box::new(FixedBody(vec![1u8; 1024])), "token");
+        let error = client
+            .download_with_progress("file-1", &mut |_, _| false)
+            .expect_err("中止が伝わっていない");
+        assert!(matches!(error, DriveError::Cancelled), "{error:?}");
     }
 }

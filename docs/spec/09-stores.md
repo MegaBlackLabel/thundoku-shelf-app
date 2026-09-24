@@ -12,23 +12,53 @@
 ### 7.0 ストア横断サマリ
 
 **ダウンロード URL の検証（全ストア共通）**: セッション Cookie / XSRF を付けた送信は、
-送信直前に `download_url::check`（`crates/core/src/download_url.rs`）で `https` + 許可
+送信直前に `download_url::check`（`crates/core/src/download_url.rs:223-227`）で `https` + 許可
 ホスト（+ 必要なパス）を検証する。理由は `bookshelf_items.download_url` が Drive の
 JSON バックアップから復元でき、改変したバックアップを復元させると外部ホストへ Cookie が
-送られるため。302 を手動追跡する経路（DLsite / FANZA）は `Location` も検証する。
+送られるため。**検証は `url::Url`（WHATWG）の正規化結果で行い、送信にも同じ正規化済み URL を使う**:
+`check` = `parse`（`:141-176`）+ `check_url`（`:186-217`）で、返る
+`ParsedUrl { url, host, path }` の `url.as_str()` を**そのまま送信 URL** にする
+（検証した宛先 = 送る宛先。生の文字列を別に送り直すと `ureq` が送信時にもう一度解釈し、
+「検証したホスト・パス」と「実際に送るホスト・パス」が食い違い得る）。
+`parse` は生のバックスラッシュ・生の `.` / `..` セグメント・`%2e` 系の符号化ドットを
+`Malformed` で拒否する（いずれも実送信時に解決されて別のホスト・パスになる。fail-closed）。
+**302 は `ureq` に自動追跡させず、各ホップを検証して自前で追う**（DLsite / FANZA / 技術書典 /
+BOOTH のすべて）。
 
 | ストア | 検証点 | 許可（ホスト / パス） |
 |---|---|---|
-| BOOTH | `download_with_progress`（Cookie 付与の前） | `booth.pm` + `/downloadables/`（完全一致） |
-| DLsite | `down_url` | `www.dlsite.com`（完全一致）+ `/{store}/download/`（`store` は同期対象の `STORES` = maniax / home / books / ai） |
-| DLsite | 302 の `Location`（CDN） | `download.dlsite.com`（完全一致。実測値） |
+| BOOTH | `download_with_progress` の**起点**（Cookie 付与の前）+ 各ホップ | `booth.pm` + `/downloadables/`（完全一致。S3 へは**資格情報を載せずに**追う） |
+| DLsite | `down_url`（proxy） | `www.dlsite.com`（完全一致）+ `/{store}/download/`（`store` は同期対象の `STORES` = maniax / home / books / ai） |
+| DLsite | 302 の `Location`（CDN）+ **以降の各ホップ** | `download.dlsite.com`（完全一致。実測値） |
 | FANZA | proxy URL | `www.dmm.co.jp`（完全一致）+ `/dc/-/proxy/`（実測 2026-09-23） |
-| FANZA | 302 の `Location`（CDN） | `contents.doujin.dmm.co.jp` とそのサブドメイン（実測は **2 種類**: `doujin.contents.doujin.dmm.co.jp` / `doujin03.contents.doujin.dmm.co.jp`。どちらも配下） |
-| 技術書典 | `resolve_download_url` の入力 | `techbookfest.org`（完全一致） |
-| 技術書典 | `download_with_progress`（本体） | `techbookfest.org` + `/api/product-dlc/`、`storage.googleapis.com` + `/tbf-tokyo-product-dlc/`。**許可 = Cookie を付けるではない**: `Cookie` / `X-XSRF-TOKEN` は宛先が `techbookfest.org` のときだけ付ける（GCS は配布先であってセッションの宛先ではない） |
+| FANZA | 302 の `Location`（CDN）+ **以降の各ホップ** | `contents.doujin.dmm.co.jp` とそのサブドメイン（実測は **2 種類**: `doujin.contents.doujin.dmm.co.jp` / `doujin03.contents.doujin.dmm.co.jp`。どちらも配下） |
+| 技術書典 | `resolve_download_url` の入力（3xx の `Location` は `validate_download_url` で判定） | `techbookfest.org`（完全一致） |
+| 技術書典 | `download_with_progress`（本体 + **各ホップ**） | `techbookfest.org` + `/api/product-dlc/`、`storage.googleapis.com` + `/tbf-tokyo-product-dlc/`。**許可 = Cookie を付けるではない**: `Cookie` / `X-XSRF-TOKEN` は宛先が `techbookfest.org` のときだけ付ける（GCS は配布先であってセッションの宛先ではない） |
 
 検証に失敗したら**リクエストを送らずに** `BlockedUrl` を返す
 （`crates/core/tests/download_credentials.rs` で「1 件も送らないこと」を確認している）。
+
+**リダイレクトの各ホップ検証（`crates/core/src/tbf/redirect.rs`）**: 302 は
+`send_with_validated_redirects(transport, spec, max_hops, rules, credentials, on_progress)`
+（`:28-95`）が自前で追う。規則は
+
+1. 各ホップの `Location` を `Url::join` で解決する（`ureq` と同じ解釈）。
+2. `download_url::check_url` で `https` + 許可ルールを検証する（**起点も送信前に検証**＝呼び出し側の
+   `check` と二重の関門。`:36-40`）。
+3. `https` 以外（ダウングレード）へは転送しない。上限超過も拒否（どちらも `TbfError::BlockedUrl`）。
+4. 各ホップの送信は `Transport::send_download`（`RequestSpec.redirects = 0`。`:62-70`）。
+5. **資格情報（`Cookie` / `X-XSRF-TOKEN` / `Authorization`）は毎ホップ `credentials(&Url)` で宛先ごとに
+   組み立て直す**（`:42-52`, `:57-60`）。呼び出し側が「そのホスト向けに収集した Cookie だけ」を返し、
+   許可リスト内のホストにだけ載せる。**許可外のホストへは資格情報を載せずに追う**（署名付き
+   CDN / S3 への転送は壊さず、セッションも渡さない）。元の `RequestSpec.headers` からは
+   `CREDENTIAL_HEADERS`（`cookie` / `x-xsrf-token` / `authorization`、`:21`）を落としてから使う。
+
+上限: DLsite = `DLSITE_REDIRECT_LIMIT = 3`（`crates/core/src/dlsite/client.rs:71`）、
+FANZA = `FANZA_REDIRECT_LIMIT = 3`（`crates/core/src/fanza/client.rs:71`）、
+技術書典 = `TBF_REDIRECT_LIMIT = 5`（`crates/core/src/tbf/mod.rs:176`）、
+BOOTH = `BOOTH_REDIRECT_LIMIT = 5`（`crates/core/src/booth.rs:74`）。
+**BOOTH だけは `Transport` を使わず ureq を直に呼ぶ**ため同じ規則を手書きしている
+（`download_agent` = `redirects(0)`、`crates/core/src/booth.rs:130-131`, `:203-204`, `:437-478`）。
 
 **Cookie の宛先スコープ（2026-09-23 修正済み）**: 送信先が実行時に決まる経路（ダウンロード
 **proxy** = `downloadLinks` / `down_url`、302 の **CDN**）も、**宛先ホスト向けに収集した
@@ -36,15 +66,22 @@ Cookie だけ**を送る（`cookie_header_for(<宛先 host>)`。proxy は検証�
 収集元すべてを 1 本にまとめる API（`HostScopedCookies::header()` /
 `FanzaSession::cookie_header()` / `DlsiteSession::cookie_header()`）は**削除済み**で、
 まとめ送りは再発しない。宛先が収集元（とその子ドメイン）でなければ Cookie は空になる
-（`crates/core/src/session_cookies.rs:34-47`, `:63-69` / `crates/core/src/download_url.rs:48-63` /
-`crates/core/src/fanza/client.rs:366-378` / `crates/core/src/dlsite/client.rs:301-313`）。
+（`crates/core/src/session_cookies.rs:236-256`（`header_for_url`、URL を解釈できなければ空 =
+fail-closed）, `:82-102`（`applies_to`: `Secure` / `Path` / 期限）, `:319-322`（`domain_matches`。
+`download_url::host_within` と同じ「ホスト自身 or そのサブドメイン」判定）/
+`crates/core/src/download_url.rs:54-74`（`host_within` / `host_matches`）/
+`crates/core/src/fanza/client.rs:395-400`（proxy）, `:465-481`（CDN の各ホップ）/
+`crates/core/src/dlsite/client.rs:327`（proxy）, `:370-386`（CDN の各ホップ））。
+**CDN 以降の各ホップでは `send_with_validated_redirects` の `credentials(&Url)` が同じ絞り込みを
+ホップごとにやり直す**（§「リダイレクトの各ホップ検証」）。
 宛先が収集元でなければ Cookie は空になり、**許可リストも実測値まで狭めた**
 （DLsite / BOOTH / 技術書典 = 完全一致、FANZA proxy = `www.dmm.co.jp` 完全一致。
 FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のまま）。
 **proxy のパスも実測値に限る**（DLsite = `/{store}/download/`、FANZA = `/dc/-/proxy/`）。**302 の CDN も実測値まで狭めた**（DLsite = `download.dlsite.com` 完全一致、FANZA = `contents.doujin.dmm.co.jp` とそのサブドメイン）。
 同じホストに複数のルールを並べるため、`download_url::check` は**ホストが一致したルールを
 全部見て**、どれかのパスに一致すれば許可、どれにも一致しなければ `PathNotAllowed` を返す。
-残る候補は Cookie の `Domain` / `Path` 属性を保存する Cookie Jar 化。
+Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存してあり（`:26-41`）、
+`header_for_url` が送信先ごとに判定する（以前「残る候補」としていた Cookie Jar 化は実装済み）。
 なお待機は **DLsite のみ**（`PAGE_INTERVAL = 10 s`、`crates/core/src/dlsite/sync.rs:90`, `:129-131`）
 で、FANZA の一覧取得に待機は無い（1 回 = 5 ページ × 20 件、`crates/core/src/fanza/sync.rs`）。
 
@@ -205,11 +242,11 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 
 | 事象 | 挙動 | アンカー |
 |---|---|---|
-| HTTP 401 / 403（一覧・メタ・DL・CDN） | `DlsiteError::Unauthorized(u16)`（表示文言 `不正アクセス（{status}）`） | `crates/core/src/dlsite/client.rs:249-250`, `:255-256`, `:297-298`, `:323-324` |
-| HTTP 200 以外 | `DlsiteError::Http(u16)`（表示 `HTTP {status}`） | `crates/core/src/dlsite/client.rs:252-253`, `:300-301`, `:326-327` |
-| 302 応答に `location` なし | `DlsiteError::Parse("302 応答に location がありません")` | `crates/core/src/dlsite/client.rs:291-295` |
-| DL で 404 / 410 | `DlsiteError::NotDownloadable`（販売終了・未購入等） | `crates/core/src/dlsite/client.rs:298-299` |
-| DL 応答が `<!doctype` / `<html` 始まり | `DlsiteError::Parse("HTML レスポンス（ファイルではない）")` | `crates/core/src/dlsite/client.rs:303-306` |
+| HTTP 401 / 403（一覧・メタ・DL・CDN） | `DlsiteError::Unauthorized(u16)`（表示文言 `不正アクセス（{status}）`） | `crates/core/src/dlsite/client.rs:290`, `:346`, `:416`, `:444` |
+| HTTP 200 以外 | `DlsiteError::Http(u16)`（表示 `HTTP {status}`） | `crates/core/src/dlsite/client.rs:293`, `:350`, `:419`, `:447` |
+| 302 応答に `location` なし | `DlsiteError::Parse("302 応答に location がありません")` | `crates/core/src/dlsite/client.rs:342-343` |
+| DL で 404 / 410 | `DlsiteError::NotDownloadable`（販売終了・未購入等） | `crates/core/src/dlsite/client.rs:347-348` |
+| DL 応答が `<!doctype` / `<html` 始まり | `DlsiteError::Parse("HTML レスポンス（ファイルではない）")` | `crates/core/src/dlsite/client.rs:421-424` |
 | JSON パース失敗（メタ） | エラーにしない（空マップ） | `crates/core/src/dlsite/client.rs:466-467` |
 | `serde_json::Error` | `DlsiteError::Parse(msg)` へ変換 | `crates/core/src/dlsite/client.rs:40-43` |
 | ネットワーク | `TbfError` → `DlsiteError::Transport` | `crates/core/src/dlsite/client.rs:248`, `:249`, `:295`, `:322` |
@@ -259,7 +296,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | 取得方法 | **アプリ内 WebView（gpui-wry / lb_wry）**。HTTP ログイン（フォーム POST）は行わない | `crates/app/src/views/dlsite_login.rs:1-2`, `:39-74` |
 | セッション Cookie 名（必須） | `__DLsite_SID` | `crates/app/src/views/dlsite_login.rs:155` |
 | 認証 ID Cookie（どちらか必須） | `uhashjp` または `uid_jp` | `crates/app/src/views/dlsite_login.rs:155-161` |
-| ダウンロード用 Cookie | `jwt`（DL の 302 `Set-Cookie` から捕捉。セッションには保存せず、その 1 回のリクエストヘッダにのみ付与）。**CDN へはこの `jwt` と「CDN 向けに収集した Cookie」だけを送り、www のセッション Cookie は送らない** | `crates/core/src/dlsite/client.rs:336-361` |
+| ダウンロード用 Cookie | `jwt`（DL の 302 `Set-Cookie` から捕捉。セッションには保存せず、CDN 以降のホップのヘッダにだけ載せる）。**CDN へはこの `jwt` と「CDN 向けに収集した Cookie」だけを送り、www のセッション Cookie は送らない** | `crates/core/src/dlsite/client.rs:364-368`, `:370-386` |
 | ログイン成否判定 | WebView の Cookie 有無のみ。**API 叩き直し・トークン検証は行わない** | `crates/app/src/views/dlsite_login.rs:151-163` |
 | `DlsiteSession::logged_in()` | `self.cookies_count() > 0`（収集元を問わず Cookie が 1 つでもあれば true） | `crates/core/src/dlsite/client.rs:95-97` |
 | 起動時復元の判定 | `app_settings["dlsite.session"]` の JSON を `DlsiteSession` に復元し `logged_in()` でフィルタ | `crates/app/src/app_state.rs:222-227` |
@@ -290,9 +327,9 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | メモリ側 | `AppState.dlsite_session: Arc<Mutex<Option<DlsiteSession>>>` と `dlsite_logged_in: Arc<Mutex<bool>>` を同時更新 | `crates/app/src/app_state.rs:100-101`, `:407-408` |
 | 削除タイミング 1 | 設定画面のログアウト `SettingsView::logout_dlsite`（`clear_dlsite_session` を呼び、失敗時はトーストで通知） | `crates/app/src/views/settings.rs:895-900` |
 | 削除タイミング 2 | `clear_dlsite_session(cx)`（メモリクリア + DB 行削除。削除に失敗したら `Err`） | `crates/app/src/app_state.rs:878-887` |
-| Cookie ヘッダ生成 | `cookie_header_for(host)` = **その宛先ホスト向けに収集した Cookie だけ**を連結（収集元と**完全一致**。大文字小文字は区別しない）。全収集元をまとめる API は持たない（削除済み） | `crates/core/src/dlsite/client.rs:125-132`, `crates/core/src/session_cookies.rs:34-52` |
-| Cookie ヘッダ生成（送信先別の適用） | `cookie_headers_for(host)` — 購入履歴 / 作品ページ / メタ API = `SITE_HOST`、proxy（`down_url`）= **検証済み URL の host**、CDN = `cdn.host` | `crates/core/src/dlsite/client.rs:195-214`, `:262`, `:310`, `:339` |
-| `jwt` の扱い | 302 応答の `Set-Cookie` から `jwt` のみ拾い、既存ヘッダに `jwt=` が無いときだけ追記。`self.session` には書き戻さない（＝永続化されない）。CDN へは `cookie_header_for(cdn.host)` + `jwt` を送るので、**通常は Cookie ヘッダが `jwt=…` だけ**になる（**実アカウントでログイン → ダウンロードできることを確認済み**: 2026-09-22） | `crates/core/src/dlsite/client.rs:334-343` |
+| Cookie ヘッダ生成 | `cookie_header_for_url(url)` = **その宛先ホスト向けに収集した Cookie だけ**を連結（収集元と**完全一致**。大文字小文字は区別しない。`Path` / `Secure` / 期限も見る）。全収集元をまとめる API は持たない（削除済み） | `crates/core/src/dlsite/client.rs:151-153`, `crates/core/src/session_cookies.rs:236-256` |
+| Cookie ヘッダ生成（送信先別の適用） | `cookie_headers_for(url)` — 購入履歴 / 作品ページ = `SITE_HOST`（`get_html`）、メタ API = その URL、proxy（`down_url`）= **検証済み URL（`ParsedUrl.url`）**、CDN 以降の各ホップ = `credentials(&Url)` が宛先ごとに再構成 | `crates/core/src/dlsite/client.rs:218-235`, `:278`, `:327`, `:370-386`, `:432` |
+| `jwt` の扱い | 302 応答の `Set-Cookie` から `jwt` のみ拾い（`:364-368`）、CDN 以降の各ホップで `credentials(&Url)` が「その宛先向けに収集した Cookie + `jwt`」を組み立て直す（`:370-386`。既存 Cookie に `jwt=` があれば追記しない）。`self.session` には書き戻さない（＝永続化されない）。CDN へは www のセッション Cookie を送らないので、**通常は Cookie ヘッダが `jwt=…` だけ**になる（**実アカウントでログイン → ダウンロードできることを確認済み**: 2026-09-22） | `crates/core/src/dlsite/client.rs:364-386` |
 
 ---
 
@@ -311,8 +348,8 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | UI ポーリング間隔 | 120 ms（`background_executor().timer(Duration::from_millis(120))`） | `crates/app/src/views/bookshelf.rs:2597-2598` |
 | connect タイムアウト | 5 秒（`UreqTransport` の production 実装。DLsite 同期・DL は `UreqTransport::new()` を使用） | `crates/core/src/tbf/transport.rs:94-106`, `crates/app/src/views/bookshelf.rs:2584-2585` |
 | read タイムアウト | 15 秒（同上。手動リダイレクト用エージェントも 5 秒 / 15 秒） | `crates/core/src/tbf/transport.rs:94-106` |
-| リダイレクト | `RequestSpec.redirects` で指定: HTML・JSON・CDN = `3`、302 手動検査 = `0`（ureq の agent は redirects 無効版を別に保持） | `crates/core/src/dlsite/client.rs:246`, `:244`, `:291`, `:320`, `crates/core/src/tbf/transport.rs:100-107` |
-| DL 進捗コールバック | 1 % 単位で `on_progress(downloaded, total)`（read バッファ 64 KiB） | `crates/core/src/tbf/transport.rs:181-198` |
+| リダイレクト | `RequestSpec.redirects` で指定: HTML・JSON = `3`（ureq の自動追跡）、proxy（302 手動検査）= `0`（ureq の agent は redirects 無効版を別に保持）。**CDN 以降は `send_with_validated_redirects` が各ホップを検証して自前で追う**（上限 `DLSITE_REDIRECT_LIMIT = 3`、`https` 以外へは転送しない） | `crates/core/src/dlsite/client.rs:286`, `:334`, `:400-414`, `:440`, `:71`, `crates/core/src/tbf/redirect.rs:28-95`, `crates/core/src/tbf/transport.rs:109-114` |
+| DL 進捗コールバック | 1 % 単位で `on_progress(downloaded, total)`（read バッファ 64 KiB）。Content-Length が無いときは 1 MiB 刻み | `crates/core/src/tbf/transport.rs:185-226` |
 | 一覧ページの `sleep` 相当 | なし（連続リクエスト） | `crates/core/src/dlsite/client.rs:198-225` |
 
 ---
@@ -385,7 +422,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | 一覧取得（1 ページ） | `pub fn purchased_page(&mut self, page: usize) -> Result<PurchasesPage, FanzaError>`（`items` / `total` / `hasNext` を返す）。全ページ版 `purchased()` は**廃止** | `crates/core/src/fanza/client.rs:249` |
 | 詳細取得 | `pub fn detail(&mut self, content_id: &str) -> Result<FanzaDetail, FanzaError>` | `crates/core/src/fanza/client.rs:222` |
 | 作品ページ取得 | `pub fn product_page(&mut self, cid: &str) -> Result<FanzaProductPage, FanzaError>` | `crates/core/src/fanza/client.rs:267` |
-| ダウンロード | `pub fn download_with_progress(&mut self, download_url: &str, on_progress: &mut dyn FnMut(u64, u64)) -> Result<Vec<u8>, FanzaError>` | `crates/core/src/fanza/client.rs:288` |
+| ダウンロード | `pub fn download_with_progress(&mut self, download_url: &str, on_progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<Vec<u8>, FanzaError>`（`false` を返すと中止。`TbfError::Cancelled` → `FanzaError::Transport`） | `crates/core/src/fanza/client.rs:380-384` |
 | UI 側起動 | `pub fn sync_fanza(&mut self, cx: &mut Context<Self>)` | `crates/app/src/views/bookshelf.rs:3432` |
 
 - 同期は **UI からの手動操作のみ**で起動する（自動同期・ポーリングなし）: `crates/app/src/views/bookshelf.rs:2237`（サイト絞り込み `"fanza"` 選択時）、`:2242`（全サイト同期時）。
@@ -416,7 +453,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | クエリ `genre` | `all`（全ジャンル） | `crates/core/src/fanza/client.rs:261-263` |
 | リクエストヘッダ | `Cookie: {cookie_header_for(SITE_HOST)}` / `Accept: application/json` / `User-Agent: {USER_AGENT}` | `crates/core/src/fanza/client.rs:221-227`（生成）、`:243`（適用） |
 | User-Agent 実値（**自認 UA**。`THUNDOKU_FANZA_UA` で差し替え可） | `ThundokuShelf/<version> (+https://github.com/MegaBlackLabel/thundoku-shelf-app)`。ブラウザ偽装はしていない | `crates/core/src/fanza/client.rs:24-33` |
-| リダイレクト追跡 | `redirects: 3`（一覧/詳細 API） | `crates/core/src/fanza/client.rs:245` |
+| リダイレクト追跡 | JSON API（`get_json`）= `redirects: 3`（`:267`）。**ダウンロードの 302 は自動追跡しない**（proxy = `redirects: 0`、CDN 以降 = `send_with_validated_redirects` が各ホップ検証） | `crates/core/src/fanza/client.rs:267`, `:409`, `:482-495` |
 | Cookie 送信形式 | 宛先ホスト向けの Cookie を `name=value` 形式で `"; "` 連結（**長い `Path` が先、同じなら名前順**で安定）。収集元（www / accounts）をまとめた和集合は送らない | `crates/core/src/session_cookies.rs:70-77` |
 | CSRF | 送らない（コメント「GET に CSRF 不要」） | `crates/core/src/fanza/client.rs:3-4` |
 
@@ -605,16 +642,16 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | リトライ | **なし（0 回）**。バックオフもなし | `crates/core/src/fanza/client.rs:169-186`, `crates/core/src/fanza/sync.rs:51-101` |
 | 並列度 | **1**（`purchased` は逐次ループ、`save_purchases` は逐次 for） | `crates/core/src/fanza/client.rs:189-216`, `crates/core/src/fanza/sync.rs:54-99` |
 | リクエストタイムアウト | FanzaClient 自身は設定しない。`UreqTransport` の agent 既定 = **connect 5 s / read 15 s** | `crates/core/src/tbf/transport.rs:94-106` |
-| リダイレクト上限 | JSON API = `redirects: 3`（`:245`）、作品ページ = `redirects: 3`（`:343`）。CDN ダウンロード = `redirects: 3`（`:439`）。proxy は `redirects: 0`（`:378`、手動 302 追跡） | `crates/core/src/fanza/client.rs:245`, `:343`, `:378`, `:439` |
+| リダイレクト上限 | JSON API = `redirects: 3`（`:267`）、作品ページ = `redirects: 3`（`:366`）。proxy は `redirects: 0`（`:409`）で 302 を手動取得し、**CDN 以降は `send_with_validated_redirects` が各ホップ検証して自前で追う**（上限 `FANZA_REDIRECT_LIMIT = 3`、`https` 以外へは転送しない） | `crates/core/src/fanza/client.rs:267`, `:366`, `:409`, `:482-495`, `:70-71`, `crates/core/src/tbf/redirect.rs:28-95` |
 | User-Agent | 固定 1 種（自認 UA。§1.3） | `crates/core/src/fanza/client.rs:24-33` |
 | 同期 UI ポーリング | 120 ms 間隔 `try_recv` | `crates/app/src/views/bookshelf.rs:2521-2523` |
 | ログイン URL 監視 | 1 秒間隔 `timer` | `crates/app/src/views/fanza_login.rs:75-77` |
-| ダウンロード進捗 | `on_progress: &mut dyn FnMut(u64, u64)`（downloaded, total）。UI は `downloaded/total` を fraction（`total > 0` のときのみ。0 なら 0.0）にして `DownloadState::Downloading` を送る | `crates/core/src/fanza/client.rs:357-366`, `crates/app/src/views/bookshelf.rs:2817-2828` |
-| ダウンロードのヘッダ（proxy） | `Cookie`（= `cookie_header_for(proxy.host)` = **proxy ホスト向けに収集したものだけ**。宛先は `downloadLinks` の URL で、`www.dmm.co.jp` のみ許可）/ `User-Agent` / `Referer: https://www.dmm.co.jp/`。**Cookie を付ける前に `download_url::check` で検証**し、その `ParsedUrl.host` を Cookie の絞り込みに使う | `crates/core/src/fanza/client.rs:366-380`, `:40-48` |
-| ダウンロードのヘッダ（CDN） | CDN 向け Cookie（`cookie_header_for(cdn.host)` + 署名 `CloudFront-*`）+ `User-Agent` + `Referer: https://www.dmm.co.jp/` + `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: cross-site` / `Upgrade-Insecure-Requests: 1` | `crates/core/src/fanza/client.rs:407-437` |
-| 署名 Cookie の取得 | proxy の 302 応答 `Set-Cookie` のうち `CloudFront-` 接頭辞のみを、未含有なら（宛先ホスト向けの）Cookie 文字列へ追記 | `crates/core/src/fanza/client.rs:407-416`（コメント `:401-406`） |
-| ZIP 判定 | 本文が `<!doctype` または `<html` で始まる場合は `FanzaError::Parse("HTML response (not a file)")` | `crates/core/src/fanza/client.rs:446-448` |
-| proxy の status 分岐 | 302 → `Location` 必須（無ければ `Parse("プロキシ応答に location がありません")`） / 401・403 → `Unauthorized` / それ以外 → `Http` | `crates/core/src/fanza/client.rs:384-397` |
+| ダウンロード進捗 | `on_progress: &mut dyn FnMut(u64, u64) -> bool`（downloaded, total。`false` で中止）。CDN 以降は `send_with_validated_redirects` にそのまま渡す。UI は `downloaded/total` を fraction（`total > 0` のときのみ。0 なら 0.0）にして `DownloadState::Downloading` を送る | `crates/core/src/fanza/client.rs:383`, `:494`, `crates/app/src/views/bookshelf.rs:2817-2828` |
+| ダウンロードのヘッダ（proxy） | `Cookie`（= `cookie_header_for_url(proxy.url)` = **proxy の宛先向けに収集したものだけ**。`Path` / `Secure` / 期限も見る。宛先は `downloadLinks` の URL で、`www.dmm.co.jp` + `/dc/-/proxy/` のみ許可）/ `User-Agent` / `Referer: https://www.dmm.co.jp/`。**Cookie を付ける前に `download_url::check` で検証**し、その `ParsedUrl.url` を**そのまま送信 URL** に使う | `crates/core/src/fanza/client.rs:389-410`, `:146-148` |
+| ダウンロードのヘッダ（CDN） | CDN 向け Cookie（`credentials(&Url)` が**各ホップで**「宛先ホスト向けに収集した Cookie + 署名 `CloudFront-*`」を組み立て直す）+ `User-Agent` + `Referer: https://www.dmm.co.jp/` + `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8` / `Accept-Language: ja,en;q=0.9` / `Sec-Fetch-Dest: document` / `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Site: cross-site` / `Upgrade-Insecure-Requests: 1` | `crates/core/src/fanza/client.rs:451-481`, `:482-495` |
+| 署名 Cookie の取得 | proxy の 302 応答 `Set-Cookie` のうち `CloudFront-` 接頭辞のみを取り、未含有なら（そのホップの宛先ホスト向けの）Cookie 文字列へ追記。**許可外ホストへは載せない**（`:465-481` の分岐は `check_url` が通ったホストでだけ呼ばれる） | `crates/core/src/fanza/client.rs:446-450`, `:465-481`, `crates/core/src/tbf/redirect.rs:59-61` |
+| ZIP 判定 | 本文が `<!doctype` または `<html` で始まる場合は `FanzaError::Parse("HTML response (not a file)")` | `crates/core/src/fanza/client.rs:498-500` |
+| proxy の status 分岐 | 302 → `Location` 必須（無ければ `Parse("プロキシ応答に location がありません")`。先頭が `/` なら `https://www.dmm.co.jp` を前置）/ 401・403 → `Unauthorized` / それ以外 → `Http` | `crates/core/src/fanza/client.rs:415-427` |
 | サムネイル取得（表紙） | `cover_url_candidates("fanza", url)` = `[原寸 URL, 保存 URL]`（原寸が失敗すれば保存 URL に戻す） | `crates/app/src/views/bookshelf.rs:6682-6691` |
 
 ---
@@ -657,8 +694,8 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | 詳細 API | `https://www.dmm.co.jp/dc/doujin/api/mylibraries/details/{contentId}/` | `crates/core/src/fanza/client.rs:223` |
 | 作品ページ（SSR HTML） | `https://www.dmm.co.jp/dc/doujin/-/detail/=/cid={cid}/` | `crates/core/src/fanza/client.rs:268` |
 | 画像セット構造 API | `GET https://www.dmm.co.jp/dc/doujin/api/mylibraries/folder-structures/{productId}/` — **コード未実装**（docs の調査記録のみ。docs は「MVP では使わない」と決定） | `docs/import-patterns.md:14`, `:25` |
-| ダウンロード proxy | 詳細の `data.downloadLinks["1"]`。先頭が `/` なら `https://www.dmm.co.jp` を前置、それ以外はそのまま | `crates/core/src/fanza/client.rs:229-241` |
-| CDN（実 ZIP） | proxy の `302 Location` をそのまま使用（例: `https://doujin.contents.doujin.dmm.co.jp/...`）。手動追跡 | `crates/core/src/fanza/client.rs:310-323`, `crates/core/src/fanza/client.rs:599-673`（テスト） |
+| ダウンロード proxy | 詳細の `data.downloadLinks["1"]`。先頭が `/` なら `https://www.dmm.co.jp` を前置、それ以外はそのまま | `crates/core/src/fanza/client.rs:319-330` |
+| CDN（実 ZIP） | proxy の `302 Location` を `Url::join` で解決して使用（相対なら `https://www.dmm.co.jp` を前置。例: `https://doujin.contents.doujin.dmm.co.jp/...`）。**各ホップ検証で自前追跡**（`send_with_validated_redirects` + `check_url`。許可外ホストへは Cookie を載せない） | `crates/core/src/fanza/client.rs:415-431`, `:482-495`, `:836-908`（テスト） |
 | ログイン起点 | `https://www.dmm.co.jp/dc/-/mylibrary/` | `crates/app/src/views/fanza_login.rs:61` |
 | Cookie 収集オリジン | `https://www.dmm.co.jp`, `https://accounts.dmm.co.jp` | `crates/app/src/views/fanza_login.rs:117` |
 | `sites` テーブルの URL | `https://www.dmm.co.jp/dc/doujin/`（`display_order = 2`, `is_visible = 1`） | `crates/core/src/db/mod.rs:383-386` |
@@ -769,13 +806,14 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | 2 | 購入履歴 1 ページ | `GET https://accounts.booth.pm/orders?page={page}`（同上） | `text/html` | `crates/core/src/booth.rs:270-273` |
 | 3 | 商品詳細（表紙 JSON） | `GET https://booth.pm/ja/items/{item_id}` | `application/json` | `crates/core/src/booth.rs:361-364` |
 | 4 | 商品ページ（作者名） | `GET https://booth.pm/ja/items/{item_id}` | `text/html` | `crates/core/src/booth.rs:400` |
-| 5 | ファイル本体 | `GET {download_url}`（`https://booth.pm/downloadables/{id}`） | `application/octet-stream, */*` | `crates/core/src/booth.rs:316-318` |
+| 5 | ファイル本体 | `GET {download_url}`（`https://booth.pm/downloadables/{id}`） | `application/octet-stream, */*` | `crates/core/src/booth.rs:437-449` |
 | 6 | CSRF トークン取得（ログアウト時） | `GET https://booth.pm/ja` | `text/html; charset=utf-8` | `crates/core/src/booth.rs:108` |
 | 7 | pixiv セッション破棄 | `POST https://accounts.booth.pm/users/sign_out`、body `_method=delete`（form） | `Accept: */*`, `X-CSRF-Token`, `Referer`/`Origin: https://accounts.booth.pm`、`Cookie` | `crates/core/src/booth.rs:117-127` |
 | 8 | booth.pm セッション破棄 | `POST https://booth.pm/users/sign_out`、body `_method=delete`（form） | `Accept: */*`, `X-CSRF-Token`, `Referer: https://booth.pm/ja`, `Origin: https://booth.pm`、`Cookie` | `crates/core/src/booth.rs:143-154` |
 
 - User-Agent（BOOTH 用。**自認 UA**、`THUNDOKU_BOOTH_UA` で差し替え可）: `ThundokuShelf/<version> (+https://github.com/MegaBlackLabel/thundoku-shelf-app)` — `crates/core/src/booth.rs:105-109`。
-- リダイレクトは明示設定なし（ureq 2.8.0 の既定 = 最大 5 回、`ureq-2.8.0/src/agent.rs:262`）。`GET https://booth.pm/downloadables/{id}` は 302 → 署名付き一時 S3 URL（**180 秒有効**）へ自動追従してファイル本体が返る — `crates/core/src/booth.rs:300-302`。
+- リダイレクトは**経路で分かれる**: 一覧・メタ・ログアウトは既定エージェント（ureq 2.8.0 の既定 = 最大 5 回、`ureq-2.8.0/src/agent.rs:262`）、**ファイル本体は `download_agent`（`redirects(0)`）で 302 を自前追跡**し、`Location` を `Url::join` で解決 → `download_url::check_url` で検証 → `https` 以外は拒否（上限 `BOOTH_REDIRECT_LIMIT = 5`）— `crates/core/src/booth.rs:130-131`, `:193-205`, `:437-478`, `:73-74`。
+- `GET https://booth.pm/downloadables/{id}` は 302 → 署名付き一時 S3 URL（**180 秒有効**）へ転送され、ファイル本体が返る。**S3 へは Cookie を載せない**（`check_url` が通ったホストでだけ `cookie_for(...)` を付ける）— `crates/core/src/booth.rs:412-414`, `:445-449`。
 - 同期（1〜4）はすべて Cookie 付き GET のみ。POST はログアウト時のみ。
 - `crates/core/src/booth.rs` に**テスト専用**モックは無い（`#[cfg(test)]` はパーサ単体テストのみ、`:627-751`）。
 
@@ -855,7 +893,7 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | 302 かつ URL に `sign_in` を含む | 応答ステータス検査 | `BoothError::NotLoggedIn` `crates/core/src/booth.rs:188-190` |
 | ライブラリ応答がログインページ | `<title>ログイン - BOOTH</title>` を含む / `ログイン</h1>` を含む / **HTML 長 < 20,000 バイト** | `log::warn!` して `BoothError::NotLoggedIn`（0 件成功として扱わない） `crates/core/src/booth.rs:227-237` |
 | JSON パース失敗（item_detail） | `serde_json::from_str` 失敗 | `BoothError::InvalidResponse(文字列)` `crates/core/src/booth.rs:365-366` |
-| ダウンロードで HTML が返る | `content-type` に `text/html` を含む | `BoothError::Network("HTML が返りました（リンクが無効の可能性）: {url} (content-type=...)")` として失敗させる `crates/core/src/booth.rs:325-335` |
+| ダウンロードで HTML が返る | `content-type` に `text/html` を含む | `BoothError::Network("HTML が返りました（リンクが無効の可能性）: {url} (content-type=...)")` として失敗させる `crates/core/src/booth.rs:485-489` |
 | ログアウト（booth.pm 側）401/403 | `ureq::Error::Status(401|403)` | `BoothError::NotLoggedIn` `crates/core/src/booth.rs:156-158` |
 | CSRF トークンが取れない | `extract_csrf_token` が `None` | `BoothError::Network("csrf token not found in page")` `crates/core/src/booth.rs:109-110` |
 | ログアウト（plaza 側）失敗 | 任意のエラー | **無視して続行**（`log::info!("booth logout(plaza): failed ({e})")`） `crates/core/src/booth.rs:135-137` |
@@ -946,17 +984,17 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | ページ間 sleep | **なし**（ライブラリも購入履歴も） | `crates/core/src/booth.rs:206-260`,`:269-293` |
 | リトライ回数 | **0**（リトライ実装なし） | `crates/core/src/booth.rs` 全体（`retry`/`backoff`/`attempt` の grep 0 件） |
 | バックオフ | なし | 同上 |
-| 接続タイムアウト | 5 秒（`timeout_connect`） | `crates/core/src/booth.rs:92` |
-| 読み取りタイムアウト | 15 秒（`timeout_read`） | `crates/core/src/booth.rs:93` |
-| リダイレクト上限 | 明示設定なし → ureq 2.8.0 既定 5 回 | `crates/core/src/booth.rs:91-94`、`ureq-2.8.0/src/agent.rs:262` |
+| 接続タイムアウト | 5 秒（`timeout_connect`。一覧用 / ダウンロード用の両エージェント共通） | `crates/core/src/booth.rs:194-205` |
+| 読み取りタイムアウト | 15 秒（`timeout_read`。同上） | `crates/core/src/booth.rs:194-205` |
+| リダイレクト上限 | 一覧・メタ・ログアウトは明示設定なし → ureq 2.8.0 既定 5 回。**ファイル本体は `download_agent`（`redirects(0)`）で 302 を自前追跡**（上限 `BOOTH_REDIRECT_LIMIT = 5`、各ホップを `check_url` で検証） | `crates/core/src/booth.rs:130-131`, `:203-204`, `:437-478`, `:73-74`、`ureq-2.8.0/src/agent.rs:262` |
 | 表紙取得の並列度 | **4 スレッド固定**（`std::thread::scope` + `for _ in 0..4`、コメント: BOOTH API への負荷を抑えるため固定） | `crates/app/src/views/bookshelf.rs:2296-2302` |
 | 表紙ダウンロード（本棚の表紙取得）の並列度 | 4 スレッド（別エージェント、接続 5 秒 / 読み取り 15 秒） | `crates/app/src/views/bookshelf.rs:1697-1700`,`:1721` |
 | 設定画面の表紙再取得の並列度 | 4 スレッド（接続 5 秒 / 読み取り 15 秒） | `crates/app/src/views/settings.rs:311-319` |
 | 同期結果ポーリング間隔 | 120 ms | `crates/app/src/views/bookshelf.rs:2443` |
 | ログイン URL 監視間隔 | 1 秒 | `crates/app/src/views/booth_login.rs:83` |
-| ダウンロード読み取りバッファ | 65,536 バイト（64 KiB）。読み取りループは BOOTH と 3 ストア（TBF/FANZA/DLsite）で共有し、**進捗コールバックが `false` を返すと中断**して途中のバイト列は破棄する（`read_body_with_progress`） | `crates/core/src/tbf/transport.rs:134-171` |
-| ダウンロード総量の上限 | **2 GiB**（`MAX_DOWNLOAD_BODY_BYTES`）。超えたら読み込みを打ち切ってエラー（宣言サイズではなく実バイト数で判定）。API 応答（JSON/HTML）は **16 MiB**（`MAX_API_BODY_BYTES`）、読み出しエラーも失敗として伝播する | `crates/core/src/tbf/transport.rs`; `crates/app/src/views/bookshelf.rs:2986-3002,4197-4220` |
-| BOOTH 側の一時 URL 有効期限 | 署名付き S3 URL は 180 秒（コメント記載） | `crates/core/src/booth.rs:301-302` |
+| ダウンロード読み取りバッファ | 65,536 バイト（64 KiB）。読み取りループは BOOTH と 3 ストア（TBF/FANZA/DLsite）で共有し、**進捗コールバックが `false` を返すと中断**して途中のバイト列は破棄する（`read_body_with_progress`。`Content-Length` が無いときは **1 MiB 刻み**で通知してキャンセルを効かせる） | `crates/core/src/tbf/transport.rs:175-227`, `crates/core/src/booth.rs:496-510` |
+| ダウンロード総量の上限 | **2 GiB**（`MAX_DOWNLOAD_BODY_BYTES`）。超えたら読み込みを打ち切ってエラー（宣言サイズではなく実バイト数で判定）。**本体ダウンロードは 4 ストア + Drive（pack / DB JSON）とも `Transport::send_download` のこの経路**を通る。API 応答（JSON/HTML）は `send` 側の **16 MiB**（`MAX_API_BODY_BYTES`）。読み出しエラーも失敗として伝播する | `crates/core/src/tbf/transport.rs:129-133`, `:265-324`; `crates/app/src/views/bookshelf.rs:2986-3002,4197-4220` |
+| BOOTH 側の一時 URL 有効期限 | 署名付き S3 URL は 180 秒（コメント記載） | `crates/core/src/booth.rs:412-414` |
 | ページ数の安全弁 | 最大 100 ページ（library / orders 共通） | `crates/core/src/booth.rs:258-260`,`:291-293` |
 
 #### 5. 同期の状態管理
@@ -1072,11 +1110,11 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | 読み取りタイムアウト（手動リダイレクト agent） | 15 s | `crates/core/src/tbf/transport.rs:105` |
 | 手動リダイレクト agent の `redirects` | 0（3xx をそのまま返す） | `crates/core/src/tbf/transport.rs:103`, `:129-135` |
 | リトライ / バックオフ | **実装なし**（tbf モジュール全体に sleep/retry/backoff が 0 件） | `crates/core/src/tbf/transport.rs:127-219`（該当コードなし） |
-| ダウンロード読み取りバッファ | 64 KiB（`vec![0u8; 64 * 1024]`） | `crates/core/src/tbf/transport.rs:181` |
-| 進捗通知の間引き | 「1 % 変化ごとに 1 回」のみコールバック | `crates/core/src/tbf/transport.rs:183-190` |
-| `content-length` 不明時 | `total = 0` → 進捗コールバックなし | `crates/core/src/tbf/transport.rs:172-175`, `:186-189` |
-| 読み込みエラー時 | `Interrupted` は continue、その他は break（部分ボディを返す） | `crates/core/src/tbf/transport.rs:196-197` |
-| デフォルト `send_download` | `send()` で全体を取得し `on_progress(total,total)` を 1 回呼ぶ | `crates/core/src/tbf/transport.rs:59-68` |
+| ダウンロード読み取りバッファ | 64 KiB（`vec![0u8; 64 * 1024]`） | `crates/core/src/tbf/transport.rs:185` |
+| 進捗通知の間引き | 「1 % 変化ごとに 1 回」のみコールバック | `crates/core/src/tbf/transport.rs:198-214` |
+| `content-length` 不明時 | `total = 0` でも **1 MiB 刻みで通知**（`UNKNOWN_TOTAL_STEP`）し、読み切ったら最後のサイズを一度通知する。**キャンセルは効く**（`false` で `BodyOutcome::Cancelled` → `TbfError::Cancelled`。途中のバイト列は返さない） | `crates/core/src/tbf/transport.rs:182`, `:207`, `:224-226` |
+| 読み込みエラー時 | `Interrupted` は continue、その他は `BodyOutcome::Io`（**部分ボディを成功として返さない**） | `crates/core/src/tbf/transport.rs:219-221`, `:149-158` |
+| デフォルト `send_download` | `send()` で全体を取得し `on_progress(total,total)` を 1 回呼ぶ。`false` なら `TbfError::Cancelled` | `crates/core/src/tbf/transport.rs:64-75` |
 | `Set-Cookie` パース | 最初の `;` まで、`name=value` に分解（値は trim） | `crates/core/src/tbf/transport.rs:33-50` |
 | ヘッダ参照 | 大小文字無視、**最後の出現**を返す | `crates/core/src/tbf/transport.rs:24-30` |
 
@@ -1272,14 +1310,14 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 
 | 関数 | 手順 / 値 | アンカー |
 |---|---|---|
-| `resolve_download_url(&mut self, url)` | **GET**（受け取った URL をそのまま）、ヘッダ `User-Agent` + `Accept` + `Accept-Language` + Cookie + XSRF、`redirects = 0`（3xx を手動処理） | `crates/core/src/tbf/mod.rs:526-540`, `:539` |
-| 401/403 | `TbfError::SessionExpired` | `crates/core/src/tbf/mod.rs:541-543` |
-| 3xx + `Location` | `absolutize` → `validate_download_url` が真なら**その絶対 URL を返す**（本文は取得しない） | `crates/core/src/tbf/mod.rs:545-552` |
-| それ以外 | `TbfError::NotFound` | `crates/core/src/tbf/mod.rs:553` |
-| `validate_download_url` | 相対は `api/product-dlc/` 前置のみ許可。絶対は `https://techbookfest.org/api/product-dlc/` または `https://storage.googleapis.com/tbf-tokyo-product-dlc/` のみ許可 | `crates/core/src/tbf/mod.rs:702-719` |
-| `download_with_progress(url, on_progress)` | **GET** ヘッダ `User-Agent` + `Cookie`（非空時）+ `X-XSRF-TOKEN`（存在時）、`redirects = 5`、`Transport::send_download` で進捗通知 | `crates/core/src/tbf/mod.rs:562-585` |
-| ダウンロードの status | 2xx 以外は `TbfError::Upstream("download status {status}")` | `crates/core/src/tbf/mod.rs:586-591` |
-| `download(url)` | `download_with_progress` + 空クロージャ | `crates/core/src/tbf/mod.rs:556-558` |
+| `resolve_download_url(&mut self, url)` | 送信**前**に `download_url::check(url, TBF_RESOLVE_RULES)`（`techbookfest.org` のみ許可）→ **GET**（受け取った URL をそのまま）、ヘッダ `User-Agent` + `Accept` + `Accept-Language` + Cookie + XSRF、`redirects = 0`（3xx を手動処理） | `crates/core/src/tbf/mod.rs:581-599`, `:172-173` |
+| 401/403 | `TbfError::SessionExpired` | `crates/core/src/tbf/mod.rs:600-602` |
+| 3xx + `Location` | `absolutize` → `validate_download_url` が真なら**その絶対 URL を返す**（本文は取得しない。ここでは `check_url` ではなく `validate_download_url` で判定する点に注意） | `crates/core/src/tbf/mod.rs:603-610` |
+| それ以外 | `TbfError::NotFound` | `crates/core/src/tbf/mod.rs:611` |
+| `validate_download_url` | 相対は `api/product-dlc/` 前置のみ許可。絶対は `https://techbookfest.org/api/product-dlc/` または `https://storage.googleapis.com/tbf-tokyo-product-dlc/` のみ許可 | `crates/core/src/tbf/mod.rs:771-789` |
+| `download_with_progress(url, on_progress)` | 起点を `download_url::check(url, TBF_DOWNLOAD_RULES)` で検証 → **`send_with_validated_redirects` が各ホップを検証して自前追跡**（上限 `TBF_REDIRECT_LIMIT = 5`、`https` 以外へは転送しない）。ヘッダは `User-Agent` だけで、**Cookie / `X-XSRF-TOKEN` は `credentials(&Url)` = `download_credential_headers` がホップごとに足す**（宛先が `techbookfest.org` とそのサブドメインのときだけ。GCS へは載せない）。本文は `Transport::send_download` で進捗通知 | `crates/core/src/tbf/mod.rs:622-654`, `:146-165`, `:183-186`; `crates/core/src/tbf/redirect.rs:28-95` |
+| ダウンロードの status | 2xx 以外は `TbfError::Upstream("download status {status}")` | `crates/core/src/tbf/mod.rs:655-660` |
+| `download(url)` | `download_with_progress` + 空クロージャ（`\|_,_\| true`） | `crates/core/src/tbf/mod.rs:615-617` |
 | UI 側フォールバック URL | `items.download_url` が無い場合 `{TBF_DOWNLOAD_BASE}/{product_id}/download`（`product_id` = `bookshelf_items.database_id`） | `crates/app/src/views/bookshelf.rs:2880-2887`, `:2740` |
 | UI 側の後処理 | ダウンロード直後に `books::set_site_id` / `books::set_tbf_product_id` / `apply_site_metadata` / `seed_progress_if_absent` / `set_owner_sub` を実行し、TBF クライアントの lock は PDF レンダリング前に drop | `crates/app/src/views/bookshelf.rs:2983-3013`, `:2903-2905` |
 
@@ -1454,9 +1492,9 @@ FANZA CDN だけは実測が 2 種類あるためサブドメイン許可のま�
 | ポーリング 1 周期あたりの HTTP 数 | `Σ_slug (10 回のイベント探索 + ⌈チェックリスト件数/100⌉ 回)`（探索は失敗 slug でもリクエスト自体は送る。例: 1 slug / 100 件以下なら 11 リクエスト） | `crates/core/src/tbf/mod.rs:333`, `:410`, `crates/app/src/workspace.rs:271` |
 | UI の結果ポーリング | 120 ms 間隔 | `crates/app/src/views/bookshelf.rs:2674-2676`, `crates/app/src/views/checklist.rs`（同方式） |
 | ログイン URL 監視 | 1 s 間隔 | `crates/app/src/views/tbf_login.rs:96-98` |
-| ダウンロード進捗通知 | 1 % 刻み | `crates/core/src/tbf/transport.rs:183-190` |
-| リダイレクト上限 | 既定 agent 5（`RequestSpec.redirects = 0` のときだけ手動） | `crates/core/src/tbf/transport.rs:79-83`, `:131-135` |
-| キャンセル | コア API にキャンセル機構なし（`Task::drop` でも中断しない設計: 専用スレッド + channel） | `crates/app/src/views/bookshelf.rs:2654-2663`, `:2754-2759` |
+| ダウンロード進捗通知 | 1 % 刻み（Content-Length が無いときは 1 MiB 刻み） | `crates/core/src/tbf/transport.rs:198-214`, `:224-226` |
+| リダイレクト上限 | 既定 agent 5（一覧・GraphQL 用）。`RequestSpec.redirects = 0` のときは 3xx をそのまま返す（`resolve_download_url` の手動処理）。**本体ダウンロードは `ureq` に追わせず `send_with_validated_redirects` が各ホップを検証**（`TBF_REDIRECT_LIMIT = 5`、`https` 以外へは転送しない） | `crates/core/src/tbf/transport.rs:109-114`, `:234-238`; `crates/core/src/tbf/mod.rs:176`, `:640-654`; `crates/core/src/tbf/redirect.rs:28-95` |
+| キャンセル | ダウンロードは**進捗コールバックが `false` を返すと中断**（`TbfError::Cancelled`。途中のバイト列は返さない）。同期（GraphQL ページング）にはキャンセル機構なし（`Task::drop` でも中断しない設計: 専用スレッド + channel） | `crates/core/src/tbf/transport.rs:149-158`, `:211-212`; `crates/app/src/views/bookshelf.rs:2654-2663`, `:2754-2759` |
 
 #### 12. エラー型とエラー時挙動
 

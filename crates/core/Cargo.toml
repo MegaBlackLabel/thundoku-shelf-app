@@ -17,6 +17,9 @@ libwebp-sys = { version = "0.9", features = ["sse41"] }
 thiserror.workspace = true
 log.workspace = true
 ureq = { version = "2", features = ["tls", "json"] }
+# 送信時（ureq 内部）と同じ WHATWG の URL 解釈で検証するため、直接依存にする。
+# 手動の文字列分割で検証すると実送信先と食い違う（バックスラッシュ・符号化ドット）。
+url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 base64 = "0.22"

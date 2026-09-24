@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use opfspack::{Identity, PackError, PackReader, entry_flags};
+use opfspack::{PackError, PackReader, PackRootKey, pack_flags};
 
 use crate::db::{SqlitePool, books, sync_state};
 use crate::drive::{DriveApi, DriveError, DriveFile};
@@ -50,8 +50,13 @@ pub enum SyncError {
     Pack(#[from] PackError),
     #[error("invalid pack: {0}")]
     InvalidPack(String),
-    #[error("identity required to decrypt pack: {0}")]
-    IdentityRequired(String),
+    /// 暗号化 pack（v3）なのに鍵（PRK）が用意できていない。
+    /// 平文として読む・平文で上書きする経路は無い（fail-closed）。
+    #[error("本を復号する鍵がありません（Google にログインして鍵を用意してください）: {0}")]
+    PackKeyRequired(String),
+    /// v2 以前の pack。v3 では開けないので**再取り込み**を案内する（仕様 §6）。
+    #[error("旧形式の本です（pack v{version}）。ストアから取り込み直してください: {pack_id}")]
+    UnsupportedPackVersion { pack_id: String, version: u32 },
 }
 
 fn pack_id_from_name(name: &str) -> Option<&str> {
@@ -91,7 +96,7 @@ fn import_book(
     pool: &SqlitePool,
     reader: &PackReader,
     pack_id: &str,
-    identity_sub: Option<&str>,
+    root_key: Option<&PackRootKey>,
     file_size: i64,
     pack_bytes: &[u8],
 ) -> Result<(), SyncError> {
@@ -99,11 +104,9 @@ fn import_book(
     let mut author = String::new();
     let mut circle_name = String::new();
     let mut purchase_date: Option<String> = None;
-    let identity = identity_sub.map(|sub| Identity {
-        sub: sub.to_string(),
-        pack_id: pack_id.to_string(),
-    });
-    if let Ok(data) = reader.read_entry(META_ENTRY, identity.as_ref())
+    // v3 の pack 鍵は pack id（= book id）から導出する。
+    let pack_key = root_key.map(|root| root.derive_pack_key(pack_id));
+    if let Ok(data) = reader.read_entry(META_ENTRY, pack_key.as_ref())
         && let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&data)
     {
         if let Some(value) = metadata.get("title").and_then(serde_json::Value::as_str) {
@@ -162,7 +165,7 @@ fn import_book(
     // pack から取り込み状態（ドキュメント・コンテンツ・ページ行）を再構築する。
     // DB だけ失った / 別端末での復元用。すでに取り込み済みなら何もしない。
     if let Err(error) =
-        crate::import::rebuild_from_pack(pool, pack_id, pack_bytes, identity.as_ref())
+        crate::import::rebuild_from_pack(pool, pack_id, pack_bytes, root_key)
     {
         log::warn!("drive restore: pack からの再構築に失敗 ({pack_id}): {error}");
     }
@@ -181,6 +184,9 @@ pub struct SyncRequest<'a> {
     pub downloads_dir: &'a Path,
     /// ログイン中アカウントの sub（未ログインは None＝アップロード対象なし）
     pub identity_sub: Option<&'a str>,
+    /// pack の復号に使う v3 のルート鍵（PRK。未ログインは None）。
+    /// 冊ごとの pack 鍵は `root.derive_pack_key(pack_id)` で導出する。
+    pub pack_root_key: Option<&'a PackRootKey>,
     /// 所有者列（`owner_sub`）の復号鍵（未ログインは None）
     pub owner_key: Option<&'a [u8; 32]>,
     /// Drive 側の同期フォルダ id
@@ -197,6 +203,7 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
         packs_dir,
         downloads_dir,
         identity_sub,
+        pack_root_key,
         owner_key,
         folder_id,
         db_path,
@@ -245,14 +252,19 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
 
         let bytes = drive.download(&file.id)?;
-        let reader = PackReader::open(&bytes)
-            .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
-        let needs_identity = reader
-            .entries()
-            .iter()
-            .any(|entry| entry.flags & entry_flags::IDENTITY_BOUND != 0);
-        if needs_identity && identity_sub.is_none() {
-            return Err(SyncError::IdentityRequired((*pack_id).to_string()));
+        let reader = PackReader::open(&bytes).map_err(|error| match error {
+            // v2 以前の pack（v3 では開けない）。再取り込みを案内する。
+            PackError::Version(version) => SyncError::UnsupportedPackVersion {
+                pack_id: (*pack_id).to_string(),
+                version,
+            },
+            other => SyncError::InvalidPack(format!("{pack_id}: {other}")),
+        })?;
+        // v3 の暗号化は header / entry の `ENCRYPTED` で判定する
+        // （v2 の `IDENTITY_BOUND` は v3 に存在しない）。
+        let encrypted = reader.header().flags & pack_flags::ENCRYPTED != 0;
+        if encrypted && pack_root_key.is_none() {
+            return Err(SyncError::PackKeyRequired((*pack_id).to_string()));
         }
 
         // sync_state 行が無い場合（新規ダウンロード直後・state クリア後・DB 復元後）は
@@ -276,7 +288,7 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             pool,
             &reader,
             pack_id,
-            identity_sub,
+            pack_root_key,
             bytes.len() as i64,
             &bytes,
         )?;
@@ -410,6 +422,19 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
         let baseline = crate::db::backup::canonical_md5_str(&json, None)?;
         if let Err(error) = crate::db::settings::set(pool, BACKUP_BASELINE_KEY, &baseline) {
             log::warn!("drive sync: failed to store the backup baseline: {error}");
+        }
+    }
+
+    // -- pack 鍵 bundle の再試行 -------------------------------------------
+    // 初回作成時にアップロードできなかった鍵 bundle をここで上げ直す（仕様 §5.1）。
+    // 失敗しても同期全体は成功として扱う（本の同期と鍵の同期は独立。印は残る）。
+    if let Some(sub) = identity_sub {
+        let secrets = crate::secrets::SecretStore::new();
+        let keys = crate::pack_keys::PackKeyStore::new(&secrets, pool, folder_id);
+        match keys.retry_pending_upload(drive, sub) {
+            Ok(true) => log::info!("drive sync: 未アップロードだった pack の鍵 bundle を上げた"),
+            Ok(false) => {}
+            Err(error) => log::warn!("drive sync: pack の鍵 bundle を再アップロードできない: {error}"),
         }
     }
 
@@ -1102,6 +1127,7 @@ mod tests {
             packs_dir: &packs,
             downloads_dir: &dl,
             identity_sub: Some("test-sub"),
+            pack_root_key: None,
             owner_key: Some(&key),
             folder_id: "folder",
             db_path: Some(&db_path),
@@ -1121,6 +1147,7 @@ mod tests {
             packs_dir: &packs,
             downloads_dir: &dl,
             identity_sub: Some("test-sub"),
+            pack_root_key: None,
             owner_key: Some(&key),
             folder_id: "folder",
             db_path: Some(&db_path),
@@ -1182,6 +1209,7 @@ mod tests {
             packs_dir: &packs,
             downloads_dir: &dl,
             identity_sub: Some("test-sub"),
+            pack_root_key: None,
             owner_key: Some(&key),
             folder_id: "folder",
             db_path: Some(&db_path),

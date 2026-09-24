@@ -4,7 +4,7 @@
 //! メモリへ読まずに済ませる（この環境には 354 MB の pack がある）。バイト列版
 //! （`PackReader`）と同じ内容・同じ失敗の仕方になることを固定する。
 
-use opfspack::{Identity, PackBuilder, PackError, PackFileReader, PackReader, derived_pack_key};
+use opfspack::{PackBuilder, PackError, PackFileReader, PackKey, PackReader, PackRootKey};
 
 fn entry_data(n: usize) -> Vec<u8> {
     format!("THUNDOKU_PAGE_{n:04}:{}", "abc".repeat(1000)).into_bytes()
@@ -12,12 +12,17 @@ fn entry_data(n: usize) -> Vec<u8> {
 
 const META: &[u8] = br#"{"schemaVersion":1,"title":"Test Book"}"#;
 
-fn build_pack(identity: Option<&Identity>, compress: bool) -> Vec<u8> {
+/// テスト用のルート鍵（固定値）と、その pack 鍵。
+fn test_key() -> PackKey {
+    PackRootKey::from_bytes([9u8; 32]).derive_pack_key("pack-1")
+}
+
+fn build_pack(key: Option<&PackKey>, compress: bool) -> Vec<u8> {
     let mut builder = PackBuilder::new(1_728_000_000_000);
     builder.add_entry("metadata.json", META.to_vec(), "application/json", compress);
     builder.add_entry("thumbnail.webp", entry_data(1), "image/webp", compress);
     builder.add_entry("pages/001.webp", entry_data(2), "image/webp", compress);
-    builder.build(identity, compress).expect("pack を作れる")
+    builder.build(key, compress).expect("pack を作れる")
 }
 
 /// テスト中だけ実ファイルを持つ pack。
@@ -67,33 +72,29 @@ fn file_reader_matches_the_in_memory_reader() {
     }
 }
 
-/// 圧縮 + identity 束縛の pack でも、事前導出した鍵で読める（鍵が無ければ同じ失敗）。
+/// 圧縮 + 暗号化の pack でも、事前導出した鍵で読める（鍵が無ければ同じ失敗）。
 #[test]
 fn file_reader_reads_compressed_and_encrypted_entries() {
-    let identity = Identity {
-        sub: "sub-1".into(),
-        pack_id: "pack-1".into(),
-    };
-    let bytes = build_pack(Some(&identity), true);
+    let key = test_key();
+    let bytes = build_pack(Some(&key), true);
     let expect = PackReader::open(&bytes).expect("バイト列版で開ける");
     let temp = TempPack::write("encrypted", &bytes);
     let mut reader = PackFileReader::open(temp.path()).expect("ファイル版で開ける");
-    let key = derived_pack_key(&identity);
 
     assert_eq!(
         reader
             .read_entry_with_key("pages/001.webp", Some(&key))
             .expect("読める"),
         expect
-            .read_entry("pages/001.webp", Some(&identity))
+            .read_entry("pages/001.webp", Some(&key))
             .expect("読める")
     );
     assert!(
         matches!(
             reader.read_entry_with_key("pages/001.webp", None),
-            Err(PackError::IdentityRequired(_))
+            Err(PackError::KeyRequired(_))
         ),
-        "鍵なしで identity 束縛エントリが読めてしまった"
+        "鍵なしで暗号化エントリが読めてしまった"
     );
 }
 

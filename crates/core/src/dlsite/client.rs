@@ -67,6 +67,9 @@ const DLSITE_CDN_RULES: &[crate::download_url::HostRule] =
         None,
     )];
 
+/// CDN 取得で追うリダイレクトの上限（各ホップは [`DLSITE_CDN_RULES`] で検証する）。
+const DLSITE_REDIRECT_LIMIT: usize = 3;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DlsiteError {
     #[error("セッション切れ・未ログイン")]
@@ -321,10 +324,11 @@ impl DlsiteClient {
             .map_err(|error| DlsiteError::BlockedUrl(format!("{down_url}: {error}")))?;
         // proxy へは**宛先 URL のホスト向けに収集した Cookie だけ**を送る。www と login を
         // 1 本にまとめると、`down_url` が別サブドメインを指したときにもう片方の収集元の Cookie まで飛ぶ。
-        let proxy_headers = self.cookie_headers_for(down_url);
+        let proxy_headers = self.cookie_headers_for(proxy.url.as_str());
         let proxy_spec = RequestSpec {
             method: "GET".into(),
-            url: down_url.into(),
+            // 検証した URL（正規化済み）をそのまま送る（検証した宛先 = 送る宛先）
+            url: proxy.url.as_str().into(),
             headers: proxy_headers,
             body: None,
             redirects: 0,
@@ -353,17 +357,35 @@ impl DlsiteClient {
         // 2) CDN へ送る Cookie は**そのホスト向けに収集したもの + 署名 `jwt`** だけ。
         //    www の認証セッションは別システム（CDN）には要らないので送らない。
         //    `jwt` は 302 の Set-Cookie で渡される署名付きダウンロード鍵。
-        let mut cookie = self.session.cookie_header_for_url(&cd_url);
-        for (k, v) in proxy_resp.set_cookies() {
-            if k == "jwt" && !cookie.contains("jwt=") {
+        //
+        //    転送は**各ホップ検証**して自前で追う（`ureq` に任せると `Cookie` は落ちても
+        //    他のヘッダをそのまま残すため、`Location` の差し替えで許可外ホストへ飛び得る）。
+        //    資格情報はホップごとに組み立て直す（許可外のホストには載せない）。
+        let jwt: Option<String> = proxy_resp
+            .set_cookies()
+            .into_iter()
+            .find(|(name, _)| name == "jwt")
+            .map(|(_, value)| value);
+        let session = &self.session;
+        let mut credentials = |destination: &url::Url| {
+            let mut cookie = session.cookie_header_for_url(destination.as_str());
+            if let Some(jwt) = &jwt
+                && !cookie.contains("jwt=")
+            {
                 if !cookie.is_empty() {
                     cookie.push_str("; ");
                 }
-                cookie.push_str(&format!("{k}={v}"));
+                cookie.push_str(&format!("jwt={jwt}"));
             }
-        }
+            // Cookie が 1 つも無ければヘッダを付けない（空の Cookie は送らない）。
+            if cookie.is_empty() {
+                Vec::new()
+            } else {
+                vec![("Cookie".to_string(), cookie)]
+            }
+        };
         // 3) CDN（download.dlsite.com）へ直接取得
-        let mut headers = vec![
+        let headers = vec![
             ("User-Agent".to_string(), user_agent()),
             ("Referer".to_string(), "https://www.dlsite.com/".to_string()),
             (
@@ -375,21 +397,21 @@ impl DlsiteClient {
             ("Sec-Fetch-Mode".to_string(), "navigate".to_string()),
             ("Sec-Fetch-Site".to_string(), "cross-site".to_string()),
         ];
-        // Cookie が 1 つも無ければヘッダを付けない（空の Cookie は送らない）。
-        if !cookie.is_empty() {
-            headers.insert(0, ("Cookie".to_string(), cookie));
-        }
-        let spec = RequestSpec {
-            method: "GET".into(),
-            url: cd_url,
-            headers,
-            body: None,
-            redirects: 3,
-        };
-        let resp = self
-            .transport
-            .send_download(spec, on_progress)
-            .map_err(DlsiteError::Transport)?;
+        let resp = crate::tbf::redirect::send_with_validated_redirects(
+            self.transport.as_mut(),
+            RequestSpec {
+                method: "GET".into(),
+                url: cdn.url.as_str().into(),
+                headers,
+                body: None,
+                redirects: 0,
+            },
+            DLSITE_REDIRECT_LIMIT,
+            DLSITE_CDN_RULES,
+            &mut credentials,
+            on_progress,
+        )
+        .map_err(DlsiteError::Transport)?;
         if resp.status == 401 || resp.status == 403 {
             return Err(DlsiteError::Unauthorized(resp.status));
         }

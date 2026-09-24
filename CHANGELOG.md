@@ -4,6 +4,85 @@
 
 ## [Unreleased]
 
+### Security
+
+- **URL の検証と実送信で同じ解釈を使い、リダイレクトも各ホップ検証する**:
+  検証は手動の文字列分割（`strip_prefix("https://")` + 最初の `/`）だったが、送信は `ureq` が
+  `url::Url`（WHATWG）で解釈し直していたため、`https://audit.invalid\.contents.doujin.dmm.co.jp/x`
+  のようにバックスラッシュで authority を切る URL は「検証は許可ホスト・実送信は別ホスト」に
+  なった（FANZA では署名 Cookie が載る）。`%2e%2e` のような符号化ドットセグメントは正規化で
+  パスが許可プレフィックスの外へ出た。検証を `url::Url` に一本化し、**返した正規化済み URL を
+  そのまま送信**する（検証した宛先 = 送る宛先）。生のバックスラッシュ・生のドットセグメント・
+  `%2e` 系は `Malformed` で拒否する。あわせて DLsite / FANZA / BOOTH / 技術書典 の転送は
+  `send_with_validated_redirects`（新設）で自前で追い、**各ホップの `Location` を検証**し、
+  資格情報（`Cookie` / `X-XSRF-TOKEN` / `Authorization`）は**宛先ごとに組み立て直して**
+  許可リスト内のホストにだけ載せる（`ureq` の自動追跡は `Cookie` を落としても他の資格情報を
+  残すため、`Location` の差し替えで許可外ホストへ残り得た）。
+  `crates/core/src/download_url.rs`、`crates/core/src/tbf/redirect.rs`（新規）、
+  `crates/core/src/{dlsite,fanza}/client.rs`、`crates/core/src/booth.rs`、
+  `crates/core/src/tbf/mod.rs`
+
+- **暗号化できないときは平文の pack を作らず、取り込みを失敗させる**:
+  Google にログインしていても pack 用の鍵が取れないと `identity = None` に落ち、
+  **暗号化されない pack が黙って作られていた**（`bookshelf.rs` のフォールバック）。
+  判断を `import::pack_identity_for_import` に集約し、ログイン済み + 鍵なしは
+  `IdentityKeyUnavailable` で失敗させる（平文は未ログインのときだけ）。あわせて Google の
+  userinfo で `sub` が欠落・空なら認証エラーにした（空文字を成功として通していた）。
+  `crates/core/src/import/mod.rs`、`crates/core/src/google.rs`、
+  `crates/app/src/views/bookshelf.rs`
+
+### Fixed
+
+- **opfspack の展開に上限と実サイズ照合を入れる**:
+  `raw_inflate` は宣言サイズを見ずに `read_to_end` していたため、小さな DEFLATE 入力から
+  任意量を確保できた。宣言サイズ +1 で打ち切り、**復号・展開後の実長が index の `size` と
+  一致することを必須**にする。index 解析では 1 エントリ 512MiB・1 冊合計 2GiB（`checked_add`）・
+  件数 10,000・格納サイズ 2GiB の上限を `Vec` の確保より前に適用し、未知のフラグビットと
+  `ENCRYPTED` / `IDENTITY_BOUND` の不整合も拒否する。`read_entry_range` は復号後の実長で
+  境界を再検査して panic しない。既知の正常本（展開後 1.33GB・3,321 ページ）は通る。
+  `crates/opfspack/src/{lib,reader,format}.rs`
+
+- **Drive の pack / DB JSON が 16MiB を超えると復元できない問題**:
+  取得は通常 API の `Transport::send`（16MiB 上限）を通っていたため、16MiB を超える pack や
+  DB JSON は「アップロードはできるのに戻せない」状態だった。取得を
+  `DriveClient::download_with_progress` → `send_download`（2GiB + 進捗 + キャンセル）へ
+  切り替える。あわせて Content-Length を返さない応答でも 1MiB 刻みで進捗を通知し、読み切った
+  サイズを最後に一度通知する（＝キャンセルが効く）。
+  `crates/core/src/drive/mod.rs`、`crates/core/src/tbf/transport.rs`
+
+### Changed
+
+- **pack の鍵を v3（アカウントごとの乱数ルート鍵 + ラップ）へ移行する（破壊的変更）**:
+  鍵は `sub` から PBKDF2 → `HKDF(master, pack_id)` で導出していたため、**`sub` を知る相手は
+  pack を復号できた**（`sub` は Google のアカウント識別子であって秘密ではない）。鍵材料を
+  32 バイトの乱数ルート鍵（PRK）に変え、冊ごとの鍵は `HKDF(PRK, book_id)` で導出する。PRK は
+  端末では OS keyring の **`thundoku-shelf.pack-root-key:<owner_id>`**、Drive では同じフォルダの
+  **`thundoku-keys.json`**（`sub` と任意のパスフレーズで**ラップ**した 48 バイト。AAD に
+  `owner_id` を入れて別アカウントへの差し替えを検出する）に置く。ルート鍵を乱数にしたことで
+  **鍵のローテーション（パスフレーズの変更・`sub` ラップの削除）がラップの作り直しだけで済む**。
+  パスフレーズは設定から**設定・変更・解除**でき、設定すると `sub` を知るだけでは解けなくなる
+  （端末を手放した／共有端末で読んだ場合の失効手段）。鍵 bundle のアップロードに失敗しても
+  取り込みは止めず、`drive.pack_keys.pending` を残して次の同期で上げ直す。鍵が無いときは
+  **平文の pack を作らず・平文として読まず**に失敗させる（fail-closed。未ログインの平文 pack は従来どおり）。
+  **v2 の pack は開けなくなった**（`unsupported pack version`。`IDENTITY_BOUND` ビットも v3 では
+  未知ビットとして拒否する）ので、旧 pack は**ストアから取り込み直す**必要がある。
+  pack 形式は `docs/spec/03-import-and-pack.md` §4、鍵の仕様は `docs/spec/10-pack-keys.md`。
+  `crates/opfspack/src/{lib,keys,crypto,builder,reader,format}.rs`、`crates/core/src/pack_keys.rs`、
+  `crates/core/src/{secrets,import/mod,drive/sync}.rs`、
+  `docs/spec/{03-import-and-pack,06-sync-auth-drive,10-pack-keys,README}.md`
+
+- **レポートの添付画像は「送信」を押した時点でアップロードする（選択しただけでは外部へ送らない）**:
+  以前は「画像を添付」を押した時点で `user-attachments` へ上げていたため、利用者が投稿を
+  やめても画像だけが GitHub へ送られていた（取り消す API も無い）。選択時はファイル名・MIME・
+  実体をローカルに保持するだけにし、送信時に **リポジトリ ID を 1 回取得 → 添付を選択順に
+  アップロード → 本文の末尾へ `![file](url)` を挿入 → Issue を 1 回作成** の順で送る。
+  アップロードに失敗したら **Issue は作らない**（利用者が押していない本文だけの Issue を
+  勝手に立てない）。下書きと添付は残るので再試行でき、**URL が確定した添付は再試行でも
+  上げ直さない**（同じ画像が user-attachments に増えない）。画像なしで送るための「外す」を
+  添付ごとに置いた。選択時にダイアログをキャンセル・サイズ超過（10MB）・読み込み失敗でも
+  要求は 1 件も出ない。
+  `crates/core/src/github.rs`、`crates/app/src/views/report.rs`、`docs/features.md`
+
 ## [0.2.8] - 2026-09-24
 
 ### Security

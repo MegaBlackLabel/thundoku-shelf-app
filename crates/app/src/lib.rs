@@ -5,6 +5,7 @@ pub mod actions;
 pub mod app_state;
 pub mod components;
 pub mod icons;
+pub mod pack_keys;
 pub mod theme;
 pub mod views;
 pub mod workspace;

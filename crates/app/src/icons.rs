@@ -75,6 +75,8 @@ pub enum AppIcon {
     Heart,
     /// お気に入り（lucide Heart、登録済み = 塗りつぶし）
     HeartFilled,
+    /// 本の鍵（lucide KeyRound。パスフレーズの設定）
+    KeyRound,
 }
 
 impl IconNamed for AppIcon {
@@ -107,6 +109,7 @@ impl IconNamed for AppIcon {
             Self::Pencil => "icons/pencil.svg".into(),
             Self::Heart => "icons/heart.svg".into(),
             Self::HeartFilled => "icons/heart-filled.svg".into(),
+            Self::KeyRound => "icons/key-round.svg".into(),
         }
     }
 }
@@ -157,6 +160,7 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
         "icons/pencil.svg" => Some(include_bytes!("../assets/icons/pencil.svg")),
         "icons/heart.svg" => Some(include_bytes!("../assets/icons/heart.svg")),
         "icons/heart-filled.svg" => Some(include_bytes!("../assets/icons/heart-filled.svg")),
+        "icons/key-round.svg" => Some(include_bytes!("../assets/icons/key-round.svg")),
         _ => None,
     }
 }
@@ -197,6 +201,7 @@ mod tests {
             AppIcon::Pencil,
             AppIcon::Heart,
             AppIcon::HeartFilled,
+            AppIcon::KeyRound,
         ];
         for icon in icons {
             let path = icon.path();

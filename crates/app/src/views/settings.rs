@@ -92,6 +92,20 @@ pub struct SettingsView {
     poll_interval_input: Option<Entity<InputState>>,
     /// 入力の変更（Blur / Enter）を購読して確定するための Subscription。
     poll_interval_subscription: Option<Subscription>,
+    /// パスフレーズの入力欄（「本の鍵」カード。render で遅延生成）。
+    passphrase_input: Option<Entity<InputState>>,
+    /// 入力欄を空にする要求（設定に成功した後。`Window` が要るので render で行う）。
+    passphrase_clear_input: bool,
+    /// この端末（keyring）に pack の鍵があるか（表示用のキャッシュ）。
+    key_has_local: bool,
+    /// Drive の bundle にパスフレーズラップがあるか（表示用のキャッシュ）。
+    key_has_passphrase: bool,
+    /// 未アップロードの鍵 bundle の `owner_id`（あれば警告する。仕様 §5.1）。
+    key_pending_owner: Option<String>,
+    /// 鍵の操作（設定 / 解除 / アップロード）の実行中フラグ。
+    key_busy: bool,
+    /// パスフレーズ解除の確認ダイアログの表示フラグ。
+    confirm_remove_passphrase: bool,
 }
 
 /// ビューアのホイール方向の設定キーと値。
@@ -103,6 +117,9 @@ pub struct SettingsView {
 pub(crate) const WHEEL_DIRECTION_KEY: &str = "viewer.wheel_direction";
 pub(crate) const WHEEL_DIRECTION_DEFAULT: &str = "down-to-next";
 pub(crate) const WHEEL_DIRECTION_UP: &str = "up-to-next";
+
+/// Drive 同期タスクの結果（失敗は利用者向けの文言と復元導線つき）。
+type SyncTaskResult = Result<sync::SyncOutcome, crate::pack_keys::SyncFailure>;
 
 /// Google の再ログインが必要なときの案内（生の `invalid_grant` JSON は出さない）。
 const GOOGLE_AUTH_EXPIRED_NOTICE: &str = "Google のログインが無効になりました（トークンが失効または取り消されています）。\
@@ -185,6 +202,13 @@ impl SettingsView {
             api_last_sync_at: None,
             poll_interval_input: None,
             poll_interval_subscription: None,
+            passphrase_input: None,
+            passphrase_clear_input: false,
+            key_has_local: false,
+            key_has_passphrase: false,
+            key_pending_owner: None,
+            key_busy: false,
+            confirm_remove_passphrase: false,
         }
     }
 
@@ -330,6 +354,185 @@ impl SettingsView {
         self.hidden_items = db::bookshelf::list_hidden(&state.db_pool).unwrap_or_default();
         // 表紙キャッシュが無いものはバックグラウンドで取得する
         self.fetch_missing_covers(cx);
+        // 本の鍵（v3 の PRK）の状態（この端末にあるか / パスフレーズ / 未アップロード）
+        self.refresh_key_state(cx);
+    }
+
+    /// 「本の鍵」カードに出す状態を読み直す。
+    ///
+    /// この端末の鍵（keyring）と未アップロードの印（DB）はその場で読み、Drive の
+    /// bundle（パスフレーズの有無）はネットワークなので背景で読む（UI を固めない）。
+    fn refresh_key_state(&mut self, cx: &mut Context<Self>) {
+        let keys = crate::pack_keys::KeyContext::from_state(AppState::global(cx));
+        self.key_has_local = keys.cached().is_some() || keys.load_keyring().is_some();
+        self.key_pending_owner = keys.pending_owner();
+        if keys.google_profile().is_none() {
+            // 未ログインでは Drive の bundle を引けない（鍵はアカウントごと）
+            self.key_has_passphrase = false;
+            return;
+        }
+        let handle = cx.entity();
+        let task = cx
+            .background_executor()
+            .spawn(async move { keys.has_passphrase() });
+        cx.spawn(async move |_window, cx| {
+            let has_passphrase = task.await.unwrap_or(false);
+            handle.update(cx, |this, cx| {
+                this.key_has_passphrase = has_passphrase;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// パスフレーズの入力欄を遅延生成する（初回のみ）。Enter で確定する。
+    fn ensure_passphrase_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.passphrase_input.is_some() {
+            return;
+        }
+        // マスクして表示する（肩越しに読まれないため。値は `value()` で取れる）
+        let state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("パスフレーズ")
+        });
+        self.passphrase_input = Some(state);
+    }
+
+    /// パスフレーズを設定 / 変更する（仕様 §5.2。PRK は変えず、ラップを作り直す）。
+    ///
+    /// 鍵がまだ無ければ作る（`ensure`）。必要なら**別端末で設定したパスフレーズ**を
+    /// 解錠ダイアログで尋ねる（この画面の入力欄は「新しく設定する値」）。
+    pub fn submit_passphrase(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.passphrase_input.clone() else {
+            return;
+        };
+        let value = input.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            self.show_toast("パスフレーズを入力してください", cx);
+            return;
+        }
+        self.key_busy = true;
+        cx.notify();
+        let handle = cx.entity();
+        let keys = crate::pack_keys::KeyContext::from_state(AppState::global(cx));
+        let task = cx
+            .background_executor()
+            .spawn(async move { keys.set_passphrase(&value, "パスフレーズの設定") });
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle.update(cx, |this, cx| {
+                this.key_busy = false;
+                match result {
+                    Ok(()) => {
+                        // 入力欄は作り直す（打った値を残さない）
+                        this.passphrase_input = None;
+                        this.passphrase_clear_input = true;
+                        this.show_toast(
+                            "パスフレーズを設定しました（この値でも本の鍵を復元できます）",
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!("passphrase set failed: {error}");
+                        this.error = Some(error);
+                    }
+                }
+                this.refresh_key_state(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// パスフレーズラップを削除する（確認ダイアログの後。仕様 §5.2）。
+    pub fn remove_passphrase(&mut self, cx: &mut Context<Self>) {
+        self.confirm_remove_passphrase = false;
+        self.key_busy = true;
+        cx.notify();
+        let handle = cx.entity();
+        let keys = crate::pack_keys::KeyContext::from_state(AppState::global(cx));
+        let task = cx
+            .background_executor()
+            .spawn(async move { keys.remove_passphrase() });
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle.update(cx, |this, cx| {
+                this.key_busy = false;
+                match result {
+                    Ok(true) => this.show_toast(
+                        "パスフレーズを解除しました（Google ログインだけで復元できます）",
+                        cx,
+                    ),
+                    Ok(false) => {
+                        this.show_toast("パスフレーズは設定されていません（変更はありません）", cx)
+                    }
+                    Err(error) => {
+                        log::warn!("passphrase remove failed: {error}");
+                        this.error = Some(error);
+                    }
+                }
+                this.refresh_key_state(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 未アップロードの鍵 bundle を上げ直す（仕様 §5.1 の再試行導線）。
+    pub fn retry_key_upload(&mut self, cx: &mut Context<Self>) {
+        self.key_busy = true;
+        cx.notify();
+        let handle = cx.entity();
+        let keys = crate::pack_keys::KeyContext::from_state(AppState::global(cx));
+        let task = cx
+            .background_executor()
+            .spawn(async move { keys.retry_pending_upload() });
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle.update(cx, |this, cx| {
+                this.key_busy = false;
+                match result {
+                    Ok(true) => this.show_toast("本の鍵を Google Drive にアップロードしました", cx),
+                    Ok(false) => this.show_toast(
+                        "アップロード待ちの鍵はありません（または鍵がこの端末にありません）",
+                        cx,
+                    ),
+                    Err(error) => {
+                        log::warn!("pack key upload retry failed: {error}");
+                        this.error = Some(error);
+                    }
+                }
+                this.refresh_key_state(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// パスフレーズを忘れた / 別端末で復元したいときの解錠を促す（鍵が無いときの導線）。
+    fn unlock_pack_key(&mut self, cx: &mut Context<Self>) {
+        let handle = cx.entity();
+        let task = crate::pack_keys::unlock_task(cx, "本の鍵の復元");
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle.update(cx, |this, cx| {
+                match &result {
+                    Ok(Some(_)) => this.show_toast("本の鍵を復元しました", cx),
+                    Ok(None) => this.show_toast(
+                        "この端末に鍵がありません（Drive に鍵が無いか、未設定です）",
+                        cx,
+                    ),
+                    Err(error) => {
+                        log::warn!("pack key unlock failed: {error}");
+                        this.error = Some(error.clone());
+                    }
+                }
+                this.refresh_key_state(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 未読/読んでいる途中/読了 の冊数を集計（Web の getReadingStatusCounts 相当）。
@@ -994,56 +1197,69 @@ impl SettingsView {
         let db_path = state.data_dir.join("thundoku-shelf.db");
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
         let db_key = state.secrets.db_key().ok();
+        // pack の鍵（v3 の PRK）の解決に要るもの（背景スレッドへ move する）
+        let keys = crate::pack_keys::KeyContext::from_state(state);
         log::info!("sync_drive_now: start");
-        let task: gpui_kit::Task<Result<sync::SyncOutcome, String>> =
-            cx.background_executor().spawn(async move {
-                let folder_id = {
-                    db::settings::get(&db, "drive.sync.folder_id")
-                        .ok()
-                        .flatten()
-                };
-                log::info!("sync_drive_now: folder_id={folder_id:?}");
-                let mut client = google.lock();
-                let client = client
-                    .as_mut()
-                    .ok_or_else(|| "Google にログインしてください".to_string())?;
-                let token = client.access_token().map_err(|e| e.to_string())?;
-                let mut drive = DriveClient::new(Box::new(UreqTransport::new()), token);
-                log::info!("sync_drive_now: token ok, drive client ready");
-                let folder_id = match folder_id {
-                    Some(id) => id,
-                    None => {
-                        log::info!("sync_drive_now: creating folder");
-                        let id = drive
-                            .create_folder("thundoku-shelf")
-                            .map_err(|e| e.to_string())?;
-                        let _ = db::settings::set(&db, "drive.sync.folder_id", &id);
-                        id
-                    }
-                };
-                log::info!("sync_drive_now: running sync engine");
-                // メインの DB プールをそのまま使う（WAL により同期タスクと並行可能）
-                let outcome = sync::sync(sync::SyncRequest {
-                    pool: &db,
-                    drive: &mut drive,
-                    packs_dir: &packs_dir,
-                    downloads_dir: &downloads_dir,
-                    identity_sub: google_sub.as_deref(),
-                    owner_key: db_key.as_ref(),
-                    folder_id: &folder_id,
-                    db_path: Some(&db_path),
-                })
-                .map_err(|e| e.to_string())?;
-                log::info!(
-                    "sync_drive_now: done dl={} ul={} skip={} conflicts={} db_backup={}",
-                    outcome.downloaded.len(),
-                    outcome.uploaded.len(),
-                    outcome.skipped.len(),
-                    outcome.conflicts.len(),
-                    outcome.database_backed_up
-                );
-                Ok(outcome)
-            });
+        let task: gpui_kit::Task<SyncTaskResult> = cx.background_executor().spawn(async move {
+            let folder_id = {
+                db::settings::get(&db, "drive.sync.folder_id")
+                    .ok()
+                    .flatten()
+            };
+            log::info!("sync_drive_now: folder_id={folder_id:?}");
+            let mut client = google.lock();
+            let client = client.as_mut().ok_or_else(|| {
+                crate::pack_keys::SyncFailure::message("Google にログインしてください")
+            })?;
+            let token = client.access_token().map_err(|e| e.to_string())?;
+            let mut drive = DriveClient::new(Box::new(UreqTransport::new()), token);
+            log::info!("sync_drive_now: token ok, drive client ready");
+            let folder_id = match folder_id {
+                Some(id) => id,
+                None => {
+                    log::info!("sync_drive_now: creating folder");
+                    let id = drive
+                        .create_folder("thundoku-shelf")
+                        .map_err(|e| e.to_string())?;
+                    let _ = db::settings::set(&db, "drive.sync.folder_id", &id);
+                    id
+                }
+            };
+            // pack の鍵（v3 の PRK）を先に用意する（必要なら解錠ダイアログが出る）。
+            // 鍵が無いまま暗号化 pack を同期すると `PackKeyRequired` で失敗する。
+            let pack_root_key = keys
+                .unlock("同期")
+                .map_err(crate::pack_keys::SyncFailure::unlock)?;
+            log::info!("sync_drive_now: running sync engine");
+            // メインの DB プールをそのまま使う（WAL により同期タスクと並行可能）
+            let outcome = sync::sync(sync::SyncRequest {
+                pool: &db,
+                drive: &mut drive,
+                packs_dir: &packs_dir,
+                downloads_dir: &downloads_dir,
+                identity_sub: google_sub.as_deref(),
+                pack_root_key: pack_root_key.as_ref(),
+                owner_key: db_key.as_ref(),
+                folder_id: &folder_id,
+                db_path: Some(&db_path),
+            })
+            .map_err(|error| crate::pack_keys::sync_failure(&error))?;
+            log::info!(
+                "sync_drive_now: done dl={} ul={} skip={} conflicts={} db_backup={}",
+                outcome.downloaded.len(),
+                outcome.uploaded.len(),
+                outcome.skipped.len(),
+                outcome.conflicts.len(),
+                outcome.database_backed_up
+            );
+            // 未アップロードの鍵 bundle があれば上げ直す（仕様 §5.1）
+            match keys.retry_pending_upload() {
+                Ok(true) => log::info!("sync_drive_now: 鍵 bundle の再アップロードに成功"),
+                Ok(false) => {}
+                Err(error) => log::warn!("sync_drive_now: 鍵 bundle を上げられない: {error}"),
+            }
+            Ok(outcome)
+        });
         cx.spawn(async move |_window, cx| {
             let result = task.await;
             // 同期が高速に終わってもスピナーが見えるよう最短表示時間を確保する
@@ -1096,25 +1312,31 @@ impl SettingsView {
                             );
                         }
                     }
-                    Err(message) => {
-                        log::error!("sync_drive_now failed: {message}");
-                        if let Some(notice) = this.handle_google_auth_expiry(&message, cx) {
+                    Err(failure) => {
+                        log::error!("sync_drive_now failed: {}", failure.message);
+                        if let Some(notice) = this.handle_google_auth_expiry(&failure.message, cx) {
                             // トークン失効。生の応答ではなく日本語の案内を出す
                             this.error = Some(notice);
                         } else {
-                            this.error = Some(message.clone());
-                            if message.contains("identity required") {
-                                // 暗号化 pack の復号には Google ログインが必要。
-                                // 認証モーダルは `dispatch_action` ではなく `Workspace::open_auth`
-                                // 経由で開く（WebView 作成時の RefCell 再入で固まるのを避ける）。
-                                cx.defer(move |cx| {
-                                    let ws_weak = AppState::global(cx).workspace.lock().clone();
-                                    if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
-                                        ws.update(cx, |ws, cx| {
-                                            ws.open_auth(cx, AuthProvider::Google);
-                                        });
-                                    }
-                                });
+                            this.error = Some(failure.message.clone());
+                            if failure.needs_unlock {
+                                // 鍵（v3 の PRK）が無い。解錠ダイアログ（パスフレーズ入力）
+                                // を出して復元へ誘導する。認証モーダルが要る場合
+                                //（未ログイン）は `dispatch_action` ではなく
+                                // `Workspace::open_auth` 経由で開く（WebView 作成時の
+                                // RefCell 再入で固まるのを避ける）。
+                                if AppState::global(cx).google_profile.lock().is_some() {
+                                    this.unlock_pack_key(cx);
+                                } else {
+                                    cx.defer(move |cx| {
+                                        let ws_weak = AppState::global(cx).workspace.lock().clone();
+                                        if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+                                            ws.update(cx, |ws, cx| {
+                                                ws.open_auth(cx, AuthProvider::Google);
+                                            });
+                                        }
+                                    });
+                                }
                             }
                         }
                     }
@@ -2011,12 +2233,23 @@ impl Render for SettingsView {
         crate::app_state::set_modal(
             cx,
             crate::app_state::ModalKind::SettingsConfirm,
-            self.confirm_delete || self.confirm_data_dir || self.confirm_clear_sync,
+            self.confirm_delete
+                || self.confirm_data_dir
+                || self.confirm_clear_sync
+                || self.confirm_remove_passphrase,
         );
         let modal = crate::app_state::active_modal(cx);
         let settings_confirm = modal == Some(crate::app_state::ModalKind::SettingsConfirm);
         // チェックリスト定期取得間隔の編集入力を確保（初回のみ生成・購読）
         self.ensure_poll_interval_input(_window, cx);
+        // パスフレーズの入力欄を確保し、設定に成功した後は空に戻す
+        self.ensure_passphrase_input(_window, cx);
+        if self.passphrase_clear_input {
+            self.passphrase_clear_input = false;
+            if let Some(input) = self.passphrase_input.clone() {
+                input.update(cx, |state, cx| state.set_value("", _window, cx));
+            }
+        }
         // 表示に使う状態（冊数・非表示リスト・同期情報）は `reload`（画面に入ったとき /
         // データが変わったとき）で読み込んでおく。ここで DB を引くと、スクロールのたびに
         // 描画が走るたびに全書籍ぶんの進捗クエリが走って引っかかる（実測: ホイール 1 ノッチで
@@ -2037,6 +2270,7 @@ impl Render for SettingsView {
         let data_dir = AppState::global(cx).data_dir.clone();
         let confirm_data_dir = settings_confirm && self.confirm_data_dir;
         let confirm_clear_sync = settings_confirm && self.confirm_clear_sync;
+        let confirm_remove_passphrase = settings_confirm && self.confirm_remove_passphrase;
         let pending_data_dir = self.pending_data_dir.clone();
         let drive_enabled = self.drive_enabled;
         let drive_last_sync = self
@@ -2365,6 +2599,186 @@ impl Render for SettingsView {
             .poll_interval_input
             .clone()
             .expect("poll input ensured");
+        // 本の鍵（v3 の PRK）。パスフレーズの設定 / 変更 / 解除と、状態の表示。
+        let key_settings = {
+            let danger = cx.theme().danger;
+            let key_has_local = self.key_has_local;
+            let key_has_passphrase = self.key_has_passphrase;
+            let key_pending = self.key_pending_owner.clone();
+            let key_busy = self.key_busy;
+            let input = self.passphrase_input.clone();
+            let handle = cx.entity();
+            let mut card = div()
+                .p_5()
+                .flex()
+                .flex_col()
+                .gap_3()
+                // 状態（この端末に鍵があるか / パスフレーズの有無）
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .text_sm()
+                        .child(div().text_color(muted_fg).child("保護状態"))
+                        .child(div().font_weight(FontWeight::MEDIUM).child(
+                            crate::pack_keys::key_status_label(
+                                key_has_local,
+                                key_has_passphrase,
+                            ),
+                        )),
+                )
+                .child(div().text_sm().text_color(muted_fg).child(
+                    "本の鍵は Google アカウントごとに 1 つで、この端末（OS の資格情報ストア）と \
+                     Google Drive の thundoku-keys.json に保存します。パスフレーズを設定しておくと、\
+                     端末を失ってもパスフレーズだけで本を復号できます。",
+                ));
+            // 未アップロードの鍵がある場合は警告する（端末故障で復元できなくなるため）
+            if key_pending.is_some() {
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(danger)
+                                .child("本の鍵がまだ Google Drive にアップロードされていません"),
+                        )
+                        .child(div().text_xs().text_color(muted_fg).child(
+                            "この端末を失うと本を復号できなくなります。同期のたびに再試行しますが、ここからすぐ試せます。",
+                        ))
+                        .child(
+                            Button::new("key-upload-retry")
+                                .cursor_pointer()
+                                .label(if key_busy {
+                                    "アップロード中..."
+                                } else {
+                                    "アップロードを再試行"
+                                })
+                                .disabled(key_busy || !google_logged_in)
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.retry_key_upload(cx));
+                                    }
+                                }),
+                        ),
+                );
+            }
+            // この端末に鍵が無いときは、パスフレーズで解錠（復元）できる導線を出す。
+            if google_logged_in && !key_has_local {
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("この端末の鍵を復元"),
+                        )
+                        .child(div().text_xs().text_color(muted_fg).child(
+                            "この端末にはまだ鍵がありません。別端末でパスフレーズを設定していれば、\
+                             入力して鍵を復元できます。",
+                        ))
+                        .child(
+                            Button::new("key-unlock-now")
+                                .cursor_pointer()
+                                .label(if key_busy {
+                                    "復元中..."
+                                } else {
+                                    "パスフレーズで解錠"
+                                })
+                                .disabled(key_busy)
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| this.unlock_pack_key(cx));
+                                    }
+                                }),
+                        ),
+                );
+            }
+            // パスフレーズの設定 / 変更 / 解除
+            if google_logged_in {
+                if let Some(input) = input {
+                    card = card.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(
+                                if key_has_passphrase {
+                                    "パスフレーズを変更"
+                                } else {
+                                    "パスフレーズで保護する"
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child("8 文字以上を推奨します。忘れると復元できません。"),
+                            )
+                            .child(Input::new(&input).cursor_text().w_full())
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("passphrase-save")
+                                            .cursor_pointer()
+                                            .primary()
+                                            .label(if key_has_passphrase {
+                                                "変更"
+                                            } else {
+                                                "設定"
+                                            })
+                                            .disabled(key_busy)
+                                            .on_click({
+                                                let handle = handle.clone();
+                                                move |_, _window, cx| {
+                                                    handle.update(cx, |this, cx| {
+                                                        this.submit_passphrase(cx)
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .children(key_has_passphrase.then(|| {
+                                        dialog_button("passphrase-remove", "解除")
+                                            .disabled(key_busy)
+                                            .on_click({
+                                                let handle = handle.clone();
+                                                move |_, _window, cx| {
+                                                    handle.update(cx, |this, cx| {
+                                                        this.confirm_remove_passphrase = true;
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            })
+                                    })),
+                            ),
+                    );
+                }
+            } else {
+                card = card.child(div().text_sm().text_color(muted_fg).child(
+                    "パスフレーズの設定には Google へのログインが必要です（鍵はアカウントごとに 1 つ）。",
+                ));
+            }
+            self.settings_card(
+                cx,
+                "本の鍵（パスフレーズ）",
+                Some("本を暗号化している鍵のバックアップとパスフレーズ"),
+                Icon::new(AppIcon::KeyRound)
+                    .size(px(16.0))
+                    .text_color(muted_fg),
+                card,
+            )
+        };
         let checklist_poll_settings =
             self.settings_card(
                 cx,
@@ -2574,6 +2988,7 @@ impl Render for SettingsView {
                     )
                     .child(storage_settings)
                     .child(drive_settings)
+                    .child(key_settings)
                     .child(checklist_poll_settings)
                     .child(db_settings)
                     // 外観
@@ -2907,6 +3322,57 @@ impl Render for SettingsView {
                                     )
                             );
                         fade_dialog(_window, cx, confirm_clear_sync, content).into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(if confirm_remove_passphrase {
+                        let handle = cx.entity();
+                        let content = dialog_surface(cx)
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("パスフレーズを解除"),
+                            )
+                            .child(div().text_sm().child(
+                                "パスフレーズを解除すると、Google ログイン（sub ラップ）だけでも本の鍵を復元できるようになります（安全性は下がります）。本の鍵そのものは変わりません。よろしいですか？",
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
+                                        dialog_button("passphrase-remove-cancel", "キャンセル")
+                                            .cursor_pointer()
+                                            .on_click({
+                                                let handle = handle.clone();
+                                                move |_, _window, cx| {
+                                                    handle.update(cx, |this, cx| {
+                                                        this.confirm_remove_passphrase = false;
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("passphrase-remove-confirm")
+                                            .cursor_pointer()
+                                            .danger()
+                                            .label("解除する")
+                                            .on_click({
+                                                let handle = handle.clone();
+                                                move |_, _window, cx| {
+                                                    handle.update(cx, |this, cx| {
+                                                        this.remove_passphrase(cx)
+                                                    });
+                                                }
+                                            }),
+                                    ),
+                            );
+                        fade_dialog(_window, cx, confirm_remove_passphrase, content)
+                            .into_any_element()
                     } else {
                         div().into_any_element()
                     }),

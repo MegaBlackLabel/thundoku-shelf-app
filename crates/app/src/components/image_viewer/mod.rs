@@ -231,13 +231,14 @@ pub struct PackPageLoader {
     pub images: Vec<DocumentImage>,
     pub packs_dir: std::path::PathBuf,
     pub db: thundoku_core::db::SqlitePool,
-    pub identity: Option<opfspack::Identity>,
+    /// pack の復号に使う v3 のルート鍵（PRK。未ログイン / 未解決は `None`）。
+    /// 冊ごとの pack 鍵は `root.derive_pack_key(book_id)` で導出する（HKDF-SHA256 は
+    /// 軽いのでページごとに導出してよい）。
+    pub pack_root_key: Option<opfspack::PackRootKey>,
     /// pack バイト列のキャッシュ（pack_id + バイト列。初回 load 時に 1 回だけ
     /// ディスクから読み込む。ページをめくるたびに数十 MB の pack を読み直すのを防ぐ）。
     /// OnceLock なので並列アクセスでも初期化は 1 回だけ。
     pub pack_bytes: std::sync::OnceLock<Option<(String, Arc<Vec<u8>>)>>,
-    /// 導出済み pack キー（identity 復号用。PBKDF2 100k 回は一度だけ実行する）。
-    pub pack_key: std::sync::OnceLock<Option<[u8; 32]>>,
 }
 
 impl PageLoader for PackPageLoader {
@@ -256,8 +257,7 @@ impl PageLoader for PackPageLoader {
         let image = self.images.get(index).ok_or("page out of range")?;
         let pack_entry = image.pack_entry_path.as_deref().ok_or("no pack entry")?;
         // pack バイト列は一度だけディスクから読み込む（OnceLock で並列でも 1 回）。
-        // get_or_init が返った時点でロックは解放済みなので、以降の復号
-        // （PBKDF2 100k イテレーション）はロックを保持せずに実行できる。
+        // 併せて **book id**（＝ v3 の pack 鍵の導出元）も保持する。
         let cached = self.pack_bytes.get_or_init(|| {
             let db = &self.db;
             let book = db::books::get(db, &book_id_of(image, db)).ok()??;
@@ -265,17 +265,19 @@ impl PageLoader for PackPageLoader {
             // 保存領域の外を指す id（改変バックアップ由来）では読まない。
             let path = thundoku_core::pack_path::pack_path(&self.packs_dir, &pack_id).ok()?;
             let bytes = std::fs::read(path).ok()?;
-            Some((pack_id, Arc::new(bytes)))
+            Some((book.id.clone(), Arc::new(bytes)))
         });
-        let (_, bytes) = cached.as_ref().ok_or("pack load failed")?;
-        let reader = opfspack::PackReader::open(bytes).map_err(|e| e.to_string())?;
-        // pack キーは一度だけ導出（PBKDF2 100k 回はページごとに実行しない）
+        let (book_id, bytes) = cached.as_ref().ok_or("pack load failed")?;
+        let reader = opfspack::PackReader::open(bytes)
+            .map_err(|e| crate::pack_keys::pack_read_error_message(&e))?;
+        // v3: 冊ごとの pack 鍵は book id から導出する（取り込み側と同じ規則）
         let key = self
-            .pack_key
-            .get_or_init(|| self.identity.as_ref().map(opfspack::derived_pack_key));
+            .pack_root_key
+            .as_ref()
+            .map(|root| root.derive_pack_key(book_id));
         let data = reader
             .read_entry_with_key(pack_entry, key.as_ref())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::pack_keys::pack_read_error_message(&e))?;
         let read_done = load_start.elapsed();
         let image = decode_render_image(&data)?;
         log::info!(
@@ -4586,9 +4588,8 @@ mod tests {
             images,
             packs_dir,
             db: db_pool,
-            identity: None,
+            pack_root_key: None,
             pack_bytes: std::sync::OnceLock::new(),
-            pack_key: std::sync::OnceLock::new(),
         });
         let view = cx.new(|cx| ImageViewer::new(cx, loader, "画像だけの本", 0, None));
 
@@ -4611,6 +4612,125 @@ mod tests {
             view.read_with(cx, |v, _| v.thumbs.iter().all(|thumb| thumb.is_some())),
             "real pack からサムネイルが読めること"
         );
+    }
+
+    /// v3 の pack（PRK から冊ごとの鍵を導出して暗号化）をアプリのローダーが
+    /// ルート鍵で復号して読めること。鍵が無ければ白ページにせず、復元の案内を出す。
+    ///
+    /// 書き込み側（core の取り込み）と同じ規則 `PRK.derive_pack_key(book_id)` で
+    /// 読めることを確かめる（鍵の渡し方がずれると全ページが読めなくなるため）。
+    #[gpui_kit::test]
+    async fn encrypted_pack_reads_with_the_root_key(cx: &mut TestAppContext) {
+        use thundoku_core::db;
+
+        cx.update(gpui_kit::component::init);
+        if cx.update(|cx| cx.try_global::<crate::app_state::AppState>().is_none()) {
+            cx.update(crate::app_state::AppState::init_test);
+        }
+        let (db_pool, packs_dir) = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            (state.db_pool.clone(), state.packs_dir.clone())
+        });
+
+        let book_id = "encrypted-pack-book";
+        let stamp = "2026-09-24 00:00:00";
+        // v3: pack の鍵はルート鍵（PRK）から book id で導出する
+        let root = opfspack::PackRootKey::generate();
+        let mut builder = opfspack::PackBuilder::new(1);
+        builder.add_entry("pages/page_0001.png", make_png(60, 80), "image/png", false);
+        let pack = builder
+            .build(Some(&root.derive_pack_key(book_id)), true)
+            .unwrap();
+        std::fs::create_dir_all(&packs_dir).unwrap();
+        std::fs::write(packs_dir.join(format!("{book_id}.opfspack")), &pack).unwrap();
+
+        db::books::insert(
+            &db_pool,
+            &db::books::Book {
+                id: book_id.into(),
+                title: "暗号化された本".into(),
+                author: String::new(),
+                circle_name: String::new(),
+                purchase_date: None,
+                file_name: "encrypted.zip".into(),
+                file_size: 1,
+                opfs_path: format!("{book_id}.opfspack"),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: None,
+                tags_fetched: 1,
+                pack_id: Some(book_id.into()),
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: stamp.into(),
+                updated_at: stamp.into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
+            },
+        )
+        .unwrap();
+        db::documents::insert_document(
+            &db_pool,
+            &db::documents::ImportedDocument {
+                id: format!("{book_id}-doc"),
+                book_id: book_id.into(),
+                source_type: "image-set".into(),
+                file_hash: "h".into(),
+                total_pages: 1,
+                metadata: None,
+                status: "completed".into(),
+                created_at: stamp.into(),
+                updated_at: stamp.into(),
+            },
+        )
+        .unwrap();
+        let images = vec![DocumentImage {
+            id: format!("{book_id}-img1"),
+            document_id: format!("{book_id}-doc"),
+            content_id: None,
+            format_id: None,
+            page_number: 1,
+            image_type: "page".into(),
+            opfs_path: format!("{book_id}.opfspack"),
+            width: 60,
+            height: 80,
+            mime_type: "image/png".into(),
+            file_size: 1,
+            pack_entry_path: Some("pages/page_0001.png".into()),
+            created_at: stamp.into(),
+        }];
+
+        // ルート鍵があれば復号して読める
+        let loader = PackPageLoader {
+            images: images.clone(),
+            packs_dir: packs_dir.clone(),
+            db: db_pool.clone(),
+            pack_root_key: Some(root.clone()),
+            pack_bytes: std::sync::OnceLock::new(),
+        };
+        assert!(
+            loader.load(0).is_ok(),
+            "解決済みのルート鍵で暗号化 pack を復号できること"
+        );
+
+        // 鍵が無ければ読めず、復元（パスフレーズ）の案内を出す
+        let loader = PackPageLoader {
+            images,
+            packs_dir,
+            db: db_pool,
+            pack_root_key: None,
+            pack_bytes: std::sync::OnceLock::new(),
+        };
+        let error = loader.load(0).expect_err("鍵が無ければ復号できない");
+        assert!(error.contains("パスフレーズ"), "復元の案内を出す: {error}");
     }
 
     /// pack が無い / 壊れている本は、白画面ではなく理由を出す（再ダウンロード導線）。
@@ -4645,9 +4765,8 @@ mod tests {
             }],
             packs_dir,
             db: db_pool,
-            identity: None,
+            pack_root_key: None,
             pack_bytes: std::sync::OnceLock::new(),
-            pack_key: std::sync::OnceLock::new(),
         });
         let view = cx.new(|cx| ImageViewer::new(cx, loader, "欠損本", 0, None));
         cx.run_until_parked();

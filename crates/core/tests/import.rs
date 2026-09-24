@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use opfspack::{Identity, PackBuilder, PackReader};
+use opfspack::{PackBuilder, PackReader, PackRootKey};
 use thundoku_core::db;
 use thundoku_core::import::{
     ImportError, MAX_NESTED_ENTRIES, MediaKind, analyze_zip, import_file, import_pdf_bytes,
@@ -1153,6 +1153,42 @@ fn zip_nested_folders_become_separate_contents() {
 }
 
 #[test]
+fn import_with_root_key_writes_an_encrypted_v3_pack() {
+    // pdfium に依存しない経路（画像 1 枚）で、鍵ありの取り込みを検証する。
+    let env = TestEnv::new("encrypted-import");
+    let root = PackRootKey::generate();
+    let png = make_png(64, 96, [10, 20, 30]);
+    let imported = thundoku_core::import::import_image_bytes(
+        &env.pool,
+        "locked.png",
+        &png,
+        &env.packs(),
+        Some(&root),
+        None,
+    )
+    .unwrap();
+
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    assert_eq!(reader.header().version, 3, "v3 で書き出す");
+    assert!(
+        reader.header().flags & opfspack::pack_flags::ENCRYPTED != 0,
+        "鍵ありの取り込みは暗号化する"
+    );
+    // metadata.json もページも鍵なしでは読めない（平文で書かれていない）。
+    assert!(reader.read_entry("metadata.json", None).is_err());
+    assert!(reader.read_entry("pages/page_0001.webp", None).is_err());
+    // 同じ PRK + 同じ book id から導出した鍵では読める。
+    let key = root.derive_pack_key(&imported.book.id);
+    let page = reader.read_entry("pages/page_0001.webp", Some(&key)).unwrap();
+    assert_eq!(&page[8..12], b"WEBP");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&reader.read_entry("metadata.json", Some(&key)).unwrap()).unwrap();
+    assert_eq!(meta["title"], "locked");
+}
+
+#[test]
 fn unsupported_extension_is_rejected() {
     let env = TestEnv::new("unsupported");
     let path = env.root.join("notes.txt");
@@ -1169,27 +1205,28 @@ fn pdf_import_binds_identity_when_provided() {
     let env = TestEnv::new("pdf-identity");
     let pdf_bytes = std::fs::read(PDF_FIXTURE).unwrap();
     let book_id = uuid::Uuid::new_v4().to_string();
-    let identity = Identity {
-        sub: "test-sub".into(),
-        pack_id: book_id.clone(),
-    };
+    let root = PackRootKey::generate();
     let imported = import_pdf_bytes(
         &env.pool,
         "bound.pdf",
         &pdf_bytes,
         &env.packs(),
-        Some(&identity),
+        Some(&root),
         &mut no_progress,
-        None,
+        Some(&book_id),
     )
     .unwrap();
     assert_eq!(imported.book.id, book_id);
     let pack_bytes = std::fs::read(env.packs().join(format!("{book_id}.opfspack"))).unwrap();
     let reader = PackReader::open(&pack_bytes).unwrap();
+    assert_eq!(reader.header().version, 3, "v3 で書き出す");
+    assert!(reader.header().flags & opfspack::pack_flags::ENCRYPTED != 0);
+    // 鍵が無い / 違う鍵では読めない（PRK から冊ごとに導出した鍵でのみ読める）
     assert!(reader.read_entry("pages/page_0001.webp", None).is_err());
-    let page = reader
-        .read_entry("pages/page_0001.webp", Some(&identity))
-        .unwrap();
+    let wrong = PackRootKey::generate().derive_pack_key(&book_id);
+    assert!(reader.read_entry("pages/page_0001.webp", Some(&wrong)).is_err());
+    let key = root.derive_pack_key(&book_id);
+    let page = reader.read_entry("pages/page_0001.webp", Some(&key)).unwrap();
     assert_eq!(&page[..4], b"RIFF");
 }
 
@@ -1266,7 +1303,7 @@ fn rename_content_in_pack_rewrites_only_that_content() {
     );
     let pack = builder.build(None, false).unwrap();
 
-    let renamed = thundoku_core::import::rename_content_in_pack(&pack, "c2", "続編", None)
+    let renamed = thundoku_core::import::rename_content_in_pack(&pack, "b1", "c2", "続編", None)
         .unwrap()
         .expect("metadata が変わった pack は Some を返す");
 
@@ -1295,10 +1332,9 @@ fn rename_content_in_pack_rewrites_only_that_content() {
 
 #[test]
 fn rename_content_in_pack_keeps_identity_binding() {
-    let identity = Identity {
-        sub: "sub-1".into(),
-        pack_id: "b1".into(),
-    };
+    let pack_id = "b1";
+    let root = PackRootKey::generate();
+    let key = root.derive_pack_key(pack_id);
     let mut builder = PackBuilder::new(7);
     builder.add_entry(
         "pages/page_0001.webp",
@@ -1312,25 +1348,29 @@ fn rename_content_in_pack_keeps_identity_binding() {
         "application/json",
         true,
     );
-    let pack = builder.build(Some(&identity), true).unwrap();
+    let pack = builder.build(Some(&key), true).unwrap();
 
-    let renamed =
-        thundoku_core::import::rename_content_in_pack(&pack, "c1", "本編", Some(&identity))
-            .unwrap()
-            .unwrap();
+    let renamed = thundoku_core::import::rename_content_in_pack(
+        &pack,
+        pack_id,
+        "c1",
+        "本編",
+        Some(&root),
+    )
+    .unwrap()
+    .unwrap();
 
     let reader = PackReader::open(&renamed).unwrap();
-    // 暗号化は維持される（identity 無しでは読めない）
+    // 暗号化は維持される（鍵無しでは読めない）
     assert!(reader.read_entry("pages/page_0001.webp", None).is_err());
     assert_eq!(
         reader
-            .read_entry("pages/page_0001.webp", Some(&identity))
+            .read_entry("pages/page_0001.webp", Some(&key))
             .unwrap(),
         b"page-1"
     );
     let meta: serde_json::Value =
-        serde_json::from_slice(&reader.read_entry("metadata.json", Some(&identity)).unwrap())
-            .unwrap();
+        serde_json::from_slice(&reader.read_entry("metadata.json", Some(&key)).unwrap()).unwrap();
     assert_eq!(meta["contents"][0]["displayName"], "本編");
 }
 
@@ -1346,7 +1386,7 @@ fn rename_content_in_pack_returns_none_when_unknown_or_missing() {
     );
     let pack = builder.build(None, false).unwrap();
     assert!(
-        thundoku_core::import::rename_content_in_pack(&pack, "missing", "x", None)
+        thundoku_core::import::rename_content_in_pack(&pack, "b1", "missing", "x", None)
             .unwrap()
             .is_none()
     );
@@ -1356,7 +1396,7 @@ fn rename_content_in_pack_returns_none_when_unknown_or_missing() {
     bare.add_entry("pages/page_0001.webp", b"p".to_vec(), "image/webp", false);
     let bare = bare.build(None, false).unwrap();
     assert!(
-        thundoku_core::import::rename_content_in_pack(&bare, "c1", "x", None)
+        thundoku_core::import::rename_content_in_pack(&bare, "b1", "c1", "x", None)
             .unwrap()
             .is_none()
     );

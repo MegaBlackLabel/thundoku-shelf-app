@@ -2,7 +2,7 @@
 //! size >= 64 -> magic -> version -> header CRC -> index CRC -> entry bounds.
 
 use crate::{
-    FORMAT_VERSION, Identity, PackEntry, PackError, PackHeader, entry_flags,
+    FORMAT_VERSION, PackEntry, PackError, PackHeader, PackKey, entry_flags,
     format::{deserialize_header, deserialize_index_entry, index_entry_size},
 };
 use std::io::{Read, Seek, SeekFrom};
@@ -45,6 +45,7 @@ impl<'a> PackReader<'a> {
             &bytes[index_offset..end - 4],
             header.index_offset,
             header.entry_count,
+            header.flags,
         )?;
         Ok(Self {
             bytes,
@@ -66,24 +67,19 @@ impl<'a> PackReader<'a> {
     }
 
     /// Read and decrypt/decompress the full entry payload.
-    pub fn read_entry(
-        &self,
-        path: &str,
-        identity: Option<&Identity>,
-    ) -> Result<Vec<u8>, PackError> {
-        let key = identity.map(|id| {
-            let master = crate::crypto::master_key(&id.sub);
-            crate::crypto::pack_key(&master, &id.pack_id)
-        });
-        self.read_entry_with_key(path, key.as_ref())
+    /// Same as [`Self::read_entry_with_key`] (kept because callers on both
+    /// sides of the crate use either name).
+    pub fn read_entry(&self, path: &str, key: Option<&PackKey>) -> Result<Vec<u8>, PackError> {
+        self.read_entry_with_key(path, key)
     }
 
-    /// Read an entry using a pre-derived pack key (avoids re-running PBKDF2
-    /// 100k iterations per page). `key` is only used for identity-bound entries.
+    /// Read an entry using the pack key derived from the account root key
+    /// (callers cache it instead of re-running HKDF per page). `key` is only
+    /// used for encrypted entries; a missing key is [`PackError::KeyRequired`].
     pub fn read_entry_with_key(
         &self,
         path: &str,
-        key: Option<&[u8; 32]>,
+        key: Option<&PackKey>,
     ) -> Result<Vec<u8>, PackError> {
         let entry = self
             .entry(path)
@@ -92,8 +88,17 @@ impl<'a> PackReader<'a> {
             return Err(PackError::UnsupportedLz4);
         }
         let start = entry.offset as usize;
-        let end = start + entry.compressed_size as usize;
-        let data = self.bytes[start..end].to_vec();
+        let end = start
+            .checked_add(entry.compressed_size as usize)
+            .ok_or_else(|| {
+                PackError::Corrupted(format!("entry offset overflow: {}", entry.path))
+            })?;
+        // 境界は `open` で検証済みだが、スライスで panic しないよう `get` で取る。
+        let data = self
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| PackError::Corrupted(format!("entry out of bounds: {}", entry.path)))?
+            .to_vec();
         decode_entry_payload(entry, data, key)
     }
 
@@ -104,7 +109,7 @@ impl<'a> PackReader<'a> {
         path: &str,
         start: u64,
         end: u64,
-        identity: Option<&Identity>,
+        key: Option<&PackKey>,
     ) -> Result<Vec<u8>, PackError> {
         let entry = self
             .entry(path)
@@ -115,15 +120,39 @@ impl<'a> PackReader<'a> {
                 entry.size
             )));
         }
-        let full = self.read_entry(path, identity)?;
+        let full = self.read_entry(path, key)?;
+        // 宣言 `size` ではなく**実際に展開できた長さ**で最終確認する。
+        // 宣言値を信じてスライスすると、細工した index で panic し得る。
+        if end > full.len() as u64 {
+            return Err(PackError::Corrupted(format!(
+                "range {start}..{end} exceeds decoded {} bytes: {path}",
+                full.len()
+            )));
+        }
         Ok(full[start as usize..end as usize].to_vec())
     }
 }
 
-fn raw_inflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    use std::io::Read;
+fn raw_inflate(data: &[u8], expected_size: u64) -> Result<Vec<u8>, std::io::Error> {
+    // 展開後の上限は index の `size`。宣言 +1 バイトまでしか読まないため、
+    // 小さな DEFLATE 入力から数 GB を展開させる細工でもメモリを食い潰せない
+    // （1 バイトでも超えたら即エラー）。
+    let limit = expected_size
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "size overflow"))?;
     let mut out = Vec::new();
-    flate2::read::DeflateDecoder::new(data).read_to_end(&mut out)?;
+    flate2::read::DeflateDecoder::new(data)
+        .take(limit)
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > expected_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "inflated {} bytes exceeds declared {expected_size}",
+                out.len()
+            ),
+        ));
+    }
     Ok(out)
 }
 
@@ -134,10 +163,12 @@ const MIN_INDEX_ENTRY_SIZE: usize = 48;
 
 /// インデックス領域（CRC を含まない）をエントリ列へ解釈する。
 /// 各エントリの格納領域が本体（ヘッダ〜インデックス）に収まっていることも検証する。
+/// サイズ・件数の上限は `Vec` の確保や本体の読み出しより前に適用する。
 fn parse_index_entries(
     index: &[u8],
     index_offset: u64,
     entry_count: u32,
+    pack_flags: u32,
 ) -> Result<Vec<PackEntry>, PackError> {
     // 件数は index 長から導ける上限で先に検査する。ここを飛ばすと、細工した
     // `entry_count`（u32::MAX 等）+ 68 バイトのデータで数百 GB の
@@ -149,16 +180,25 @@ fn parse_index_entries(
             "entry_count {entry_count} exceeds index capacity {max_entries}"
         )));
     }
+    // 索引領域そのものが大きい pack では上の検査をすり抜けるため、件数上限を別に持つ。
+    if entry_count > crate::MAX_ENTRY_COUNT {
+        return Err(PackError::Corrupted(format!(
+            "entry_count {entry_count} exceeds limit {}",
+            crate::MAX_ENTRY_COUNT
+        )));
+    }
     let mut entries = Vec::with_capacity(entry_count as usize);
     let mut pos = 0;
+    let mut total_size: u64 = 0;
     for _ in 0..entry_count {
         if pos >= index.len() {
             return Err(PackError::Corrupted(format!(
                 "index truncated: expected {entry_count} entries"
             )));
         }
-        let entry = deserialize_index_entry(&index[pos..])?;
+        let entry: PackEntry = deserialize_index_entry(&index[pos..])?.into();
         pos += index_entry_size(&entry.path, &entry.mime_type);
+        validate_entry(&entry, &mut total_size)?;
         let data_end = entry
             .offset
             .checked_add(entry.compressed_size)
@@ -171,25 +211,96 @@ fn parse_index_entries(
                 entry.path
             )));
         }
-        entries.push(entry.into());
+        entries.push(entry);
     }
+    validate_pack_encryption(pack_flags, &entries)?;
     Ok(entries)
+}
+
+/// index が宣言するフラグとサイズを検査する。`size` / `compressed_size` は
+/// 攻撃者が自由に書けるため、確保や読み出しの前に上限と突き合わせる。
+fn validate_entry(entry: &PackEntry, total_size: &mut u64) -> Result<(), PackError> {
+    // version 3 で `IDENTITY_BOUND`（v2 の identity 束縛）が立っていれば、
+    // その pack は v3 として壊れている（鍵スケジュールは header version で
+    // 選ぶので、フラグでは選ばない）。
+    if entry.flags & !entry_flags::KNOWN_MASK != 0 {
+        return Err(PackError::Corrupted(format!(
+            "unknown entry flags {:#x}: {}",
+            entry.flags, entry.path
+        )));
+    }
+    if entry.size > crate::MAX_ENTRY_SIZE {
+        return Err(PackError::Corrupted(format!(
+            "entry size {} exceeds limit {}: {}",
+            entry.size,
+            crate::MAX_ENTRY_SIZE,
+            entry.path
+        )));
+    }
+    if entry.compressed_size > crate::MAX_STORED_ENTRY_SIZE {
+        return Err(PackError::Corrupted(format!(
+            "stored size {} exceeds limit {}: {}",
+            entry.compressed_size,
+            crate::MAX_STORED_ENTRY_SIZE,
+            entry.path
+        )));
+    }
+    *total_size = total_size
+        .checked_add(entry.size)
+        .ok_or_else(|| PackError::Corrupted(format!("total size overflow: {}", entry.path)))?;
+    if *total_size > crate::MAX_TOTAL_SIZE {
+        return Err(PackError::Corrupted(format!(
+            "total size {} exceeds limit {}: {}",
+            *total_size,
+            crate::MAX_TOTAL_SIZE,
+            entry.path
+        )));
+    }
+    Ok(())
+}
+
+/// ヘッダの `ENCRYPTED` とエントリの暗号化フラグの整合を検査する。
+/// builder は鍵を渡されたときに**全**エントリを暗号化するため、混在は破損。
+fn validate_pack_encryption(pack_flags: u32, entries: &[PackEntry]) -> Result<(), PackError> {
+    let header_encrypted = pack_flags & crate::pack_flags::ENCRYPTED != 0;
+    let encrypted = |entry: &PackEntry| entry.flags & entry_flags::ENCRYPTED != 0;
+    if header_encrypted && !entries.iter().all(encrypted) {
+        return Err(PackError::Corrupted(
+            "encrypted pack contains a plaintext entry".into(),
+        ));
+    }
+    if !header_encrypted && entries.iter().any(encrypted) {
+        return Err(PackError::Corrupted(
+            "pack contains encrypted entries without the ENCRYPTED flag".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 格納バイト列（AES-GCM 暗号文 / raw DEFLATE）を平文へ戻す。
 fn decode_entry_payload(
     entry: &PackEntry,
     mut data: Vec<u8>,
-    key: Option<&[u8; 32]>,
+    key: Option<&PackKey>,
 ) -> Result<Vec<u8>, PackError> {
-    if entry.flags & entry_flags::IDENTITY_BOUND != 0 {
-        let key = key.ok_or_else(|| PackError::IdentityRequired(entry.path.clone()))?;
-        data = crate::crypto::decrypt(&data, &entry.iv, key)
+    if entry.flags & entry_flags::ENCRYPTED != 0 {
+        let key = key.ok_or_else(|| PackError::KeyRequired(entry.path.clone()))?;
+        data = crate::crypto::decrypt(&data, &entry.iv, key.as_bytes())
             .map_err(|_| PackError::Corrupted(format!("decryption failed: {}", entry.path)))?;
     }
     if entry.flags & entry_flags::COMPRESSED != 0 {
-        data = raw_inflate(&data)
+        data = raw_inflate(&data, entry.size)
             .map_err(|e| PackError::Corrupted(format!("decompression failed: {e}")))?;
+    }
+    // 宣言 `size` と実長の一致は圧縮・非圧縮・暗号化の全経路で必須。
+    // 欠くと、細工した index で `read_entry_range` のスライスが panic し得る。
+    if data.len() as u64 != entry.size {
+        return Err(PackError::Corrupted(format!(
+            "entry size mismatch: {} declares {} bytes, decoded {}",
+            entry.path,
+            entry.size,
+            data.len()
+        )));
     }
     Ok(data)
 }
@@ -257,6 +368,7 @@ impl PackFileReader {
             &index[..index.len() - 4],
             header.index_offset,
             header.entry_count,
+            header.flags,
         )?;
         Ok(Self {
             file,
@@ -281,7 +393,7 @@ impl PackFileReader {
     pub fn read_entry_with_key(
         &mut self,
         path: &str,
-        key: Option<&[u8; 32]>,
+        key: Option<&PackKey>,
     ) -> Result<Vec<u8>, PackError> {
         let entry = self
             .entry(path)
