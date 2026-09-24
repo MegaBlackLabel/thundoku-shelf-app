@@ -16,8 +16,9 @@ pub struct TbfEvent {
     pub is_cancelled: i64,
     pub display_order: i64,
     pub is_featured: i64,
-    /// 「このイベントについて、技術書典手から最新状況を同期する」トグル。
-    /// 1 = ポーリング対象（サーバー同期で上書きしない）。
+    /// 「このイベントについて、技術書典から最新状況を同期する」トグル。
+    /// 1 = ポーリング対象。注目イベントは新規作成時に既定で 1 になり、
+    /// 既存行ではユーザーの設定を保持する（サーバー同期で上書きしない）。
     pub poll_sync_enabled: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -44,6 +45,12 @@ pub struct CheckedItem {
     pub created_at: String,
 }
 
+/// Upsert a `tbf_events` row.
+///
+/// `poll_sync_enabled` は**新規行では呼び出し側の値をそのまま**入れる
+/// （`tbf::sync` が注目イベントなら 1 を渡す）。既存行ではユーザーの設定を
+/// 保持するが、**非注目 → 注目**に変わったときだけ既定（呼び出し側の値）を入れる
+/// （本棚同期が先に作った行でも、注目イベントになった時点でポーリングが始まる）。
 pub fn upsert_event(pool: &SqlitePool, event: &TbfEvent) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query(
@@ -63,7 +70,11 @@ pub fn upsert_event(pool: &SqlitePool, event: &TbfEvent) -> Result<(), sqlx::Err
                is_cancelled = excluded.is_cancelled,
                display_order = excluded.display_order,
                is_featured = excluded.is_featured,
-               poll_sync_enabled = tbf_events.poll_sync_enabled,
+               poll_sync_enabled = CASE
+                 WHEN tbf_events.is_featured = 0 AND excluded.is_featured <> 0
+                 THEN excluded.poll_sync_enabled
+                 ELSE tbf_events.poll_sync_enabled
+               END,
                updated_at = excluded.updated_at",
         )
         .bind(&event.id)
@@ -100,7 +111,7 @@ pub fn list_events(pool: &SqlitePool) -> Result<Vec<TbfEvent>, sqlx::Error> {
     })
 }
 
-/// 「このイベントについて、技術書典手から最新状況を同期する」トグルを保存する。
+/// 「このイベントについて、技術書典から最新状況を同期する」トグルを保存する。
 pub fn set_poll_enabled(pool: &SqlitePool, slug: &str, enabled: bool) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
         sqlx::query("UPDATE tbf_events SET poll_sync_enabled = ?1 WHERE slug = ?2")

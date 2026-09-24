@@ -579,6 +579,23 @@ async fn upsert_rows(
         } else {
             obj
         };
+        // 旧バックアップ（`poll_sync_enabled` 列を足す前に取ったもの）は、そのまま復元すると
+        // スキーマの DEFAULT（0 = ポーリング対象外）になり、注目イベントでも 5 分ポーラーが
+        // 動かない。欠落しているときだけ注目イベントへ既定（1）を補う
+        // （列を持つ新しいバックアップの利用者設定はそのまま復元する）。
+        let with_poll_default;
+        let obj = if table == "tbf_events" && !obj.contains_key("poll_sync_enabled") {
+            let mut owned = obj.clone();
+            let featured = obj.get("is_featured").and_then(Value::as_i64).unwrap_or(0) != 0;
+            owned.insert(
+                "poll_sync_enabled".to_string(),
+                Value::Number(Number::from(if featured { 1 } else { 0 })),
+            );
+            with_poll_default = owned;
+            &with_poll_default
+        } else {
+            obj
+        };
         // PK / 競合判定列が欠けている行は INSERT しない（NULL を作らない）
         if let Some(missing) = pk
             .iter()
@@ -1276,5 +1293,61 @@ mod tests {
             age_rating: None,
             series_name: None,
         }
+    }
+
+    /// `poll_sync_enabled` 列を持たない古いバックアップを復元したとき、
+    /// 注目イベントは既定（1 = ポーリング対象）で復元される
+    /// （列が無いとスキーマの DEFAULT 0 になり、5 分ポーラーが動かない）。
+    #[test]
+    fn import_json_fills_poll_default_for_legacy_tbf_events() {
+        let pool = crate::db::test_pool();
+        let payload = serde_json::json!({
+            "format_version": 2,
+            "tbf_events": [
+                {
+                    "id": "tbf20", "site_id": "techbookfest", "slug": "tbf20",
+                    "tbf_event_id": "Event:tbf20", "event_name": "技術書典20",
+                    "event_date": "2026-04-11", "event_start_date": "2026-04-11",
+                    "event_end_date": "2026-04-26", "event_format": "hybrid",
+                    "is_cancelled": 0, "display_order": 0, "is_featured": 1,
+                    "created_at": "2026-08-23 00:00:00", "updated_at": "2026-08-23 00:00:00"
+                },
+                {
+                    "id": "tbf19", "site_id": "techbookfest", "slug": "tbf19",
+                    "tbf_event_id": "Event:tbf19", "event_name": "技術書典19",
+                    "event_date": "2025-11-15", "event_start_date": "2025-11-15",
+                    "event_end_date": "2025-11-30", "event_format": "hybrid",
+                    "is_cancelled": 0, "display_order": 1, "is_featured": 0,
+                    "created_at": "2026-08-23 00:00:00", "updated_at": "2026-08-23 00:00:00"
+                }
+            ]
+        });
+        import_json(&pool, &payload.to_string()).unwrap();
+        assert_eq!(
+            crate::db::checklist::list_enabled_slugs(&pool).unwrap(),
+            vec!["tbf20".to_string()]
+        );
+    }
+
+    /// 列を持つ（新しい）バックアップのユーザー設定は、復元で勝手に変えない。
+    #[test]
+    fn import_json_keeps_poll_setting_from_backup() {
+        let pool = crate::db::test_pool();
+        let payload = serde_json::json!({
+            "format_version": 3,
+            "tbf_events": [
+                {
+                    "id": "tbf20", "site_id": "techbookfest", "slug": "tbf20",
+                    "tbf_event_id": "Event:tbf20", "event_name": "技術書典20",
+                    "event_date": "2026-04-11", "event_start_date": "2026-04-11",
+                    "event_end_date": "2026-04-26", "event_format": "hybrid",
+                    "is_cancelled": 0, "display_order": 0, "is_featured": 1,
+                    "poll_sync_enabled": 0,
+                    "created_at": "2026-08-23 00:00:00", "updated_at": "2026-08-23 00:00:00"
+                }
+            ]
+        });
+        import_json(&pool, &payload.to_string()).unwrap();
+        assert!(crate::db::checklist::list_enabled_slugs(&pool).unwrap().is_empty());
     }
 }

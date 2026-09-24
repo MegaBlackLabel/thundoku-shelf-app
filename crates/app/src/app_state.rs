@@ -136,6 +136,10 @@ pub struct AppState {
     pub auth_open_requested: Arc<AtomicBool>,
     /// auth_open_requested 時の認証プロバイダ。
     pub auth_open_provider: Arc<Mutex<Option<crate::views::auth::AuthProvider>>>,
+    /// 設定の「ローカルデータをすべて削除」でローカルのデータを消したことを通知する。
+    /// チェックリストの「空のイベントを開いたら 1 回だけ自動同期」は削除前の試行を
+    /// 引きずらないよう、この通知で履歴を捨てる。
+    pub local_data_deleted: Arc<AtomicBool>,
     /// いま表示中のモーダル（ダイアログ）の登録簿。
     ///
     /// 各ビューは自分の状態を独立に持っているため、**同じ画面に 2 つ出てしまう**
@@ -447,6 +451,7 @@ impl AppState {
             google_login_done: Arc::new(AtomicBool::new(false)),
             google_logout_done: Arc::new(AtomicBool::new(false)),
             auth_open_requested: Arc::new(AtomicBool::new(false)),
+            local_data_deleted: Arc::new(AtomicBool::new(false)),
             auth_open_provider: Arc::new(Mutex::new(None)),
             modals: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         });
@@ -526,6 +531,7 @@ impl AppState {
             google_login_done: Arc::new(AtomicBool::new(false)),
             google_logout_done: Arc::new(AtomicBool::new(false)),
             auth_open_requested: Arc::new(AtomicBool::new(false)),
+            local_data_deleted: Arc::new(AtomicBool::new(false)),
             auth_open_provider: Arc::new(Mutex::new(None)),
             modals: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         });

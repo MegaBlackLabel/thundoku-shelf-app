@@ -67,6 +67,9 @@ pub struct ChecklistView {
     /// ダウンロード失敗したサムネイル（reload 連鎖の無限ループ防止。
     /// 失敗はアプリ再起動でリセットされ、次回起動時に再試行される）
     fetch_failed: HashSet<String>,
+    /// 空のイベントを開いたときに自動同期を試した slug（同じイベントを開き直しても
+    /// 繰り返し叩かない。ビューの寿命 = アプリを閉じるまで）
+    auto_sync_attempted: HashSet<String>,
 }
 
 impl ChecklistView {
@@ -88,12 +91,21 @@ impl ChecklistView {
             evicted_thumb_images: Vec::new(),
             thumbnail_fetching: HashSet::new(),
             fetch_failed: HashSet::new(),
+            auto_sync_attempted: HashSet::new(),
         };
         view.reload(cx);
         view
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        // 設定の「ローカルデータをすべて削除」のあとは、自動同期の試行履歴を捨てる
+        // （同じイベントを開き直したときに、もう一度取りに行けるように）
+        if AppState::global(cx)
+            .local_data_deleted
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.auto_sync_attempted.clear();
+        }
         let (events, items, last_sync, selected) = {
             let state = AppState::global(cx);
             let db = &state.db_pool;
@@ -373,6 +385,27 @@ impl ChecklistView {
         self.selected_slug = Some(slug.to_string());
         self.page = 0;
         self.reload(cx);
+        self.maybe_auto_sync(cx);
+    }
+
+    /// 開いたイベントにアイテムが 1 件も無ければ、1 回だけ自動で同期する
+    /// （全データ削除や初回インストールのあと、チェックリストが空のままにならないように）。
+    /// 未ログインのときは何もしない（`sync()` はログイン要求を出すため、
+    /// 画面を開いただけの利用者を邪魔しない）。
+    fn maybe_auto_sync(&mut self, cx: &mut Context<Self>) {
+        let Some(slug) = self.selected_slug.clone() else {
+            return;
+        };
+        if self.busy || !self.items.is_empty() {
+            return;
+        }
+        if !*AppState::global(cx).tbf_logged_in.lock() {
+            return;
+        }
+        if !self.auto_sync_attempted.insert(slug) {
+            return;
+        }
+        self.sync(cx);
     }
 
     /// イベント一覧に戻る（Web の「← イベント一覧に戻る」相当）。
@@ -427,25 +460,32 @@ impl ChecklistView {
             });
         cx.spawn(async move |_window, cx| {
             let result = task.await;
-            handle.update(cx, |this, cx| {
-                this.busy = false;
-                match result {
-                    Ok(count) => {
-                        log::info!("sync done: {count} entries");
-                        this.toast = Some(format!("チェックリストを同期しました（{count} 件）"));
-                        this.reload(cx);
-                    }
-                    Err(message) => {
-                        this.error = Some(message.clone());
-                        if message.contains("session expired") {
-                            cx.defer(move |cx| cx.dispatch_action(&crate::actions::OpenAuth));
-                        }
-                    }
-                }
-                cx.notify();
-            });
+            handle.update(cx, |this, cx| this.finish_sync(cx, result));
         })
         .detach();
+    }
+
+    /// 同期タスクの完了処理（結果の反映と、選択中イベントでの自動同期の再判定）。
+    ///
+    /// 同期中に別のイベントを開くと `maybe_auto_sync` は `busy` で見送られるため、
+    /// 完了時にもう一度判定する（実行中の同期が終わった時点で取得が始まる）。
+    fn finish_sync(&mut self, cx: &mut Context<Self>, result: Result<usize, String>) {
+        self.busy = false;
+        match result {
+            Ok(count) => {
+                log::info!("sync done: {count} entries");
+                self.toast = Some(format!("チェックリストを同期しました（{count} 件）"));
+                self.reload(cx);
+            }
+            Err(message) => {
+                self.error = Some(message.clone());
+                if message.contains("session expired") {
+                    cx.defer(move |cx| cx.dispatch_action(&crate::actions::OpenAuth));
+                }
+            }
+        }
+        self.maybe_auto_sync(cx);
+        cx.notify();
     }
 
     /// お気に入り（checkedProductInfos）をチェックリストへ取り込む。
@@ -494,6 +534,8 @@ impl ChecklistView {
                         }
                     }
                 }
+                // 取り込み中に別のイベントを開いていた場合に備えて再判定する
+                this.maybe_auto_sync(cx);
                 cx.notify();
             });
         })
@@ -1196,7 +1238,7 @@ impl ChecklistView {
                                         div()
                                             .text_sm()
                                             .text_color(muted_fg)
-                                            .child("このイベントについて、技術書典手から最新状況を同期する"),
+                                            .child("このイベントについて、技術書典から最新状況を同期する"),
                                     )
                                     .into_any_element()
                             } else {
@@ -1471,6 +1513,7 @@ fn truncate_text(text: &str, max_length: usize) -> String {
 mod tests {
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use thundoku_core::db::checklist as checklist_db;
 
@@ -1692,6 +1735,7 @@ mod tests {
             evicted_thumb_images: Vec::new(),
             thumbnail_fetching: HashSet::new(),
             fetch_failed: HashSet::new(),
+            auto_sync_attempted: HashSet::new(),
         }
     }
 
@@ -1873,5 +1917,212 @@ mod tests {
         });
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].image_data.as_deref(), Some("aGVsbG8="));
+    }
+
+    /// 技術書典のチェックリスト応答を差し替えたクライアント（実通信しない）。
+    /// `checklist_calls` にはチェックリスト取得の回数だけを数える。
+    fn mock_tbf_client(items: usize, checklist_calls: Arc<AtomicUsize>) -> tbf::TbfClient {
+        use tbf::{RequestSpec, ResponseSpec, TbfError, Transport};
+
+        struct MockTransport {
+            items: usize,
+            checklist_calls: Arc<AtomicUsize>,
+        }
+        impl Transport for MockTransport {
+            fn send(&mut self, spec: RequestSpec) -> Result<ResponseSpec, TbfError> {
+                if spec
+                    .url
+                    .contains("operationName=EventOfflineCircleChecklistQuery")
+                {
+                    self.checklist_calls.fetch_add(1, Ordering::SeqCst);
+                    let edges: Vec<serde_json::Value> = (0..self.items)
+                        .map(|index| {
+                            serde_json::json!({ "node": {
+                                "productInfo": {
+                                    "databaseID": format!("fixture-{index}"),
+                                    "organization": {
+                                        "name": format!("サークル{index}"),
+                                        "circles": { "edges": [ { "node": {
+                                            "databaseID": format!("circle-{index}"),
+                                            "event": { "databaseID": "Event:tbf20" },
+                                            "spaces": ["あ-01"],
+                                            "hasOfflineCourse": true
+                                        }}] }
+                                    },
+                                    "name": format!("同人誌{index}"),
+                                    "productVariants": { "edges": [] },
+                                    "loginUserBookShelfItem": {}
+                                },
+                                "createdAt": "2026-04-12T00:00:00Z"
+                            }})
+                        })
+                        .collect();
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "data": { "viewer": { "checkedProductInfos": {
+                            "edges": edges,
+                            "pageInfo": { "hasNextPage": false }
+                        }}}
+                    }))
+                    .expect("fixture json");
+                    return Ok(ResponseSpec {
+                        status: 200,
+                        headers: Vec::new(),
+                        body,
+                    });
+                }
+                // イベント発見（TbfEventQuery）は無効化する → events() は canonical のみ
+                Ok(ResponseSpec {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+            }
+        }
+        tbf::TbfClient::with_transport(Box::new(MockTransport {
+            items,
+            checklist_calls,
+        }))
+    }
+
+    /// 技術書典にログイン済みの状態にして、通信をモックに差し替える。
+    fn login_with(cx: &mut TestAppContext, client: tbf::TbfClient) {
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            *state.tbf.lock() = client;
+            *state.tbf_logged_in.lock() = true;
+        });
+    }
+
+    /// 空のイベントを開いたら、自動で 1 回同期して項目が表示される
+    /// （全データ削除や初回インストールのあとでも、チェックリストが空のままにならない）。
+    #[gpui_kit::test]
+    async fn opening_empty_event_syncs_automatically(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_event(cx, "tbf20", "技術書典20");
+        let calls = Arc::new(AtomicUsize::new(0));
+        login_with(cx, mock_tbf_client(1, calls.clone()));
+        let view = cx.new(ChecklistView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.items.len()), 1);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.items[0].circle_name.clone()),
+            "サークル0".to_string()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// すでに項目があるイベントを開くときは通信しない。
+    #[gpui_kit::test]
+    async fn opening_event_with_items_does_not_sync(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_event(cx, "tbf20", "技術書典20");
+        seed_item(cx, "item-1", "tbf20", "サークルA");
+        let calls = Arc::new(AtomicUsize::new(0));
+        login_with(cx, mock_tbf_client(1, calls.clone()));
+        let view = cx.new(ChecklistView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.items[0].circle_name.clone()),
+            "サークルA".to_string()
+        );
+    }
+
+    /// 未ログインなら自動同期しない（ログインを促すトーストも出さない。
+    /// 画面を開いただけで邪魔しない）。
+    #[gpui_kit::test]
+    async fn not_logged_in_does_not_auto_sync(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_event(cx, "tbf20", "技術書典20");
+        let calls = Arc::new(AtomicUsize::new(0));
+        cx.update(|cx| *AppState::global(cx).tbf.lock() = mock_tbf_client(1, calls.clone()));
+        let view = cx.new(ChecklistView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(view.read_with(cx, |v, _| v.toast.is_none()));
+    }
+
+    /// サーバー側も空だったときは、同じイベントを開き直しても再試行しない
+    /// （自動同期でサーバーを叩き続けない）。
+    #[gpui_kit::test]
+    async fn empty_event_does_not_sync_again(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_event(cx, "tbf20", "技術書典20");
+        let calls = Arc::new(AtomicUsize::new(0));
+        login_with(cx, mock_tbf_client(0, calls.clone()));
+        let view = cx.new(ChecklistView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 一覧に戻って開き直しても、もう自動同期しない
+        cx.update(|cx| view.update(cx, |this, cx| this.back_to_list(cx)));
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 別のイベントを同期している間に空のイベントを開いた場合でも、
+    /// 同期が終わった時点でそのイベントの自動同期が走る。
+    #[gpui_kit::test]
+    async fn empty_event_opened_during_sync_is_synced_after_it_finishes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_event(cx, "tbf20", "技術書典20");
+        seed_event(cx, "tbf19", "技術書典19");
+        // fixture の購入日は技術書典20 の開催期間なので、アイテムは tbf19 側に置く
+        seed_item(cx, "item-1", "tbf19", "サークルA");
+        let calls = Arc::new(AtomicUsize::new(0));
+        login_with(cx, mock_tbf_client(1, calls.clone()));
+        let view = cx.new(ChecklistView::new);
+        // アイテムのあるイベントを開く（自動同期は走らない）
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf19")));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // 同期中（busy）に空のイベントへ移動しても、その場では見送られる
+        cx.update(|cx| view.update(cx, |this, _| this.busy = true));
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // 同期が終わったら、いま開いている空のイベントを取得する
+        cx.update(|cx| view.update(cx, |this, cx| this.finish_sync(cx, Ok(0))));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(view.read_with(cx, |v, _| v.items.len()), 1);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.items[0].circle_name.clone()),
+            "サークル0".to_string()
+        );
+    }
+
+    /// 設定の「ローカルデータをすべて削除」のあとは、同じイベントを開き直せば
+    /// もう一度自動同期する（削除前の試行履歴を引きずらない）。
+    #[gpui_kit::test]
+    async fn opening_event_after_local_data_delete_syncs_again(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_event(cx, "tbf20", "技術書典20");
+        let calls = Arc::new(AtomicUsize::new(0));
+        login_with(cx, mock_tbf_client(0, calls.clone()));
+        let view = cx.new(ChecklistView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 設定画面の「ローカルデータをすべて削除」と同じ通知
+        cx.update(|cx| {
+            AppState::global(cx)
+                .local_data_deleted
+                .store(true, Ordering::SeqCst)
+        });
+        cx.update(|cx| view.update(cx, |this, cx| this.back_to_list(cx)));
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

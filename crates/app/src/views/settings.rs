@@ -1484,6 +1484,11 @@ impl SettingsView {
                         .await
                 });
             }
+            // チェックリストの「空のイベントを開いたら 1 回だけ自動同期」が、
+            // 削除前の試行履歴を引きずらないようにする。
+            state
+                .local_data_deleted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         {
             let state = AppState::global(cx);

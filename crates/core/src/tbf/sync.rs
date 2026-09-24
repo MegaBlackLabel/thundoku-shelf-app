@@ -59,7 +59,9 @@ fn ensure_event(
             is_cancelled: 0,
             display_order: 0,
             is_featured: is_featured as i64,
-            poll_sync_enabled: 0,
+            // 注目イベントはポーリングのトグルを既定で入れる
+            // （全データ削除・初回インストールでもチェックリストが最新化されるように）
+            poll_sync_enabled: if is_featured { 1 } else { 0 },
             created_at: timestamp.clone(),
             updated_at: timestamp,
         },
@@ -154,7 +156,9 @@ pub fn save_events(pool: &SqlitePool, events: &[TbfEventInfo]) -> Result<usize, 
                 is_cancelled: event.is_cancelled as i64,
                 display_order: event.display_order,
                 is_featured: event.is_featured as i64,
-                poll_sync_enabled: 0,
+                // 注目イベント（API の並びの先頭）はポーリングのトグルを既定で入れる。
+                // 既存行のユーザー設定は upsert_event 側が保持する
+                poll_sync_enabled: if event.is_featured { 1 } else { 0 },
                 created_at: timestamp.clone(),
                 updated_at: timestamp.clone(),
             },
@@ -248,7 +252,7 @@ fn item_signature(items: &[checklist::CheckedItem]) -> Vec<(String, String, Stri
         .collect()
 }
 
-/// 1 つのイベントについて、技術書典手から最新状況を同期する。
+/// 1 つのイベントについて、技術書典から最新状況を同期する。
 /// イベントマスタ（`events()`）とチェックリスト（`checklist(slug)`）を取得して保存し、
 /// `api.last_sync_at` を更新する。`changed` は保存前後でイベント・項目に差分が
 /// あったか（Drive 同期が必要か）を返す。
@@ -453,6 +457,80 @@ mod tests {
         let outcome = refresh_checklist(&pool, &mut client, "tbf20", None).unwrap();
         assert_eq!(outcome.count, 1);
         assert!(!outcome.changed);
+    }
+
+    fn event_info(slug: &str, featured: bool) -> TbfEventInfo {
+        TbfEventInfo {
+            slug: slug.into(),
+            tbf_event_id: format!("Event:{slug}"),
+            event_name: format!("イベント{slug}"),
+            event_date: None,
+            event_start_date: None,
+            event_end_date: None,
+            event_format: "offline".into(),
+            is_cancelled: false,
+            display_order: 0,
+            is_featured: featured,
+        }
+    }
+
+    /// 注目イベントは新規作成時にポーリングのトグルが既定で入る
+    /// （全データ削除や初回インストールのあと、チェックリストが勝手に最新化されるように）。
+    #[test]
+    fn save_events_enables_polling_for_featured_event() {
+        let pool = crate::db::test_pool();
+        migrate(&pool).unwrap();
+        save_events(
+            &pool,
+            &[event_info("tbf20", true), event_info("tbf19", false)],
+        )
+        .unwrap();
+        assert_eq!(
+            checklist::list_enabled_slugs(&pool).unwrap(),
+            vec!["tbf20".to_string()]
+        );
+    }
+
+    /// 本棚同期は canonical マスターの先頭（= 現行の技術書典20）を注目イベントとして
+    /// 作るため、その時点でポーリングのトグルが入る。
+    #[test]
+    fn bookshelf_sync_enables_polling_for_current_event() {
+        let pool = crate::db::test_pool();
+        migrate(&pool).unwrap();
+        ensure_event(&pool, "tbf20", Some("技術書典20")).unwrap();
+        assert_eq!(
+            checklist::list_enabled_slugs(&pool).unwrap(),
+            vec!["tbf20".to_string()]
+        );
+    }
+
+    /// 非注目で作られた行でも、あとから注目イベントに変わった時点で既定の
+    /// ポーリングが入る。
+    #[test]
+    fn promoting_event_to_featured_enables_polling() {
+        let pool = crate::db::test_pool();
+        migrate(&pool).unwrap();
+        // 過去のイベントとして先に行ができている（注目フラグは無い）
+        ensure_event(&pool, "tbf19", Some("技術書典19")).unwrap();
+        assert!(checklist::list_enabled_slugs(&pool).unwrap().is_empty());
+        // あとから API の並びで注目イベントになった
+        save_events(&pool, &[event_info("tbf19", true)]).unwrap();
+        assert_eq!(
+            checklist::list_enabled_slugs(&pool).unwrap(),
+            vec!["tbf19".to_string()]
+        );
+    }
+
+    /// ユーザーが OFF にした注目イベントは、再同期でも OFF のまま
+    /// （注目フラグで勝手に戻さない）。
+    #[test]
+    fn user_disabled_polling_stays_disabled_for_featured_event() {
+        let pool = crate::db::test_pool();
+        migrate(&pool).unwrap();
+        save_events(&pool, &[event_info("tbf20", true)]).unwrap();
+        checklist::set_poll_enabled(&pool, "tbf20", false).unwrap();
+        save_events(&pool, &[event_info("tbf20", true)]).unwrap();
+        assert!(checklist::list_enabled_slugs(&pool).unwrap().is_empty());
     }
 
     #[test]
