@@ -14,7 +14,10 @@ path = "src/main.rs"
 # Carousel（Multiple Item）は未リリース。crates.io の最新 0.6.1 の gpui-component には
 # carousel モジュールが無いため、上流 main を rev 固定で使う（本棚リストの関連書籍カルーセル）。
 # Carousel を含む版が crates.io に出たら `version = "0.6"` に戻す。
-gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "84f57fdfcb4910623fb0bb7f795b077e249f9271", features = ["test-support"] }
+# `test-support`（gpui のテストハーネス）は **dev-dependencies 側だけ**で有効にする:
+# 本番ビルドで有効にすると gpui の `leak-detection` が入り、終了時に残っている
+# ハンドル（常駐タスクが持つ `WeakEntity` など）で `Exited with leaked handles` パニックする。
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "84f57fdfcb4910623fb0bb7f795b077e249f9271" }
 gpui-wry = { version = "0.6" }
 thundoku-core = { path = "../core" }
 url = "2"
@@ -51,3 +54,6 @@ winres = "0.1"
 [dev-dependencies]
 # ライセンス一覧の生成・突き合わせ（examples/regen_licenses.rs と licenses.rs のテスト）
 toml = "1"
+# テストは gpui のテストハーネス（`#[gpui_kit::test]` / `TestAppContext`）を使う。
+# 本番ビルドには入れない（`leak-detection` が終了時にパニックするため）。
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "84f57fdfcb4910623fb0bb7f795b077e249f9271", features = ["test-support"] }
