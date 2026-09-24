@@ -190,10 +190,32 @@ const DRIVE_NOTICE_STORE: &str = "技術書典で購入済みの書籍を同期�
                                   本棚の同期ボタンから技術書典にログイン（メールアドレスと\
                                   パスワード）してください。";
 
+/// 本の鍵（pack の暗号化鍵）の説明（**Google ドライブの注意の次**に出す）。
+///
+/// 鍵は「Google のアカウント識別子から作る」のをやめて**アカウントごとの乱数**にした。
+/// 失うと復号できないため、パスフレーズでの保護を勧める（設定画面の「本の鍵」）。
+const KEY_NOTICE_LABEL: &str = "本の鍵について";
+const KEY_NOTICE_TITLE: &str = "取り込んだ本は「本の鍵」で暗号化されます";
+const KEY_NOTICE_BODY: &str = "取り込んだ本（.opfspack）は、このアプリが作ったアカウントごとの鍵\
+                               （乱数）で暗号化されます。鍵はお使いの PC の OS 資格情報ストア\
+                               （Windows: 資格情報マネージャー / macOS: キーチェーン）に保存され、\
+                               Google Drive の thundoku-keys.json には「Google アカウントで解ける\
+                               形」と「パスフレーズで解ける形」の 2 通りで保存されます。";
+const KEY_NOTICE_PASSPHRASE: &str = "パスフレーズを設定すると、Google アカウントの情報を\
+                                     知っているだけでは鍵を解けなくなり、端末を失っても\
+                                     バックアップから復元できます。設定画面の一番上の\
+                                     「本の鍵」から設定・変更・解除ができます。ログイン直後に\
+                                     未設定だと、このアプリが設定を促す案内を出します。";
+const KEY_NOTICE_LOSS: &str = "鍵の控え（OS 資格情報ストアと Google Drive の\
+                                thundoku-keys.json）をすべて失うと、取り込んだ本は復号できなく\
+                                なります（ストアから取り込み直すことはできます）。旧形式（v2）の\
+                                .opfspack はこの方式に対応していないため開けません。\
+                                お手数ですが取り込み直してください。";
+
 /// 説明画面の「主な機能」に出す項目（タイトル / アイコン / 説明）。
 /// **実装済みの機能をここに並べる**（テスト `about_lists_the_implemented_features` が
 /// 主要機能の記載漏れを防ぐ）。
-const FEATURES: [(&str, AppIcon, &str); 13] = [
+const FEATURES: [(&str, AppIcon, &str); 14] = [
     (
         "本棚",
         AppIcon::LibraryBig,
@@ -247,6 +269,13 @@ const FEATURES: [(&str, AppIcon, &str); 13] = [
         AppIcon::HardDrive,
         "書籍ファイルと本棚の DB を Google Drive と双方向同期。別の PC や Web 版と本棚を\
          共有できます。",
+    ),
+    (
+        "本の鍵（パスフレーズ）",
+        AppIcon::KeyRound,
+        "取り込んだ本は、アカウントごとの乱数で作られた鍵で暗号化されます。鍵は OS の資格情報\
+         ストアと Google Drive（thundoku-keys.json）に保存され、パスフレーズを設定すると\
+         端末を失っても復元できます。設定画面の「本の鍵」から設定・変更・解除ができます。",
     ),
     (
         "関連書籍のショートカット",
@@ -575,6 +604,56 @@ impl AboutView {
                     .text_color(muted_fg)
                     .line_height(relative(1.7))
                     .child(DRIVE_NOTICE_STORE),
+            )
+    }
+
+    /// 本の鍵（pack の暗号化鍵）の説明。Drive の注意と同じ見た目にする。
+    fn key_notice_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let warning = cx.theme().warning;
+        let muted_fg = cx.theme().muted_foreground;
+        div()
+            .debug_selector(|| "about-key-notice".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_xl()
+            .border_1()
+            .border_color(warning.opacity(0.35))
+            .bg(warning.opacity(0.10))
+            .p_4()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(warning)
+                    .child(KEY_NOTICE_LABEL),
+            )
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(KEY_NOTICE_TITLE),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .line_height(relative(1.7))
+                    .child(KEY_NOTICE_BODY),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .line_height(relative(1.7))
+                    .child(KEY_NOTICE_PASSPHRASE),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .line_height(relative(1.7))
+                    .child(KEY_NOTICE_LOSS),
             )
     }
 
@@ -1060,6 +1139,8 @@ impl AboutView {
                     )
                     // Google ドライブの注意（ストアのログイン手順の次に置く）
                     .child(self.drive_notice_section(cx))
+                    // 本の鍵の説明（Drive の注意と対にして、鍵の扱いを伝える）
+                    .child(self.key_notice_section(cx))
                     // フッター（保存場所の注意 + ライセンス表示への導線）
                     .child(
                         div()
@@ -1381,6 +1462,30 @@ mod tests {
             .unwrap_or_else(|| panic!("「{title}」が説明画面に無い"))
     }
 
+    /// 説明画面が「本の鍵」の仕組みと注意を書いていること
+    /// （鍵を失うと復号できない・パスフレーズで保護できる・v2 は取り込み直し）。
+    #[test]
+    fn about_explains_the_book_keys() {
+        let all = format!(
+            "{KEY_NOTICE_LABEL} {KEY_NOTICE_TITLE} {KEY_NOTICE_BODY} {KEY_NOTICE_PASSPHRASE} {KEY_NOTICE_LOSS}"
+        );
+        for keyword in [
+            "暗号化",
+            "乱数",
+            "資格情報ストア",
+            "thundoku-keys.json",
+            "パスフレーズ",
+            "復元",
+            "取り込み直",
+        ] {
+            assert!(all.contains(keyword), "説明文に「{keyword}」が無い: {all}");
+        }
+        assert!(
+            description("本の鍵（パスフレーズ）").contains("パスフレーズ"),
+            "「主な機能」に本の鍵の説明が無い"
+        );
+    }
+
     /// 説明画面の「主な機能」が実装済みの機能を網羅していること。
     /// （説明画面は利用者向けの機能一覧なので、実装との乖離はそのまま誤情報になる）
     #[test]
@@ -1396,6 +1501,7 @@ mod tests {
             "チェックリスト",
             "ダウンロードと取り込み",
             "Google Drive 同期",
+            "本の鍵（パスフレーズ）",
             "関連書籍のショートカット",
             "自動タグ生成",
             "複数アカウントの切替",
