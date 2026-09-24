@@ -1404,9 +1404,11 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 | 周期 | `checklist.poll.interval_min`（既定 5 分 / 下限 1 分）を**毎周期読み直す** | `crates/app/src/workspace.rs:245-250`, `:297-299` |
 | 未ログイン時 | 何もせず interval 分 sleep して continue | `crates/app/src/workspace.rs:251-256` |
 | 対象イベント 0 件時 | 何もせず interval 分 sleep して continue | `crates/app/src/workspace.rs:257-263` |
-| 対象イベント列挙 | `db::checklist::list_enabled_slugs`（`poll_sync_enabled = 1` かつ `slug IS NOT NULL` を `display_order` 順） | `crates/core/src/db/checklist.rs:116-124`, `crates/app/src/workspace.rs:257` |
+| 対象イベント列挙 | `db::checklist::list_enabled_slugs`（`poll_sync_enabled = 1` かつ `slug IS NOT NULL` を `display_order` 順） | `crates/core/src/db/checklist.rs:127-135`, `crates/app/src/workspace.rs:257` |
+| 既定（注目イベント） | イベント行を**新規作成**するとき、注目イベント（API の並び / canonical の先頭）は `poll_sync_enabled = 1`、それ以外は 0。既存行はユーザーの設定を保持し、**非注目 → 注目**に変わったときだけ既定を入れる。`poll_sync_enabled` 列を持たない古いバックアップの復元時にも注目イベントへ既定を補う | `crates/core/src/db/checklist.rs:48-99`, `crates/core/src/tbf/sync.rs:15-73`, `:141-170`, `crates/core/src/db/backup.rs:582-598` |
+| 空のイベントを開いた時の 1 回同期 | イベント詳細を開いた時点でアイテム 0 件 + 技術書典ログイン済みなら `sync()` を 1 回だけ呼ぶ（同じイベントを開き直しても再試行しない。未ログインでは何もせず、ログイン要求も出さない。別の同期中に開いた場合はその完了時に再判定し、全データ削除の通知後は試行履歴を捨てる）。全データ削除・初回インストール直後に空のままにならないようにする | `crates/app/src/views/checklist.rs:395-411`, `:430-490` |
 | 逐次実行 | 有効 slug を**順番に** `refresh_checklist`（並列度 1）。1 件失敗してもログを出して次へ進む | `crates/app/src/workspace.rs:267-289` |
-| ロック | `AppState::tbf: Arc<Mutex<TbfClient>>` をポーラーと手動同期が共有。手動側は専用スレッド/バックグラウンドタスクで lock するため直列化される | `crates/app/src/app_state.rs:42`, `crates/app/src/workspace.rs:265-268`, `crates/app/src/views/checklist.rs:417-419`, `crates/app/src/views/bookshelf.rs:2658` |
+| ロック | `AppState::tbf: Arc<Mutex<TbfClient>>` をポーラーと手動同期が共有。手動側は専用スレッド/バックグラウンドタスクで lock するため直列化される | `crates/app/src/app_state.rs:42`, `crates/app/src/workspace.rs:265-268`, `crates/app/src/views/checklist.rs:450-452`, `crates/app/src/views/bookshelf.rs:2658` |
 | セッション切れ | メッセージに `"session expired"` を含むとき `OpenAuth` を dispatch。ポーラーは `auth_dispatched` フラグで**1 回だけ**出す | `crates/app/src/workspace.rs:243`, `:278-290` |
 | Drive 連携 | `changed == true` のときだけ `settings.sync_drive_now(cx)` を呼ぶ | `crates/app/src/workspace.rs:294-296`, `docs/features.md:568-570` |
 | 最終同期時刻 | `api.last_sync_at`（`refresh_checklist` が毎回更新、本棚同期 `save_bookshelf` では**更新しない**） | `crates/core/src/tbf/sync.rs:258-262` |

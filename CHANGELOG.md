@@ -42,7 +42,33 @@
   `crates/opfspack/src/keys.rs`、`crates/core/src/db/backup.rs`、`crates/core/src/drive/sync.rs`、
   `docs/spec/10-pack-keys.md`（§11）、`docs/spec/06-sync-auth-drive.md`
 
+### Added
+
+- **空のイベントを開いたら、チェックリストを自動で 1 回同期する**:
+  同期の入口はイベントごとの手動操作（「同期」ボタン / 自動同期トグル）だけだったため、
+  全データ削除や初回インストールの直後はチェックリストが空のままで、何をすればよいか
+  分からなかった。イベントを開いた時点でアイテムが 0 件かつ技術書典にログイン済みなら
+  1 回だけ同期する（同じイベントを開き直しても繰り返さない。未ログインでは何もしない =
+  ログイン要求も出さない）。別のイベントの同期中に開いた場合も、その同期が終わった時点で
+  取りに行き、設定の「ローカルデータをすべて削除」のあとは試行履歴を捨てて取り直せる。
+  `crates/app/src/views/checklist.rs`
+
+- **注目イベントは、イベント行を作るときに自動同期を既定で有効にする**:
+  自動同期のトグル（`poll_sync_enabled`）は既定 OFF で、全データ削除では `tbf_events` ごと
+  消えるため、削除後に本棚を同期してもチェックリストが二度と自動更新されなかった。
+  `tbf::sync` が注目イベント（API の並び / canonical の先頭）を作るときに 1 を入れ、
+  既存行ではユーザーの設定を保持する（**非注目 → 注目**に変わったときだけ既定を入れる）。
+  `poll_sync_enabled` 列を持たない古いバックアップの復元時も、注目イベントには既定を補う。
+  `crates/core/src/db/checklist.rs`、`crates/core/src/tbf/sync.rs`、`crates/core/src/db/backup.rs`
+
 ### Fixed
+
+- **終了時に `Exited with leaked handles` でクラッシュしていた**:
+  配布ビルドで `gpui-kit` の `test-support` を有効にしていたため、gpui の `leak-detection` が
+  アプリ終了時に残っているハンドル（`SettingsView` / `PopupMenu` の実体）を検出して
+  panic していた（ログの `PANIC` 行とクラッシュダンプ）。`test-support` を
+  dev-dependencies 側へ移し、テストでは従来どおりリーク検出を効かせる。
+  `crates/app/Cargo.toml`
 
 - **opfspack の展開に上限と実サイズ照合を入れる**:
   `raw_inflate` は宣言サイズを見ずに `read_to_end` していたため、小さな DEFLATE 入力から
