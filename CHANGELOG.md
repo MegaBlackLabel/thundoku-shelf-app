@@ -31,6 +31,17 @@
   `crates/core/src/import/mod.rs`、`crates/core/src/google.rs`、
   `crates/app/src/views/bookshelf.rs`
 
+- **Drive のメタデータバックアップ（本棚・進捗・履歴・付箋）を認証付き暗号化する**:
+  `thundoku-backup.json` は平文だったため、Drive のアカウント侵害・共有フォルダ・リンク共有で
+  読め、書き換えも検知できなかった。鍵は pack と同じルート鍵から
+  `HKDF(PRK, salt="thundoku-backup:v1", info="thundoku-backup-key")` で導出し、**v3 の封筒**
+  （`format_version: 3` / AES-256-GCM / AAD `thundoku-backup:3:<owner_id>` / 平文の
+  `content_hmac`）にする。変更検知と復元提案は暗号文の md5 ではなく **`content_hmac`** で行う
+  （毎回変わる暗号文で「変わった」と誤判定しない）。**v2 の平文バックアップも読める**。
+  鍵が用意できないときは平文で書き警告を残す（利用者の唯一の控えを失う方を避ける）。
+  `crates/opfspack/src/keys.rs`、`crates/core/src/db/backup.rs`、`crates/core/src/drive/sync.rs`、
+  `docs/spec/10-pack-keys.md`（§11）、`docs/spec/06-sync-auth-drive.md`
+
 ### Fixed
 
 - **opfspack の展開に上限と実サイズ照合を入れる**:
@@ -71,17 +82,26 @@
   `crates/core/src/{secrets,import/mod,drive/sync}.rs`、
   `docs/spec/{03-import-and-pack,06-sync-auth-drive,10-pack-keys,README}.md`
 
-- **レポートの添付画像は「送信」を押した時点でアップロードする（選択しただけでは外部へ送らない）**:
-  以前は「画像を添付」を押した時点で `user-attachments` へ上げていたため、利用者が投稿を
-  やめても画像だけが GitHub へ送られていた（取り消す API も無い）。選択時はファイル名・MIME・
-  実体をローカルに保持するだけにし、送信時に **リポジトリ ID を 1 回取得 → 添付を選択順に
-  アップロード → 本文の末尾へ `![file](url)` を挿入 → Issue を 1 回作成** の順で送る。
-  アップロードに失敗したら **Issue は作らない**（利用者が押していない本文だけの Issue を
-  勝手に立てない）。下書きと添付は残るので再試行でき、**URL が確定した添付は再試行でも
-  上げ直さない**（同じ画像が user-attachments に増えない）。画像なしで送るための「外す」を
-  添付ごとに置いた。選択時にダイアログをキャンセル・サイズ超過（10MB）・読み込み失敗でも
-  要求は 1 件も出ない。
-  `crates/core/src/github.rs`、`crates/app/src/views/report.rs`、`docs/features.md`
+- **GitHub の権限過大（R02）を解消するため、レポートの投稿をブラウザー方式へ切り替える**:
+  Issue 投稿はアプリの OAuth トークン（`public_repo` = 利用者が権限を持つ**全公開リポジトリ**の
+  読み書きが可能）で行っていた。アプリは固定リポジトリの Issue 作成画面
+  （`https://github.com/MegaBlackLabel/thundoku-shelf-app/issues/new?title=…&body=…`）を
+  **既定ブラウザーで開くだけ**にし、**GitHub のトークンを一切取得・保存しない**（Device Flow、
+  keyring の `github` スロット、GitHub ログイン画面、設定の GitHub 行を削除）。本文が URL に
+  収まらないときは本文をクリップボードへコピーして素の `/issues/new` を開く。テンプレートは
+  **匿名で取得**する（公開リポジトリなのでトークン不要。取得に失敗してもテンプレート無しで書ける）。
+  画像は GitHub の画面で添付する（アプリ内のアップロードは廃止＝**外部へ先に送られる経路自体が消える**）。
+  `crates/core/src/github.rs`、`crates/core/src/secrets.rs`、`crates/app/src/views/report.rs`、
+  `crates/app/src/{app_state,workspace}.rs`、`crates/app/src/views/github_login.rs`（削除）、
+  `docs/features.md`、`docs/spec/04-ui.md`
+
+- **パスフレーズの設定を促す導線を整える**:
+  設定画面の「本の鍵」を**先頭**に移し、ログイン直後にパスフレーズ未設定なら警告ダイアログを出す
+  （「設定する」で設定画面の入力欄へフォーカス／「あとで」は閉じるだけ。同じログインセッションでは
+  繰り返さない。鍵が未解決・Drive 未設定・判定できないときは出さない＝誤警告を避ける）。
+  パスフレーズ入力は右端の**目のアイコン**でマスク⇄表示を切り替えられる（設定と解錠ダイアログの
+  両方。既定はマスク。gpui-kit の `Input::mask_toggle()` を使い、アイコンは同梱の lucide `eye` /
+  `eye-off` を再利用）。`crates/app/src/{views/settings.rs, workspace.rs, app_state.rs, pack_keys.rs}`
 
 ## [0.2.8] - 2026-09-24
 

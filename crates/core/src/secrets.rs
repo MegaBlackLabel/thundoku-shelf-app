@@ -60,8 +60,6 @@ pub const USER_GOOGLE: &str = "google";
 /// `sub` は `books.owner_sub` の判定（バックアップの所有者フィルタ・本棚の絞り込み）に
 /// 使うため、起動直後にネットワーク取得できない場合でも復元できるよう残す。
 pub const USER_GOOGLE_PROFILE: &str = "google-profile";
-/// GitHub（レポート機能のログイン）のアクセストークンの保存キー。
-pub const USER_GITHUB: &str = "github";
 /// BOOTH（booth.pm）のセッション Cookie の保存キー。
 pub const USER_BOOTH: &str = "booth";
 /// `books.owner_sub` 暗号化用のローカル鍵（keyring）。

@@ -1,9 +1,6 @@
 //! 認証ダイアログ: 技術書典・Google・BOOTH をアプリ内 WebView（gpui-wry）でログインする。
 //! 各プロバイダは WebView でログイン画面を開き、Cookie / 認可フローを自動処理する。
-//! GitHub だけは WebView を使わず、OAuth Device Flow（表示したコードを既定ブラウザで
-//! 入力）で認可する。クライアントシークレットは持たない。
 
-use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
@@ -18,9 +15,6 @@ use crate::app_state::AppState;
 use crate::views::booth_login::{BoothLoginCancelled, BoothLoginDone, BoothLoginView};
 use crate::views::dlsite_login::{DlsiteLoginCancelled, DlsiteLoginDone, DlsiteLoginView};
 use crate::views::fanza_login::{FanzaLoginCancelled, FanzaLoginDone, FanzaLoginView};
-use crate::views::github_login::{
-    GithubLoginCancelled, GithubLoginDone, GithubLoginFailed, GithubLoginView,
-};
 use crate::views::google_login::{
     GoogleLoginCancelled, GoogleLoginDone, GoogleLoginFailed, GoogleLoginView,
 };
@@ -31,7 +25,6 @@ use crate::views::tbf_login::{TbfLoginCancelled, TbfLoginDone, TbfLoginView};
 pub enum AuthProvider {
     TechBookFest,
     Google,
-    Github,
     Booth,
     Fanza,
     Dlsite,
@@ -40,7 +33,7 @@ pub enum AuthProvider {
 impl AuthProvider {
     /// 本の供給元（サイト）なら、本棚の絞り込みと同じサイト id を返す。
     ///
-    /// Google / GitHub はアカウント連携用で本の供給元ではないため `None`
+    /// Google はアカウント連携用で本の供給元ではないため `None`
     /// （本棚の同期は無い）。
     fn site_sync_id(self) -> Option<&'static str> {
         match self {
@@ -48,7 +41,7 @@ impl AuthProvider {
             AuthProvider::Booth => Some("booth"),
             AuthProvider::Fanza => Some("fanza"),
             AuthProvider::Dlsite => Some("dlsite"),
-            AuthProvider::Google | AuthProvider::Github => None,
+            AuthProvider::Google => None,
         }
     }
 }
@@ -80,14 +73,6 @@ pub struct AuthDialog {
     /// Google ログインの購読（Done / Failed / Cancelled の 3 本）。束縛せずに捨てると
     /// イベントが届かなくなる（✕ やエラーでモーダルが閉じなくなる）。
     google_subscriptions: Vec<gpui_kit::Subscription>,
-    /// GitHub の Device Flow ログインモーダルを表示中か
-    show_github_login: bool,
-    github_login: Option<Entity<GithubLoginView>>,
-    /// GitHub ログインの購読（Done / Failed / Cancelled の 3 本）。
-    ///
-    /// 3 本とも保持すること。`Subscription` は Drop で解除されるので、束縛せずに
-    /// 捨てるとイベントが届かなくなる（✕ や完了でモーダルが閉じなくなる）。
-    github_subscriptions: Vec<gpui_kit::Subscription>,
     /// 技術書典の WebView ログインモーダルを表示中か
     show_tbf_login: bool,
     tbf_login: Option<Entity<TbfLoginView>>,
@@ -101,7 +86,7 @@ impl AuthDialog {
     /// ここでは同期そのものは実行しない（本棚の状態を持つのは `BookshelfView` なので、
     /// 要求を `AppState` に置いて `Workspace` の監視タスクが拾う。`AuthDialog` から
     /// `Workspace` を直接 update すると RefCell の再入で固まる）。
-    /// Google / GitHub のログインでは何もしない。
+    /// Google のログインでは何もしない。
     fn request_site_sync_after_login(&self, provider: AuthProvider, cx: &mut Context<Self>) {
         let Some(site) = provider.site_sync_id() else {
             return;
@@ -128,9 +113,6 @@ impl AuthDialog {
             show_google_login: false,
             google_login: None,
             google_subscriptions: Vec::new(),
-            show_github_login: false,
-            github_login: None,
-            github_subscriptions: Vec::new(),
             show_tbf_login: false,
             tbf_login: None,
             tbf_subscriptions: Vec::new(),
@@ -150,7 +132,6 @@ impl AuthDialog {
         match provider {
             AuthProvider::TechBookFest => self.show_tbf_login = true,
             AuthProvider::Google => self.show_google_login = true,
-            AuthProvider::Github => self.show_github_login = true,
             AuthProvider::Booth => self.show_booth_login = true,
             AuthProvider::Fanza => self.show_fanza_login = true,
             AuthProvider::Dlsite => self.show_dlsite_login = true,
@@ -173,12 +154,6 @@ impl AuthDialog {
     #[cfg(test)]
     pub(crate) fn show_google_login(&self) -> bool {
         self.show_google_login
-    }
-
-    /// GitHub の Device Flow ログインモーダルを表示中か（テスト用）。
-    #[cfg(test)]
-    pub(crate) fn show_github_login(&self) -> bool {
-        self.show_github_login
     }
 
     /// 技術書典の WebView ログインモーダルを表示中か（テスト用）。
@@ -337,47 +312,6 @@ impl AuthDialog {
                 cx.notify();
             });
         }
-        // GitHub: Device Flow（WebView を作らないため deferred にせず、認証モーダル内の
-        // 通常のモーダルとして描く）。表示したコードを既定ブラウザで入力してもらい、
-        // 完了は view 側が AppState を更新 → Workspace の監視タスクがモーダルを閉じる。
-        if self.show_github_login && self.github_login.is_none() {
-            cx.defer_in(window, |this, window, cx| {
-                let github_login = cx.new(|cx| GithubLoginView::new(window, cx));
-                // 成功: トークン保存・ログイン状態・完了フラグ（github_login_done）は
-                // view 側で更新済み。ここでは view を畳むだけにする（Workspace の監視
-                // タスクがモーダル全体を閉じる）。
-                let done = cx.subscribe(
-                    &github_login,
-                    |this: &mut Self, _: Entity<GithubLoginView>, _: &GithubLoginDone, _| {
-                        this.show_github_login = false;
-                        this.github_login = None;
-                        this.github_subscriptions.clear();
-                    },
-                );
-                // 失敗: client_id 未設定などの失敗は view 内で完結する（エラー表示も view が
-                // 出す）。new() 内の同期 emit は購読前に飛ぶため、ここには届かない想定。
-                // 届いた場合も view を残し、✕（Cancelled）で閉じてもらう。
-                let failed = cx.subscribe(
-                    &github_login,
-                    |_: &mut Self, _: Entity<GithubLoginView>, _: &GithubLoginFailed, _| {},
-                );
-                // キャンセル: view を破棄してログイン画面に戻る（次回は新規フロー）
-                let cancelled = cx.subscribe(
-                    &github_login,
-                    |this: &mut Self, _: Entity<GithubLoginView>, _: &GithubLoginCancelled, _| {
-                        this.show_github_login = false;
-                        this.github_login = None;
-                        this.github_subscriptions.clear();
-                    },
-                );
-                this.github_subscriptions = vec![done, failed, cancelled];
-                // Device Flow は new で開始済み。モーダルを表示状態にする
-                // （render 毎に呼ぶと再通知ループになるため、生成時に 1 回だけ呼ぶ）。
-                github_login.update(cx, |view, cx| view.show(cx));
-                this.github_login = Some(github_login);
-                cx.notify();
-            });
-        }
         // 技術書典: WebView ログイン（テスト環境では WebView を作らない）
         if self.show_tbf_login && self.tbf_login.is_none() {
             cx.defer_in(window, |this, window, cx| {
@@ -417,12 +351,6 @@ impl AuthDialog {
         cx.notify();
     }
 
-    pub fn login_github(&mut self, cx: &mut Context<Self>) {
-        // Device Flow のモーダルを開く（コードの表示と既定ブラウザの起動は view 側で行う）
-        self.show_github_login = true;
-        cx.notify();
-    }
-
     pub fn login_tbf(&mut self, cx: &mut Context<Self>) {
         // WebView モーダルで技術書典ログインを開始する
         self.show_tbf_login = true;
@@ -459,9 +387,6 @@ impl Render for AuthDialog {
         let error = self.error.clone();
         let tbf_logged_in = self.tbf_logged_in;
         let google_profile = self.google_profile.clone();
-        // client_id が埋め込まれていないビルドでは GitHub ログインを開始できない
-        // （Device Flow は client_id 必須。埋め込みは option_env! + ビルド設定）。
-        let github_login_enabled = !crate::app_state::default_github_client_id().is_empty();
         let provider = self.provider;
         let handle = cx.entity();
 
@@ -502,18 +427,11 @@ impl Render for AuthDialog {
                     Some(dlsite) => deferred(dlsite.clone()).into_any_element(),
                     None => div().into_any_element(),
                 }
-            } else if self.show_github_login {
-                // GitHub は WebView を使わない（Device Flow）ため deferred にしない。
-                // AuthDialog 自体が workspace の deferred レイヤーに載るので前面に出る。
-                match &self.github_login {
-                    Some(github) => github.clone().into_any_element(),
-                    None => div().into_any_element(),
-                }
             } else {
                 div().into_any_element()
             })
-            .child(if self.show_booth_login || self.show_google_login || self.show_tbf_login || self.show_fanza_login || self.show_dlsite_login || self.show_github_login {
-                // WebView / Device Flow のログインモーダル表示中は auth-modal（中央モーダル）を
+            .child(if self.show_booth_login || self.show_google_login || self.show_tbf_login || self.show_fanza_login || self.show_dlsite_login {
+                // WebView のログインモーダル表示中は auth-modal（中央モーダル）を
                 // 重ねない。前面に出るログインビューがあるため不要な見た目になる。
                 div().into_any_element()
             } else {
@@ -544,7 +462,6 @@ impl Render for AuthDialog {
                             .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
                                 match provider {
                                     Some(AuthProvider::Google) => "Googleでログイン",
-                                    Some(AuthProvider::Github) => "GitHubでログイン",
                                     Some(AuthProvider::TechBookFest) => "技術書典でログイン",
                                     Some(AuthProvider::Booth) => "BOOTHでログイン",
                                     Some(AuthProvider::Fanza) => "FANZAでログイン",
@@ -636,40 +553,6 @@ impl Render for AuthDialog {
                                         move |_, _window, cx| {
                                             handle.update(cx, |this, cx| {
                                                 this.show_google_login = true;
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            )
-                            .into_any_element(),
-                        // GitHub: Device Flow（WebView もクライアントシークレットも使わない）
-                        Some(AuthProvider::Github) => div()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        if github_login_enabled {
-                                            "GitHub のログインはデバイスフローで行います。\n表示されたコードを既定のブラウザで github.com/login/device に入力すると認可されます。"
-                                        } else {
-                                            "このビルドには GitHub の client_id が埋め込まれていないため、GitHub ログインを利用できません。"
-                                        },
-                                    ),
-                            )
-                            .child(
-                                Button::new("auth-github-open")
-                                    .cursor_pointer()
-                                    .primary()
-                                    .label("GitHubログイン画面を開く")
-                                    .disabled(!github_login_enabled)
-                                    .on_click({
-                                        let handle = handle.clone();
-                                        move |_, _window, cx| {
-                                            handle.update(cx, |this, cx| {
-                                                this.show_github_login = true;
                                                 cx.notify();
                                             });
                                         }
@@ -832,7 +715,7 @@ mod dialog_render_tests {
 
     /// サイトのログインが完了したら、そのサイトの同期を要求すること。
     ///
-    /// Google / GitHub はアカウント連携用で本の供給元（サイト）ではないため要求しない。
+    /// Google はアカウント連携用で本の供給元（サイト）ではないため要求しない。
     #[gpui_kit::test]
     async fn site_login_completion_requests_that_sites_sync(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
@@ -844,7 +727,6 @@ mod dialog_render_tests {
             (AuthProvider::Fanza, Some("fanza")),
             (AuthProvider::Dlsite, Some("dlsite")),
             (AuthProvider::Google, None),
-            (AuthProvider::Github, None),
         ] {
             cx.update(|cx| {
                 *AppState::global(cx).login_sync_requested.lock() = None;
@@ -921,20 +803,6 @@ mod dialog_render_tests {
         assert!(
             dialog.read_with(cx, |d, _| d.show_google_login()),
             "Google provider should open webview login directly"
-        );
-    }
-
-    #[gpui_kit::test]
-    async fn github_provider_opens_device_flow_login_flag(cx: &mut TestAppContext) {
-        cx.update(AppState::init_test);
-        let dialog = cx.new(AuthDialog::new);
-        dialog.update(cx, |dialog, _| {
-            dialog.open_with_provider(Some(AuthProvider::Github));
-        });
-        // GitHub は WebView ではなく Device Flow。プロバイダ指定でモーダルを直接開く。
-        assert!(
-            dialog.read_with(cx, |d, _| d.show_github_login()),
-            "GitHub provider should open device flow login directly"
         );
     }
 

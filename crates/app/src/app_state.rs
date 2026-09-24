@@ -12,7 +12,6 @@ use thundoku_core::booth::BoothSession;
 use thundoku_core::db;
 use thundoku_core::dlsite::client::DlsiteSession;
 use thundoku_core::fanza::client::FanzaSession;
-use thundoku_core::github::{GithubClient, GithubToken, GithubUser};
 use thundoku_core::google::{GoogleClient, GoogleProfile};
 use thundoku_core::secrets::SecretStore;
 use thundoku_core::session_store::{PurgeMarker, SessionVault, StoreSession};
@@ -34,16 +33,6 @@ pub const DEFAULT_GOOGLE_CLIENT_SECRET: Option<&str> =
         Some(value) if !value.is_empty() => Some(value),
         _ => Some("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"),
     };
-
-/// GitHub の OAuth App client_id。ビルド時に `THUNDOKU_GITHUB_CLIENT_ID` で上書きできる。
-///
-/// Device Flow を使うため **client_secret は持たない**（GitHub はクライアントサイドの
-/// コードに client_secret を含めることを禁じている）。client_id 自体は公開情報で、
-/// 認可 URL に載る値なので埋め込んで問題ない。
-pub const DEFAULT_GITHUB_CLIENT_ID: &str = match option_env!("THUNDOKU_GITHUB_CLIENT_ID") {
-    Some(value) if !value.is_empty() => value,
-    _ => "Ov23liUeEiN5CSmII2BH",
-};
 
 /// ログアウト時に削除できなかった資格情報の印に使うスロット名（Google）。
 pub const GOOGLE_LOGOUT_SLOT: &str = "google";
@@ -92,16 +81,6 @@ pub struct AppState {
     pub google_logged_in: Arc<Mutex<bool>>,
     /// モーダルなし Google ログインの直近のエラー（ログイン状態パネルに表示）
     pub google_login_error: Arc<Mutex<Option<String>>>,
-    /// GitHub（レポート機能）の REST クライアント。未ログインなら token が None。
-    pub github: Arc<Mutex<Option<GithubClient>>>,
-    /// GitHub のログインユーザー（取得できたときだけ入る。表示名に使う）。
-    pub github_profile: Arc<Mutex<Option<GithubUser>>>,
-    /// GitHub ログイン状態（keyring にトークンがあるか）。
-    pub github_logged_in: Arc<Mutex<bool>>,
-    /// GitHub ログインの直近のエラー（ログイン画面に表示）。
-    pub github_login_error: Arc<Mutex<Option<String>>>,
-    /// GitHub ログイン（成功・失敗）が完了したことを Workspace 監視タスクへ通知する。
-    pub github_login_done: Arc<AtomicBool>,
     pub tbf_logged_in: Arc<Mutex<bool>>,
     /// BOOTH（booth.pm）のセッション Cookie
     pub booth_session: Arc<Mutex<Option<BoothSession>>>,
@@ -173,6 +152,9 @@ pub struct AppState {
 /// 最も強い 1 つを選ぶ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModalKind {
+    /// パスフレーズ未設定のお願い（ログイン直後に 1 回だけ出す情報）。
+    /// 答えを待っている相手がいないので**最も弱い**（他のモーダルが終わってから出す）。
+    PassphraseNotice,
     /// 同期の続き通知（情報 + 「続きを取り込む」）。状態は保持されるので後から出せる。
     SyncNotice,
     /// 終了確認（アップロードの確認）。
@@ -197,6 +179,7 @@ impl ModalKind {
     /// トースト・ログ用の短い日本語（「◯◯が終わるまで閉じられません」に使う）。
     pub fn label(self) -> &'static str {
         match self {
+            Self::PassphraseNotice => "パスフレーズの設定の確認",
             Self::SyncNotice => "同期の続きの確認",
             Self::ExitConfirm => "終了の確認",
             Self::DownloadCancel => "ダウンロードの中止の確認",
@@ -271,19 +254,6 @@ pub fn save_data_path(path: &std::path::Path) {
         &file,
         serde_json::to_string_pretty(&json).unwrap_or_default(),
     );
-}
-
-/// GitHub のアクセストークンを keyring から復元したクライアントと、
-/// ログイン状態（トークンがあるか）を返す。起動時（本番・テスト共通）に呼ぶ。
-fn restore_github_token(secrets: &SecretStore) -> (GithubClient, bool) {
-    let mut client = GithubClient::new();
-    if let Ok(Some(json)) = secrets.load(thundoku_core::secrets::USER_GITHUB)
-        && let Ok(token) = serde_json::from_str::<GithubToken>(&json)
-    {
-        client.restore_token(token);
-    }
-    let logged_in = client.is_authenticated();
-    (client, logged_in)
 }
 
 /// 保存済みの Google プロフィール（`sub` 等）を keyring から復元する（起動時に呼ぶ）。
@@ -388,18 +358,6 @@ impl AppState {
         // プロフィール（email 等）の取得に失敗してもログイン状態は維持する。
         let google_logged_in = google.as_ref().is_some_and(|c| c.has_tokens());
 
-        // GitHub のトークン（Device Flow で取得したもの）を keyring から復元する。
-        // トークンは小さいので keyring に置く（Cookie 群が DB なのは文字数上限のため）。
-        let (github, github_logged_in) = restore_github_token(&secrets);
-        log::info!(
-            "github session: 起動時復元 = {}",
-            if github_logged_in {
-                "ログイン済み"
-            } else {
-                "未ログイン"
-            }
-        );
-
         // BOOTH / FANZA / DLsite のセッションを DB（app_settings）から復元する。
         // セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を
         // 超えることがあるため DB に置くが、**keyring の鍵で暗号化して**保存する
@@ -466,11 +424,6 @@ impl AppState {
             pack_key_prompt: Arc::new(crate::pack_keys::PackKeyPrompt::default()),
             google_logged_in: Arc::new(Mutex::new(google_logged_in)),
             google_login_error: Arc::new(Mutex::new(None)),
-            github: Arc::new(Mutex::new(Some(github))),
-            github_profile: Arc::new(Mutex::new(None)),
-            github_logged_in: Arc::new(Mutex::new(github_logged_in)),
-            github_login_error: Arc::new(Mutex::new(None)),
-            github_login_done: Arc::new(AtomicBool::new(false)),
             tbf_logged_in: Arc::new(Mutex::new(tbf_logged_in)),
             booth_session: Arc::new(Mutex::new(booth_session)),
             booth_logged_in: Arc::new(Mutex::new(booth_logged_in)),
@@ -527,7 +480,6 @@ impl AppState {
         // 本番と同じ復元経路を通す（keyring の代わりにメモリバックエンド）
         let session_vault =
             SessionVault::new(&secrets, &std::env::temp_dir().join("thundoku-shelf-test")).ok();
-        let (github, github_logged_in) = restore_github_token(&secrets);
         cx.set_global(Self {
             data_dir: std::env::temp_dir().join("thundoku-shelf-test"),
             packs_dir: std::env::temp_dir().join("thundoku-shelf-test/packs"),
@@ -551,11 +503,6 @@ impl AppState {
             pack_key_prompt: Arc::new(crate::pack_keys::PackKeyPrompt::default()),
             google_logged_in: Arc::new(Mutex::new(false)),
             google_login_error: Arc::new(Mutex::new(None)),
-            github: Arc::new(Mutex::new(Some(github))),
-            github_profile: Arc::new(Mutex::new(None)),
-            github_logged_in: Arc::new(Mutex::new(github_logged_in)),
-            github_login_error: Arc::new(Mutex::new(None)),
-            github_login_done: Arc::new(AtomicBool::new(false)),
             tbf_logged_in: Arc::new(Mutex::new(false)),
             booth_session: Arc::new(Mutex::new(None)),
             booth_logged_in: Arc::new(Mutex::new(false)),
@@ -601,82 +548,6 @@ pub fn default_client_id() -> String {
     } else {
         DEFAULT_GOOGLE_CLIENT_ID.to_string()
     }
-}
-
-/// ビルド時に埋め込んだ GitHub の OAuth App client_id（未設定なら空文字）。
-/// 空なら GitHub ログインは無効（Device Flow を開始できない）。
-pub fn default_github_client_id() -> String {
-    DEFAULT_GITHUB_CLIENT_ID.to_string()
-}
-
-/// keyring にトークンを書き込む（**ブロッキング**。UI スレッドでは呼ばないこと）。
-///
-/// OS の資格情報ストアは許可ダイアログ待ちなどで返らないことがあるため、呼び出し側は
-/// 背景タスクから実行し、完了後に [`set_github_session`] で状態を更新する。
-pub fn store_github_token_secret(token: &GithubToken) -> Result<(), String> {
-    let json = serde_json::to_string(token).map_err(|error| error.to_string())?;
-    SecretStore::new()
-        .save(thundoku_core::secrets::USER_GITHUB, &json)
-        .map_err(|error| {
-            log::error!("github token save failed: {error}");
-            "トークンを保存できませんでした（資格情報ストアを確認してください）".to_string()
-        })
-}
-
-/// keyring からトークンを削除する（**ブロッキング**。UI スレッドでは呼ばないこと）。
-pub fn delete_github_token_secret() -> Result<(), String> {
-    SecretStore::new()
-        .delete(thundoku_core::secrets::USER_GITHUB)
-        .map_err(|error| {
-            log::error!("github token delete failed: {error}");
-            "ログアウトできませんでした（資格情報を削除できませんでした）".to_string()
-        })
-}
-
-/// メモリ上の状態をログイン済みにする（keyring への保存が**成功した後**に呼ぶ）。
-pub fn set_github_session(cx: &App, token: &GithubToken) {
-    let state = AppState::global(cx);
-    if let Some(client) = state.github.lock().as_mut() {
-        client.restore_token(token.clone());
-    }
-    *state.github_logged_in.lock() = true;
-    *state.github_login_error.lock() = None;
-    log::info!("github session: ログイン状態にした");
-}
-
-/// keyring は触らず、メモリ上のログイン状態だけを落とす（削除の完了後に呼ぶ）。
-pub fn clear_github_session(cx: &App) {
-    let state = AppState::global(cx);
-    if let Some(client) = state.github.lock().as_mut() {
-        client.clear_token();
-    }
-    *state.github_profile.lock() = None;
-    *state.github_logged_in.lock() = false;
-    *state.github_login_error.lock() = None;
-    log::info!("github session: 未ログイン状態にした");
-}
-
-/// GitHub のトークンを keyring に保存し、クライアントとログイン状態を更新する。
-///
-/// 同期版（テストと、同期文脈からの利用）。UI スレッドから呼ぶと keyring の応答待ちで
-/// 固まりうるので、画面からは [`store_github_token_secret`] を背景で実行すること。
-///
-/// 保存に失敗したら**ログイン状態を立てない**（keyring に何も無いのに「ログイン済み」と
-/// 見せると、次の起動で黙って未ログインに戻って理由が分からなくなる）。
-pub fn save_github_token(cx: &App, token: &GithubToken) -> Result<(), String> {
-    store_github_token_secret(token)?;
-    set_github_session(cx, token);
-    Ok(())
-}
-
-/// GitHub のトークンを破棄する（同期版。ログアウト画面からは背景実行を使う）。
-///
-/// 削除に失敗したら**ログイン状態を下げない**（トークンが残っているのに「ログアウト
-/// 済み」と見せると、次回起動で勝手にログインし直って見える）。
-pub fn clear_github_token(cx: &App) -> Result<(), String> {
-    delete_github_token_secret()?;
-    clear_github_session(cx);
-    Ok(())
 }
 
 /// Google プロフィール（`sub` 等）を keyring に保存する（**ブロッキング**）。
@@ -1047,8 +918,16 @@ mod tests {
         cx.update(AppState::init_test);
         cx.update(|cx| {
             assert_eq!(active_modal(cx), None, "初期状態はモーダル無し");
+            // パスフレーズ未設定のお願いは情報なので最も弱い（他が終わってから出る）
+            set_modal(cx, ModalKind::PassphraseNotice, true);
+            assert_eq!(active_modal(cx), Some(ModalKind::PassphraseNotice));
             set_modal(cx, ModalKind::SyncNotice, true);
-            assert_eq!(active_modal(cx), Some(ModalKind::SyncNotice));
+            assert_eq!(
+                active_modal(cx),
+                Some(ModalKind::SyncNotice),
+                "同期の続き通知が勝ち、パスフレーズのお願いは待つ"
+            );
+            set_modal(cx, ModalKind::PassphraseNotice, false);
 
             set_modal(cx, ModalKind::ExitConfirm, true);
             assert_eq!(
@@ -1088,18 +967,6 @@ mod tests {
             assert_eq!(active_modal(cx), None);
             assert!(!any_modal_active(cx));
         });
-    }
-
-    /// メモリバックエンドはプロセス内で共有されるため、`USER_GITHUB` スロットを使う
-    /// テストはこの Mutex で直列化する（並列だと保存と削除が競合する）。
-    static GITHUB_SLOT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    fn token() -> GithubToken {
-        GithubToken {
-            access_token: "tok-github".to_string(),
-            token_type: "bearer".to_string(),
-            scope: "public_repo".to_string(),
-        }
     }
 
     fn google_profile() -> thundoku_core::google::GoogleProfile {
@@ -1159,49 +1026,6 @@ mod tests {
             thundoku_core::google::delete_saved_profile(&AppState::global(cx).secrets);
         });
         let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    /// keyring に保存済みの GitHub トークンが起動時に復元され、ログイン状態になる。
-    #[gpui_kit::test]
-    async fn restores_github_token_on_startup(cx: &mut gpui_kit::TestAppContext) {
-        let _guard = GITHUB_SLOT.lock();
-        cx.update(gpui_kit::component::init);
-        cx.update(AppState::init_test);
-        cx.update(|cx| {
-            // 前のテストの残りを消してから始める（メモリバックエンドは共有）
-            let state = AppState::global(cx);
-            let _ = state.secrets.delete(thundoku_core::secrets::USER_GITHUB);
-            let json = serde_json::to_string(&token()).unwrap();
-            state
-                .secrets
-                .save(thundoku_core::secrets::USER_GITHUB, &json)
-                .unwrap();
-            // 保存しただけでは（＝その起動では）ログイン状態にならない
-            assert!(!*state.github_logged_in.lock());
-        });
-
-        // 次回起動相当（keyring から読み直す）
-        cx.update(AppState::init_test);
-
-        cx.update(|cx| {
-            let state = AppState::global(cx);
-            assert!(
-                *state.github_logged_in.lock(),
-                "GitHub のログイン状態が復元されていない"
-            );
-            let client = state.github.lock();
-            let restored = client
-                .as_ref()
-                .and_then(|client| client.token())
-                .expect("トークンが復元されていない");
-            assert_eq!(restored.access_token, "tok-github");
-            assert_eq!(restored.scopes(), vec!["public_repo"]);
-        });
-
-        // メモリバックエンドはプロセス内で共有されるため後始末する
-        cx.update(|cx| {
-            let _ = clear_github_token(cx);
-        });
     }
 
     /// 保護期限は 5 秒（自動消滅と同じ）。
@@ -1292,45 +1116,6 @@ mod tests {
                 "消えない通知の設定が残っている（他と同じ時間で消えない）"
             );
             assert!(!*state.toast_progress.lock(), "進行中フラグが残っている");
-        });
-    }
-
-    /// ログアウトでトークンが消え、ログイン状態も下がる（keyring からも消える）。
-    #[gpui_kit::test]
-    async fn clearing_github_token_clears_state(cx: &mut gpui_kit::TestAppContext) {
-        let _guard = GITHUB_SLOT.lock();
-        cx.update(gpui_kit::component::init);
-        cx.update(AppState::init_test);
-        cx.update(|cx| save_github_token(cx, &token()).expect("保存できる"));
-        cx.update(|cx| {
-            let state = AppState::global(cx);
-            assert!(*state.github_logged_in.lock(), "ログイン状態になっていない");
-        });
-
-        cx.update(|cx| clear_github_token(cx).expect("削除できる"));
-
-        cx.update(|cx| {
-            let state = AppState::global(cx);
-            assert!(
-                !*state.github_logged_in.lock(),
-                "ログアウトしてもログイン状態が残っている"
-            );
-            assert!(
-                state
-                    .github
-                    .lock()
-                    .as_ref()
-                    .is_some_and(|client| !client.is_authenticated()),
-                "クライアントのトークンが残っている"
-            );
-            assert!(
-                state
-                    .secrets
-                    .load(thundoku_core::secrets::USER_GITHUB)
-                    .unwrap()
-                    .is_none(),
-                "keyring にトークンが残っている（再起動で復元されてしまう）"
-            );
         });
     }
 }

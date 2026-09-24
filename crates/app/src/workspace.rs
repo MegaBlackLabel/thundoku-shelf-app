@@ -54,7 +54,7 @@ pub enum NavTarget {
     History,
     Notes,
     Checklist,
-    /// GitHub Issue を作るレポート画面（GitHub ログイン時のみ導線を出す）。
+    /// GitHub Issue をブラウザーで作るレポート画面。
     Report,
     Settings,
     About,
@@ -65,6 +65,13 @@ pub enum NavTarget {
 /// 確認ダイアログは押した時点で閉じるため、これが進行中の唯一の手がかりになる。
 const EXIT_UPLOAD_NOTICE: &str =
     "バックアップをアップロード中です…（完了するとアプリが終了します）";
+
+/// パスフレーズ未設定の警告の本文（ログイン直後に 1 回だけ出す）。
+///
+/// 「いま危ない状態である」ことと、**パスフレーズがあれば端末を失っても復元できる**
+/// ことを短く伝える（設定画面の「本の鍵」カードと同じ説明に揃える）。
+const PASSPHRASE_NOTICE_BODY: &str = "この端末の鍵はパスフレーズで保護されていません。\
+     パスフレーズを設定すると、端末を失っても Drive のバックアップから鍵を復元できます。";
 
 /// 進行中の通知の id（`Notification::id`）。
 ///
@@ -131,7 +138,7 @@ pub struct Workspace {
     pub notes: Entity<NotesView>,
     checklist: Entity<ChecklistView>,
     about: Entity<AboutView>,
-    /// レポート画面（GitHub Issue を作る）。
+    /// レポート画面（GitHub Issue をブラウザーで作る）。
     report: Entity<ReportView>,
     /// Account/ログインパネル。
     auth_panel_open: bool,
@@ -171,11 +178,24 @@ pub struct Workspace {
     pack_key_input_reset: bool,
     /// 解錠ダイアログに出す案内（直前のパスフレーズが違ったとき）。
     pack_key_error: Option<String>,
+    /// パスフレーズ未設定の警告を出したいか（ログイン直後の判定結果）。
+    ///
+    /// 「あとで」を押すまで保持する（他のモーダルが勝っている間は待たせ、
+    /// それが閉じたら出す）。
+    passphrase_notice: bool,
+    /// このログインセッションで警告の判定を済ませたか。
+    ///
+    /// 1 回判定したら再判定しない（Drive を引き直さない）。
+    passphrase_notice_checked: bool,
+    /// このログインセッションで警告を閉じた（「あとで」「設定する」）か。
+    ///
+    /// 閉じた後に遅れて届いた判定結果でも出し直さない（ログアウト→再ログインで戻す）。
+    passphrase_notice_dismissed: bool,
 }
 
 /// いずれかのサイト（技術書典 / BOOTH / FANZA同人 / DLsite）にログイン済みか。
 ///
-/// Google / GitHub はアカウント連携用で本の供給元（サイト）ではないため含めない。
+/// Google はアカウント連携用で本の供給元（サイト）ではないため含めない。
 /// 本棚のサイト行を出す判定と同じ 4 サイトを見る。
 fn any_site_logged_in(cx: &App) -> bool {
     let state = AppState::global(cx);
@@ -278,7 +298,7 @@ impl Workspace {
 
         // どのサイトにもログインしていなければ、本棚ではなく説明画面を初期表示に
         // する（本が 1 冊も入らない空の本棚より、各ストアのログイン手順が書かれた
-        // 説明画面のほうが入口として機能する）。Google / GitHub だけのログインは
+        // 説明画面のほうが入口として機能する）。Google だけのログインは
         // サイトのログインではないため本棚を出さない。
         let active = if any_site_logged_in(cx) {
             NavTarget::Bookshelf
@@ -316,6 +336,9 @@ impl Workspace {
             pack_key_input: None,
             pack_key_input_reset: false,
             pack_key_error: None,
+            passphrase_notice: false,
+            passphrase_notice_checked: false,
+            passphrase_notice_dismissed: false,
         };
         this.register_actions(cx);
         this.refresh_unread_count(cx);
@@ -333,17 +356,15 @@ impl Workspace {
         this
     }
 
-    /// Google / GitHub ログイン（成功・失敗）完了フラグを監視し、認証モーダルを閉じる。
+    /// Google ログイン（成功・失敗）完了フラグを監視し、認証モーダルを閉じる。
     /// 技術書典のログイン状態（`tbf_logged_in`）も同じループで見張り、変わったら
     /// アプリメニューを組み直す（メニューはアプリ全体で 1 つなので、サイドバーの
     /// ように描画のたびに読むことができない）。
     /// `AuthDialog` から `Workspace` を直接 update すると RefCell 再入問題で固まるため、
     /// AppState のフラグを追ってここで状態をリセットする。
-    /// GitHub（Device Flow）は view 側が完了時に `github_login_done` を立てる。
     fn start_login_done_watcher(&mut self, cx: &mut Context<Self>) {
         let handle = cx.weak_entity();
         let flag = AppState::global(cx).google_login_done.clone();
-        let github_flag = AppState::global(cx).github_login_done.clone();
         let logout_flag = AppState::global(cx).google_logout_done.clone();
         let auth_open = AppState::global(cx).auth_open_requested.clone();
         let auth_provider = AppState::global(cx).auth_open_provider.clone();
@@ -397,8 +418,11 @@ impl Workspace {
                     });
                     // ログインできたら pack の鍵（v3 の PRK）を背景で解決する
                     // （keyring → Drive の bundle。パスフレーズがあれば解錠ダイアログ）。
+                    // 鍵の解決が終わった時点で、パスフレーズ未設定なら警告を出す
+                    // （ログインセッションごとに 1 回。「あとで」なら再表示しない）。
                     let _ = handle.update(cx, |this, cx| {
-                        this.start_pack_key_unlock("ログイン", cx);
+                        this.reset_passphrase_notice();
+                        this.start_login_key_flow(cx);
                     });
                     // cx.notify() は RefCell already borrowed を起こすため、
                     // AsyncApp::refresh()（&self）で再描画を要求する。
@@ -408,23 +432,11 @@ impl Workspace {
                 if logout_flag.load(std::sync::atomic::Ordering::SeqCst) {
                     logout_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                     let _ = handle.update(cx, |this, cx| {
+                        // パスフレーズ未設定の警告はログインセッションの話なので一緒に片付ける
+                        // （次にログインしたときに、また判定して出す）。
+                        this.reset_passphrase_notice();
                         this.bookshelf.update(cx, |b, bx| b.reload(bx));
                     });
-                    cx.refresh();
-                }
-                // GitHub ログイン（Device Flow）の完了。Google と同じく認証モーダルを閉じて
-                // 設定画面へ戻す。GitHub は書店ではないので本棚の再フィルタは不要。
-                if github_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                    github_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                    let _ = handle.update(cx, |this, _cx| {
-                        this.show_auth = false;
-                        this.auth_dialog = None;
-                        this.auth_loading = false;
-                        this.active = NavTarget::Settings;
-                        this.sidebar_open = true;
-                    });
-                    // cx.notify() は RefCell already borrowed を起こすため、
-                    // AsyncApp::refresh()（&self）で再描画を要求する。
                     cx.refresh();
                 }
                 // 技術書典のログイン状態が変わったらアプリメニューを組み直す
@@ -930,23 +942,85 @@ impl Workspace {
             .is_some_and(|profile| !profile.sub.trim().is_empty())
     }
 
-    /// pack の鍵（v3 の PRK）を背景で解決する（必要なら解錠ダイアログを出す）。
+    /// ログイン直後の鍵の流れ: 解決 → その結果に応じた「パスフレーズ未設定」の警告。
     ///
-    /// 鍵が要る処理（本を開く・同期・取り込み）の前に呼ぶ。解決できなかった場合は
-    /// トーストで理由を知らせる（`Unavailable` = 復元の案内は core の文言に入っている）。
-    fn start_pack_key_unlock(&mut self, purpose: &str, cx: &mut Context<Self>) {
-        let task = crate::pack_keys::unlock_task(cx, purpose);
+    /// 警告は**鍵の解決が終わってから**判定する。先に判定すると、解錠ダイアログ
+    /// （背景タスクが答えを待っている）を出している最中に、まだ鍵が無いという理由で
+    /// 判定してしまう（＝本当はパスフレーズがある端末でも警告が出かねない）。
+    ///
+    /// 解決できなかった場合はトーストで理由を知らせる（`Unavailable` = 復元の案内は
+    /// core の文言に入っている）。
+    fn start_login_key_flow(&mut self, cx: &mut Context<Self>) {
+        let task = crate::pack_keys::unlock_task(cx, "ログイン");
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |_this, cx| {
+            let _ = this.update(cx, |this, cx| {
                 if let Err(error) = result {
                     log::warn!("pack key unlock failed: {error}");
                     crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Error, error);
                 }
+                this.start_passphrase_notice_check(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// パスフレーズ未設定の警告を出すか判定する（ログインセッションごとに 1 回）。
+    ///
+    /// 判定は Drive を引くので背景で行う。判定できないとき（オフライン等）は出さない
+    /// （[`crate::pack_keys::passphrase_notice_needed`]）。
+    fn start_passphrase_notice_check(&mut self, cx: &mut Context<Self>) {
+        if self.passphrase_notice_checked {
+            return;
+        }
+        self.passphrase_notice_checked = true;
+        let keys = crate::pack_keys::KeyContext::from_state(AppState::global(cx));
+        let task = cx
+            .background_executor()
+            .spawn(async move { keys.needs_passphrase_notice() });
+        cx.spawn(async move |this, cx| {
+            let wanted = task.await;
+            let _ = this.update(cx, |this, cx| this.apply_passphrase_notice(wanted, cx));
+        })
+        .detach();
+    }
+
+    /// 判定の結果を反映する（調べるのは背景・反映は UI スレッド）。
+    ///
+    /// 「あとで」を選んだ後に遅れて届いた結果でも出し直さない（`dismissed`）。
+    fn apply_passphrase_notice(&mut self, wanted: bool, cx: &mut Context<Self>) {
+        if wanted && !self.passphrase_notice_dismissed {
+            self.passphrase_notice = true;
+            cx.notify();
+        }
+    }
+
+    /// ログインセッションの始まりに警告の状態を戻す（ログインのたびに 1 回出す）。
+    fn reset_passphrase_notice(&mut self) {
+        self.passphrase_notice = false;
+        self.passphrase_notice_checked = false;
+        self.passphrase_notice_dismissed = false;
+    }
+
+    /// パスフレーズ未設定の警告で「あとで」を選んだ（このセッションでは再表示しない）。
+    fn dismiss_passphrase_notice(&mut self, cx: &mut Context<Self>) {
+        self.passphrase_notice = false;
+        self.passphrase_notice_dismissed = true;
+        cx.notify();
+    }
+
+    /// パスフレーズ未設定の警告で「設定する」を選んだ（設定画面の本の鍵カードへ）。
+    fn open_passphrase_settings(&mut self, cx: &mut Context<Self>) {
+        self.passphrase_notice = false;
+        // 「設定する」を選んだ時点で用は済んでいるので、このセッションでは出し直さない
+        self.passphrase_notice_dismissed = true;
+        self.switch_to(NavTarget::Settings, cx);
+        self.sidebar_open = true;
+        // 本の鍵カードの入力欄にフォーカスを合わせる（すぐ入力できるように）
+        self.settings
+            .update(cx, |settings, cx| settings.request_passphrase_focus(cx));
+        cx.notify();
     }
 
     /// 解錠ダイアログの入力欄を遅延生成する（初回表示のみ）。
@@ -958,7 +1032,8 @@ impl Workspace {
         if let Some(input) = self.pack_key_input.clone() {
             return input;
         }
-        // 肩越しに読まれないようマスクする（値は `value()` で取れる）
+        // 肩越しに読まれないようマスクする（値は `value()` で取れる）。
+        // 目のアイコン（`Input::mask_toggle`）で表示 ⇄ マスクを切り替えられる。
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
@@ -1109,6 +1184,14 @@ impl Workspace {
             cx,
             ModalKind::PackPassphrase,
             AppState::global(cx).pack_key_prompt.pending().is_some(),
+        );
+        // パスフレーズ未設定のお願いは**情報**で、答えを待っている相手がいない。
+        // 優先度は最も弱く（他が終わってから出す）し、登録簿の外にある確認
+        // （Drive の有効化・起動時の取り込み確認）と重なるときも出さない。
+        set_modal(
+            cx,
+            ModalKind::PassphraseNotice,
+            self.passphrase_notice && !self.show_drive_prompt && !self.show_restore_prompt,
         );
         // 本棚のモーダルは**本棚が表示されているときだけ**登録する。表示されていない
         // （他画面にいる）間は登録を外し、見えないモーダルで「閉じる」を塞がないようにする。
@@ -1391,9 +1474,6 @@ impl Workspace {
         let theme = cx.theme().clone();
         let handle = cx.entity();
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
-        let github_logged_in = *AppState::global(cx).github_logged_in.lock();
-        // client_id が埋め込まれていないビルドでは GitHub ログインを開始できない
-        let github_login_enabled = !crate::app_state::default_github_client_id().is_empty();
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
@@ -1404,12 +1484,6 @@ impl Workspace {
             .lock()
             .clone()
             .map(|p| p.email);
-        let github_login = AppState::global(cx)
-            .github_profile
-            .lock()
-            .clone()
-            .map(|p| p.login)
-            .filter(|login| !login.is_empty());
         let site_row = |name: &str,
                         logged_in: bool,
                         login_provider: Option<AuthProvider>,
@@ -1422,10 +1496,6 @@ impl Workspace {
             let handle = handle.clone();
             let name = name.to_string();
             let name_for_id = name.clone();
-            // GitHub は client_id 未設定のビルドだと開始できないので、ログインボタンを
-            // グレー表示にして押しても何も起きない見た目にする。
-            let login_enabled =
-                login_provider != Some(AuthProvider::Github) || github_login_enabled;
             div()
                 .id(format!("account-row-{name_for_id}"))
                 .flex()
@@ -1452,25 +1522,6 @@ impl Workspace {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(google_email.clone().unwrap()),
-                            )
-                        })
-                        // GitHub はログイン中、@login を 2 段目に表示
-                        .when(github_login.is_some() && name_for_id == "GitHub", |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("@{}", github_login.clone().unwrap())),
-                            )
-                        })
-                        // client_id 未設定のビルドでは押せない理由を出す（非活性の理由が
-                        // 見えないと「壊れている」と見える）。
-                        .when(!github_login_enabled && name_for_id == "GitHub", |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("client_id 未設定"),
                             )
                         }),
                 )
@@ -1516,40 +1567,30 @@ impl Workspace {
                     Box::new(
                         div()
                             .id(format!("account-login-{name}"))
-                            .when(login_enabled, |this| {
-                                this.on_click({
-                                    let provider = login_provider;
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        if let Some(provider) = provider {
-                                            cx.defer(move |cx| {
-                                                cx.dispatch_action(
-                                                    &crate::actions::OpenAuthProvider { provider },
-                                                );
-                                            });
-                                            handle.update(cx, |this, cx| {
-                                                this.auth_panel_open = false;
-                                                cx.notify();
-                                            });
-                                        }
+                            .on_click({
+                                let provider = login_provider;
+                                let handle = handle.clone();
+                                move |_, _window, cx| {
+                                    if let Some(provider) = provider {
+                                        cx.defer(move |cx| {
+                                            cx.dispatch_action(
+                                                &crate::actions::OpenAuthProvider { provider },
+                                            );
+                                        });
+                                        handle.update(cx, |this, cx| {
+                                            this.auth_panel_open = false;
+                                            cx.notify();
+                                        });
                                     }
-                                })
+                                }
                             })
                             .rounded_md()
                             .px_2()
                             .py_1()
-                            .bg(if login_enabled {
-                                theme.primary
-                            } else {
-                                theme.secondary
-                            })
-                            .text_color(if login_enabled {
-                                theme.primary_foreground
-                            } else {
-                                theme.muted_foreground
-                            })
+                            .bg(theme.primary)
+                            .text_color(theme.primary_foreground)
                             .text_xs()
-                            .when(login_enabled, |this| this.cursor_pointer())
+                            .cursor_pointer()
                             .child("ログイン"),
                     )
                     .into_any_element()
@@ -1574,12 +1615,6 @@ impl Workspace {
                 google_logged_in,
                 Some(AuthProvider::Google),
                 Some(crate::views::settings::SettingsView::logout_google),
-            ))
-            .child(site_row(
-                "GitHub",
-                github_logged_in,
-                Some(AuthProvider::Github),
-                Some(crate::views::settings::SettingsView::logout_github),
             ))
             .child(site_row(
                 "技術書典",
@@ -2166,6 +2201,58 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
+            // パスフレーズ未設定のお願い（ログイン直後に 1 回だけ。優先度は最も弱いので
+            // 他のモーダルが終わってから出る）
+            .child(if self.passphrase_notice
+                && modal == Some(crate::app_state::ModalKind::PassphraseNotice)
+            {
+                let handle = cx.entity();
+                let content = dialog_surface(cx)
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("本の鍵を保護してください"),
+                    )
+                    .child(div().text_sm().child(PASSPHRASE_NOTICE_BODY))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_center()
+                            .gap_2()
+                            .child(
+                                dialog_button("passphrase-notice-later", "あとで")
+                                    .debug_selector(|| "passphrase-notice-later".into())
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.dismiss_passphrase_notice(cx)
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("passphrase-notice-settings")
+                                    .debug_selector(|| "passphrase-notice-settings".into())
+                                    .cursor_pointer()
+                                    .primary()
+                                    .label("設定する")
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.open_passphrase_settings(cx)
+                                            });
+                                        }
+                                    }),
+                            ),
+                    );
+                fade_dialog(window, cx, self.passphrase_notice, content).into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(if self.pack_key_pending
                 && modal == Some(crate::app_state::ModalKind::PackPassphrase)
             {
@@ -2195,7 +2282,18 @@ impl Render for Workspace {
                         "{purpose}には本の鍵が必要ですが、この端末に鍵がありません。\
                          別端末で設定したパスフレーズを入力すると復元できます（次回からは尋ねません）。"
                     )))
-                    .child(Input::new(&input).cursor_text().w_full());
+                    // 入力欄の右端の目のアイコンでマスク ⇄ 表示を切り替える
+                    // （既定はマスク。値とフォーカスは保たれる）
+                    .child(
+                        div()
+                            .debug_selector(|| "pack-key-input".into())
+                            .child(
+                                Input::new(&input)
+                                    .cursor_text()
+                                    .w_full()
+                                    .mask_toggle(),
+                            ),
+                    );
                 if let Some(error) = error {
                     content = content.child(div().text_sm().text_color(danger).child(error));
                 }
@@ -2408,27 +2506,24 @@ impl Workspace {
         let unread = (active == NavTarget::Bookshelf).then_some(unread_count);
         // テーマ名はキャッシュから（描画のたびに `theme.mode` を DB から読まない）
         let theme_mode_name = self.theme_mode_name.clone();
-        // レポート（GitHub にログインしているときだけ設定の上に出す）。
-        // ログインしていないと Issue を作れないため導線も出さない。
-        let github_logged_in = *AppState::global(cx).github_logged_in.lock();
+        // レポート（設定の上に出す）。GitHub のトークンを持たない（投稿はブラウザーで
+        // 行う）ので、ログイン状態に関わらず常に出す。
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
-        let report_item = github_logged_in.then(|| {
-            self.bottom_item(
-                "sidebar-nav-report",
-                Icon::new(AppIcon::Megaphone)
-                    .size(px(24.0))
-                    .text_color(sidebar_icon_color(&theme, NavTarget::Report, active))
-                    .into_any_element(),
-                "レポート",
-                open,
-                active == NavTarget::Report,
-                |this, cx| {
-                    this.switch_to(NavTarget::Report, cx);
-                },
-                handle.clone(),
-                cx,
-            )
-        });
+        let report_item = self.bottom_item(
+            "sidebar-nav-report",
+            Icon::new(AppIcon::Megaphone)
+                .size(px(24.0))
+                .text_color(sidebar_icon_color(&theme, NavTarget::Report, active))
+                .into_any_element(),
+            "レポート",
+            open,
+            active == NavTarget::Report,
+            |this, cx| {
+                this.switch_to(NavTarget::Report, cx);
+            },
+            handle.clone(),
+            cx,
+        );
         // バッジ色分け: 100 件以上=赤 / 10〜99 件=黄 / 1〜9 件=緑
         let badge_color = if unread_count >= 100 {
             gpui_kit::rgb(BADGE_RED)
@@ -2639,7 +2734,7 @@ impl Workspace {
                     .gap_1()
                     .mt_auto()
                     .pb(px(16.0))
-                    .when_some(report_item, |this, item| this.child(item))
+                    .child(report_item)
                     .child(
                         self.bottom_item(
                             "sidebar-nav-settings",
@@ -3335,14 +3430,12 @@ mod tests {
         cx: &mut TestAppContext,
         logged_in_sites: &[&str],
         google_logged_in: bool,
-        github_logged_in: bool,
     ) -> gpui_kit::Entity<Workspace> {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         cx.update(|cx| {
             let state = AppState::global(cx);
             *state.google_logged_in.lock() = google_logged_in;
-            *state.github_logged_in.lock() = github_logged_in;
             for site in logged_in_sites {
                 match *site {
                     "tbf" => *state.tbf_logged_in.lock() = true,
@@ -3362,7 +3455,7 @@ mod tests {
     /// ストアのログイン手順が書いてあるのでそちらを入口にする。
     #[gpui_kit::test]
     async fn starts_on_the_about_view_when_no_site_is_logged_in(cx: &mut TestAppContext) {
-        let ws = setup_with_logins(cx, &[], false, false);
+        let ws = setup_with_logins(cx, &[], false);
         assert_eq!(
             ws.read_with(cx, |w, _| w.active),
             NavTarget::About,
@@ -3370,24 +3463,24 @@ mod tests {
         );
     }
 
-    /// Google / GitHub にログインしていても、サイトにログインしていなければ説明画面。
+    /// Google にログインしていても、サイトにログインしていなければ説明画面。
     ///
-    /// Google / GitHub はアカウント連携用で本の供給元（サイト）ではないため、
+    /// Google はアカウント連携用で本の供給元（サイト）ではないため、
     /// それだけでは本棚を初期表示にしない。
     #[gpui_kit::test]
-    async fn google_and_github_login_alone_do_not_start_on_the_bookshelf(cx: &mut TestAppContext) {
-        let ws = setup_with_logins(cx, &[], true, true);
+    async fn google_login_alone_does_not_start_on_the_bookshelf(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &[], true);
         assert_eq!(
             ws.read_with(cx, |w, _| w.active),
             NavTarget::About,
-            "Google / GitHub だけのログインで本棚が初期表示になっている"
+            "Google だけのログインで本棚が初期表示になっている"
         );
     }
 
     /// どのサイトでもよいので 1 つログイン済みなら、本棚を初期表示にする。
     #[gpui_kit::test]
     async fn starts_on_the_bookshelf_when_a_site_is_logged_in(cx: &mut TestAppContext) {
-        let ws = setup_with_logins(cx, &["tbf"], false, false);
+        let ws = setup_with_logins(cx, &["tbf"], false);
         assert_eq!(
             ws.read_with(cx, |w, _| w.active),
             NavTarget::Bookshelf,
@@ -4117,10 +4210,10 @@ mod tests {
         );
     }
 
-    /// サイドバーの「レポート」行は GitHub にログインしているときだけ出る
-    /// （ログインしていないと Issue を作れないため導線も出さない）。
+    /// サイドバーの「レポート」行は**いつでも出す**（GitHub のトークンを持たず、
+    /// 投稿はブラウザーで行うので、ログイン状態に依存しない）。
     #[gpui_kit::test]
-    async fn report_row_needs_github_login(cx: &mut TestAppContext) {
+    async fn report_row_is_always_available(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
             ws.update(cx, |w, cx| {
@@ -4146,19 +4239,9 @@ mod tests {
         };
 
         draw(visual);
-        assert!(
-            visual.debug_bounds("sidebar-nav-report").is_none(),
-            "未ログインなのにレポート行が出ている"
-        );
-
-        cx.update(|cx| {
-            *AppState::global(cx).github_logged_in.lock() = true;
-            ws.update(cx, |_, cx| cx.notify());
-        });
-        draw(visual);
         let report = visual
             .debug_bounds("sidebar-nav-report")
-            .expect("GitHub にログインしてもレポート行が出ていない");
+            .expect("ログインしていなくてもレポート行が出ていない");
         let settings = visual
             .debug_bounds("sidebar-nav-settings")
             .expect("設定の行が出ていない");
@@ -4177,19 +4260,6 @@ mod tests {
             "レポート行の位置・幅が他の行と揃っていない: report={:?} settings={:?}",
             report.size,
             settings.size
-        );
-
-        // ログアウトすると導線も消える
-        // （keyring を触る clear_github_token は他のテストと競合するので、
-        //   ここではログイン状態だけを落とす）
-        cx.update(|cx| {
-            *AppState::global(cx).github_logged_in.lock() = false;
-            ws.update(cx, |_, cx| cx.notify());
-        });
-        draw(visual);
-        assert!(
-            visual.debug_bounds("sidebar-nav-report").is_none(),
-            "ログアウトしてもレポート行が残っている"
         );
     }
 
@@ -5194,5 +5264,268 @@ mod tests {
             1,
             "アップロード中の通知が自動で消えている（完了まで出しておくこと）"
         );
+    }
+
+    /// パスフレーズ未設定の警告は、**ログインセッションごとに 1 回**だけ出す。
+    ///
+    /// 「あとで」を選んだ後に、遅れて届いた判定結果で出し直すと「あとで」が効かない。
+    /// ログアウト→再ログインではまた出す（[`Workspace::reset_passphrase_notice`]）。
+    #[gpui_kit::test]
+    async fn passphrase_notice_shows_once_per_login_session(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        // 判定の結果「パスフレーズ未設定」と分かった
+        ws.update(cx, |w, cx| w.apply_passphrase_notice(true, cx));
+        assert!(
+            ws.read_with(cx, |w, _| w.passphrase_notice),
+            "警告を出す判定が反映されていない"
+        );
+
+        // 判定は 1 セッション 1 回（2 回目は Drive を引き直さない）
+        ws.update(cx, |w, cx| w.start_passphrase_notice_check(cx));
+        assert!(
+            ws.read_with(cx, |w, _| w.passphrase_notice_checked),
+            "判定済みの印が立っていない（毎回 Drive を引いてしまう）"
+        );
+
+        // 「あとで」で閉じる
+        ws.update(cx, |w, cx| w.dismiss_passphrase_notice(cx));
+        assert!(!ws.read_with(cx, |w, _| w.passphrase_notice));
+
+        // 遅れて届いた同じ結果では出し直さない
+        ws.update(cx, |w, cx| w.apply_passphrase_notice(true, cx));
+        assert!(
+            !ws.read_with(cx, |w, _| w.passphrase_notice),
+            "「あとで」の後に警告を出し直している"
+        );
+
+        // ログアウト→再ログインではまた出す
+        ws.update(cx, |w, _| w.reset_passphrase_notice());
+        ws.update(cx, |w, cx| w.apply_passphrase_notice(true, cx));
+        assert!(
+            ws.read_with(cx, |w, _| w.passphrase_notice),
+            "再ログインしてもう一度出なくなっている"
+        );
+    }
+
+    /// 警告は他のモーダルと重ならない（優先度で 1 つだけ出す）。
+    ///
+    /// 情報なので他のモーダル（答えを待つ確認）には譲り、閉じたら繰り上がる。
+    /// 登録簿の外にある確認（Drive の有効化）とも重ねない。
+    #[gpui_kit::test]
+    async fn passphrase_notice_yields_to_other_modals(cx: &mut TestAppContext) {
+        use crate::app_state::{ModalKind, active_modal};
+
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        cx.update(|cx| ws.update(cx, |w, cx| w.apply_passphrase_notice(true, cx)));
+        draw_frames(visual);
+        assert_eq!(
+            cx.update(|cx| active_modal(cx)),
+            Some(ModalKind::PassphraseNotice),
+            "警告がモーダルとして登録されていない"
+        );
+        assert!(
+            visual.debug_bounds("passphrase-notice-settings").is_some(),
+            "警告ダイアログが描画されていない"
+        );
+
+        // 終了確認（答えを待つ）が勝ち、警告は待つ
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.exit_upload_prompt = true;
+                cx.notify();
+            });
+        });
+        draw_frames(visual);
+        assert_eq!(
+            cx.update(|cx| active_modal(cx)),
+            Some(ModalKind::ExitConfirm),
+            "答えを待つ確認より警告が前に出ている"
+        );
+        assert!(
+            visual.debug_bounds("passphrase-notice-settings").is_none(),
+            "2 つのモーダルが同時に出ている"
+        );
+
+        // 閉じたら繰り上がる（警告の状態は保持されている）
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.exit_upload_prompt = false;
+                cx.notify();
+            });
+        });
+        draw_frames(visual);
+        assert_eq!(
+            cx.update(|cx| active_modal(cx)),
+            Some(ModalKind::PassphraseNotice),
+            "勝者が閉じても警告が出てこない"
+        );
+
+        // Drive の有効化の確認（登録簿の外の確認）と重なるときは出さない
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.show_drive_prompt = true;
+                cx.notify();
+            });
+        });
+        draw_frames(visual);
+        assert_eq!(
+            cx.update(|cx| active_modal(cx)),
+            None,
+            "Drive の確認と警告を重ねて出している"
+        );
+        assert!(visual.debug_bounds("passphrase-notice-settings").is_none());
+    }
+
+    /// 警告の「設定する」は設定画面へ移動し、「あとで」は閉じるだけ。
+    #[gpui_kit::test]
+    async fn passphrase_notice_buttons_open_settings_or_dismiss(cx: &mut TestAppContext) {
+        // Google ログイン済みにしておく（設定画面の本の鍵カードに入力欄が出る）
+        let ws = setup_with_logins(cx, &[], true);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        // 「あとで」は閉じるだけ（画面は変わらない）
+        let before = ws.read_with(cx, |w, _| w.active);
+        cx.update(|cx| ws.update(cx, |w, cx| w.apply_passphrase_notice(true, cx)));
+        draw_frames(visual);
+        let later = visual
+            .debug_bounds("passphrase-notice-later")
+            .expect("「あとで」ボタンが出ていない");
+        visual.simulate_click(later.center(), gpui_kit::Modifiers::default());
+        assert!(
+            !ws.read_with(cx, |w, _| w.passphrase_notice),
+            "「あとで」で閉じていない"
+        );
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            before,
+            "「あとで」で画面が変わっている"
+        );
+
+        // 「設定する」は設定画面へ移動し、本の鍵カードの入力欄にフォーカスを合わせる
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.reset_passphrase_notice();
+                w.apply_passphrase_notice(true, cx);
+            });
+        });
+        draw_frames(visual);
+        let settings_button = visual
+            .debug_bounds("passphrase-notice-settings")
+            .expect("「設定する」ボタンが出ていない");
+        visual.simulate_click(settings_button.center(), gpui_kit::Modifiers::default());
+        draw_frames(visual);
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Settings,
+            "「設定する」で設定画面へ移動していない"
+        );
+        assert!(
+            !ws.read_with(cx, |w, _| w.passphrase_notice),
+            "「設定する」で閉じていない"
+        );
+        // 本の鍵カードは先頭にあり、入力欄にフォーカスが入っている
+        let key_card = visual
+            .debug_bounds("settings-card-key")
+            .expect("設定画面に本の鍵カードが出ていない");
+        assert!(
+            key_card.top() < gpui_kit::px(800.0) && key_card.bottom() > gpui_kit::px(0.0),
+            "本の鍵カードが画面の外にある（上端から見えない）"
+        );
+        let input = ws
+            .read_with(cx, |w, cx| w.settings.read(cx).passphrase_input())
+            .expect("入力欄が作られていない");
+        assert!(
+            visual.update(|window, cx| input.read(cx).focus_handle(cx).is_focused(window)),
+            "本の鍵カードの入力欄にフォーカスが入っていない"
+        );
+    }
+
+    /// 解錠ダイアログの入力欄も、右端の目のアイコンでマスク ⇄ 表示を切り替えられる。
+    #[gpui_kit::test]
+    async fn pack_key_dialog_input_mask_toggles_with_the_eye_button(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        // 背景タスクがパスフレーズを尋ねている状態を作る（ダイアログは要求を見て出す）
+        let prompt = cx.update(|cx| AppState::global(cx).pack_key_prompt.clone());
+        let asked = std::thread::spawn({
+            let prompt = prompt.clone();
+            move || prompt.ask("本を開く", None)
+        });
+        for _ in 0..200 {
+            if prompt.pending().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(prompt.pending().is_some(), "解錠の要求が出ていない");
+
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.pack_key_pending = true;
+                cx.notify();
+            });
+        });
+        draw_frames(visual);
+
+        let input = ws.read_with(cx, |w, _| w.pack_key_input.clone()).expect("入力欄");
+        assert!(
+            cx.read(|cx| input.read(cx).presentation().is_masked()),
+            "既定はマスク"
+        );
+
+        let bounds = visual
+            .debug_bounds("pack-key-input")
+            .expect("解錠ダイアログの入力欄が出ていない");
+        let eye = gpui_kit::point(
+            bounds.right() - gpui_kit::px(22.0),
+            bounds.center().y,
+        );
+        visual.update(|window, cx| {
+            input.update(cx, |state, cx| state.set_value("passphrase-1", window, cx));
+        });
+
+        visual.simulate_click(eye, gpui_kit::Modifiers::default());
+        assert!(
+            !cx.read(|cx| input.read(cx).presentation().is_masked()),
+            "目のアイコンを押しても表示に切り替わらない"
+        );
+        assert_eq!(
+            cx.read(|cx| input.read(cx).value()),
+            "passphrase-1",
+            "切り替えで入力内容を失っている"
+        );
+
+        // 背景タスク（テストが起こした 1 件）を終わらせる
+        cx.update(|cx| {
+            AppState::global(cx)
+                .pack_key_prompt
+                .answer(crate::pack_keys::PassphraseAnswer::Skipped);
+        });
+        assert_eq!(asked.join().ok(), Some(crate::pack_keys::PassphraseAnswer::Skipped));
     }
 }

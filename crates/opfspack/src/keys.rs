@@ -11,6 +11,17 @@
 //!   KEK_passphrase = PBKDF2-SHA256(NFKC(passphrase), salt, iterations)
 //!   ラップの AAD    = UTF8("thundoku-pack-root:1:" + owner_id)
 //! ```
+//!
+//! §11 のメタデータバックアップ（`thundoku-backup.json` v3）も同じ PRK から導出する
+//! （[`BackupEnvelope`]）:
+//!
+//! ```text
+//! backup_cipher_key = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1",
+//!                                 info = b"thundoku-backup-key")
+//! backup_hash_key   = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1",
+//!                                 info = b"thundoku-backup-hash")
+//! 封筒の AAD         = UTF8("thundoku-backup:3:" + owner_id)
+//! ```
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -38,6 +49,58 @@ const NONCE_LEN: usize = 12;
 
 /// ラップされた PRK の長さ（32B + 16B タグ・仕様 §3.2）。
 const WRAP_CIPHERTEXT_LEN: usize = 32 + 16;
+
+/// Drive に置くメタデータバックアップ（`thundoku-backup.json`）の v3 封筒の
+/// `format_version`（仕様 §11）。v2 以前は平文のバックアップ JSON。
+pub const BACKUP_FORMAT_VERSION: u32 = 3;
+
+/// 封筒の AAD 接頭辞（`"{AAD}:{format_version}:{owner_id}"` を AAD にする）。
+/// 別アカウントの封筒・別版の封筒への差し替えを検出する。
+const BACKUP_AAD_PREFIX: &str = "thundoku-backup";
+
+/// バックアップ鍵の HKDF salt（PRK から用途分離した 2 本の鍵を作る）。
+const BACKUP_KDF_SALT: &[u8] = b"thundoku-backup:v1";
+
+/// 封筒の暗号鍵の HKDF info。
+const BACKUP_CIPHER_INFO: &[u8] = b"thundoku-backup-key";
+
+/// 平文の HMAC 鍵の HKDF info。
+const BACKUP_HASH_INFO: &[u8] = b"thundoku-backup-hash";
+
+/// 封筒の `encryption.alg`（唯一の値）。
+pub const BACKUP_ALG: &str = "aes-256-gcm";
+
+/// 封筒の `encryption.kdf`（唯一の値）。
+pub const BACKUP_KDF: &str = "hkdf-sha256";
+
+/// 封筒の暗号文の最小長（AES-GCM のタグ 16B）。
+const BACKUP_TAG_LEN: usize = 16;
+
+/// 封筒の AAD バイト列。
+fn backup_aad(owner_id: &str) -> Vec<u8> {
+    format!("{BACKUP_AAD_PREFIX}:{BACKUP_FORMAT_VERSION}:{owner_id}").into_bytes()
+}
+
+/// HMAC-SHA256（RFC 2104。`backup_envelope.rs` のベクタで固定している）。
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
+/// 定数時間比較（HMAC の検証に使う。早期 return で一致位置を漏らさない）。
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
 
 /// `sub` ラップの KEK = v2 の master key と同式
 /// （`PBKDF2-SHA256(password = UTF8(sub) ‖ APP_SALT, salt = APP_SALT, 100_000)`）。
@@ -106,6 +169,25 @@ impl PackRootKey {
             pack_id.as_bytes(),
             crate::crypto::HKDF_INFO,
         ))
+    }
+
+    /// メタデータバックアップ（`thundoku-backup.json` v3 の封筒）の暗号鍵
+    /// = `HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1",
+    /// info = b"thundoku-backup-key")`（仕様 §11）。
+    ///
+    /// pack 鍵とは別の `info` を使う（同じ PRK から用途ごとに鍵を分ける）。
+    pub fn derive_backup_cipher_key(&self) -> [u8; 32] {
+        crate::crypto::hkdf_sha256(&self.0, BACKUP_KDF_SALT, BACKUP_CIPHER_INFO)
+    }
+
+    /// バックアップ平文の HMAC 鍵
+    /// = `HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1",
+    /// info = b"thundoku-backup-hash")`（仕様 §11）。
+    ///
+    /// 変更検知（アップロード要否・復元提案）に使う。暗号文は nonce が乱数で
+    /// 毎回変わるため、暗号文の md5 では比較できない。
+    pub fn derive_backup_hash_key(&self) -> [u8; 32] {
+        crate::crypto::hkdf_sha256(&self.0, BACKUP_KDF_SALT, BACKUP_HASH_INFO)
     }
 }
 
@@ -486,4 +568,220 @@ impl WireWrap {
             ciphertext,
         })
     }
+}
+
+// ---- §11: メタデータバックアップ（`thundoku-backup.json` v3）の封筒 -------------
+
+/// Drive のメタデータバックアップ（`thundoku-backup.json`）v3 の封筒（仕様 §11）。
+///
+/// - 平文は**現行のバックアップ JSON そのもの**（`db::backup::export_json` の出力）
+/// - 暗号化は `AES-256-GCM(backup_cipher_key)`、AAD は `thundoku-backup:3:<owner_id>`
+/// - `nonce` は乱数なので**暗号文は毎回変わる** — 変更検知は [`Self::content_hmac`]
+///   （平文の HMAC-SHA256）で行い、暗号文の md5 は使わない
+///
+/// 鍵は PRK から導出した [`PackRootKey::derive_backup_cipher_key`] /
+/// [`PackRootKey::derive_backup_hash_key`] だけを使う（新しい鍵管理を増やさない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupEnvelope {
+    format_version: u32,
+    owner_id: String,
+    alg: String,
+    kdf: String,
+    nonce: [u8; NONCE_LEN],
+    ciphertext: Vec<u8>,
+    content_hmac: [u8; 32],
+}
+
+impl BackupEnvelope {
+    /// 平文を封筒に入れる（nonce は乱数）。本番の作成経路。
+    pub fn seal(plaintext: &[u8], root: &PackRootKey, owner_id: &str) -> Self {
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        Self::seal_with_nonce(plaintext, root, owner_id, nonce)
+    }
+
+    /// nonce を指定して封をする（**決定的**。テストベクタの検算に使う）。
+    pub fn seal_with_nonce(
+        plaintext: &[u8],
+        root: &PackRootKey,
+        owner_id: &str,
+        nonce: [u8; NONCE_LEN],
+    ) -> Self {
+        let ciphertext = crate::crypto::encrypt_with(
+            plaintext,
+            &root.derive_backup_cipher_key(),
+            &nonce,
+            &backup_aad(owner_id),
+        );
+        let content_hmac = hmac_sha256(&root.derive_backup_hash_key(), plaintext);
+        Self {
+            format_version: BACKUP_FORMAT_VERSION,
+            owner_id: owner_id.to_owned(),
+            alg: BACKUP_ALG.to_owned(),
+            kdf: BACKUP_KDF.to_owned(),
+            nonce,
+            ciphertext,
+            content_hmac,
+        }
+    }
+
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    pub fn nonce(&self) -> &[u8; NONCE_LEN] {
+        &self.nonce
+    }
+
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
+    }
+
+    /// 平文の HMAC。**同じ平文なら（nonce が違っても）同じ値**になるので、
+    /// 「内容が変わったか」の判定に使う。
+    pub fn content_hmac(&self) -> &[u8; 32] {
+        &self.content_hmac
+    }
+
+    /// [`Self::content_hmac`] の小文字 hex（設定に保存する基準値）。
+    pub fn content_hmac_hex(&self) -> String {
+        hex_encode(&self.content_hmac)
+    }
+
+    /// 復号する。**鍵違い・改変・`owner_id` 違いはすべてエラー**で、平文を返さない。
+    ///
+    /// `owner_id` は AAD に入れる値（呼び出し側が確認した所有者）。封筒に記録された
+    /// [`Self::owner_id`] を渡すのが通常で、別の値を渡すと復号に失敗する
+    /// （＝別アカウントの封筒への差し替えを検出できる）。
+    pub fn open(&self, root: &PackRootKey, owner_id: &str) -> Result<Vec<u8>, PackError> {
+        self.validate()?;
+        let plaintext = crate::crypto::decrypt_with(
+            &self.ciphertext,
+            &self.nonce,
+            &root.derive_backup_cipher_key(),
+            &backup_aad(owner_id),
+        )
+        .map_err(|_| {
+            PackError::Corrupted("backup decryption failed (wrong key or tampered)".into())
+        })?;
+        let expected = hmac_sha256(&root.derive_backup_hash_key(), &plaintext);
+        if !constant_time_eq(&expected, &self.content_hmac) {
+            return Err(PackError::Corrupted("backup content hmac mismatch".into()));
+        }
+        Ok(plaintext)
+    }
+
+    /// 封筒（`thundoku-backup.json` の中身）のバイト列。TS `JSON.stringify` と同じ詰めた形。
+    pub fn to_json(&self) -> Result<Vec<u8>, PackError> {
+        let wire = WireEnvelope {
+            format_version: self.format_version,
+            owner_id: self.owner_id.clone(),
+            encryption: WireEncryption {
+                alg: self.alg.clone(),
+                kdf: self.kdf.clone(),
+                nonce: BASE64.encode(self.nonce),
+                ciphertext: BASE64.encode(&self.ciphertext),
+            },
+            content_hmac: self.content_hmac_hex(),
+        };
+        serde_json::to_vec(&wire)
+            .map_err(|e| PackError::Corrupted(format!("failed to serialize backup envelope: {e}")))
+    }
+
+    /// 封筒を読む。`format_version` が 3 以外・構造が不正なら `Corrupted`
+    /// （**平文として扱える形では返さない**）。
+    pub fn from_json(bytes: &[u8]) -> Result<Self, PackError> {
+        let invalid =
+            |detail: String| PackError::Corrupted(format!("invalid backup envelope: {detail}"));
+        let wire: WireEnvelope = serde_json::from_slice(bytes)
+            .map_err(|e| invalid(format!("not a JSON envelope: {e}")))?;
+        if wire.format_version != BACKUP_FORMAT_VERSION {
+            return Err(invalid(format!(
+                "unsupported format_version {}",
+                wire.format_version
+            )));
+        }
+        if wire.encryption.alg != BACKUP_ALG {
+            return Err(invalid(format!("unknown alg {:?}", wire.encryption.alg)));
+        }
+        if wire.encryption.kdf != BACKUP_KDF {
+            return Err(invalid(format!("unknown kdf {:?}", wire.encryption.kdf)));
+        }
+        let nonce: [u8; NONCE_LEN] = BASE64
+            .decode(&wire.encryption.nonce)
+            .map_err(|_| invalid("nonce is not base64".into()))?
+            .try_into()
+            .map_err(|_| invalid("nonce is not 12 bytes".into()))?;
+        let ciphertext = BASE64
+            .decode(&wire.encryption.ciphertext)
+            .map_err(|_| invalid("ciphertext is not base64".into()))?;
+        if ciphertext.len() < BACKUP_TAG_LEN {
+            return Err(invalid("ciphertext is shorter than the GCM tag".into()));
+        }
+        let content_hmac = hex_decode_32(&wire.content_hmac)
+            .ok_or_else(|| invalid("content_hmac is not 32 hex bytes".into()))?;
+        Ok(Self {
+            format_version: wire.format_version,
+            owner_id: wire.owner_id,
+            alg: wire.encryption.alg,
+            kdf: wire.encryption.kdf,
+            nonce,
+            ciphertext,
+            content_hmac,
+        })
+    }
+
+    /// 読んだ値の自己検査（`open` の前段）。
+    fn validate(&self) -> Result<(), PackError> {
+        if self.format_version != BACKUP_FORMAT_VERSION {
+            return Err(PackError::Corrupted(format!(
+                "unsupported backup format version: {}",
+                self.format_version
+            )));
+        }
+        if self.alg != BACKUP_ALG || self.kdf != BACKUP_KDF {
+            return Err(PackError::Corrupted(format!(
+                "unsupported backup encryption: {}/{}",
+                self.alg, self.kdf
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireEnvelope {
+    format_version: u32,
+    owner_id: String,
+    encryption: WireEncryption,
+    content_hmac: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireEncryption {
+    alg: String,
+    kdf: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+/// 32 バイトの小文字 hex（`content_hmac` の表現）。
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// hex 64 文字を 32 バイトに戻す（大文字も許す。書き出しは常に小文字）。
+fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(value.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }

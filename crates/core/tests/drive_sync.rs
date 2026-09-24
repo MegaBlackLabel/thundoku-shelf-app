@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use opfspack::{PackBuilder, PackRootKey};
+use opfspack::{BackupEnvelope, PackBuilder, PackRootKey};
 use thundoku_core::db;
-use thundoku_core::drive::sync::{SyncError, sync};
+use thundoku_core::drive::sync::{BACKUP_BASELINE_KEY, SyncError, sync};
 use thundoku_core::drive::{DriveApi, DriveError, DriveFile};
 
 struct FakeDrive {
@@ -899,5 +899,417 @@ fn db_backup_upload_records_the_baseline_for_the_next_check() {
     assert!(
         !status.should_offer_restore(),
         "アップロード直後の起動で復元確認を出してはいけない"
+    );
+}
+
+// ---- R06: DB バックアップの暗号化（v3 の封筒。docs/spec/10-pack-keys.md §11） ----
+
+/// keyring（テストではメモリ）に PRK を保存する。
+fn save_root_key(sub: &str, root: &PackRootKey) {
+    thundoku_core::secrets::SecretStore::use_memory_backend();
+    thundoku_core::secrets::SecretStore::new()
+        .save_pack_root_key(&opfspack::derive_owner_id(sub), &root.to_base64())
+        .unwrap();
+}
+
+/// keyring から PRK を消す（鍵の無い端末を再現する）。
+fn delete_root_key(sub: &str) {
+    thundoku_core::secrets::SecretStore::use_memory_backend();
+    let _ = thundoku_core::secrets::SecretStore::new()
+        .delete_pack_root_key(&opfspack::derive_owner_id(sub));
+}
+
+/// 現在の sub が所有する本を 1 冊入れる（DB バックアップの対象）。
+fn insert_owned_book(
+    pool: &thundoku_core::db::SqlitePool,
+    id: &str,
+    title: &str,
+    sub: &str,
+    key: &[u8; 32],
+) {
+    db::books::insert(
+        pool,
+        &db::books::Book {
+            id: id.into(),
+            title: title.into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: format!("{id}.opfspack"),
+            file_size: 1,
+            opfs_path: format!("{id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 0,
+            pack_id: Some(id.into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-09-01 00:00:00".into(),
+            updated_at: "2026-09-01 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+    db::books::set_owner_sub(pool, id, Some(thundoku_core::owner::encrypt(key, sub))).unwrap();
+}
+
+/// DB バックアップ付きの同期（所有者と鍵を明示する）。
+fn sync_with_backup(
+    env: &TestEnv,
+    drive: &mut dyn DriveApi,
+    sub: &str,
+    root: Option<&PackRootKey>,
+    owner_key: &[u8; 32],
+    db_path: &std::path::Path,
+) -> Result<thundoku_core::drive::sync::SyncOutcome, SyncError> {
+    sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some(sub),
+        pack_root_key: root,
+        owner_key: Some(owner_key),
+        folder_id: "folder-1",
+        db_path: Some(db_path),
+    })
+}
+
+/// 所有者フィルタ付きの起動時チェック。
+fn inspect_owned(
+    env: &TestEnv,
+    drive: &mut FakeDrive,
+    sub: &str,
+    owner_key: &[u8; 32],
+    baseline: Option<&str>,
+) -> Option<thundoku_core::drive::sync::BackupStatus> {
+    let owned = db::books::owned_book_ids(&env.pool, owner_key, Some(sub)).unwrap();
+    let filter = thundoku_core::db::backup::OwnerFilter {
+        key: owner_key,
+        sub: Some(sub),
+    };
+    thundoku_core::drive::sync::inspect_drive_backup(
+        &env.pool,
+        drive,
+        "folder-1",
+        Some(&owned),
+        Some(&filter),
+        baseline,
+    )
+    .unwrap()
+}
+
+/// バックアップファイルの中身を返す。
+fn uploaded_backup(drive: &FakeDrive) -> Vec<u8> {
+    drive
+        .files
+        .get("id-thundoku-backup.json")
+        .expect("バックアップが存在すること")
+        .bytes
+        .clone()
+}
+
+fn baseline_of(pool: &thundoku_core::db::SqlitePool) -> Option<String> {
+    db::settings::get(pool, BACKUP_BASELINE_KEY).unwrap()
+}
+
+/// PRK があれば `thundoku-backup.json` は**暗号化された封筒（v3）**として上がる。
+#[test]
+fn db_backup_is_encrypted_when_the_root_key_is_available() {
+    let env = TestEnv::new("backup-v3");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-v3";
+    let owner_key = [42u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    let db_path = env.packs().join("thundoku-shelf.db");
+
+    let outcome =
+        sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+    assert!(outcome.database_backed_up, "初回はアップロードすること");
+
+    let uploaded = uploaded_backup(&drive);
+    let raw = String::from_utf8_lossy(&uploaded);
+    assert!(
+        !raw.contains("自分の本"),
+        "平文（本のタイトル）が Drive のファイルに残っている"
+    );
+    let owner_id = opfspack::derive_owner_id(sub);
+    let envelope = BackupEnvelope::from_json(&uploaded).expect("v3 の封筒として読める");
+    assert_eq!(envelope.format_version(), 3);
+    assert_eq!(envelope.owner_id(), owner_id);
+    let plaintext = envelope.open(&root, &owner_id).expect("PRK で復号できる");
+    assert!(
+        String::from_utf8(plaintext).unwrap().contains("自分の本"),
+        "封筒の中身は元のバックアップ JSON"
+    );
+    // 基準値は封筒の content_hmac（暗号文の md5 ではない）
+    assert_eq!(
+        baseline_of(&env.pool).as_deref(),
+        Some(envelope.content_hmac_hex().as_str())
+    );
+}
+
+/// 同じ内容を再度同期しても上げ直さない（暗号文は毎回変わるので md5 では判定できない）。
+#[test]
+fn db_backup_is_not_reuploaded_when_the_content_is_unchanged() {
+    let env = TestEnv::new("backup-v3-skip");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-v3-skip";
+    let owner_key = [43u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    let db_path = env.packs().join("thundoku-shelf.db");
+
+    assert!(
+        sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path)
+            .unwrap()
+            .database_backed_up
+    );
+    let first = uploaded_backup(&drive);
+
+    let outcome =
+        sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+    assert!(
+        !outcome.database_backed_up,
+        "内容が同じなら再アップロードしない（content_hmac が一致する）"
+    );
+    assert_eq!(uploaded_backup(&drive), first, "ファイルは置き換わらない");
+
+    // 参考: 同じ平文を封印し直すと暗号文（とファイルの md5）は変わるが、
+    // 変更検知に使う content_hmac は同じ（＝暗号文 md5 を基準にしてはいけない理由）
+    let owner_id = opfspack::derive_owner_id(sub);
+    let envelope = BackupEnvelope::from_json(&first).unwrap();
+    let plaintext = envelope.open(&root, &owner_id).unwrap();
+    let resealed = BackupEnvelope::seal(&plaintext, &root, &owner_id);
+    assert_eq!(resealed.content_hmac_hex(), envelope.content_hmac_hex());
+    assert_ne!(resealed.to_json().unwrap(), first);
+    assert_ne!(
+        format!("{:x}", md5::compute(resealed.to_json().unwrap())),
+        format!("{:x}", md5::compute(&first))
+    );
+}
+
+/// PRK が無いときは従来どおり平文（v2）で上げる（鍵が無いだけで控えを失わない）。
+#[test]
+fn db_backup_stays_plaintext_without_the_root_key() {
+    let env = TestEnv::new("backup-v2-fallback");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-v2-fallback";
+    let owner_key = [44u8; 32];
+    delete_root_key(sub);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    let db_path = env.packs().join("thundoku-shelf.db");
+
+    let outcome =
+        sync_with_backup(&env, &mut drive, sub, None, &owner_key, &db_path).unwrap();
+    assert!(outcome.database_backed_up);
+
+    let uploaded = uploaded_backup(&drive);
+    let text = String::from_utf8(uploaded.clone()).expect("平文の JSON");
+    assert!(text.contains("自分の本"), "平文なので内容が読める");
+    let backup = thundoku_core::db::backup::DriveBackup::parse(&uploaded).unwrap();
+    assert!(!backup.is_encrypted(), "鍵が無いときは v2 の平文");
+    assert_eq!(backup.plaintext(None).unwrap(), text);
+    // 基準値は従来どおり正規形 md5（v2 の比較方法を変えない）
+    assert_eq!(
+        baseline_of(&env.pool),
+        Some(thundoku_core::db::backup::canonical_md5_str(&text, None).unwrap())
+    );
+
+    // 2 回目は md5 一致でスキップ（従来動作）
+    let outcome =
+        sync_with_backup(&env, &mut drive, sub, None, &owner_key, &db_path).unwrap();
+    assert!(!outcome.database_backed_up);
+    assert_eq!(uploaded_backup(&drive), uploaded);
+}
+
+/// アップロード直後の起動時チェックは静か（基準値 = 封筒の `content_hmac`）。
+/// 他端末が別の内容を上げたときだけ復元確認を出す。
+#[test]
+fn inspect_drive_backup_handles_v3_envelopes() {
+    let env = TestEnv::new("backup-v3-inspect");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-v3-inspect";
+    let owner_key = [45u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    let db_path = env.packs().join("thundoku-shelf.db");
+
+    sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+    let baseline = baseline_of(&env.pool);
+
+    let status = inspect_owned(&env, &mut drive, sub, &owner_key, baseline.as_deref())
+        .expect("バックアップが存在すること");
+    assert!(!status.drive_changed, "自分が上げた封筒を『動いた』としない");
+    assert!(!status.local_differs, "内容も同じ");
+    assert!(!status.should_offer_restore());
+
+    // 他端末（同じ PRK）が別の内容を上げた
+    let other = thundoku_core::db::test_pool();
+    db::migrate(&other).unwrap();
+    insert_owned_book(&other, "b9", "他端末の本", sub, &owner_key);
+    let other_json = thundoku_core::db::backup::export_json(&other, None, None).unwrap();
+    let other_envelope = BackupEnvelope::seal(
+        other_json.as_bytes(),
+        &root,
+        &opfspack::derive_owner_id(sub),
+    );
+    drive.seed(
+        "thundoku-backup.json",
+        &other_envelope.to_json().unwrap(),
+    );
+
+    let status = inspect_owned(&env, &mut drive, sub, &owner_key, baseline.as_deref())
+        .expect("バックアップが存在すること");
+    assert!(status.drive_changed, "別端末の封筒を検出する");
+    assert!(status.local_differs, "内容が違う");
+    assert!(status.should_offer_restore(), "復元確認を出す");
+}
+
+/// 鍵が無ければ内容は比較できない（復元もできない）ので、復元確認を出さない。
+#[test]
+fn inspect_drive_backup_without_the_key_does_not_offer_a_restore() {
+    let env = TestEnv::new("backup-v3-nokey");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-v3-nokey";
+    let owner_key = [46u8; 32];
+    let root = PackRootKey::generate();
+    let owner_id = opfspack::derive_owner_id(sub);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+
+    let source = thundoku_core::db::backup::export_json(&env.pool, None, None).unwrap();
+    let envelope = BackupEnvelope::seal(source.as_bytes(), &root, &owner_id);
+    drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
+    delete_root_key(sub);
+
+    let status = inspect_owned(&env, &mut drive, sub, &owner_key, Some("stale-baseline"))
+        .expect("バックアップが存在すること");
+    assert!(status.drive_changed, "基準値とは違う");
+    assert!(
+        !status.local_differs,
+        "復号できないので内容の比較はしない"
+    );
+    assert!(
+        !status.should_offer_restore(),
+        "復元できないバックアップで確認を出さない"
+    );
+}
+
+/// v3 の封筒を復号して復元でき、基準値（content_hmac）も更新される。
+#[test]
+fn restore_decrypts_a_v3_envelope() {
+    let env = TestEnv::new("backup-v3-restore");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-v3-restore";
+    let owner_key = [47u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    let owner_id = opfspack::derive_owner_id(sub);
+
+    // 別端末のバックアップ（同じアカウントの PRK）を Drive に置く
+    let source = thundoku_core::db::test_pool();
+    db::migrate(&source).unwrap();
+    insert_owned_book(&source, "b1", "復元される本", sub, &owner_key);
+    let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
+    let envelope = BackupEnvelope::seal(json.as_bytes(), &root, &owner_id);
+    drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
+
+    thundoku_core::drive::sync::restore_drive_backup(&mut drive, "folder-1", &env.pool).unwrap();
+
+    let book = db::books::get(&env.pool, "b1").unwrap().expect("復元される");
+    assert_eq!(book.title, "復元される本");
+    // 復元後は基準値が封筒の content_hmac になり、次の起動で「動いた」と言わない
+    assert_eq!(
+        baseline_of(&env.pool).as_deref(),
+        Some(envelope.content_hmac_hex().as_str())
+    );
+    let status = inspect_owned(&env, &mut drive, sub, &owner_key, baseline_of(&env.pool).as_deref())
+        .expect("バックアップが存在すること");
+    assert!(!status.drive_changed, "復元直後は静かであること");
+}
+
+/// 鍵が無ければ復元しない（暗号文を平文として取り込む経路は無い）。
+#[test]
+fn restore_without_the_key_is_rejected_and_imports_nothing() {
+    let env = TestEnv::new("backup-v3-restore-nokey");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-v3-restore-nokey";
+    let owner_key = [48u8; 32];
+    let root = PackRootKey::generate();
+    let owner_id = opfspack::derive_owner_id(sub);
+
+    let source = thundoku_core::db::test_pool();
+    db::migrate(&source).unwrap();
+    insert_owned_book(&source, "b1", "復元される本", sub, &owner_key);
+    let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
+    let envelope = BackupEnvelope::seal(json.as_bytes(), &root, &owner_id);
+    drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
+    delete_root_key(sub);
+
+    let error =
+        thundoku_core::drive::sync::restore_drive_backup(&mut drive, "folder-1", &env.pool)
+            .expect_err("鍵が無ければ復元しない");
+    assert!(
+        matches!(&error, SyncError::BackupKeyRequired(id) if id == &owner_id),
+        "{error:?}"
+    );
+    assert!(
+        db::books::get(&env.pool, "b1").unwrap().is_none(),
+        "暗号文を内容として取り込まない"
+    );
+}
+
+/// 別アカウントの封筒は、そのアカウントの鍵が無ければ復号できない
+/// （所有者の判定は封筒の `owner_id` と keyring のスロットで行う）。
+#[test]
+fn a_v3_envelope_from_another_account_is_not_restored() {
+    let env = TestEnv::new("backup-v3-other-account");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-v3-other-account";
+    let other_sub = "sub-backup-v3-other-account-2";
+    let owner_key = [49u8; 32];
+    let other_root = PackRootKey::generate();
+    let other_owner = opfspack::derive_owner_id(other_sub);
+    // この端末の keyring には自分の鍵だけがある（別アカウントの鍵は無い）
+    save_root_key(sub, &PackRootKey::generate());
+    delete_root_key(other_sub);
+
+    let source = thundoku_core::db::test_pool();
+    db::migrate(&source).unwrap();
+    insert_owned_book(&source, "b1", "別アカウントの本", other_sub, &owner_key);
+    let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
+    let envelope = BackupEnvelope::seal(json.as_bytes(), &other_root, &other_owner);
+    drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
+
+    // 封筒の owner_id に対応する鍵が keyring に無い → 復号も取り込みもしない
+    let error =
+        thundoku_core::drive::sync::restore_drive_backup(&mut drive, "folder-1", &env.pool)
+            .expect_err("鍵が無ければ復元しない");
+    assert!(
+        matches!(&error, SyncError::BackupKeyRequired(id) if id == &other_owner),
+        "{error:?}"
+    );
+    assert!(db::books::get(&env.pool, "b1").unwrap().is_none());
+
+    // 鍵を持っていても、AAD の `owner_id` が違えば復号できない（封筒の差し替え検知）
+    assert!(
+        envelope
+            .open(&other_root, &opfspack::derive_owner_id(sub))
+            .is_err(),
+        "owner_id が違えば AAD が合わず開けない"
     );
 }

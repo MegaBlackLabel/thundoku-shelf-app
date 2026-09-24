@@ -6,10 +6,16 @@
 > `unsupported pack version` として拒否され、再取り込みが要る。
 > **残り**: Web 版（`thundoku-shelf` モノレポ / `packages/opfspack`）の対応（§7 のチェックリスト）と、
 > アプリ側の配線（パスフレーズの入力 UI など。本章は core / opfspack の仕様まで）。
+> **§11（メタデータバックアップの暗号化）も Rust 側は実装済み**（2026-09-25 / R06）。
+> `thundoku-backup.json` は PRK がある限り**暗号化された封筒（v3）**になり、v2 の平文も読める。
 >
 > **決定（2026-09-24）**: 方式は **C（`sub` ラップ + 任意のパスフレーズラップ）**。
 > α 版のため**後方互換は切る**。**パスフレーズラップも今回の実装に含める**。
 > Web 版は本仕様を見て後から対応する。
+>
+> **決定（2026-09-25 / R06）**: Drive に上げる**メタデータバックアップも暗号化する**（§11）。
+> ローカルの SQLite は対象外（ディスク暗号化 + OS アカウント分離が前提）。v2 の平文
+> バックアップは**読めるまま残す**（既存の控えを読めなくしない）。
 >
 > 背景: 旧実装（v2）は `sub` から鍵を導出していたため、**`sub` を知る相手は pack を復号できる**。
 > 本仕様は鍵材料を乱数化し、導出可能なのは「ラップを解ける要因」だけにする。
@@ -265,5 +271,164 @@ keyring が無いので 2 → 3 の順。`sub` は既存の認証セッション
 |---|---|
 | パスフレーズの PBKDF2 反復回数 | `600_000` で確定（release 実測 ≒ 60ms。ローカルの解錠では体感できない。将来上げる場合はラップの `iterations` を上げて作り直すだけ＝ PRK も pack も変えない） |
 | NFKC 正規化の必要性 | IME / OS による差（合成文字）を避けるために仕様に含めたが、実機での差は未検証。Rust 側は `unicode_normalization` で NFKC してから PBKDF2 に渡す（`crates/opfspack/src/keys.rs`。パスフレーズのラップ作成・復号の両方） |
-| Drive のフォルダがアカウント別でない既知の制約 | `docs/spec/README.md` §4 の「Drive の保存先フォルダはアカウント別ではない」。bundle は `owner_id` で選別するので混在しても誤用しない設計だが、フォルダ分離は別件 |
+| Drive のフォルダがアカウント別でない既知の制約 | `docs/spec/README.md` §4 の「Drive の保存先フォルダはアカウント別ではない」。bundle は `owner_id` で選別するので混在しても誤用しない設計だが、フォルダ分離は別件（§11.5 も参照） |
 | Web 側の鍵の保持 | メモリのみか IndexedDB かは Web 側の判断（XSS リスクの tradeoff。本仕様はどちらも許容する） |
+
+## 11. バックアップの暗号化（`thundoku-backup.json` v3 / R06）
+
+> **状態: Rust 側は実装済み（2026-09-25）/ Web 版は未対応**。実装の正は
+> `crates/opfspack/src/keys.rs`（鍵導出と封筒 `BackupEnvelope`）と
+> `crates/core/src/db/backup.rs`（`DriveBackup` = v3/v2 の判別と復号）、同期への配線は
+> `crates/core/src/drive/sync.rs`。
+
+### 11.1 何を守るか（線引き）
+
+| | 内容 |
+|---|---|
+| 守る | Drive に上げる**メタデータバックアップ**（本棚・進捗・履歴・付箋メモ。`crates/core/src/db/backup.rs` の `TABLES` のテキスト列） |
+| **守らない** | **ローカルの SQLite（`thundoku-shelf.db`）**。SQLCipher 等は入れない（重い・既存の読み書き経路を総取り替えになる）。**ディスク暗号化（BitLocker / FileVault 等）と OS アカウント分離**を前提にする（`README.md`） |
+| 守らない | 端末の OS アカウントを奪われて keyring を読まれる場合（PRK そのものが取られる。§1.2 と同じ） |
+| 対象外 | 画像（`thumbnail_data` / `image_data`）とページ本文（`extracted_text`）は**そもそもバックアップに含めない**（`docs/spec/06-sync-auth-drive.md` §3.4） |
+
+鍵は §2 の PRK から導出する。**新しい鍵管理を増やさない**（keyring と `thundoku-keys.json` の
+既存の仕組みをそのまま使う）。
+
+### 11.2 鍵導出
+
+```text
+backup_cipher_key = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1", info = b"thundoku-backup-key",  32B)
+backup_hash_key   = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1", info = b"thundoku-backup-hash", 32B)
+```
+
+| 定数 | 値 |
+|---|---|
+| salt | `b"thundoku-backup:v1"` |
+| info（暗号鍵） | `b"thundoku-backup-key"` |
+| info（HMAC 鍵） | `b"thundoku-backup-hash"` |
+| 封筒の AAD | `UTF8("thundoku-backup:3:" + owner_id)`（`owner_id` = `derive_owner_id(sub)`） |
+
+- 実装: `PackRootKey::derive_backup_cipher_key()` / `derive_backup_hash_key()`
+  （`crates/opfspack/src/keys.rs`）。2 本に分けるのは用途分離のため（同じ PRK から導出するが、
+  暗号鍵を HMAC に流用しない）。
+- pack 鍵（`HKDF_INFO` = `opfspack-entry-key`）とは salt も info も違う。
+- 封筒の `format_version`（3）を AAD に含めるので、**同じ平文でも版が上がれば別の暗号文**になる。
+
+### 11.3 封筒の形式
+
+```json
+{
+  "format_version": 3,
+  "owner_id": "6366bfc3b6ab37feaf2adb385aeaa515c4aa52cf09e70cac890d888e4409f3b0",
+  "encryption": {
+    "alg": "aes-256-gcm",
+    "kdf": "hkdf-sha256",
+    "nonce": "<base64 12B 乱数>",
+    "ciphertext": "<base64 平文 + 16B タグ>"
+  },
+  "content_hmac": "<hex 64>"
+}
+```
+
+| フィールド | 型 | 規則 |
+|---|---|---|
+| `format_version` | number | `3` 固定。**これ以外は読めない版として拒否する**（平文として扱わない） |
+| `owner_id` | string | `derive_owner_id(sub)`（§2）。keyring のスロット選択と AAD に使う |
+| `encryption.alg` | string | `"aes-256-gcm"` のみ |
+| `encryption.kdf` | string | `"hkdf-sha256"` のみ（`nonce` は乱数なので salt は持たない） |
+| `encryption.nonce` | string (base64) | AES-GCM の 12B IV。**毎回乱数**（固定しない） |
+| `encryption.ciphertext` | string (base64) | `AES-256-GCM(backup_cipher_key, nonce, AAD)(平文)` = 平文長 + 16B（GCM タグ） |
+| `content_hmac` | string (hex 64) | `HMAC-SHA256(backup_hash_key, UTF8(平文))` を小文字 hex |
+
+- **平文は現行のバックアップ JSON そのもの**（`db::backup::export_json` の出力。
+  いまの `format_version` は 2）。封筒は**外側だけ**で、中身の形式は変えない。
+- base64 は標準アルファベット + padding（§3.2 と同じ。base64url は使わない）。
+- **`content_hmac` の主目的は変更検知**。`nonce` が乱数なので**暗号文（＝ファイルの md5）は
+  毎回変わる** — 暗号文の md5 を「変わったか」の判定に使うと毎回無駄なアップロードになる。
+  平文に対する HMAC なら**同じ内容なら同じ値**になる。
+- `content_hmac` は**復号時にも再計算して照合する**（平文と封筒の組が食い違う改変を検出する。
+  合わなければ平文を返さない）。
+- **`content_hmac` の入力は平文のバイト列そのもの**（正規化・再直列化をしない）。
+  `export_json` はテーブル順・SELECT 順が決定的なので、DB の内容が同じなら同じ HMAC になる。
+  揮発列（`books.updated_at` / `bookshelf_items.synced_at` 等）だけが動いた場合は HMAC も変わる
+  ＝「アップロード要否」の判定は **v2（生の md5 比較）と同じ粒度**。正規化した比較（揮発列を落とし、
+  行を PK 順に並べる）は**起動時の復元提案**（`local_differs`）が従来どおり行う（§11.5）。
+
+### 11.4 読み出しと互換
+
+- ファイルの判別は `db::backup::DriveBackup::parse`:
+  - `encryption`（オブジェクト）があれば**封筒として扱う**。`format_version` が 3 でなければ
+    `対応していないバックアップ形式です（v{n}）` として**拒否**する（暗号文を平文として取り込まない）
+  - `encryption` が無ければ従来の平文バックアップ（v2 / 版なし）として読む＝**既存の控えを読めなくしない**
+- 復号に使う鍵は keyring の `thundoku-shelf.pack-root-key:<owner_id>`（§3.1 と同じスロット）。
+  スロットは**封筒の `owner_id` で選ぶ**。
+- core には UI が無いのでパスフレーズを尋ねられない。解錠はアプリの `PackKeyStore` が行い、
+  成功すれば keyring に入る（§4.1）。したがって**keyring に無い鍵では復号しない**。
+  - 復元（`restore_drive_backup`）: `SyncError::BackupKeyRequired` で失敗し、**1 行も取り込まない**
+  - 起動時の差分判定（`inspect_drive_backup`）: `drive_changed` だけ判定して `local_differs` は
+    false＝**復元確認を出さない**（復元しても失敗するため）
+- パスフレーズのみの構成（keyring に PRK を置かない）でも、`PackKeyStore::unlock` が成功すれば
+  keyring に保存されるので、その後の起動では復号できる。
+
+### 11.5 同期での扱い（`crates/core/src/drive/sync.rs`）
+
+| 局面 | v3（PRK あり） | v2（PRK なし） |
+|---|---|---|
+| アップロード | 封筒（`content_hmac` を基準値に保存） | **平文のまま + 警告ログ**（鍵が無いだけで利用者の唯一の控えを失わないため。§11.1） |
+| アップロード要否 | 基準値 `app_settings['drive.backup.md5']`（= 前回上げた `content_hmac`）と今回の封筒の `content_hmac` を比較。Drive 側にファイルが無ければ上げ直す | 従来どおり書き出したバイト列の md5 と Drive の `md5Checksum` を比較 |
+| 復元提案 `drive_changed` | 基準値と Drive の封筒の `content_hmac` を比較 | 基準値と Drive の平文の正規形 md5 を比較（従来どおり） |
+| 復元提案 `local_differs` | 復号した平文とローカルを**正規形**で比較（従来と同じ基準） | 同左 |
+| 復元 | keyring の PRK で復号 → `import_json`。基準値に封筒の `content_hmac` を保存 | そのまま `import_json`。基準値に正規形 md5 を保存 |
+
+- `app_settings['drive.backup.md5']` の**値の意味は形式で変わる**（v3 = `content_hmac` /
+  v2 = 正規形 md5）。形式が入れ替わった直後（例: 相手が v3 で上げ、こちらがまだ v2 の基準値を
+  持っている）は `drive_changed` が true になり得る。無駄な確認を防ぐのは `local_differs` の
+  判定（内容の比較）で、**内容が同じなら復元確認は出ない**。
+- 既知の挙動（v3 で変わる点）:
+  - 他端末が上げた封筒でも**内容が同じなら自分の控えを上げ直さない**（相手のファイルを無駄に
+    上書きしない）。内容が違う場合も、ローカルの内容が動いた時点で自分の控えを上げる。
+  - **Drive のフォルダはアカウント別ではない**（§10）。別アカウントの封筒は、その `owner_id` の
+    鍵がこの端末の keyring にある場合にだけ復号できる（v2 の平文は誰でも読めていたので、
+    これは緩和であって新たな穴ではない）。
+  - PRK が無い端末で同期すると、Drive 上の**暗号化された控えが平文で置き換わる**（同じ内容でも
+    `content_hmac` の比較は成立しないため上の表の v2 経路に落ち、md5 が違うのでアップロードする）。
+    設計判断として許容する（鍵が無いだけでバックアップを止めない）。鍵を用意できれば次の同期で
+    封筒に戻る。
+
+### 11.6 テストベクタ（実装間の一致確認）
+
+**鍵導出**（PRK = `00 01 … 1f`。独立実装（WebCrypto）で検算済み）
+
+| 入力 | 期待値 |
+|---|---|
+| `derive_backup_cipher_key()` | `514e03cce7c0aa82128b07af6ed7cbd1b2e7a30262f811d39201f21fd4faba8e` |
+| `derive_backup_hash_key()` | `840d69fba8e9af9525b86e4c0dfa74403ecfcaa8743a6ed4f7576322c81df043` |
+
+**封筒**（`PRK = 00 01 … 1f` / `owner_id = derive_owner_id("test-sub")` /
+`nonce = 0b 0a 09 08 07 06 05 04 03 02 01 00` /
+平文 = `{"format_version":3,"tables":{}}`（UTF-8））
+
+| 項目 | 期待値 |
+|---|---|
+| `AAD` (UTF-8) | `thundoku-backup:3:6366bfc3b6ab37feaf2adb385aeaa515c4aa52cf09e70cac890d888e4409f3b0` |
+| `nonce` (hex) | `0b0a09080706050403020100` |
+| `ciphertext` (hex) | `a89bac086476371010c84a0f976bee1d8e83650f48c9c2c411b5bbcf54df7cdea7185fdbd89c979adeb6404b869a38b3` |
+| `content_hmac` (hex) | `1d43363600f7a97ed4357e385917178206398a86b2bb0b0512c67d412007488b` |
+
+- 平文は封筒ベクタのための**例**（実際の平文は `export_json` の出力で `format_version` は 2）。
+- Rust 側はこの表を `crates/opfspack/tests/backup_envelope.rs` で固定し、`content_hmac` が
+  同じ平文で不変・暗号文は毎回変わることも同じファイルで固定している。値を書き換えるときは
+  仕様書と実装を同時に直す。
+
+### 11.7 Web 実装チェックリスト（`thundoku-shelf` モノレポ）
+
+- [ ] `deriveBackupKey(prk)`: HKDF で 2 本（`info` は `thundoku-backup-key` / `thundoku-backup-hash`、
+  `salt` は `thundoku-backup:v1`）。§11.2 の式と一致させる。
+- [ ] 封筒の `seal` / `open`: `crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce,
+  additionalData: UTF8("thundoku-backup:3:" + ownerId) }, ...)` と `HMAC`（`crypto.subtle.sign`）。
+  `content_hmac` は**平文のバイト列そのもの**に対して計算する（JSON を再直列化しない。
+  キー順や空白が違うと値が変わり、無駄なアップロードになる）。
+- [ ] 読むときは `encryption` の有無で v3 / v2 を判別する。未知の `format_version` は**エラー**
+  （平文として扱わない）。
+- [ ] アップロード要否は `content_hmac` の比較。暗号文の md5 / ファイルサイズで判定しない。
+- [ ] PRK が無いときのフォールバック（平文で書く + 警告）と、その結果 Drive 上に平文の
+   バックアップが載り得ることを UI / ログで利用者に伝える。

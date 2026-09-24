@@ -9,6 +9,8 @@
 use serde_json::{Map, Number, Value};
 use sqlx::{Row, TypeInfo, ValueRef};
 
+use opfspack::{BackupEnvelope, PackRootKey};
+
 use crate::db::SqlitePool;
 
 /// エクスポート対象のテーブル（テキストデータのみ）。
@@ -180,6 +182,113 @@ fn owner_matches(filter: &OwnerFilter<'_>, blob: Option<&str>) -> bool {
 /// みなす。3 状態（0 = なし / 1 = あり / 2 = 不明）になってからの `0` は「DRM なしと
 /// 確認できた」なので、復元時に意味を取り違えないよう版を持たせる。
 pub const FORMAT_VERSION: i64 = 2;
+
+// ---- Drive のバックアップファイル（`thundoku-backup.json`） ---------------------
+
+/// Drive の `thundoku-backup.json` の中身（`docs/spec/10-pack-keys.md` §11）。
+///
+/// v3 は PRK から導出した鍵で暗号化した封筒（[`DriveBackup::Encrypted`]）、
+/// v2 以前は平文のバックアップ JSON（[`DriveBackup::Plain`]）。**どちらも読める**
+/// （既存のバックアップを読めなくしない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveBackup {
+    /// v3: 暗号化された封筒（ファイルの `format_version` = 3）。
+    Encrypted(BackupEnvelope),
+    /// v2 以前: 平文のバックアップ JSON。
+    Plain(String),
+}
+
+/// Drive のバックアップを読めなかった理由。
+#[derive(Debug, thiserror::Error)]
+pub enum BackupError {
+    /// JSON として読めない・構造が不正。
+    #[error("バックアップが壊れています: {0}")]
+    Corrupt(String),
+    /// 自分より新しい形式（暗号化されているのに版が違う）。
+    #[error("対応していないバックアップ形式です（v{0}）。新しいアプリで作成されています")]
+    UnsupportedVersion(i64),
+    /// 暗号化バックアップだが、この端末に鍵（PRK）が無い。
+    #[error("暗号化されたバックアップを復号する鍵がありません")]
+    KeyRequired,
+    /// 封筒を復号できない（鍵違い・改変・別アカウントの封筒）。
+    #[error("暗号化されたバックアップを復号できません（鍵が違うか、内容が改変されています）")]
+    Rejected,
+}
+
+impl DriveBackup {
+    /// ファイルのバイト列を解釈する。**復号はしない**（鍵を持たない経路でも呼べる）。
+    ///
+    /// - `encryption` があるファイルは**必ず封筒として**扱う。読めなければエラーで、
+    ///   平文バックアップには落とさない（暗号文を内容として取り込まないため）
+    /// - `encryption` が無ければ従来の平文バックアップ（v2 / 版なし）
+    pub fn parse(bytes: &[u8]) -> Result<Self, BackupError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| BackupError::Corrupt(format!("JSON として読めない: {e}")))?;
+        // `encryption` があれば（型が違っても）封筒として扱う。平文バックアップには
+        // このキーが無いので、ここで迷ったら**安全側（復号できないなら拒否）**に倒す。
+        let encrypted = value
+            .get("encryption")
+            .is_some_and(|encryption| !encryption.is_null());
+        if encrypted {
+            let version = value
+                .get("format_version")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| BackupError::Corrupt("封筒に format_version が無い".to_string()))?;
+            if version != i64::from(opfspack::BACKUP_FORMAT_VERSION) {
+                return Err(BackupError::UnsupportedVersion(version));
+            }
+            let envelope = BackupEnvelope::from_json(bytes)
+                .map_err(|error| BackupError::Corrupt(error.to_string()))?;
+            return Ok(Self::Encrypted(envelope));
+        }
+        let json = String::from_utf8(bytes.to_vec())
+            .map_err(|e| BackupError::Corrupt(format!("UTF-8 として読めない: {e}")))?;
+        Ok(Self::Plain(json))
+    }
+
+    /// 暗号化された封筒か（＝鍵が要るか）。
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, Self::Encrypted(_))
+    }
+
+    /// 封筒の所有者（`owner_id`）。平文バックアップは `None`。
+    ///
+    /// keyring の鍵スロット（`thundoku-shelf.pack-root-key:<owner_id>`）を選ぶのに使う。
+    pub fn owner_id(&self) -> Option<&str> {
+        match self {
+            Self::Encrypted(envelope) => Some(envelope.owner_id()),
+            Self::Plain(_) => None,
+        }
+    }
+
+    /// 変更検知の基準値。v3 = 封筒の `content_hmac`（hex）、v2 = 正規形 md5。
+    ///
+    /// **暗号文は nonce が乱数で毎回変わるので、暗号文の md5 を基準値にしてはいけない**
+    /// （毎回「変わった」と判定して無駄なアップロードになる）。
+    pub fn change_token(&self) -> Result<String, BackupError> {
+        match self {
+            Self::Encrypted(envelope) => Ok(envelope.content_hmac_hex()),
+            Self::Plain(json) => {
+                canonical_md5_str(json, None).map_err(|e| BackupError::Corrupt(e.to_string()))
+            }
+        }
+    }
+
+    /// 平文のバックアップ JSON を返す。暗号化されている場合は `root`（PRK）が要る。
+    pub fn plaintext(self, root: Option<&PackRootKey>) -> Result<String, BackupError> {
+        match self {
+            Self::Encrypted(envelope) => {
+                let root = root.ok_or(BackupError::KeyRequired)?;
+                let plaintext = envelope
+                    .open(root, envelope.owner_id())
+                    .map_err(|_| BackupError::Rejected)?;
+                String::from_utf8(plaintext)
+                    .map_err(|e| BackupError::Corrupt(format!("平文が UTF-8 でない: {e}")))
+            }
+            Self::Plain(json) => Ok(json),
+        }
+    }
+}
 
 /// 主要テーブルを JSON 文字列にエクスポートする。
 /// `book_ids` が `Some(ids)` のとき、所有者（本の id 集合）に連動して
@@ -1019,5 +1128,153 @@ mod tests {
         });
         assert_eq!(rows[0].1.as_deref(), Some(owner_a.as_str()));
         assert_eq!(rows[1].1.as_deref(), Some(owner_b.as_str()));
+    }
+
+    // ---- Drive のバックアップファイル（v3 の封筒 / v2 の平文） -----------------
+
+    const OWNER_ID: &str = "6366bfc3b6ab37feaf2adb385aeaa515c4aa52cf09e70cac890d888e4409f3b0";
+
+    fn plain_backup() -> String {
+        r#"{"format_version":2,"books":[{"id":"book-1","title":"テスト本"}]}"#.to_string()
+    }
+
+    #[test]
+    fn plaintext_backups_are_still_readable() {
+        // v2（平文）は今までどおり読める。基準値は従来の正規形 md5。
+        let json = plain_backup();
+        let backup = DriveBackup::parse(json.as_bytes()).unwrap();
+        assert!(!backup.is_encrypted());
+        assert_eq!(backup.owner_id(), None);
+        let token = backup.change_token().unwrap();
+        assert_eq!(token, canonical_md5_str(&json, None).unwrap());
+        assert_eq!(backup.plaintext(None).unwrap(), json);
+    }
+
+    #[test]
+    fn encrypted_backups_need_the_right_root_key() {
+        let root = PackRootKey::from_bytes([3u8; 32]);
+        let json = plain_backup();
+        let envelope =
+            BackupEnvelope::seal(json.as_bytes(), &root, OWNER_ID).to_json().unwrap();
+
+        let backup = DriveBackup::parse(&envelope).unwrap();
+        assert!(backup.is_encrypted());
+        assert_eq!(backup.owner_id(), Some(OWNER_ID));
+        // 基準値は封筒の `content_hmac`（暗号文の md5 ではない）
+        let token = backup.change_token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert_ne!(token, format!("{:x}", md5::compute(&envelope)));
+
+        // 鍵が無ければ復号しない（平文を返さない）
+        assert!(matches!(
+            backup.clone().plaintext(None),
+            Err(BackupError::KeyRequired)
+        ));
+        // 別の鍵でも復号しない
+        let other = PackRootKey::from_bytes([4u8; 32]);
+        assert!(matches!(
+            backup.clone().plaintext(Some(&other)),
+            Err(BackupError::Rejected)
+        ));
+        // 正しい鍵なら元の平文に戻る
+        assert_eq!(backup.plaintext(Some(&root)).unwrap(), json);
+    }
+
+    #[test]
+    fn encrypted_backups_are_never_treated_as_plaintext() {
+        // 壊れた封筒・未知の版はエラーにする（暗号文を内容として取り込まない）
+        let root = PackRootKey::from_bytes([5u8; 32]);
+        let envelope = BackupEnvelope::seal(b"{}", &root, OWNER_ID)
+            .to_json()
+            .unwrap();
+        let json = String::from_utf8(envelope).unwrap();
+
+        let bumped = json.replace("\"format_version\":3", "\"format_version\":9");
+        assert!(matches!(
+            DriveBackup::parse(bumped.as_bytes()),
+            Err(BackupError::UnsupportedVersion(9))
+        ));
+        // encryption があるのに版が無い
+        let no_version = json.replace("\"format_version\":3,", "");
+        assert!(matches!(
+            DriveBackup::parse(no_version.as_bytes()),
+            Err(BackupError::Corrupt(_))
+        ));
+        // 中身が base64 でない
+        let broken = json.replace("aes-256-gcm", "rot13");
+        assert!(matches!(
+            DriveBackup::parse(broken.as_bytes()),
+            Err(BackupError::Corrupt(_))
+        ));
+        // JSON ですらない
+        assert!(matches!(
+            DriveBackup::parse(b"not json"),
+            Err(BackupError::Corrupt(_))
+        ));
+        // `encryption` の型が違っても平文には落とさない（安全側に倒す）
+        let wrong_type = br#"{"format_version":3,"encryption":"aes-256-gcm","content_hmac":"00"}"#;
+        assert!(matches!(
+            DriveBackup::parse(wrong_type),
+            Err(BackupError::Corrupt(_))
+        ));
+        // 版が無ければ平文として読む（v2 以前のバックアップ）
+        let legacy = br#"{"books":[{"id":"book-1"}]}"#;
+        assert!(matches!(
+            DriveBackup::parse(legacy),
+            Ok(DriveBackup::Plain(_))
+        ));
+    }
+
+    #[test]
+    fn an_envelope_plaintext_is_importable() {
+        // 封筒の中身は通常のバックアップ JSON なので、復元経路（import_json）に載る
+        let pool = crate::db::test_pool();
+        crate::db::migrate(&pool).unwrap();
+        let source = crate::db::books::list(&pool).unwrap();
+        assert!(source.is_empty());
+        crate::db::books::insert(&pool, &test_book("book-1")).unwrap();
+        let json = export_json(&pool, None, None).unwrap();
+
+        let root = PackRootKey::from_bytes([6u8; 32]);
+        let envelope = BackupEnvelope::seal(json.as_bytes(), &root, OWNER_ID)
+            .to_json()
+            .unwrap();
+        let restored = DriveBackup::parse(&envelope)
+            .unwrap()
+            .plaintext(Some(&root))
+            .unwrap();
+        assert_eq!(restored, json);
+    }
+
+    fn test_book(id: &str) -> crate::db::books::Book {
+        crate::db::books::Book {
+            id: id.into(),
+            title: "復元される本".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: format!("{id}.opfspack"),
+            file_size: 1,
+            opfs_path: format!("{id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some(id.into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-09-01 00:00:00".into(),
+            updated_at: "2026-09-01 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        }
     }
 }

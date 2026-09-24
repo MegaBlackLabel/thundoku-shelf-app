@@ -8,9 +8,9 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Subscription, Window,
-    div, img, px,
+    App, AppContext as _, Context, Entity, Focusable as _, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement as _,
+    Subscription, Window, div, img, px,
 };
 use gpui_kit::{ReadGlobal as _, Styled as _};
 
@@ -96,6 +96,9 @@ pub struct SettingsView {
     passphrase_input: Option<Entity<InputState>>,
     /// 入力欄を空にする要求（設定に成功した後。`Window` が要るので render で行う）。
     passphrase_clear_input: bool,
+    /// パスフレーズの入力欄へフォーカスを移す要求（「あとで」以外から本の鍵カードへ
+    /// 誘導されたとき。`Window` が要るので render で行う）。
+    passphrase_focus_requested: bool,
     /// この端末（keyring）に pack の鍵があるか（表示用のキャッシュ）。
     key_has_local: bool,
     /// Drive の bundle にパスフレーズラップがあるか（表示用のキャッシュ）。
@@ -204,6 +207,7 @@ impl SettingsView {
             poll_interval_subscription: None,
             passphrase_input: None,
             passphrase_clear_input: false,
+            passphrase_focus_requested: false,
             key_has_local: false,
             key_has_passphrase: false,
             key_pending_owner: None,
@@ -390,13 +394,30 @@ impl SettingsView {
         if self.passphrase_input.is_some() {
             return;
         }
-        // マスクして表示する（肩越しに読まれないため。値は `value()` で取れる）
+        // マスクして表示する（肩越しに読まれないため。値は `value()` で取れる）。
+        // 目のアイコン（`Input::mask_toggle`）で表示 ⇄ マスクを切り替えられる。
         let state = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
                 .placeholder("パスフレーズ")
         });
         self.passphrase_input = Some(state);
+    }
+
+    /// 「本の鍵」カードの入力欄へフォーカスを移す（警告ダイアログの「設定する」から）。
+    ///
+    /// `Window` を持っていない呼び出し側（`Workspace`）から誘導するため、
+    /// 要求を立てて次の描画で合わせる（[`Self::render`]）。
+    pub fn request_passphrase_focus(&mut self, cx: &mut Context<Self>) {
+        self.passphrase_focus_requested = true;
+        cx.notify();
+    }
+
+    /// 本の鍵カードの入力欄（まだ描画していなければ `None`）。
+    ///
+    /// フォーカスが移ったことを外（`Workspace` とそのテスト）から確かめるための口。
+    pub fn passphrase_input(&self) -> Option<Entity<InputState>> {
+        self.passphrase_input.clone()
     }
 
     /// パスフレーズを設定 / 変更する（仕様 §5.2。PRK は変えず、ラップを作り直す）。
@@ -1012,43 +1033,6 @@ impl SettingsView {
         .detach();
         log::info!("logout_google: done ({:?})", t.elapsed());
         cx.notify();
-    }
-
-    pub fn logout_github(&mut self, cx: &mut Context<Self>) {
-        let t = std::time::Instant::now();
-        // keyring の削除は OS の応答待ち（許可ダイアログ等）で止まり得るので背景で行う。
-        // 削除に成功したときだけログイン状態を落とす（失敗時に「ログアウト済み」と見せると、
-        // 次回起動で勝手にログインし直って見える）。GitHub は本棚の絞り込みに関係しないので
-        // 再取得は不要。
-        let handle = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::app_state::delete_github_token_secret() })
-                .await;
-            let _ = handle.update(cx, |this, cx| {
-                match result {
-                    Ok(()) => {
-                        crate::app_state::clear_github_session(cx);
-                        log::info!("logout_github: token cleared ({:?})", t.elapsed());
-                        this.show_toast("GitHub からログアウトしました", cx);
-                    }
-                    Err(message) => {
-                        log::error!("logout_github: {message}");
-                        // サイドバーのアカウント欄から呼ばれると設定画面は表示されていないので、
-                        // 画面内の赤字だけでは見えない。トーストでも出す。
-                        crate::app_state::set_toast_kind(
-                            cx,
-                            crate::app_state::ToastKind::Error,
-                            message.clone(),
-                        );
-                        this.error = Some(message);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     pub fn logout_booth(&mut self, cx: &mut Context<Self>) {
@@ -1824,7 +1808,7 @@ impl SettingsView {
                 ),
         )
     }
-    /// アカウント欄（Google / GitHub / 技術書典 / BOOTH / FANZA / DLsite のログイン状態）。
+    /// アカウント欄（Google / 技術書典 / BOOTH / FANZA / DLsite のログイン状態）。
     ///
     /// `render` のスタックフレームを抑えるため別メソッドに切り出している。
     #[allow(clippy::too_many_arguments)]
@@ -1833,8 +1817,6 @@ impl SettingsView {
         cx: &Context<Self>,
         google_profile: Option<thundoku_core::google::GoogleProfile>,
         google_logged_in: bool,
-        github_profile: Option<thundoku_core::github::GithubUser>,
-        github_logged_in: bool,
         tbf_logged_in: bool,
         booth_logged_in: bool,
         fanza_logged_in: bool,
@@ -1842,12 +1824,10 @@ impl SettingsView {
     ) -> gpui_kit::AnyElement {
         let handle = cx.weak_entity();
         let muted_fg = cx.theme().muted_foreground;
-        // client_id が埋め込まれていないビルドでは GitHub ログインを開始できない
-        let github_login_enabled = !crate::app_state::default_github_client_id().is_empty();
         self.settings_card(
             cx,
             "アカウント",
-            Some("技術書典・Google・GitHub・BOOTH・FANZA・DLsite のログイン状態"),
+            Some("技術書典・Google・BOOTH・FANZA・DLsite のログイン状態"),
             Icon::new(IconName::CircleUser)
                 .size(px(16.0))
                 .text_color(muted_fg),
@@ -1907,74 +1887,6 @@ impl SettingsView {
                                         if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
                                             ws.update(cx, |ws, cx| {
                                                 ws.open_auth(cx, AuthProvider::Google);
-                                            });
-                                        }
-                                    });
-                                })
-                                .into_any_element()
-                        }),
-                )
-                // GitHub 行（Device Flow。完了は Workspace の監視タスクが拾ってモーダルを閉じる）
-                .child(
-                    div()
-                        .debug_selector(|| "account-row-github".into())
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .text_sm()
-                                .child(div().font_weight(FontWeight::MEDIUM).child("GitHub"))
-                                .child(div().text_xs().text_color(muted_fg).child(
-                                    if !github_login_enabled {
-                                        // 未設定のビルドでは Device Flow を開始できない。押せない
-                                        // 理由と直し方が見えないと「壊れている」と見える。
-                                        "client_id 未設定（ビルド時に THUNDOKU_GITHUB_CLIENT_ID）"
-                                            .to_string()
-                                    } else {
-                                        match &github_profile {
-                                            Some(profile) if !profile.login.is_empty() => {
-                                                format!("@{}", profile.login)
-                                            }
-                                            Some(_) => "ログイン済み".to_string(),
-                                            None if github_logged_in => "ログイン済み".to_string(),
-                                            None => "未ログイン".to_string(),
-                                        }
-                                    },
-                                )),
-                        )
-                        .child(if github_logged_in {
-                            Button::new("logout-github")
-                                .cursor_pointer()
-                                .label("ログアウト")
-                                .cursor_pointer()
-                                .on_click({
-                                    let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_github(cx)).ok();
-                                    }
-                                })
-                                .into_any_element()
-                        } else {
-                            Button::new("login-github")
-                                .cursor_pointer()
-                                .label("ログイン")
-                                .cursor_pointer()
-                                .disabled(!github_login_enabled)
-                                .on_click(|_, _window, cx| {
-                                    // 認証モーダル（GitHub は Device Flow）を開く。SettingsView を
-                                    // 非表示にしてから開くのは Google と同じ理由（RefCell 競合回避）。
-                                    cx.defer(move |cx| {
-                                        let ws_weak = AppState::global(cx).workspace.lock().clone();
-                                        if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
-                                            ws.update(cx, |ws, cx| {
-                                                ws.open_auth(cx, AuthProvider::Github);
                                             });
                                         }
                                     });
@@ -2250,6 +2162,15 @@ impl Render for SettingsView {
                 input.update(cx, |state, cx| state.set_value("", _window, cx));
             }
         }
+        // 「本の鍵」カードへ誘導されたときは入力欄にフォーカスを移す
+        // （`Window` は呼び出し側に無いので、要求をここで消費する）
+        if self.passphrase_focus_requested {
+            self.passphrase_focus_requested = false;
+            if let Some(input) = self.passphrase_input.clone() {
+                let focus = input.read(cx).focus_handle(cx);
+                _window.focus(&focus, cx);
+            }
+        }
         // 表示に使う状態（冊数・非表示リスト・同期情報）は `reload`（画面に入ったとき /
         // データが変わったとき）で読み込んでおく。ここで DB を引くと、スクロールのたびに
         // 描画が走るたびに全書籍ぶんの進捗クエリが走って引っかかる（実測: ホイール 1 ノッチで
@@ -2262,8 +2183,6 @@ impl Render for SettingsView {
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let google_profile = AppState::global(cx).google_profile.lock().clone();
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
-        let github_profile = AppState::global(cx).github_profile.lock().clone();
-        let github_logged_in = *AppState::global(cx).github_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
         let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
@@ -2723,7 +2642,18 @@ impl Render for SettingsView {
                                     .text_color(muted_fg)
                                     .child("8 文字以上を推奨します。忘れると復元できません。"),
                             )
-                            .child(Input::new(&input).cursor_text().w_full())
+                            // 入力欄の右端の目のアイコンでマスク ⇄ 表示を切り替える
+                            // （既定はマスク。値とフォーカスは保たれる）
+                            .child(
+                                div()
+                                    .debug_selector(|| "passphrase-input".into())
+                                    .child(
+                                        Input::new(&input)
+                                            .cursor_text()
+                                            .w_full()
+                                            .mask_toggle(),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -2930,8 +2860,6 @@ impl Render for SettingsView {
             cx,
             google_profile,
             google_logged_in,
-            github_profile,
-            github_logged_in,
             tbf_logged_in,
             booth_logged_in,
             fanza_logged_in,
@@ -2960,6 +2888,7 @@ impl Render for SettingsView {
                             .gap_1()
                             .child(
                                 div()
+                                    .debug_selector(|| "settings-title".into())
                                     .text_2xl()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("設定"),
@@ -2971,7 +2900,18 @@ impl Render for SettingsView {
                                     .child("アプリケーション設定"),
                             ),
                     )
-                    .child(account_settings)
+                    // 本の鍵（パスフレーズ）は一番上に置く。パスフレーズ未設定の警告から
+                    // ここへ誘導するため、設定画面を開いた直後に見える必要がある。
+                    .child(
+                        div()
+                            .debug_selector(|| "settings-card-key".into())
+                            .child(key_settings),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "settings-card-account".into())
+                            .child(account_settings),
+                    )
                     .child(global_viewer_settings)
                     .child(viewer_settings)
                     .child(booth_viewer_settings)
@@ -2988,7 +2928,6 @@ impl Render for SettingsView {
                     )
                     .child(storage_settings)
                     .child(drive_settings)
-                    .child(key_settings)
                     .child(checklist_poll_settings)
                     .child(db_settings)
                     // 外観
@@ -3659,47 +3598,6 @@ mod tests {
         }
     }
 
-    #[gpui_kit::test]
-    async fn account_lists_github_row(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::component::init);
-        cx.update(AppState::init_test);
-        let view = cx.new(SettingsView::new);
-        let window = cx.open_window(
-            gpui_kit::Size {
-                width: gpui_kit::px(1000.0),
-                height: gpui_kit::px(700.0),
-            },
-            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
-        );
-        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
-        visual.update(|window, cx| {
-            let arena_clear = window.draw(cx);
-            arena_clear.clear(cx);
-        });
-        // アカウント欄に GitHub 行がある（未ログインでも常に出す）
-        assert!(
-            visual.debug_bounds("account-row-github").is_some(),
-            "アカウントに GitHub 行があること"
-        );
-        // ログイン中（プロフィールあり）でも同じ行が描ける（@login を出す分岐）
-        view.update(cx, |_, cx| {
-            let state = AppState::global(cx);
-            *state.github_logged_in.lock() = true;
-            *state.github_profile.lock() = Some(thundoku_core::github::GithubUser {
-                login: "octocat".to_string(),
-                name: Some("The Octocat".to_string()),
-            });
-            cx.notify();
-        });
-        visual.update(|window, cx| {
-            let arena_clear = window.draw(cx);
-            arena_clear.clear(cx);
-        });
-        assert!(
-            visual.debug_bounds("account-row-github").is_some(),
-            "ログイン中も GitHub 行があること"
-        );
-    }
 
     #[gpui_kit::test]
     async fn drive_sync_toggle_persists(cx: &mut TestAppContext) {
@@ -3802,5 +3700,117 @@ mod tests {
             );
             assert!(!*state.toast_progress.lock(), "進行中のままになっている");
         });
+    }
+
+    /// 設定画面を開いて数フレーム描画する（レイアウトが確定してから
+    /// `debug_bounds` / 要素 id の照会をする）。
+    ///
+    /// Google ログイン済みにしておく（パスフレーズの入力欄は鍵を持つアカウントの
+    /// ときだけ出す）。
+    fn open_settings(
+        cx: &mut TestAppContext,
+    ) -> (&'static mut gpui_kit::VisualTestContext, Entity<SettingsView>) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| *AppState::global(cx).google_logged_in.lock() = true);
+        let view = cx.new(SettingsView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..3 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        (visual, view)
+    }
+
+    /// 「本の鍵」カードは設定画面の**先頭**（ヘッダーの直後）にある。
+    ///
+    /// パスフレーズ未設定の警告から「設定する」でここへ誘導するので、開いた直後に
+    /// 見えていないと導線が機能しない（下端に埋もれていた）。
+    #[gpui_kit::test]
+    async fn key_card_is_the_first_setting_section(cx: &mut TestAppContext) {
+        let (visual, _view) = open_settings(cx);
+        let title = visual
+            .debug_bounds("settings-title")
+            .expect("ヘッダーが描画されている");
+        let key = visual
+            .debug_bounds("settings-card-key")
+            .expect("本の鍵カードが描画されている");
+        let account = visual
+            .debug_bounds("settings-card-account")
+            .expect("アカウントカードが描画されている");
+        // 設定画面は縦 1 列なので、上にあるものほど先に並んでいる
+        assert!(key.top() < account.top(), "本の鍵カードが先頭にない");
+        assert!(
+            title.top() < key.top(),
+            "本の鍵カードがヘッダーより上に出ている"
+        );
+    }
+
+    /// パスフレーズの入力欄は**既定でマスク**し、右端の目のアイコンで
+    /// マスク ⇄ 表示を切り替えられる（値もフォーカスも失わない）。
+    #[gpui_kit::test]
+    async fn passphrase_input_mask_toggles_with_the_eye_button(cx: &mut TestAppContext) {
+        let (visual, view) = open_settings(cx);
+        let input = cx
+            .read(|cx| view.read(cx).passphrase_input())
+            .expect("描画で入力欄が作られる");
+        assert!(
+            cx.read(|cx| input.read(cx).presentation().is_masked()),
+            "既定はマスク"
+        );
+
+        // 値を入れておく（切り替えで消えないことを見る）
+        let window_bounds = visual
+            .debug_bounds("passphrase-input")
+            .expect("入力欄が描画されている");
+        visual.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("passphrase-1", window, cx);
+                let focus = state.focus_handle(cx);
+                window.focus(&focus, cx);
+            });
+        });
+        // 目のアイコンは入力欄の右端（余白 + アイコン）にある
+        let eye = gpui_kit::point(
+            window_bounds.right() - gpui_kit::px(22.0),
+            window_bounds.center().y,
+        );
+
+        visual.simulate_click(eye, gpui_kit::Modifiers::default());
+        assert!(
+            !cx.read(|cx| input.read(cx).presentation().is_masked()),
+            "目のアイコンを押しても表示に切り替わらない"
+        );
+        assert_eq!(
+            cx.read(|cx| input.read(cx).value()),
+            "passphrase-1",
+            "切り替えで入力内容を失っている"
+        );
+        assert!(
+            visual.update(|window, cx| input.read(cx)
+                .focus_handle(cx)
+                .is_focused(window)),
+            "切り替えでフォーカスを失っている"
+        );
+
+        visual.simulate_click(eye, gpui_kit::Modifiers::default());
+        assert!(
+            cx.read(|cx| input.read(cx).presentation().is_masked()),
+            "もう一度押すとマスクに戻る"
+        );
+        assert_eq!(
+            cx.read(|cx| input.read(cx).value()),
+            "passphrase-1",
+            "切り替えで入力内容を失っている"
+        );
     }
 }

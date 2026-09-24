@@ -30,8 +30,8 @@ mod reader;
 
 pub use builder::PackBuilder;
 pub use keys::{
-    KEY_BUNDLE_FORMAT_VERSION, PackKey, PackKeyBundle, PackRootKey, PackRootKeyWrap, WrapKind,
-    sub_wrap_kek,
+    BACKUP_FORMAT_VERSION, BackupEnvelope, KEY_BUNDLE_FORMAT_VERSION, PackKey, PackKeyBundle,
+    PackRootKey, PackRootKeyWrap, WrapKind, sub_wrap_kek,
 };
 pub use reader::{PackFileReader, PackReader};
 

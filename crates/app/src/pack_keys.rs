@@ -123,6 +123,26 @@ pub fn passphrase_prompt_needed(keyring_has_key: bool, bundle_has_passphrase: bo
     !keyring_has_key && bundle_has_passphrase
 }
 
+/// ログイン直後に「パスフレーズ未設定」の警告を出すか（純関数）。
+///
+/// 出すのは **この端末に守るべき鍵があり**、かつ Drive の bundle に
+/// パスフレーズのラップが無いと **判定できた** ときだけ:
+///
+/// - 鍵がまだ無い（新規アカウント / 解決できていない）→ 守る対象が無いので出さない
+/// - Drive 未設定 → 「Drive のバックアップから復元」の話ができないので出さない
+/// - 判定できない（オフライン等で `None`）→ 出さない
+/// - 既にパスフレーズがある → 出さない
+///
+/// 誤警告は「本当に危ない状態」の警告を無視させるので、**判定できないときは黙る**
+/// 側に倒す（警告はログインのたびに出せるが、信用は一度で失われる）。
+pub fn passphrase_notice_needed(
+    has_local_key: bool,
+    drive_configured: bool,
+    has_passphrase: Option<bool>,
+) -> bool {
+    has_local_key && drive_configured && has_passphrase == Some(false)
+}
+
 /// 手元の材料から PRK を決める（仕様 §4.1 手順 1〜4 の判定）。
 ///
 /// - `keyring` にあれば**何も尋ねない**
@@ -463,6 +483,33 @@ impl KeyContext {
         store
             .has_passphrase(&mut drive, &sub)
             .map_err(|error| pack_keys_error_message(&error))
+    }
+
+    /// ログイン直後に「パスフレーズ未設定」の警告を出すか（**背景スレッド専用**）。
+    ///
+    /// 鍵の解決が終わった時点で呼ぶ（解決前に呼ぶと、解錠ダイアログを待っている間の
+    /// 状態で判定してしまう）。判定できないときは `false`（[`passphrase_notice_needed`]）。
+    pub fn needs_passphrase_notice(&self) -> bool {
+        let Some(sub) = self.sub() else {
+            return false;
+        };
+        // 鍵は「このセッションで解決済み」か「keyring にある」のどちらでもよい
+        // （解決済みなら背景タスクが載せている）。
+        let has_local_key =
+            self.cached().is_some() || keyring_root_key(&self.secrets, &sub).is_some();
+        let drive_configured = db::settings::get(&self.pool, DRIVE_FOLDER_KEY)
+            .ok()
+            .flatten()
+            .is_some();
+        let has_passphrase = match self.has_passphrase() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                // オフライン等。警告は出さない（誤警告を避ける）
+                log::warn!("passphrase notice check failed: {error}");
+                None
+            }
+        };
+        passphrase_notice_needed(has_local_key, drive_configured, has_passphrase)
     }
 }
 
@@ -962,6 +1009,44 @@ mod tests {
         assert!(key_status_label(false, true).contains("復元できます"));
         assert!(key_status_label(true, false).contains("パスフレーズ未設定"));
         assert_eq!(key_status_label(false, false), "この端末に鍵なし");
+    }
+
+    /// ログイン直後の警告は「守るべき鍵があり、パスフレーズが無いと分かった」ときだけ。
+    ///
+    /// 分からないとき（鍵が未解決・Drive 未設定・オフライン）に出すと誤警告になり、
+    /// 本当に危ない状態の警告が無視されるようになる。
+    #[test]
+    fn passphrase_notice_only_when_the_answer_is_known() {
+        // 鍵はあるがパスフレーズが無い = 警告する（本来の目的）
+        assert!(passphrase_notice_needed(true, true, Some(false)));
+
+        // パスフレーズがある / 無いと分かっている
+        assert!(!passphrase_notice_needed(true, true, Some(true)));
+
+        // まだ鍵が無い（新規アカウント・解決前）: 守る対象が無いので出さない
+        assert!(!passphrase_notice_needed(false, true, Some(false)));
+
+        // Drive 未設定: 「Drive のバックアップから復元」の話ができない
+        assert!(!passphrase_notice_needed(true, false, Some(false)));
+
+        // 判定できない（オフライン等）: 誤警告を出さない
+        assert!(!passphrase_notice_needed(true, true, None));
+        assert!(!passphrase_notice_needed(false, false, None));
+    }
+
+    /// 未ログインでは警告の判定をしない（鍵はアカウントごと。Drive も引かない）。
+    #[gpui_kit::test]
+    async fn passphrase_notice_check_is_off_without_a_google_login(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        // `key_env` は同じ `sub` の keyring を消すので直列化する（並列だと他のテストと競合）
+        let _guard = KEYRING_SLOT.lock();
+        let (_secrets, _pool) = key_env(cx);
+        let keys = cx.read(|cx| KeyContext::from_state(AppState::global(cx)));
+        assert!(
+            !keys.needs_passphrase_notice(),
+            "未ログインで警告を出す判定になっている"
+        );
     }
 
     // ---- ここから下は Drive を伴う経路（偽 Drive を使う） ----

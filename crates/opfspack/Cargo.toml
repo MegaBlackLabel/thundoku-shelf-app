@@ -10,6 +10,9 @@ serde.workspace = true
 serde_json.workspace = true
 pbkdf2 = "0.12"
 hkdf = "0.12"
+# バックアップ封筒（§11）の平文 HMAC。HKDF の内部依存として既にグラフにあり、
+# 直接依存にしてもライセンス一覧（licenses.json）は変わらない。
+hmac = "0.12"
 sha2.workspace = true
 aes-gcm = "0.10"
 base64 = "0.22"

@@ -9,6 +9,11 @@
 //! - Conflict (both changed, different content): Drive wins; the local pack
 //!   is backed up to `{packId}.conflict-local.opfspack`.
 //! - Deletions are never propagated in either direction.
+//! - The metadata backup (`thundoku-backup.json`) is uploaded as an encrypted
+//!   envelope (v3) when the PRK is available, and as plaintext (v2) otherwise.
+//!   Change detection uses the envelope's `content_hmac` — never the ciphertext
+//!   md5, because the nonce is random on every upload
+//!   (`docs/spec/10-pack-keys.md` §11).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -57,6 +62,15 @@ pub enum SyncError {
     /// v2 以前の pack。v3 では開けないので**再取り込み**を案内する（仕様 §6）。
     #[error("旧形式の本です（pack v{version}）。ストアから取り込み直してください: {pack_id}")]
     UnsupportedPackVersion { pack_id: String, version: u32 },
+    /// 暗号化された DB バックアップ（v3 の封筒）だが、この端末に鍵（PRK）が無い。
+    /// 平文として読む経路は無い（fail-closed）。`owner_id` は封筒が主張する所有者。
+    #[error(
+        "暗号化されたバックアップを復号する鍵がありません（設定画面の「本の鍵」からパスフレーズで解錠してください）: {0}"
+    )]
+    BackupKeyRequired(String),
+    /// DB バックアップの形式が不正、または復号できない（改変・鍵違い）。
+    #[error("drive backup error: {0}")]
+    Backup(#[from] crate::db::backup::BackupError),
 }
 
 fn pack_id_from_name(name: &str) -> Option<&str> {
@@ -364,8 +378,8 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
     log::info!("drive sync: upload direction done, database backup start");
     // -- database backup ---------------------------------------------------
     // DB のテキストデータを JSON にまとめて `thundoku-backup.json` として
-    // Drive にバックアップする。画像 base64 は含めず、md5 が変わったとき
-    // だけアップロードする（200MB 級の DB ファイル全体は上げない）。
+    // Drive にバックアップする。**PRK があれば封筒（v3）に暗号化して上げる**
+    // （仕様 §11）。画像 base64 は含めず、内容が変わったときだけアップロードする。
     // 所有者フィルタ（identity_sub / owner_key）を構成できないときは DB バックアップを
     // 上げない。空の所有集合でエクスポートすると、Drive 上の既存バックアップを
     // 「本を含まない内容」で置き換えてしまい、復元手段を失うため。
@@ -386,16 +400,57 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             _ => None,
         };
         let json = crate::db::backup::export_json(pool, Some(&upload_ids), owner_filter.as_ref())?;
-        let bytes = json.as_bytes();
-        let local_md5 = format!("{:x}", md5::compute(bytes));
+        // 鍵（PRK）があれば封をする。無ければ**平文（v2）で書く**（仕様 §11）。
+        // Drive 同期はログイン必須なので通常は鍵がある。鍵が用意できないだけで
+        // バックアップを止める＝利用者の唯一の控えを失う方が危険、という判断。
+        let envelope = match (pack_root_key, identity_sub) {
+            (Some(root), Some(sub)) => Some(opfspack::BackupEnvelope::seal(
+                json.as_bytes(),
+                root,
+                &opfspack::derive_owner_id(sub),
+            )),
+            _ => {
+                log::warn!(
+                    "drive sync: pack のルート鍵（PRK）が無いため、DB バックアップを\
+                     平文（v2）で書き出す（暗号化されない）"
+                );
+                None
+            }
+        };
         let existing = files.iter().find(|f| f.name == DB_BACKUP_NAME);
-        let needs_upload = existing
-            .map(|f| f.md5_checksum.as_deref() != Some(&local_md5))
-            .unwrap_or(true);
+        let needs_upload = match &envelope {
+            // v3: 暗号文は nonce が乱数で毎回変わるため、暗号文の md5 では比較できない。
+            // 最後にアップロードした内容の `content_hmac`（基準値）と比べる
+            // ＝ 同じ内容なら上げ直さない（仕様 §11）。Drive 側に他端末の封筒が
+            // ある場合も、内容が同じなら相手の控えを無駄に上書きしない。
+            Some(envelope) => {
+                let baseline = crate::db::settings::get(pool, BACKUP_BASELINE_KEY)?;
+                existing.is_none() || baseline.as_deref() != Some(&envelope.content_hmac_hex())
+            }
+            // v2（平文）: 従来どおり、書き出したバイト列の md5 と Drive の md5 を比べる。
+            None => {
+                let local_md5 = format!("{:x}", md5::compute(json.as_bytes()));
+                existing
+                    .map(|f| f.md5_checksum.as_deref() != Some(&local_md5))
+                    .unwrap_or(true)
+            }
+        };
         if needs_upload {
+            // 上げるバイト列: v3 は封筒の JSON、v2 はエクスポートそのもの。
+            // 封印（base64 化）は上げるときだけ行い、平文のコピーは作らない。
+            let envelope_json = envelope
+                .as_ref()
+                .map(opfspack::BackupEnvelope::to_json)
+                .transpose()?;
+            let bytes: &[u8] = envelope_json.as_deref().unwrap_or(json.as_bytes());
             log::info!(
-                "drive sync: uploading database backup ({} bytes)",
-                bytes.len()
+                "drive sync: uploading database backup ({} bytes, {})",
+                bytes.len(),
+                if envelope.is_some() {
+                    "encrypted v3"
+                } else {
+                    "plaintext v2"
+                }
             );
             // 先に新しいバックアップを上げてから旧ファイルを消す。
             // 削除→アップロードの順だと、途中で失敗したときに Drive 上の
@@ -416,10 +471,14 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
                 drive.touch(&file.id)?;
             }
         }
-        // アップロードした場合も md5 一致でスキップした場合も、Drive 上の内容は
+        // アップロードした場合もスキップした場合も、Drive 上の内容は
         // このエクスポートと一致している。起動時の判定に使う基準値をここで更新する
         // （更新しないと、次回起動で「Drive 側が動いた」と誤判定して復元確認が出る）。
-        let baseline = crate::db::backup::canonical_md5_str(&json, None)?;
+        // v3 は封筒の `content_hmac`、v2 は正規形 md5（形式ごとに比較できる値が違う）。
+        let baseline = match &envelope {
+            Some(envelope) => envelope.content_hmac_hex(),
+            None => crate::db::backup::canonical_md5_str(&json, None)?,
+        };
         if let Err(error) = crate::db::settings::set(pool, BACKUP_BASELINE_KEY, &baseline) {
             log::warn!("drive sync: failed to store the backup baseline: {error}");
         }
@@ -473,6 +532,9 @@ pub fn check_drive_backup(
 
 /// Drive の `thundoku-backup.json` をダウンロードして DB に反映する。
 /// UPSERT でマージするため既存のローカル行は残り、Drive 側の値が優先される。
+///
+/// v3 の封筒は**この端末の keyring にある PRK** で復号する（鍵が無ければエラー。
+/// 暗号文を平文として取り込む経路は無い）。v2 の平文バックアップはそのまま読める。
 pub fn restore_drive_backup(
     drive: &mut dyn DriveApi,
     folder_id: &str,
@@ -481,24 +543,58 @@ pub fn restore_drive_backup(
     let info = check_drive_backup(drive, folder_id)?
         .ok_or_else(|| SyncError::Db(sqlx::Error::Protocol("no drive backup found".into())))?;
     let bytes = drive.download(&info.file_id)?;
-    let json = String::from_utf8(bytes)
-        .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
+    let backup = crate::db::backup::DriveBackup::parse(&bytes)?;
+    let token = backup.change_token()?;
+    let root = match backup.owner_id() {
+        Some(owner_id) => Some(
+            keyring_root_key(owner_id)
+                .ok_or_else(|| SyncError::BackupKeyRequired(owner_id.to_string()))?,
+        ),
+        None => None,
+    };
+    let json = backup.plaintext(root.as_ref())?;
     log::info!(
-        "drive sync: restoring database backup ({} bytes, md5={:?})",
+        "drive sync: restoring database backup ({} bytes, md5={:?}, {})",
         json.len(),
-        info.md5
+        info.md5,
+        if root.is_some() { "encrypted v3" } else { "plaintext v2" }
     );
     crate::db::backup::import_json(pool, &json)?;
     // 復元直後はローカルが Drive の内容を含んでいる。ここで基準値を更新しないと、
     // 次回起動でも「Drive が動いた」と見えて同じバックアップを復元し続けてしまう
     // （ローカルに Drive に無い行が残っている限り差分は消えないため）。
-    let baseline = crate::db::backup::canonical_md5_str(&json, None)?;
-    crate::db::settings::set(pool, BACKUP_BASELINE_KEY, &baseline)?;
+    // 基準値の形式は Drive 側の形式に合わせる（v3 = content_hmac / v2 = 正規形 md5）。
+    crate::db::settings::set(pool, BACKUP_BASELINE_KEY, &token)?;
     Ok(())
 }
 
-/// 最後にアップロードした DB バックアップの内容（正規形 md5）を保存する設定キー。
+/// keyring にある PRK（`thundoku-shelf.pack-root-key:<owner_id>`）を読む。
+///
+/// 起動時の差分判定と復元は「この端末が既に知っている鍵」でしか復号できない。
+/// core には UI が無いのでパスフレーズを尋ねられない（解錠はアプリの
+/// `PackKeyStore` が行い、成功すれば keyring に保存される — 仕様 §4.1）。
+fn keyring_root_key(owner_id: &str) -> Option<PackRootKey> {
+    let secrets = crate::secrets::SecretStore::new();
+    match secrets.load_pack_root_key(owner_id) {
+        Ok(Some(encoded)) => PackRootKey::from_base64(&encoded).or_else(|| {
+            log::warn!("drive sync: keyring の pack ルート鍵が壊れている（owner_id={owner_id}）");
+            None
+        }),
+        Ok(None) => None,
+        Err(error) => {
+            log::warn!("drive sync: keyring を読めない（owner_id={owner_id}）: {error}");
+            None
+        }
+    }
+}
+
+/// 最後にアップロード（または復元）した DB バックアップの内容を保存する設定キー。
 /// 起動時の判定で「Drive 側が動いたのか、ローカル側だけが動いたのか」を区別するために使う。
+///
+/// 値の意味は Drive 側の形式で変わる（**形式ごとに比較できる値が違う**）:
+/// - v3（暗号化された封筒）= 平文の `content_hmac`（hex）。暗号文は nonce が乱数で
+///   毎回変わるため、暗号文の md5 を基準値にはできない（仕様 §11）
+/// - v2（平文のバックアップ JSON）= 正規形 md5（[`crate::db::backup::canonical_md5_str`]）
 pub const BACKUP_BASELINE_KEY: &str = "drive.backup.md5";
 
 /// Drive の DB バックアップとローカルの比較結果（起動時の復元確認の判定材料）。
@@ -532,8 +628,13 @@ impl BackupStatus {
 /// - ローカルは Drive 側に存在するテーブルだけを比較する（`view_history` など
 ///   新しく追加されたテーブルが Drive 側にまだ無い場合に毎回復元確認が出るのを防ぐ）
 ///
-/// `baseline_md5` は最後にアップロードした内容の正規形 md5（[`BACKUP_BASELINE_KEY`]）。
-/// Drive 側の正規形 md5 がこれと違うときだけ「Drive が動いた」と判定する。
+/// v3（暗号化された封筒）は keyring の PRK で復号してから同じ比較に載せる。鍵が無ければ
+/// 内容は比較できない（復元もできない）ので、`drive_changed` だけを判定して
+/// `local_differs` は false にする＝復元確認は出さない。
+///
+/// `baseline_md5` は最後にアップロードした内容の基準値（[`BACKUP_BASELINE_KEY`]。
+/// v3 = `content_hmac` / v2 = 正規形 md5）。Drive 側の値がこれと違うときだけ
+/// 「Drive が動いた」と判定する。
 pub fn inspect_drive_backup(
     pool: &SqlitePool,
     drive: &mut dyn DriveApi,
@@ -546,7 +647,28 @@ pub fn inspect_drive_backup(
         return Ok(None);
     };
     let drive_bytes = drive.download(&info.file_id)?;
-    let drive_json: serde_json::Value = serde_json::from_slice(&drive_bytes)
+    let backup = crate::db::backup::DriveBackup::parse(&drive_bytes)?;
+    let drive_token = backup.change_token()?;
+    let drive_changed = baseline_md5.is_some_and(|baseline| baseline != drive_token);
+    let root = match backup.owner_id() {
+        Some(owner_id) => keyring_root_key(owner_id),
+        None => None,
+    };
+    let drive_text = match backup.plaintext(root.as_ref()) {
+        Ok(json) => json,
+        Err(error @ crate::db::backup::BackupError::KeyRequired) => {
+            log::warn!(
+                "drive sync: 暗号化バックアップを復号する鍵が無いため内容の比較をスキップ（{error}）"
+            );
+            return Ok(Some(BackupStatus {
+                info,
+                drive_changed,
+                local_differs: false,
+            }));
+        }
+        Err(error) => return Err(SyncError::from(error)),
+    };
+    let drive_json: serde_json::Value = serde_json::from_str(&drive_text)
         .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
     let local_json: serde_json::Value =
         serde_json::from_str(&crate::db::backup::export_json(pool, book_ids, owner)?)
@@ -559,7 +681,7 @@ pub fn inspect_drive_backup(
     let local_md5 = crate::db::backup::canonical_md5(&local_json, Some(table_names.as_slice()));
     Ok(Some(BackupStatus {
         info,
-        drive_changed: baseline_md5.is_some_and(|baseline| baseline != drive_md5),
+        drive_changed,
         local_differs: local_md5 != drive_md5,
     }))
 }

@@ -80,8 +80,7 @@ const FIRST_STEPS_NOTES: [(&str, &str); 2] = [
     (
         "同期できないときは",
         "そのストアのセッションが切れていないか確認し、必要ならログインし直してください。\
-         アプリの不具合は、サイドバーの「レポート」から GitHub に報告できます\
-         （GitHub にログイン時のみ表示）",
+         アプリの不具合は、サイドバーの「レポート」から GitHub に報告できます",
     ),
 ];
 
@@ -113,7 +112,7 @@ const SIDEBAR_ITEMS: [(&str, &str); 9] = [
     ),
     (
         "レポート",
-        "アプリの不具合などを GitHub に報告します（GitHub にログイン時のみ表示）",
+        "アプリの不具合などを GitHub に報告します（作成画面がブラウザーで開きます）",
     ),
     ("設定", "保存先・バックアップ・アカウントなどの設定"),
     (
@@ -130,18 +129,14 @@ const SIDEBAR_ITEMS: [(&str, &str); 9] = [
 const ACCOUNT_LOGIN_TITLE: &str = "アカウントのログイン方法";
 const ACCOUNT_LOGIN_STEPS: [&str; 4] = [
     "1. サイドバー下部の「アカウント」をクリックして一覧を開く",
-    "2. ログインするサービスを選ぶ（Google / GitHub / 技術書典 / BOOTH / FANZA同人 / DLsite）",
+    "2. ログインするサービスを選ぶ（Google / 技術書典 / BOOTH / FANZA同人 / DLsite）",
     "3. 「ログイン」を押し、画面の案内に従って認証する",
     "4. ログインできると行の右端に緑のチェックが付く（ログアウトも同じ位置のアイコン）",
 ];
-const ACCOUNT_LOGIN_METHODS: [(&str, &str); 3] = [
+const ACCOUNT_LOGIN_METHODS: [(&str, &str); 2] = [
     (
         "Google",
         "システムブラウザが開くので、Google アカウントで認証します",
-    ),
-    (
-        "GitHub",
-        "画面に出るコードをコピーし、ブラウザで github.com/login/device に入力します",
     ),
     (
         "ストア（技術書典 / BOOTH / FANZA同人 / DLsite）",
@@ -1658,7 +1653,7 @@ mod tests {
             "アカウントのログイン手順は 4 ステップ（開く → 選ぶ → 認証 → 完了）"
         );
         let steps = ACCOUNT_LOGIN_STEPS.join(" ");
-        for keyword in ["アカウント", "Google", "GitHub"] {
+        for keyword in ["アカウント", "Google", "技術書典"] {
             assert!(
                 steps.contains(keyword),
                 "ログイン手順に「{keyword}」が無い: {steps}"
