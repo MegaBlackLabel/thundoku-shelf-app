@@ -73,7 +73,8 @@ PRK の保管 = ラップ（Wrapping）= 以下で AES-256-GCM した 32B
 |---|---|---|
 | `APP_SALT` | `b"opfspack-v1-identity-salt-2024"` | v2 と同一（`sub` ラップの KEK は v2 の master key そのもの） |
 | `PBKDF2_ITERATIONS`（sub） | `100_000` | 同上 |
-| `PBKDF2_ITERATIONS`（passphrase） | `600_000`（暫定・§10） | ラップごとに `iterations` を記録するので将来上げられる |
+| `PBKDF2_ITERATIONS`（passphrase） | `600_000` | ラップごとに `iterations` を記録するので将来上げられる。**実測: release ビルドで 1 回 ≒ 60ms**（debug は ≒ 3.4s。2026-09-24 計測） |
+| `MIN_PASSPHRASE_CHARS` | `12` | パスフレーズの最低文字数。強度は反復回数より**長さ**に強く効くため、短いものは設定時に拒否する（`crates/core/src/pack_keys.rs`） |
 | `HKDF_INFO` | `b"opfspack-entry-key"` | v2 と同一 |
 | `owner_id` | `SHA-256("opfspack:v1:" + sub)` の小文字 hex | 既存 `derive_owner_id` と同一 |
 | ラップの AAD | `"thundoku-pack-root:1:" + owner_id` | 別アカウントのラップへの差し替えを検出する |
@@ -262,7 +263,7 @@ keyring が無いので 2 → 3 の順。`sub` は既存の認証セッション
 
 | 項目 | 現状 |
 |---|---|
-| パスフレーズの PBKDF2 反復回数 | `600_000` は暫定（実機の復号時間を測って決める。ラップに記録するので後から上げられる） |
+| パスフレーズの PBKDF2 反復回数 | `600_000` で確定（release 実測 ≒ 60ms。ローカルの解錠では体感できない。将来上げる場合はラップの `iterations` を上げて作り直すだけ＝ PRK も pack も変えない） |
 | NFKC 正規化の必要性 | IME / OS による差（合成文字）を避けるために仕様に含めたが、実機での差は未検証。Rust 側は `unicode_normalization` で NFKC してから PBKDF2 に渡す（`crates/opfspack/src/keys.rs`。パスフレーズのラップ作成・復号の両方） |
 | Drive のフォルダがアカウント別でない既知の制約 | `docs/spec/README.md` §4 の「Drive の保存先フォルダはアカウント別ではない」。bundle は `owner_id` で選別するので混在しても誤用しない設計だが、フォルダ分離は別件 |
 | Web 側の鍵の保持 | メモリのみか IndexedDB かは Web 側の判断（XSS リスクの tradeoff。本仕様はどちらも許容する） |

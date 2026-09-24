@@ -34,6 +34,12 @@ pub const PASSPHRASE_ITERATIONS: u32 = opfspack::PASSPHRASE_WRAP_ITERATIONS;
 /// パスフレーズを尋ねる口。`None` は「利用者がスキップした」。
 pub type PassphrasePrompt<'a> = &'a mut dyn FnMut() -> Option<String>;
 
+/// パスフレーズの最低文字数。
+///
+/// PRK を守る強度は PBKDF2 の反復回数（実測: release で 600k ≒ 60ms）より**長さ**に
+/// 強く効く。短いパスフレーズは「保護したつもり」になるため、設定時に拒否する。
+pub const MIN_PASSPHRASE_CHARS: usize = 12;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PackKeysError {
     #[error("keyring error: {0}")]
@@ -51,6 +57,9 @@ pub enum PackKeysError {
     /// 入力されたパスフレーズが違う。`sub` ラップへ**黙って落ちない**（仕様 §4.1 手順 3）。
     #[error("パスフレーズが違います")]
     PassphraseFailed,
+    /// 設定しようとしたパスフレーズが短すぎる（[`MIN_PASSPHRASE_CHARS`] 未満）。
+    #[error("パスフレーズは {min} 文字以上にしてください")]
+    PassphraseTooShort { min: usize },
     /// Drive の bundle が別アカウントのもの（`owner_id` 不一致）。
     /// 黙って上書きすると相手の鍵を失うためエラーにする（仕様 §3.2）。
     #[error("{KEY_BUNDLE_NAME} は別のアカウントの鍵です（owner_id: {found}）")]
@@ -158,6 +167,12 @@ impl<'a> PackKeyStore<'a> {
         root: &PackRootKey,
         passphrase: &str,
     ) -> Result<(), PackKeysError> {
+        // 短いパスフレーズは「保護したつもり」になるので拒否する（長さが強度に効く）。
+        if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+            return Err(PackKeysError::PassphraseTooShort {
+                min: MIN_PASSPHRASE_CHARS,
+            });
+        }
         let owner_id = derive_owner_id(sub);
         let now_ms = now_ms();
         let mut bundle = load_or_new_bundle(drive, self.folder_id, &owner_id, now_ms)?;
@@ -732,6 +747,31 @@ mod tests {
         assert!(keys.pending_owner().unwrap().is_some(), "印は残す");
     }
 
+    /// 短いパスフレーズは拒否する（PRK を守る強度は反復回数より**長さ**に効く）。
+    /// 拒否したときは bundle を作らない（中途半端な保護状態にしない）。
+    #[test]
+    fn set_passphrase_rejects_short_passphrases() {
+        let sub = "sub-pack-keys-too-short";
+        let secrets = secrets();
+        let pool = pool();
+        let mut drive = FakeDrive::new();
+        let keys = PackKeyStore::new(&secrets, &pool, "folder-1");
+        let mut prompt = no_prompt();
+        let root = keys.ensure(&mut drive, sub, &mut prompt).unwrap();
+
+        let error = keys
+            .set_passphrase(&mut drive, sub, &root, "short")
+            .expect_err("短いパスフレーズを受け付けている");
+        assert!(
+            matches!(error, PackKeysError::PassphraseTooShort { min } if min == MIN_PASSPHRASE_CHARS),
+            "{error:?}"
+        );
+        assert!(
+            !keys.has_passphrase(&mut drive, sub).unwrap(),
+            "拒否したのに passphrase ラップができている"
+        );
+    }
+
     /// 10. パスフレーズの設定 / 変更 / 削除は bundle に反映される（§5.2）。
     #[test]
     fn passphrase_operations_are_reflected_on_drive() {
@@ -744,13 +784,17 @@ mod tests {
         let mut prompt = no_prompt();
         let root = keys.ensure(&mut drive, sub, &mut prompt).unwrap();
 
-        keys.set_passphrase(&mut drive, sub, &root, "pw-1").unwrap();
+        keys.set_passphrase(&mut drive, sub, &root, "pw-1-is-long-enough")
+            .unwrap();
         assert!(keys.has_passphrase(&mut drive, sub).unwrap());
         let bundle = load_bundle(&mut drive, "folder-1", &owner_id)
             .unwrap()
             .unwrap();
         assert_eq!(
-            bundle.unwrap_with_passphrase("pw-1").unwrap().as_bytes(),
+            bundle
+                .unwrap_with_passphrase("pw-1-is-long-enough")
+                .unwrap()
+                .as_bytes(),
             root.as_bytes()
         );
         assert!(bundle.has_wrap(WrapKind::Sub), "sub ラップは残す");
@@ -761,13 +805,21 @@ mod tests {
         );
 
         // 変更は置換（同じ kind を 2 つ持たない）。
-        keys.set_passphrase(&mut drive, sub, &root, "pw-2").unwrap();
+        keys.set_passphrase(&mut drive, sub, &root, "pw-2-is-long-enough")
+            .unwrap();
         let bundle = load_bundle(&mut drive, "folder-1", &owner_id)
             .unwrap()
             .unwrap();
         assert_eq!(bundle.wraps().len(), 2, "sub + passphrase の 2 つだけ");
-        assert!(bundle.unwrap_with_passphrase("pw-1").is_none(), "旧は無効");
-        assert!(bundle.unwrap_with_passphrase("pw-2").is_some());
+        assert!(
+            bundle.unwrap_with_passphrase("pw-1-is-long-enough").is_none(),
+            "旧は無効"
+        );
+        assert!(
+            bundle
+                .unwrap_with_passphrase("pw-2-is-long-enough")
+                .is_some()
+        );
 
         assert!(keys.remove_passphrase(&mut drive, sub).unwrap());
         assert!(!keys.has_passphrase(&mut drive, sub).unwrap());
