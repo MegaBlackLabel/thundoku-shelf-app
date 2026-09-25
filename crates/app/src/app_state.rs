@@ -327,15 +327,19 @@ impl AppState {
         let client_id = default_client_id();
         // 前回のログアウトで keyring から削除できなかった資格情報は復元しない
         // （「ログアウトしたのに次回起動で勝手にログインし直す」のを防ぐ）。
+        // **削除に成功したときだけ**印を消す（失敗したら印を残して、この起動では
+        // トークンもプロフィールも復元しない）。
         let purge_marker = PurgeMarker::new(&data_dir);
-        if purge_marker.is_pending(GOOGLE_LOGOUT_SLOT) {
+        let google_restorable = if purge_marker.is_pending(GOOGLE_LOGOUT_SLOT) {
             log::warn!(
                 "google: 前回のログアウトで資格情報を削除できなかったため復元しません（再ログインが必要）"
             );
-            let _ = secrets.delete(thundoku_core::secrets::USER_GOOGLE);
-            thundoku_core::google::delete_saved_profile(&secrets);
-            purge_marker.clear(GOOGLE_LOGOUT_SLOT);
-        }
+            let token_delete = secrets.delete(thundoku_core::secrets::USER_GOOGLE);
+            let profile_deleted = thundoku_core::google::delete_saved_profile(&secrets);
+            clear_pending_logout(&purge_marker, GOOGLE_LOGOUT_SLOT, token_delete, profile_deleted)
+        } else {
+            true
+        };
         let mut google: Option<GoogleClient> = if client_id.is_empty() {
             None
         } else {
@@ -346,15 +350,21 @@ impl AppState {
         };
         let google_profile: Option<thundoku_core::google::GoogleProfile> =
             if let Some(client) = google.as_mut() {
-                if let Ok(Some(json)) = secrets.load(thundoku_core::secrets::USER_GOOGLE)
-                    && let Ok(tokens) = serde_json::from_str(&json)
-                {
-                    client.restore_tokens(tokens);
+                // 前回のログアウトで消せなかった資格情報が残っている起動では、
+                // トークンもプロフィールも復元しない（`google_restorable` が false）。
+                if google_restorable {
+                    if let Ok(Some(json)) = secrets.load(thundoku_core::secrets::USER_GOOGLE)
+                        && let Ok(tokens) = serde_json::from_str(&json)
+                    {
+                        client.restore_tokens(tokens);
+                    }
+                    // `sub` は所有者判定（本棚の絞り込み・Drive バックアップの所有者フィルタ）に
+                    // 使うため、保存済みプロフィールを起動時に復元する。表示用の email 等が
+                    // 古くても実害は無く、設定画面を開けば取得し直す。
+                    restore_google_profile(&secrets)
+                } else {
+                    None
                 }
-                // `sub` は所有者判定（本棚の絞り込み・Drive バックアップの所有者フィルタ）に
-                // 使うため、保存済みプロフィールを起動時に復元する。表示用の email 等が
-                // 古くても実害は無く、設定画面を開けば取得し直す。
-                restore_google_profile(&secrets)
             } else {
                 None
             };
@@ -910,9 +920,100 @@ pub fn load_window_bounds(cx: &App) -> Option<WindowBounds> {
     decode_window_bounds(&json)
 }
 
+/// 前回のログアウトで削除できなかった資格情報の後始末。戻り値は
+/// 「この起動で保存済みのトークン・プロフィールを復元してよいか」。
+///
+/// **削除に成功したときだけ**印を消す（fail-closed）。印を消してしまうと、消えなかった
+/// トークンをこの先の起動経路がそのまま読み戻し、「ログアウトしたのにログイン状態で
+/// 起動する」ことになる（セキュリティ評価 F04）。失敗したら印を残し、次の起動で再試行する。
+fn clear_pending_logout(
+    marker: &PurgeMarker,
+    slot: &str,
+    token_delete: Result<(), thundoku_core::secrets::SecretError>,
+    profile_deleted: bool,
+) -> bool {
+    if !marker.is_pending(slot) {
+        return true;
+    }
+    if token_delete.is_ok() && profile_deleted {
+        marker.clear(slot);
+        log::info!("google: 前回のログアウトで残っていた資格情報を削除しました");
+        return true;
+    }
+    log::warn!(
+        "google: 資格情報を削除できないため、この起動では復元しません（再ログインが必要）"
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// メモリバックエンド（`SecretStore`）はプロセス内で共有されるため、
+    /// `USER_GOOGLE_PROFILE` スロットを使うテストはこの Mutex で直列化する
+    /// （`crates/core/src/google.rs` のテストと同じ扱い）。
+    static PROFILE_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_profile_slot() -> std::sync::MutexGuard<'static, ()> {
+        PROFILE_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 前回のログアウトで削除できなかった資格情報は、**削除に成功するまで復元しない**。
+    ///
+    /// 印（`session-purge.pending`）を削除結果に関わらず消していたため、keyring の削除が
+    /// 失敗すると「ログアウトしたのに次の起動でトークンを読み戻す」状態になっていた
+    /// （セキュリティ評価 F04）。fail-closed に倒す。
+    #[test]
+    fn pending_logout_is_cleared_only_after_the_credentials_are_deleted() {
+        let dir = std::env::temp_dir().join("thundoku-shelf-test/pending-logout");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("テンポラリを作れる");
+        let marker = PurgeMarker::new(&dir);
+        marker.mark(GOOGLE_LOGOUT_SLOT).expect("印を付けられる");
+        let failed = || Err(thundoku_core::secrets::SecretError::Keyring("locked".into()));
+
+        // トークンの削除に失敗 → 復元させない・印は残す（次の起動でも再試行）
+        assert!(
+            !clear_pending_logout(&marker, GOOGLE_LOGOUT_SLOT, failed(), true),
+            "削除に失敗したのに復元を許している"
+        );
+        assert!(
+            marker.is_pending(GOOGLE_LOGOUT_SLOT),
+            "削除に失敗したのに印を消している（次回起動で復元される）"
+        );
+
+        // プロフィールだけ削除に失敗 → 同じ扱い
+        assert!(!clear_pending_logout(
+            &marker,
+            GOOGLE_LOGOUT_SLOT,
+            Ok(()),
+            false
+        ));
+        assert!(
+            marker.is_pending(GOOGLE_LOGOUT_SLOT),
+            "プロフィールを消せていないのに印を消している"
+        );
+
+        // 両方成功 → 印を消して復元を許す
+        assert!(clear_pending_logout(
+            &marker,
+            GOOGLE_LOGOUT_SLOT,
+            Ok(()),
+            true
+        ));
+        assert!(
+            !marker.is_pending(GOOGLE_LOGOUT_SLOT),
+            "削除できたのに印が残っている"
+        );
+
+        // 印が無い通常起動 → 復元を許す（削除は呼ばない）
+        assert!(clear_pending_logout(&marker, GOOGLE_LOGOUT_SLOT, failed(), true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// モーダルは**優先度で 1 つだけ**が選ばれる（同じ画面に 2 つ出さない）。
     ///
@@ -984,6 +1085,53 @@ mod tests {
         }
     }
 
+    /// 前回のログアウトの印が残っている起動では、保存済みプロフィール（`sub`）を復元しない。
+    ///
+    /// 起動経路が印を見て削除をやり直し、**成功したときだけ**印を外す配線の確認
+    /// （削除に失敗したときに復元させない分岐は
+    /// `pending_logout_is_cleared_only_after_the_credentials_are_deleted` で固定している）。
+    #[gpui_kit::test]
+    async fn startup_with_a_pending_logout_marker_does_not_restore_the_profile(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        // 同じプロフィールスロットを触る既存テストと直列化する（`lock_profile_slot`）
+        let _slot = lock_profile_slot();
+        thundoku_core::secrets::SecretStore::use_memory_backend();
+        cx.update(gpui_kit::component::init);
+        let data_dir = std::env::temp_dir().join("thundoku-shelf-test/pending-logout-startup");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        cx.update(|cx| AppState::init_with_data_dir(cx, data_dir.clone()));
+        // ログイン済みの状態（プロフィールが keyring に保存されている）を作る
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            thundoku_core::google::save_profile(&state.secrets, &google_profile())
+                .expect("プロフィールを保存できる");
+        });
+
+        // 前回のログアウトで削除に失敗した印を付けて起動し直す
+        PurgeMarker::new(&data_dir)
+            .mark(GOOGLE_LOGOUT_SLOT)
+            .expect("印を付けられる");
+        cx.update(|cx| AppState::init_with_data_dir(cx, data_dir.clone()));
+
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            assert!(
+                state.google_profile.lock().is_none(),
+                "復元禁止の印がある起動でプロフィールを復元している（削除をやり直す前の値を使っている）"
+            );
+            assert!(
+                !PurgeMarker::new(&data_dir).is_pending(GOOGLE_LOGOUT_SLOT),
+                "削除に成功したのに印が残っている"
+            );
+        });
+
+        cx.update(|cx| {
+            let _ = thundoku_core::google::delete_saved_profile(&AppState::global(cx).secrets);
+        });
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     /// keyring に保存したプロフィール（sub）が起動時に復元されること。
     ///
     /// プロフィールは設定画面を開くまで取得されない（`userinfo` はネットワーク）ため、
@@ -992,8 +1140,9 @@ mod tests {
     /// 終了時のアップロードが丸ごとスキップされ、起動のたびに復元確認が出る。
     #[gpui_kit::test]
     async fn restores_google_profile_on_startup(cx: &mut gpui_kit::TestAppContext) {
-        // keyring には触らない（メモリバックエンドはプロセス内で共有されるが、
-        // プロフィールを読むのは本番の起動経路＝このテストだけ）
+        // keyring のプロフィールスロットはプロセス内で共有される（`lock_profile_slot` で
+        // 直列化。同じスロットを触るテスト: `startup_with_a_pending_logout_marker_...`）
+        let _slot = lock_profile_slot();
         thundoku_core::secrets::SecretStore::use_memory_backend();
         cx.update(gpui_kit::component::init);
         let data_dir = std::env::temp_dir().join("thundoku-shelf-test/google-profile-startup");
@@ -1001,7 +1150,7 @@ mod tests {
         cx.update(|cx| AppState::init_with_data_dir(cx, data_dir.clone()));
         cx.update(|cx| {
             let state = AppState::global(cx);
-            thundoku_core::google::delete_saved_profile(&state.secrets);
+            let _ = thundoku_core::google::delete_saved_profile(&state.secrets);
             assert!(
                 state.google_profile.lock().is_none(),
                 "保存前はプロフィールを持たない"
@@ -1029,7 +1178,7 @@ mod tests {
 
         // メモリバックエンドはプロセス内で共有されるため後始末する
         cx.update(|cx| {
-            thundoku_core::google::delete_saved_profile(&AppState::global(cx).secrets);
+            let _ = thundoku_core::google::delete_saved_profile(&AppState::global(cx).secrets);
         });
         let _ = std::fs::remove_dir_all(&data_dir);
     }

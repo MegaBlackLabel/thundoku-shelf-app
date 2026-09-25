@@ -1047,7 +1047,7 @@ impl SettingsView {
                 .spawn(async move {
                     let deleted = store.delete(secrets::USER_GOOGLE);
                     // プロフィール（sub）の控えも消す（残ると所有者判定だけ生き残る）。
-                    thundoku_core::google::delete_saved_profile(&store);
+                    let _ = thundoku_core::google::delete_saved_profile(&store);
                     deleted
                 })
                 .await;
@@ -1197,7 +1197,7 @@ impl SettingsView {
             let store = state.secrets.clone();
             cx.background_spawn(async move {
                 let _ = store.delete(secrets::USER_GOOGLE);
-                thundoku_core::google::delete_saved_profile(&store);
+                let _ = thundoku_core::google::delete_saved_profile(&store);
             })
             .detach();
         }

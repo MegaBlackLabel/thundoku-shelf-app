@@ -87,10 +87,18 @@ pub fn saved_profile(store: &crate::secrets::SecretStore) -> Option<GoogleProfil
     }
 }
 
-/// 保存済みプロフィールを削除する（ログアウト時）。
-pub fn delete_saved_profile(store: &crate::secrets::SecretStore) {
-    if let Err(error) = store.delete(crate::secrets::USER_GOOGLE_PROFILE) {
-        log::warn!("google profile: 保存値を削除できません: {error}");
+/// 保存済みプロフィールを削除する（ログアウト時）。**削除できたか**を返す。
+///
+/// 呼び出し側が結果を必要としない場合（利用者への表示が別経路のとき）は `let _ =` で
+/// 捨ててよいが、起動時の「前回のログアウトで消せなかった資格情報を復元しない」判定は
+/// この戻り値で行う（セキュリティ評価 F04）。
+pub fn delete_saved_profile(store: &crate::secrets::SecretStore) -> bool {
+    match store.delete(crate::secrets::USER_GOOGLE_PROFILE) {
+        Ok(()) => true,
+        Err(error) => {
+            log::warn!("google profile: 保存値を削除できません: {error}");
+            false
+        }
     }
 }
 
@@ -1111,7 +1119,7 @@ mod tests {
         let _guard = lock_profile_slot();
         crate::secrets::SecretStore::use_memory_backend();
         let store = crate::secrets::SecretStore::new();
-        delete_saved_profile(&store);
+        let _ = delete_saved_profile(&store);
 
         let profile = GoogleProfile {
             sub: "sub-1".to_string(),
@@ -1127,7 +1135,7 @@ mod tests {
             "保存したプロフィールが読み戻せること"
         );
 
-        delete_saved_profile(&store);
+        let _ = delete_saved_profile(&store);
         assert_eq!(saved_profile(&store), None, "削除後は読み戻せないこと");
     }
 
@@ -1147,6 +1155,6 @@ mod tests {
             .save(crate::secrets::USER_GOOGLE_PROFILE, r#"{"sub":"only-sub"}"#)
             .unwrap();
         assert_eq!(saved_profile(&store), None, "項目が欠けた値も無視する");
-        delete_saved_profile(&store);
+        let _ = delete_saved_profile(&store);
     }
 }
