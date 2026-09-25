@@ -49,6 +49,9 @@ pub enum SyncError {
     Drive(#[from] DriveError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// 進捗コールバックが中止を要求した（利用者操作）。取り込み済みの分はそのまま残る。
+    #[error("同期を中止しました")]
+    Cancelled,
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
     #[error("pack error: {0}")]
@@ -186,6 +189,38 @@ fn import_book(
     Ok(())
 }
 
+/// 同期の段階。中止は段階の区切り（ダウンロード中はその場、アップロード中は
+/// 次のファイルの直前、バックアップは開始前）で効く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPhase {
+    /// Drive から pack を取得中
+    Download,
+    /// Drive へ pack をアップロード中（転送そのものに進捗 API が無いので、開始だけ報告する）
+    Upload,
+    /// DB バックアップ（`thundoku-backup.json`）を書き出して上げる直前
+    Backup,
+}
+
+/// 同期中に進む**大きな転送**の進捗。
+///
+/// 表示用の値だけを持つ。`Download` は受信バイト数まで報告し、`Upload` / `Backup` は
+/// 段階の開始（＝中止できる区切り）だけを報告する（`count == 0` は総数不明）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncProgress {
+    /// 今どの段階か（表示の文言が変わる）
+    pub phase: SyncPhase,
+    /// 転送中のファイル名（表示用。例: `pack-1.opfspack`）
+    pub name: String,
+    /// 何件目（1 始まり）/ 全件。分母は今回の同期で転送する総数（スキップは数えない）。
+    /// 0 は「総数不明」。
+    pub index: usize,
+    pub count: usize,
+    /// 受信済みのバイト数
+    pub bytes: u64,
+    /// 総バイト数。`Content-Length` が無いときは `None`（`0` が不明の合図）
+    pub total_bytes: Option<u64>,
+}
+
 /// 同期 1 回分の入力。
 pub struct SyncRequest<'a> {
     /// ローカル DB プール
@@ -211,6 +246,20 @@ pub struct SyncRequest<'a> {
 
 /// Run one full sync pass.
 pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
+    sync_with_progress(request, &mut |_| true)
+}
+
+/// Run one full sync pass, reporting the progress of pack downloads.
+///
+/// `on_progress` は転送の区切りで呼ばれ、`false` を返すと中止する
+/// （[`SyncError::Cancelled`]。取り込み済みの分はそのまま残る）。中止が効くのは
+/// 「pack の取得中はその場」「アップロード中は次のファイルの直前」「DB バックアップは
+/// 書き出す前」。`Download` は受信バイト数まで報告し、`Upload` / `Backup` は
+/// 段階の開始（`count == 0` = 総数不明）だけを報告する。
+pub fn sync_with_progress(
+    request: SyncRequest<'_>,
+    on_progress: &mut dyn FnMut(&SyncProgress) -> bool,
+) -> Result<SyncOutcome, SyncError> {
     let SyncRequest {
         pool,
         drive,
@@ -252,6 +301,9 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
 
     log::info!("drive sync: download direction start");
     // -- download direction -------------------------------------------------
+    // 進捗の分母（転送対象の総数）を確定させるため、md5 一致でスキップする分を先に外す
+    // （スキップを分母に数えると「2/5」のまま終わらず、利用者に進まないように見える）。
+    let mut pending_downloads: Vec<(&str, &DriveFile, String)> = Vec::new();
     for (pack_id, file) in &drive_pack_by_id {
         let state = sync_state::get(pool, pack_id)?;
         let drive_md5 = file.md5_checksum.clone().unwrap_or_default();
@@ -262,10 +314,40 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             outcome.skipped.push((*pack_id).to_string());
             continue;
         }
+        pending_downloads.push((pack_id, file, drive_md5));
+    }
+    let download_count = pending_downloads.len();
+    // 進捗コールバックが中止を求めた（`false`）。転送が進捗を報告しない場合
+    // （`Content-Length` 無しの小さな pack など）でも、次の pack へ進む前に止める。
+    let mut cancelled = false;
+    for (offset, (pack_id, file, drive_md5)) in pending_downloads.into_iter().enumerate() {
+        if cancelled {
+            return Err(SyncError::Cancelled);
+        }
         let local_path = crate::pack_path::pack_path(packs_dir, pack_id)
             .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
 
-        let bytes = drive.download(&file.id)?;
+        // 進捗つきの取得（16MiB の API 上限ではなく 2GiB のダウンロード経路）。
+        let bytes = drive
+            .download_with_progress(&file.id, &mut |received, total| {
+                if cancelled {
+                    return false;
+                }
+                cancelled = !on_progress(&SyncProgress {
+                    phase: SyncPhase::Download,
+                    name: file.name.clone(),
+                    index: offset + 1,
+                    count: download_count,
+                    bytes: received,
+                    // 転送側は「総数不明」を 0 で表す（`read_body_with_progress`）
+                    total_bytes: (total > 0).then_some(total),
+                });
+                !cancelled
+            })
+            .map_err(|error| match error {
+                DriveError::Cancelled => SyncError::Cancelled,
+                other => SyncError::Drive(other),
+            })?;
         let reader = PackReader::open(&bytes).map_err(|error| match error {
             // v2 以前の pack（v3 では開けない）。再取り込みを案内する。
             PackError::Version(version) => SyncError::UnsupportedPackVersion {
@@ -315,7 +397,7 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             &sync_state::DriveSyncState {
                 pack_id: (*pack_id).to_string(),
                 drive_file_id: file.id.clone(),
-                md5: drive_md5.clone(),
+                md5: drive_md5,
                 modified_time: file.modified_time.clone(),
                 last_synced_at: now(),
             },
@@ -355,6 +437,18 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
             }
         };
         if should_upload {
+            // アップロードは進捗 API が無いので、ファイルごとの開始だけを報告する。
+            // ここが中止の区切り（戻り値が `false` なら**このファイルは上げない**）。
+            if !on_progress(&SyncProgress {
+                phase: SyncPhase::Upload,
+                name: format!("{pack_id}.{PACK_EXTENSION}"),
+                index: 0,
+                count: 0,
+                bytes: 0,
+                total_bytes: None,
+            }) {
+                return Err(SyncError::Cancelled);
+            }
             let bytes = std::fs::read(&local_path)?;
             let file_id = drive.upload_multipart(
                 &format!("{pack_id}.{PACK_EXTENSION}"),
@@ -392,6 +486,17 @@ pub fn sync(request: SyncRequest<'_>) -> Result<SyncOutcome, SyncError> {
         );
     }
     if db_path.is_some() && can_backup_db {
+        // DB バックアップの書き出し前が最後の中止の区切り（`false` なら上げない）
+        if !on_progress(&SyncProgress {
+            phase: SyncPhase::Backup,
+            name: DB_BACKUP_NAME.to_string(),
+            index: 0,
+            count: 0,
+            bytes: 0,
+            total_bytes: None,
+        }) {
+            return Err(SyncError::Cancelled);
+        }
         let owner_filter = match (owner_key, identity_sub) {
             (Some(key), Some(sub)) => Some(crate::db::backup::OwnerFilter {
                 key,

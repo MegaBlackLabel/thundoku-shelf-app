@@ -606,6 +606,8 @@ pub struct SyncFailure {
     pub message: String,
     /// 鍵の復元（パスフレーズ入力 / ログイン）へ誘導すべきか
     pub needs_unlock: bool,
+    /// 利用者の中止（`SyncError::Cancelled`）。エラー表示ではなく通知で伝える。
+    pub cancelled: bool,
 }
 
 impl SyncFailure {
@@ -614,6 +616,7 @@ impl SyncFailure {
         Self {
             message: message.into(),
             needs_unlock: false,
+            cancelled: false,
         }
     }
 
@@ -622,6 +625,16 @@ impl SyncFailure {
         Self {
             message: message.into(),
             needs_unlock: true,
+            cancelled: false,
+        }
+    }
+
+    /// 利用者の中止（転送は止まったが、取り込み済みの本はそのまま残る）。
+    pub fn cancelled() -> Self {
+        Self {
+            message: "同期を中止しました".to_string(),
+            needs_unlock: false,
+            cancelled: true,
         }
     }
 }
@@ -645,6 +658,7 @@ pub fn sync_failure(error: &thundoku_core::drive::sync::SyncError) -> SyncFailur
                  お手数ですがストアから取り込み直してください"
             ),
             needs_unlock: false,
+            cancelled: false,
         },
         SyncError::PackKeyRequired(pack_id) => SyncFailure {
             message: format!(
@@ -652,10 +666,14 @@ pub fn sync_failure(error: &thundoku_core::drive::sync::SyncError) -> SyncFailur
                  設定画面の「本の鍵」からパスフレーズを入力して復元してください"
             ),
             needs_unlock: true,
+            cancelled: false,
         },
+        // 利用者の中止（エラーではない）。取り込み済みの本はそのまま残る。
+        SyncError::Cancelled => SyncFailure::cancelled(),
         other => SyncFailure {
             message: other.to_string(),
             needs_unlock: false,
+            cancelled: false,
         },
     }
 }

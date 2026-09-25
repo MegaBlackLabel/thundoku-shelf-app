@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use opfspack::{BackupEnvelope, PackBuilder, PackRootKey};
 use thundoku_core::db;
-use thundoku_core::drive::sync::{BACKUP_BASELINE_KEY, SyncError, sync};
+use thundoku_core::drive::sync::{
+    BACKUP_BASELINE_KEY, SyncError, SyncPhase, SyncProgress, sync, sync_with_progress,
+};
 use thundoku_core::drive::{DriveApi, DriveError, DriveFile};
 
 struct FakeDrive {
@@ -205,17 +207,28 @@ fn sync_env(
     env: &mut TestEnv,
     drive: &mut dyn DriveApi,
 ) -> Result<thundoku_core::drive::sync::SyncOutcome, SyncError> {
-    sync(thundoku_core::drive::sync::SyncRequest {
-        pool: &env.pool,
-        drive,
-        packs_dir: &env.packs(),
-        downloads_dir: &env.downloads(),
-        identity_sub: None,
-        pack_root_key: None,
-        owner_key: None,
-        folder_id: "folder-1",
-        db_path: None,
-    })
+    sync_env_with_progress(env, drive, &mut |_| true)
+}
+
+fn sync_env_with_progress(
+    env: &mut TestEnv,
+    drive: &mut dyn DriveApi,
+    on_progress: &mut dyn FnMut(&SyncProgress) -> bool,
+) -> Result<thundoku_core::drive::sync::SyncOutcome, SyncError> {
+    sync_with_progress(
+        thundoku_core::drive::sync::SyncRequest {
+            pool: &env.pool,
+            drive,
+            packs_dir: &env.packs(),
+            downloads_dir: &env.downloads(),
+            identity_sub: None,
+            pack_root_key: None,
+            owner_key: None,
+            folder_id: "folder-1",
+            db_path: None,
+        },
+        on_progress,
+    )
 }
 
 #[test]
@@ -305,6 +318,211 @@ fn skips_unchanged_md5() {
     let outcome = sync_env(&mut env, &mut drive).unwrap();
     assert_eq!(outcome.skipped, vec!["pack-1"]);
     assert_eq!(drive.download_count(), 1);
+}
+
+/// 進捗コールバックは転送中の pack ごとに呼ばれ、名前・何件目 / 全件・バイト数を伝える。
+///
+/// 分母（`count`）は「今回の同期で転送する pack の総数」なので、md5 一致でスキップした
+/// pack は数えない（表示が「2/5」のまま終わらない）。
+#[test]
+fn sync_with_progress_reports_each_pack_download() {
+    let mut env = TestEnv::new("progress");
+    let mut drive = FakeDrive::new();
+    let pack_1 = plain_pack("pages/page_0001.webp", b"AAAA");
+    let pack_2 = plain_pack("pages/page_0001.webp", b"BBBBBBBB");
+    drive.seed("pack-1.opfspack", &pack_1);
+    drive.seed("pack-2.opfspack", &pack_2);
+
+    let mut events: Vec<SyncProgress> = Vec::new();
+    let outcome = sync_env_with_progress(&mut env, &mut drive, &mut |progress| {
+        events.push(progress.clone());
+        true
+    })
+    .unwrap();
+
+    assert_eq!(outcome.downloaded.len(), 2);
+    assert_eq!(events.len(), 2, "pack ごとに進捗を報告する");
+    assert!(
+        events.iter().all(|e| e.phase == SyncPhase::Download),
+        "取得中はダウンロードとして報告する（アップロード・バックアップは走らない構成）"
+    );
+    let mut indexes: Vec<usize> = events.iter().map(|e| e.index).collect();
+    indexes.sort_unstable();
+    assert_eq!(indexes, vec![1, 2], "何件目は 1 始まりの連番");
+    assert!(
+        events.iter().all(|e| e.count == 2),
+        "分母は転送対象の総数: {events:?}"
+    );
+    let event = events
+        .iter()
+        .find(|e| e.name == "pack-1.opfspack")
+        .expect("ファイル名を報告する");
+    assert_eq!(event.bytes, pack_1.len() as u64);
+    assert_eq!(event.total_bytes, Some(pack_1.len() as u64));
+}
+
+/// 進捗コールバックが `false` を返したら、その場で中止する（書かない・取り込まない・
+/// 次の pack へ進まない）。
+#[test]
+fn sync_with_progress_stops_when_the_callback_asks_to_cancel() {
+    let mut env = TestEnv::new("cancel");
+    let mut drive = FakeDrive::new();
+    drive.seed(
+        "pack-1.opfspack",
+        &metadata_pack("中止される本", "", "", "2026-08-21"),
+    );
+    drive.seed(
+        "pack-2.opfspack",
+        &metadata_pack("まだ進まない本", "", "", "2026-08-21"),
+    );
+
+    let mut seen = 0usize;
+    let error = sync_env_with_progress(&mut env, &mut drive, &mut |_| {
+        seen += 1;
+        false
+    })
+    .unwrap_err();
+
+    assert!(
+        matches!(error, SyncError::Cancelled),
+        "中止は Cancelled で返す: {error}"
+    );
+    assert_eq!(seen, 1, "最初の進捗で止める");
+    assert_eq!(drive.download_count(), 1, "次の pack を取りに行かない");
+    assert!(
+        !env.packs().join("pack-1.opfspack").exists(),
+        "中止した pack を保存しない"
+    );
+    assert!(
+        db::books::get(&env.pool, "pack-1").unwrap().is_none(),
+        "中止した pack を取り込まない"
+    );
+}
+
+/// ローカルに pack を置き、`test-sub` が所有する本として登録する（＝アップロード対象）。
+/// 戻り値は所有者列の暗号鍵。
+fn seed_owned_local_pack(env: &TestEnv, pack_id: &str, bytes: &[u8]) -> [u8; 32] {
+    let key = [11u8; 32];
+    std::fs::write(env.packs().join(format!("{pack_id}.opfspack")), bytes).unwrap();
+    db::books::insert(
+        &env.pool,
+        &db::books::Book {
+            id: pack_id.into(),
+            title: pack_id.into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: format!("{pack_id}.opfspack"),
+            file_size: bytes.len() as i64,
+            opfs_path: format!("{pack_id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some(pack_id.into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-08-21 00:00:00".into(),
+            updated_at: "2026-08-21 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+    db::books::set_owner_sub(
+        &env.pool,
+        pack_id,
+        Some(thundoku_core::owner::encrypt(&key, "test-sub")),
+    )
+    .unwrap();
+    key
+}
+
+/// 所有者つき（アップロード・DB バックアップも走る）同期を進捗つきで実行する。
+fn owned_sync_with_progress(
+    env: &TestEnv,
+    drive: &mut dyn DriveApi,
+    key: &[u8; 32],
+    db_path: Option<&std::path::Path>,
+    on_progress: &mut dyn FnMut(&SyncProgress) -> bool,
+) -> Result<thundoku_core::drive::sync::SyncOutcome, SyncError> {
+    sync_with_progress(
+        thundoku_core::drive::sync::SyncRequest {
+            pool: &env.pool,
+            drive,
+            packs_dir: &env.packs(),
+            downloads_dir: &env.downloads(),
+            identity_sub: Some("test-sub"),
+            pack_root_key: None,
+            owner_key: Some(key),
+            folder_id: "folder-1",
+            db_path,
+        },
+        on_progress,
+    )
+}
+
+/// アップロードは「ファイルごとの開始」で進捗を報告し、そこで中止できる
+/// （転送そのものに進捗 API が無いので、開始前に止める）。
+#[test]
+fn sync_with_progress_stops_before_uploading_when_the_callback_asks_to_cancel() {
+    let env = TestEnv::new("cancel-upload");
+    let mut drive = FakeDrive::new();
+    let bytes = plain_pack("pages/page_0001.webp", b"LOCAL-ONLY");
+    let key = seed_owned_local_pack(&env, "pack-9", &bytes);
+
+    let mut phases: Vec<SyncPhase> = Vec::new();
+    let error = owned_sync_with_progress(&env, &mut drive, &key, None, &mut |progress| {
+        phases.push(progress.phase);
+        false
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, SyncError::Cancelled), "中止を返す: {error}");
+    assert_eq!(
+        phases,
+        vec![SyncPhase::Upload],
+        "アップロードの開始で中止を効かせる"
+    );
+    assert_eq!(drive.upload_count(), 0, "中止したファイルを上げない");
+    assert!(
+        db::sync_state::get(&env.pool, "pack-9").unwrap().is_none(),
+        "中止したファイルの同期状態を残さない"
+    );
+}
+
+/// DB バックアップの書き出し前も中止できる（`false` なら上げない）。
+#[test]
+fn sync_with_progress_stops_before_backing_up_the_database() {
+    let env = TestEnv::new("cancel-backup");
+    let mut drive = FakeDrive::new();
+    let key = [11u8; 32];
+    let db_path = env.root.join("thundoku-shelf.db");
+
+    let mut phases: Vec<SyncPhase> = Vec::new();
+    let error = owned_sync_with_progress(
+        &env,
+        &mut drive,
+        &key,
+        Some(&db_path),
+        &mut |progress| {
+            phases.push(progress.phase);
+            false
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, SyncError::Cancelled), "中止を返す: {error}");
+    assert_eq!(phases, vec![SyncPhase::Backup], "バックアップの前で止める");
+    assert_eq!(drive.upload_count(), 0, "バックアップを上げない");
 }
 
 #[test]

@@ -10,9 +10,10 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, Focusable as _, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement as _,
-    Subscription, Window, div, img, px,
+    Subscription, Window, div, img, px, relative,
 };
 use gpui_kit::{ReadGlobal as _, Styled as _};
+use gpui_kit::prelude::FluentBuilder as _;
 
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
@@ -109,6 +110,11 @@ pub struct SettingsView {
     key_busy: bool,
     /// パスフレーズ解除の確認ダイアログの表示フラグ。
     confirm_remove_passphrase: bool,
+    /// Drive 同期の進捗（pack のダウンロード中だけ `Some`。`render` は DB を読まない）。
+    sync_progress: Option<sync::SyncProgress>,
+    /// 実行中の同期の中止フラグ（`Some` の間だけ中止できる）。
+    /// 立っていると次の進捗で転送を止める（`SyncError::Cancelled`）。
+    sync_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// ビューアのホイール方向の設定キーと値。
@@ -146,6 +152,49 @@ fn logout_purge_failed_message(service: &str) -> String {
 /// 変わったらテストが落ちるようにしてある。
 fn is_google_auth_expired(message: &str) -> bool {
     message.contains("re-authorize required")
+}
+
+/// バイト数を表示用の文字列にする（1MB 未満は KB。小さい pack を「0 MB」と出さない）。
+fn format_transfer_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
+}
+
+/// 同期の進捗ラベル（純関数）。`Content-Length` が無い転送は「受信」とだけ出す
+/// （総数を偽らない）。
+fn sync_progress_label(progress: &sync::SyncProgress) -> String {
+    match progress.phase {
+        sync::SyncPhase::Download => {
+            let size = match progress.total_bytes.filter(|total| *total > 0) {
+                Some(total) => format!(
+                    "{} / {}",
+                    format_transfer_bytes(progress.bytes),
+                    format_transfer_bytes(total)
+                ),
+                None => format!("{} 受信", format_transfer_bytes(progress.bytes)),
+            };
+            format!(
+                "{} を取得中（{}/{}・{size}）",
+                progress.name, progress.index, progress.count
+            )
+        }
+        // 転送そのものに進捗 API が無いので、どのファイルを上げているかだけ出す
+        sync::SyncPhase::Upload => format!("{} をアップロード中", progress.name),
+        sync::SyncPhase::Backup => "バックアップを作成中".to_string(),
+    }
+}
+
+/// 進捗の割合（0..=100）。総数が分からないとき（アップロード・バックアップ、
+/// `Content-Length` 無しの取得）は `None`（バーを出さず、割合を偽らない）。
+fn sync_progress_percent(progress: &sync::SyncProgress) -> Option<u32> {
+    if progress.phase != sync::SyncPhase::Download {
+        return None;
+    }
+    let total = progress.total_bytes.filter(|total| *total > 0)?;
+    Some((progress.bytes.saturating_mul(100) / total).min(100) as u32)
 }
 
 impl SettingsView {
@@ -213,6 +262,8 @@ impl SettingsView {
             key_pending_owner: None,
             key_busy: false,
             confirm_remove_passphrase: false,
+            sync_progress: None,
+            sync_cancel: None,
         }
     }
 
@@ -1166,12 +1217,30 @@ impl SettingsView {
         Some(GOOGLE_AUTH_EXPIRED_NOTICE.to_string())
     }
 
-    /// Drive 同期（接続済み前提）。エンジンは `drive::sync::sync`。
+    /// 実行中の Drive 同期の中止を要求する（次の進捗で転送を止める）。
+    ///
+    /// 止まるのは転送だけで、取り込み済みの本はそのまま残る（`SyncError::Cancelled`）。
+    pub fn cancel_sync_drive(&mut self, cx: &mut Context<Self>) {
+        let Some(cancel) = self.sync_cancel.as_ref() else {
+            return;
+        };
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        log::info!("sync_drive_now: cancel requested");
+        cx.notify();
+    }
+
+    /// Drive 同期（接続済み前提）。エンジンは `drive::sync::sync_with_progress`。
     pub fn sync_drive_now(&mut self, cx: &mut Context<Self>) {
         self.busy = true;
         self.error = None;
+        self.sync_progress = None;
+        // 中止フラグは同期ごとに作り直す（前回の中止が残らないように）
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.sync_cancel = Some(cancel.clone());
         // busy 状態を即座に UI へ反映（スピナー表示のため）
         cx.notify();
+        // 進捗はチャネル経由で UI スレッドへ渡す（worker から直接 `notify` できない）
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<sync::SyncProgress>();
         let handle = cx.entity();
         let state = AppState::global(cx);
         let google = state.google.clone();
@@ -1216,17 +1285,24 @@ impl SettingsView {
                 .map_err(crate::pack_keys::SyncFailure::unlock)?;
             log::info!("sync_drive_now: running sync engine");
             // メインの DB プールをそのまま使う（WAL により同期タスクと並行可能）
-            let outcome = sync::sync(sync::SyncRequest {
-                pool: &db,
-                drive: &mut drive,
-                packs_dir: &packs_dir,
-                downloads_dir: &downloads_dir,
-                identity_sub: google_sub.as_deref(),
-                pack_root_key: pack_root_key.as_ref(),
-                owner_key: db_key.as_ref(),
-                folder_id: &folder_id,
-                db_path: Some(&db_path),
-            })
+            let outcome = sync::sync_with_progress(
+                sync::SyncRequest {
+                    pool: &db,
+                    drive: &mut drive,
+                    packs_dir: &packs_dir,
+                    downloads_dir: &downloads_dir,
+                    identity_sub: google_sub.as_deref(),
+                    pack_root_key: pack_root_key.as_ref(),
+                    owner_key: db_key.as_ref(),
+                    folder_id: &folder_id,
+                    db_path: Some(&db_path),
+                },
+                &mut |progress| {
+                    // UI 側が閉じている（送れない）か、中止が要求されていれば止める
+                    progress_tx.send(progress.clone()).is_ok()
+                        && !cancel.load(std::sync::atomic::Ordering::SeqCst)
+                },
+            )
             .map_err(|error| crate::pack_keys::sync_failure(&error))?;
             log::info!(
                 "sync_drive_now: done dl={} ul={} skip={} conflicts={} db_backup={}",
@@ -1245,6 +1321,35 @@ impl SettingsView {
             Ok(outcome)
         });
         cx.spawn(async move |_window, cx| {
+            // 進捗を UI へ流す（worker が終わってチャネルが閉じるまで）。
+            // 値が変わったときだけ描き直す（50ms ごとの notify で設定画面を無駄に描かない）。
+            let mut disconnected = false;
+            while !disconnected {
+                let mut latest: Option<sync::SyncProgress> = None;
+                loop {
+                    match progress_rx.try_recv() {
+                        Ok(progress) => latest = Some(progress),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some(progress) = latest {
+                    handle.update(cx, |this, cx| {
+                        if this.sync_progress.as_ref() != Some(&progress) {
+                            this.sync_progress = Some(progress);
+                            cx.notify();
+                        }
+                    });
+                }
+                if !disconnected {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                }
+            }
             let result = task.await;
             // 同期が高速に終わってもスピナーが見えるよう最短表示時間を確保する
             cx.background_executor()
@@ -1252,6 +1357,8 @@ impl SettingsView {
                 .await;
             handle.update(cx, |this, cx| {
                 this.busy = false;
+                this.sync_progress = None;
+                this.sync_cancel = None;
                 match result {
                     Ok(outcome) => {
                         // 最終同期日時・ファイル数・容量を保存（設定画面に表示する）
@@ -1297,11 +1404,22 @@ impl SettingsView {
                         }
                     }
                     Err(failure) => {
-                        log::error!("sync_drive_now failed: {}", failure.message);
-                        if let Some(notice) = this.handle_google_auth_expiry(&failure.message, cx) {
+                        // 利用者の中止はエラーではない（取り込み済みの本はそのまま残る）
+                        if failure.cancelled {
+                            log::info!("sync_drive_now: cancelled by the user");
+                            crate::app_state::set_toast_kind(
+                                cx,
+                                crate::app_state::ToastKind::Info,
+                                failure.message.clone(),
+                            );
+                        } else if let Some(notice) =
+                            this.handle_google_auth_expiry(&failure.message, cx)
+                        {
                             // トークン失効。生の応答ではなく日本語の案内を出す
+                            log::error!("sync_drive_now failed: {}", failure.message);
                             this.error = Some(notice);
                         } else {
+                            log::error!("sync_drive_now failed: {}", failure.message);
                             this.error = Some(failure.message.clone());
                             if failure.needs_unlock {
                                 // 鍵（v3 の PRK）が無い。解錠ダイアログ（パスフレーズ入力）
@@ -2185,6 +2303,8 @@ impl Render for SettingsView {
         self.refresh_google_profile(cx);
         let busy = self.busy;
         let error = self.error.clone();
+        // 同期の進捗（`sync_drive_now` がチャネル経由で更新する。ここでは DB を引かない）
+        let sync_progress = self.sync_progress.clone();
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let google_profile = AppState::global(cx).google_profile.lock().clone();
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
@@ -2440,6 +2560,53 @@ impl Render for SettingsView {
                                     }),
                             )
                     )
+                    // 同期の進捗（pack のダウンロード中だけ出す。総数が分からない転送では
+                    // バーを出さずに「受信」とだけ表示する＝割合を偽らない）
+                    .when_some(sync_progress, |this, progress| {
+                        let label = sync_progress_label(&progress);
+                        let percent = sync_progress_percent(&progress);
+                        let track = cx.theme().muted;
+                        let fill = cx.theme().primary;
+                        this.child(
+                            div()
+                                .debug_selector(|| "sync-progress".into())
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_xs().text_color(muted_fg).child(label))
+                                .when_some(percent, |this, percent| {
+                                    this.child(
+                                        div()
+                                            .debug_selector(|| "sync-progress-bar".into())
+                                            .h(px(6.0))
+                                            .w_full()
+                                            .rounded_full()
+                                            .bg(track)
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .rounded_full()
+                                                    .bg(fill)
+                                                    .w(relative(percent as f32 / 100.0)),
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    Button::new("drive-sync-cancel")
+                                        .debug_selector(|| "drive-sync-cancel".into())
+                                        .label("中止")
+                                        .cursor_pointer()
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.cancel_sync_drive(cx);
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                    })
                     // 現在の保存先（ローカルパス）
                     .child(
                         div()
@@ -3328,6 +3495,7 @@ impl Render for SettingsView {
 mod tests {
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
+    use thundoku_core::drive::sync::{SyncPhase, SyncProgress};
 
     use thundoku_core::db;
 
@@ -3816,6 +3984,173 @@ mod tests {
             cx.read(|cx| input.read(cx).value()),
             "passphrase-1",
             "切り替えで入力内容を失っている"
+        );
+    }
+
+    /// ログインしていないときの同期でも、進捗の送出ループを抜けて busy は必ず解除される
+    /// （チャネルが閉じたままループが残る、といった取りこぼしを防ぐ）。
+    #[gpui_kit::test]
+    async fn sync_drive_now_clears_busy_when_it_fails(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(SettingsView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| this.sync_drive_now(cx));
+        });
+        assert!(cx.read(|cx| view.read(cx).busy), "実行中は busy");
+
+        // worker の終了（進捗チャネルのクローズ）と最短表示（600ms）を進める
+        for _ in 0..40 {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+
+        cx.read(|cx| {
+            let view = view.read(cx);
+            assert!(!view.busy, "busy が解除されない");
+            assert!(view.sync_progress.is_none(), "進捗が残っている");
+            assert!(view.sync_cancel.is_none(), "中止フラグが残っている");
+            assert!(
+                view.error.is_some(),
+                "ログイン不足がエラーとして出ていない"
+            );
+        });
+    }
+
+    /// 同期の進捗ラベルと割合（純関数）。段階で文言が変わり、総数が分からない
+    /// 段階（アップロード・バックアップ・`Content-Length` 無しの取得）では割合を出さない。
+    #[test]
+    fn sync_progress_label_and_percent_are_readable() {
+        let progress = SyncProgress {
+            phase: SyncPhase::Download,
+            name: "pack-1.opfspack".into(),
+            index: 2,
+            count: 5,
+            bytes: 3 * 1024 * 1024,
+            total_bytes: Some(9 * 1024 * 1024),
+        };
+        assert_eq!(
+            sync_progress_label(&progress),
+            "pack-1.opfspack を取得中（2/5・3.0 MB / 9.0 MB）"
+        );
+        assert_eq!(sync_progress_percent(&progress), Some(33));
+
+        let unknown = SyncProgress {
+            total_bytes: None,
+            bytes: 512 * 1024,
+            ..progress.clone()
+        };
+        assert_eq!(
+            sync_progress_label(&unknown),
+            "pack-1.opfspack を取得中（2/5・512 KB 受信）"
+        );
+        assert_eq!(
+            sync_progress_percent(&unknown),
+            None,
+            "総数が不明ならバーを出さない（割合を偽らない）"
+        );
+
+        // アップロード・バックアップは段階の開始だけを報告する（進捗の割合は無い）
+        let upload = SyncProgress {
+            phase: SyncPhase::Upload,
+            name: "pack-2.opfspack".into(),
+            index: 0,
+            count: 0,
+            bytes: 0,
+            total_bytes: None,
+        };
+        assert_eq!(
+            sync_progress_label(&upload),
+            "pack-2.opfspack をアップロード中"
+        );
+        assert_eq!(sync_progress_percent(&upload), None);
+
+        let backup = SyncProgress {
+            phase: SyncPhase::Backup,
+            name: "thundoku-backup.json".into(),
+            index: 0,
+            count: 0,
+            bytes: 0,
+            total_bytes: None,
+        };
+        assert_eq!(sync_progress_label(&backup), "バックアップを作成中");
+        assert_eq!(sync_progress_percent(&backup), None);
+    }
+
+    /// 同期中は進捗（ファイル名・何件目 / 全件・バー）と「中止」を出し、
+    /// 「中止」でその同期に中止が伝わる。
+    #[gpui_kit::test]
+    async fn drive_sync_shows_progress_with_a_cancel_button(cx: &mut TestAppContext) {
+        // Drive カードは設定画面の下の方（実測 y≈3000px）にあるので、縦に長いウィンドウで描く
+        // （ウィンドウ外に描かれた要素はクリックできない）
+        const WINDOW_H: f32 = 3400.0;
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| *AppState::global(cx).google_logged_in.lock() = true);
+        let view = cx.new(SettingsView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(WINDOW_H),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..3 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        assert!(
+            visual.debug_bounds("sync-progress").is_none(),
+            "同期していないときは進捗を出さない"
+        );
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.sync_progress = Some(SyncProgress {
+                    phase: SyncPhase::Download,
+                    name: "pack-1.opfspack".into(),
+                    index: 1,
+                    count: 3,
+                    bytes: 1024 * 1024,
+                    total_bytes: Some(4 * 1024 * 1024),
+                });
+                this.sync_cancel = Some(cancel.clone());
+                cx.notify();
+            })
+        });
+        for _ in 0..3 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+
+        assert!(
+            visual.debug_bounds("sync-progress").is_some(),
+            "進捗が出ていない"
+        );
+        assert!(
+            visual.debug_bounds("sync-progress-bar").is_some(),
+            "バーが出ていない"
+        );
+        let button = visual
+            .debug_bounds("drive-sync-cancel")
+            .expect("中止ボタンが出ていない");
+        // ウィンドウの外に描かれた要素はクリックできない。設定画面が伸びたら
+        // このテストのウィンドウも高くする（クリックが無反応になる前に気付けるように）。
+        assert!(
+            button.center().y < gpui_kit::px(WINDOW_H),
+            "中止ボタンがウィンドウの外にある（ウィンドウを高くする）: {button:?}"
+        );
+        visual.simulate_click(button.center(), gpui_kit::Modifiers::default());
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "中止が実行中の転送に伝わらない"
         );
     }
 }
