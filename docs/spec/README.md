@@ -124,8 +124,6 @@ flowchart LR
 
 | 箇所 | 内容 |
 |---|---|
-| 実装（未対応） | `ReadFilter::Unread` がローカル本のみ一致（未ダウンロード本は「未読」表示なのに未読フィルタに出ない） |
-| 実装（未対応） | 履歴一覧が非仮想化（全行描画） |
 | 実装（既知の制約） | Drive の保存先フォルダはアカウント別ではない（単一キー。`docs/account-switch.md` に明記済み） |
 | 実装（Web 版のみ未対応） | pack の鍵は **v3（乱数ルート鍵 + `sub`／パスフレーズのラップ）へ移行済み**（`docs/spec/03-import-and-pack.md` §4.5 / `docs/spec/10-pack-keys.md`）。**v2 の pack は読めない**（`PackError::Version(2)`）ので、旧 pack は再取り込みが要る。残るのは **Web 版（`thundoku-shelf` モノレポの `packages/opfspack`）の対応**（§10 §7 のチェックリスト。Web が書く v2 pack はデスクトップでは開けない） |
 | 運用（公開前の確認） | Google Cloud のクライアント種別・Web 版との secret 共用・同意画面の設定は**コードからは確認できない**。公開前に `docs/spec/06-sync-auth-drive.md` §2.5 の表で確認する |

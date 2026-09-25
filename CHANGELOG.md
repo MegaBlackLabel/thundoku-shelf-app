@@ -61,7 +61,40 @@
   `poll_sync_enabled` 列を持たない古いバックアップの復元時も、注目イベントには既定を補う。
   `crates/core/src/db/checklist.rs`、`crates/core/src/tbf/sync.rs`、`crates/core/src/db/backup.rs`
 
+- **Drive 同期の進捗を表示し、途中で中止できるようにする**:
+  大きな pack の取得中は「今すぐ同期」がスピナーになるだけで、何をどれだけ取得しているのか
+  分からず、止める手段も無かった。`drive::sync` が pack のダウンロードごとに進捗
+  （ファイル名 / 何件目 / 受信バイト数。`Content-Length` が無ければ総数なし＝割合は出さない）を
+  報告し、設定画面が進捗バーと「中止」を出す。段階（`SyncPhase`）も報告するので、
+  アップロード中は「〜をアップロード中」、DB バックアップ中は「バックアップを作成中」と出し、
+  進み具合が分からない段階ではバーを出さない。中止は次の区切り（取得中はその場、
+  アップロードは次のファイルの直前、バックアップは書き出す前）で効き
+  （`SyncError::Cancelled`、取り込み済みの本はそのまま残る）、エラーではなく通知で伝える。
+  `crates/core/src/drive/sync.rs`、`crates/app/src/views/settings.rs`、`crates/app/src/pack_keys.rs`
+
 ### Fixed
+
+- **チェックリストの試し読みが開けなくなっていた**:
+  試し読み画像は自サイトの `/api/image/{id}.png` から落ちるが、本体ダウンロード用の許可リスト
+  （`/api/product-dlc/` と署名付き GCS だけ）をそのまま使っていたため、**画像の取得が全部
+  `BlockedUrl` で拒否**されていた（実測: `https://techbookfest.org/api/image/…` が
+  「許可しないパス」。`docs/spec/09-stores.md` の SEC-02 対応で入った制限）。
+  自サイト画像（試し読みページ・表紙）専用の許可リスト（`/api/image/` だけ）と入口
+  `TbfClient::download_site_image(_with_progress)` を分け、本体用の入口は画像パスを拒否したまま
+  にした。同じサイトの画像なので Cookie は付く（別ホストへは付けない）。
+  **本棚の TBF 表紙のフォールバック**（認証つきクライアントで取り直す経路）も同じ理由で
+  必ず失敗する状態だったので、同じ入口に切り替えた。
+  あわせて取得中はチェックリストの行の表紙に**進捗リングと %** を出す（ページごとの受信
+  バイトで進み、`Content-Length` が無い画像はページを読み切った時点で進む）。
+  `crates/core/src/tbf/mod.rs`、`crates/app/src/views/checklist.rs`
+  （リングは `crates/app/src/views/bookshelf.rs` の `progress_ring_image` を共有）
+
+- **未ダウンロードの本が「未読」フィルタに出なかった**:
+  カードのバッジは `card.local` が無い本を「未読」と表示し、サイドバーの未読バッジも
+  未読として数えていたが、`ReadFilter::Unread` はローカルに取り込んだ本だけを見ていた。
+  そのため未ダウンロードの本は「未読 12」と表示されても一覧の未読フィルタに出なかった。
+  表示・バッジと同じ既定（`ReadingState::Unread`）にそろえる。
+  `crates/app/src/views/bookshelf.rs`
 
 - **終了時に `Exited with leaked handles` でクラッシュしていた**:
   配布ビルドで `gpui-kit` の `test-support` を有効にしていたため、gpui の `leak-detection` が
@@ -128,6 +161,15 @@
   パスフレーズ入力は右端の**目のアイコン**でマスク⇄表示を切り替えられる（設定と解錠ダイアログの
   両方。既定はマスク。gpui-kit の `Input::mask_toggle()` を使い、アイコンは同梱の lucide `eye` /
   `eye-off` を再利用）。`crates/app/src/{views/settings.rs, workspace.rs, app_state.rs, pack_keys.rs}`
+
+- **閲覧履歴の一覧を本棚と同じ行単位の仮想化にする**:
+  履歴は日付ぶんの全カード / 全行を毎フレーム構築していた（表紙は 1 冊 1 回に共有していたが、
+  要素の構築とタグの計測は全件ぶん走っていた）。本棚と同じ `gpui_kit::list` + `ListState` に
+  載せ替え、行（日付バー + カードは列数ぶん / リストは 1 件）を組み立てて**可視行だけ**を
+  構築する。列数はウィンドウ幅で変わるため、変わったときだけ行を組み直す。行の高さは一律の
+  ヒントを与えて描画時に実測へ置き換える（`measure_all` は初回フレームで全行を構築するため
+  使わない）。選択移動のスクロールは `ListState::scroll_to_reveal_item` に置き換える。
+  `crates/app/src/views/history.rs`
 
 ## [0.2.8] - 2026-09-24
 

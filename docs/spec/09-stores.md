@@ -34,6 +34,7 @@ BOOTH のすべて）。
 | FANZA | 302 の `Location`（CDN）+ **以降の各ホップ** | `contents.doujin.dmm.co.jp` とそのサブドメイン（実測は **2 種類**: `doujin.contents.doujin.dmm.co.jp` / `doujin03.contents.doujin.dmm.co.jp`。どちらも配下） |
 | 技術書典 | `resolve_download_url` の入力（3xx の `Location` は `validate_download_url` で判定） | `techbookfest.org`（完全一致） |
 | 技術書典 | `download_with_progress`（本体 + **各ホップ**） | `techbookfest.org` + `/api/product-dlc/`、`storage.googleapis.com` + `/tbf-tokyo-product-dlc/`。**許可 = Cookie を付けるではない**: `Cookie` / `X-XSRF-TOKEN` は宛先が `techbookfest.org` のときだけ付ける（GCS は配布先であってセッションの宛先ではない） |
+| 技術書典 | `download_site_image(_with_progress)`（**自サイトの画像** = 試し読みページ・表紙 + **各ホップ**） | `techbookfest.org` + **`/api/image/`** のみ（`TBF_SITE_IMAGE_RULES`）。本体用のリストとは別。同じサイトの画像なので Cookie は付く。本体用の入口（`download_*`）は画像パスを拒否し、画像用の入口は本体パス・別ホストを拒否する（`crates/core/tests/download_credentials.rs`） |
 
 検証に失敗したら**リクエストを送らずに** `BlockedUrl` を返す
 （`crates/core/tests/download_credentials.rs` で「1 件も送らないこと」を確認している）。

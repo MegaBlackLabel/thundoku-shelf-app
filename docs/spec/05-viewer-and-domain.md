@@ -232,7 +232,7 @@ pub fn from_progress(progress: Option<&ReadingProgress>) -> Self {
 |---|---|---|
 | カードのバッジ | `card.local` が無ければ `unwrap_or(ReadingState::Unread)`。`Read` → 「読了」（背景 `rgb(0xd1fae5)` / 文字 `rgb(0x047857)`）、`Reading` → 「読んでいる途中」（背景 `rgb(0xe0f2fe)` / 文字 `rgb(0x0369a1)`）、`Unread` → 「未読」（背景 `rgb(0xfef3c7)` / 文字 `rgb(0xb45309)`）を表紙左上に重ねる | `crates/app/src/views/bookshelf.rs:4043-4059` |
 | リストのステータス | ローカル本のみ `Read` → `status_tag(database_id, "read", "既読", TagVariant::Success)` / `Reading` → `("reading", "読んでいる途中", TagVariant::Info)` / `Unread` → `("unread", "未読", TagVariant::Secondary)`。未ダウンロード本は「未読」ではなく `"not-downloaded"` のアイコンを出す | `crates/app/src/views/bookshelf.rs:4974`、`crates/app/src/views/bookshelf.rs:5017` |
-| 表示とフィルタの差 | 未ダウンロード本はカード上「未読」バッジだが、`ReadFilter::Unread` は `card.local.map(|e| e.reading_state) == Some(Unread)` なので **未読フィルタに一致しない** | `crates/app/src/views/bookshelf.rs:3966`、`crates/app/src/views/bookshelf.rs:2195-2208` |
+| 表示とフィルタ | **一致**（`card.local` が無い本＝未ダウンロード本は `unwrap_or(ReadingState::Unread)` で「未読」表示・未読フィルタの両方に載る。サイドバーの未読バッジ `refresh_unread_count` と同じ数え方） | `crates/app/src/views/bookshelf.rs:3966`、`crates/app/src/views/bookshelf.rs:3069-3088` |
 
 使用者（判定が 1 か所であることの根拠）: 本棚カード（`crates/app/src/views/bookshelf.rs:1355`）、フィルタ（`crates/app/src/views/bookshelf.rs:2216-2228`）、設定の冊数集計（`crates/app/src/views/settings.rs:256-259`）、履歴画面（`crates/app/src/views/history.rs:265-267`）、付箋画面（`crates/app/src/views/notes.rs:167-169`）、サイドバー未読バッジ（`crates/app/src/workspace.rs:483-484`）。
 
@@ -567,7 +567,7 @@ pub enum ReadFilter { All, Unread, Reading, Read, Favorite }   // crates/app/src
 | 6 | タグ | `selected_tags` が非空のとき `any(|t| card_tags.contains(t))` が false なら除外（**OR**）。`card_tags` = `card.local.map(|e| e.tags)` に **`bookshelf_items.tags_json` も結合**（`bookshelf::tags_of(&card.shelf)`。未ダウンロード本もチップが出ているタグで一致する） | カテゴリ内 OR / 他とは AND | `crates/app/src/views/bookshelf.rs:2672-2691` |
 | 7 | サークル | `circle_filter == Some(c)` のとき `shelf.circle_name != *c` なら除外（完全一致・大小文字区別あり） | AND | `crates/app/src/views/bookshelf.rs:2183-2187` |
 | 8 | 作者 | `author_filter == Some(a)` のとき `shelf.author != *a` なら除外（完全一致） | AND | `crates/app/src/views/bookshelf.rs:2188-2192` |
-| 9 | 読書状態 / お気に入り | `ReadFilter::All` → 通す / `Unread` / `Reading` / `Read` → `card.local.map(|e| e.reading_state) == Some(該当状態)`（ローカル本のみ該当。リモート本は不一致）/ `Favorite` → `card.shelf.is_favorite == 1` | AND | `crates/app/src/views/bookshelf.rs:2195-2208` |
+| 9 | 読書状態 / お気に入り | `ReadFilter::All` → 通す / `Unread` → `card.local.map(|e| e.reading_state).unwrap_or(ReadingState::Unread) == Unread`（**未ダウンロード本も未読として通す**）/ `Reading` / `Read` → `card.local.map(|e| e.reading_state) == Some(該当状態)`（ローカル本のみ該当）/ `Favorite` → `card.shelf.is_favorite == 1` | AND | `crates/app/src/views/bookshelf.rs:3069-3088` |
 
 適用箇所は 2 系統あり、どちらも同じ `matches_filter` を通る:
 

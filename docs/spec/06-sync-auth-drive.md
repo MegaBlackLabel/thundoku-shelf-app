@@ -192,7 +192,7 @@
 - **取得は「保存できたのに戻せない」状態を解消した**: 以前は通常 API（`Transport::send`）を通っていたため応答本文が `MAX_API_BODY_BYTES`（**16 MiB**）で打ち切られ、16 MiB 超の pack / DB JSON を取得できなかった。現在は `DriveClient::download_with_progress` が `Transport::send_download` を使うので、上限は `MAX_DOWNLOAD_BODY_BYTES`（**2 GiB**）になり、進捗コールバックとキャンセルも効く `crates/core/src/drive/mod.rs:201-234`, `crates/core/src/tbf/transport.rs:129-133`。
 - `DriveError::Cancelled` を追加（進捗コールバックが `false` を返したとき。**部分的な本文は返さない**）。`From<TbfError>` は `TbfError::Cancelled` だけ `DriveError::Cancelled` に写し、他は `Network` にする `crates/core/src/drive/mod.rs:41-42`, `:45-51`。
 - **Content-Length が無い応答でも進捗・キャンセルは効く**: `read_body_with_progress` が `total = 0` のとき **1 MiB 刻み**で通知し（`UNKNOWN_TOTAL_STEP`）、読み切ったら最後のサイズを一度通知する `crates/core/src/tbf/transport.rs:175-227`（`:182`, `:207`, `:224-226`）。
-- 同期エンジン（`drive/sync.rs`）は `drive.download(...)` を呼ぶため（pack = `:268`、DB バックアップ復元 = `:545`、差分検査 = `:649`）、**pack も DB JSON もこの 2 GiB 経路を通る**。現状 `download_with_progress` を直接呼ぶのはテストのみで、進捗表示・キャンセルは API としては用意されているが UI からは未使用 `crates/core/src/drive/sync.rs:254`, `:483`, `:548`, `crates/core/src/drive/mod.rs:414-432`。
+- 同期エンジン（`drive/sync.rs`）は pack の取得に `drive.download_with_progress(...)` を通す（進捗 = `sync_with_progress` の報告、キャンセル = コールバックが `false`）。DB バックアップの復元（`:545`）と差分検査（`:649`）は `drive.download(...)`（＝`download_with_progress` に委譲）で、こちらは 2 GiB 経路だけを使い進捗は報告しない（1 ファイルの小さな JSON のため）`crates/core/src/drive/sync.rs:312-331`, `crates/core/src/drive/mod.rs:414-432`。
 - 同期フォルダは My Drive 直下の `thundoku-shelf/`（Web 版 appdata ではなくユーザー可視フォルダ）`docs/features.md:440-442`。フォルダ ID は初回同期時に `create_folder("thundoku-shelf")` で作成し `app_settings['drive.sync.folder_id']` に保存 `crates/app/src/views/settings.rs:799-808`。
 - **鍵 bundle `thundoku-keys.json`（v3）**: 同じフォルダに、`sub` / パスフレーズで**ラップした** PRK を置く（ファイル形式・ラップの計算は `docs/spec/10-pack-keys.md` §3.2、実装は `crates/core/src/pack_keys.rs`）。
   - 取得 `pack_keys::load_bundle(drive, folder_id, owner_id)`: 名前で一覧から探してダウンロードし、**`owner_id` が一致しない bundle は使わない**（`PackKeysError::OwnerMismatch`。黙って上書きすると相手の鍵を失うため）。無ければ `None`。
@@ -200,7 +200,7 @@
   - **未アップロードの印**は `app_settings['drive.pack_keys.pending']`（値は `owner_id`）。取り込み中のアップロード失敗は取り込みを止めず、印を残して**同期の最後に再試行**する（`retry_pending_upload`。§3.2 手順 8）。この間その鍵は端末にしか無い＝端末故障で復元不能なので、警告ログを出す。
   - keyring に PRK が無い / 未ログインのときは何もしない（再試行は `false`）。`crates/core/src/pack_keys.rs:23`, `:29`, `:214-245`, `:268-325`
 
-### 3.2 双方向同期アルゴリズム（`drive::sync::sync`）
+### 3.2 双方向同期アルゴリズム（`drive::sync::sync_with_progress`）
 
 入力 `SyncRequest` のフィールド `crates/core/src/drive/sync.rs:190-210`: `pool`, `drive`, `packs_dir`（DL 先/UL 元）, `downloads_dir`（作業用）, `identity_sub: Option<&str>`（未ログインは None）, `pack_root_key: Option<&PackRootKey>`（v3 の PRK。未ログインは None。冊ごとの pack 鍵は `derive_pack_key(pack_id)` で導出）, `owner_key: Option<&[u8;32]>`, `folder_id`, `db_path: Option<&Path>`（None なら DB バックアップ/復元をしない）。
 
@@ -214,7 +214,7 @@
    1. `sync_state::get(pool, pack_id)` を読む。
    2. `drive_md5` が空でなく `state.md5` と一致 → スキップ（`outcome.skipped`）`crates/core/src/drive/sync.rs:255-264`。
    3. `local_changed = state があり、ローカル pack の mtime(秒) > state.last_synced_at("%Y-%m-%d %H:%M:%S")`（厳密に大。ファイル無し・metadata 取得失敗・mtime 取得失敗・日時パース失敗はすべて false = 未変更扱い）`crates/core/src/drive/sync.rs:87-107`。
-   4. `drive.download(file.id)` で全バイト取得（実体は `Transport::send_download` の 2 GiB + 進捗/キャンセル経路。§3.1）`crates/core/src/drive/sync.rs:268`。
+   4. `drive.download_with_progress(file.id, on_progress)` で全バイト取得（実体は `Transport::send_download` の 2 GiB + 進捗/キャンセル経路。§3.1）。進捗は `SyncProgress { name, index, count, bytes, total_bytes }` として `sync_with_progress` のコールバックへ渡す（`total_bytes` は `Content-Length` が無ければ `None`）。コールバックが `false` を返すと `SyncError::Cancelled` で同期全体を中断する（**その pack は書かない・取り込まない。取り込み済みの分は残る**）`crates/core/src/drive/sync.rs:284-331`。
    5. `PackReader::open(&bytes)` が失敗 → **`PackError::Version` は `SyncError::UnsupportedPackVersion`**（v2 以前の pack。ストアからの**再取り込み**を案内）、それ以外は `SyncError::InvalidPack` `crates/core/src/drive/sync.rs:269-277`。
    6. ヘッダの `ENCRYPTED` が立ち、`pack_root_key` が無い → `SyncError::PackKeyRequired`（同期全体を中断）。**平文として読む・平文で上書きする経路は無い**（fail-closed）`crates/core/src/drive/sync.rs:279-281`。
    7. 競合（`local_changed` かつローカル pack が存在）→ ローカルを `packs/{pack_id}.conflict-local.opfspack` にコピーし `outcome.conflicts` に追加。**Drive 側が勝つ**。
@@ -222,12 +222,14 @@
    9. `import_book` で DB 反映（後述）。
    10. ログイン中なら `books::set_owner_sub(pack_id, encrypt(key, sub))`。
    11. `sync_state::upsert(pack_id, drive_file_id, md5, modified_time, last_synced_at=now)`。`now` は UTC の `%Y-%m-%d %H:%M:%S` `crates/core/src/drive/sync.rs:81-83`。
-6. **アップロード方向**（`books::list(pool)` の全行について）`crates/core/src/drive/sync.rs:327-377`:
+
+6. **アップロード方向**（`books::list(pool)` の全行について）:
    1. `pack_id = book.pack_id`（無ければ `book.id`）。空ならスキップ。
    2. `upload_ids` に含まれない本（未所属・他アカウント）はスキップ。
    3. `packs_dir/{pack_id}.opfspack` が無ければスキップ。
    4. `sync_state` が無ければアップロード。あれば「Drive 側に同じ `drive_file_id` がまだ存在」**かつ**「ローカル mtime > last_synced_at」のときだけアップロード（削除は伝播させない）。
-   5. `upload_multipart` 実行後、`sync_state::upsert(md5 = md5(local bytes), modified_time = None, last_synced_at = now)`。
+   5. 上げる直前に `SyncPhase::Upload` の進捗（`count = 0` = 総数不明。ファイル名のみ）を報告し、`false` なら**そのファイルを上げずに** `SyncError::Cancelled` で中断する（転送そのものは止められないので、ここが区切り）。
+   6. `upload_multipart` 実行後、`sync_state::upsert(md5 = md5(local bytes), modified_time = None, last_synced_at = now)`。
 7. **DB バックアップ**（`db_path.is_some()` のとき）`crates/core/src/drive/sync.rs:379-485`:
    1. `db::backup::export_json(pool, Some(&upload_ids), owner_filter)` でテキストテーブルの JSON を生成（所有者フィルタは必須。無ければバックアップしない）。
    2. **PRK があれば `thundoku-backup.json` を v3 の暗号化された封筒にする**（後述。仕様は `docs/spec/10-pack-keys.md` §11）。**鍵が無ければ平文（v2）で書き、警告をログに残す**（鍵が用意できないだけで利用者の唯一の控えを失う方が危険、という判断）`crates/core/src/drive/sync.rs:406-419`。
@@ -238,8 +240,9 @@
    5. 上げない場合（同じ内容）→ `drive.touch(file.id)` で `modifiedTime` だけ現在時刻に更新（バックアップの更新日時が古いままにならないように）。
    6. どちらの場合も基準値を保存する（**v3 = `content_hmac` / v2 = 正規形 md5**。形式ごとに比較できる値が違う）`crates/core/src/drive/sync.rs:478-485`, `:598`。
 8. **鍵 bundle の再試行**（`identity_sub` があるとき）`crates/core/src/drive/sync.rs:487-500`: `pack_keys::PackKeyStore::retry_pending_upload` を呼び、`drive.pack_keys.pending` が自分の `owner_id` なら `thundoku-keys.json` を上げ直して印を消す。**失敗しても同期全体は成功**として扱う（印は残り、次の同期で再試行。§3.1）。
+- 進捗つき API: `sync(request)` は `sync_with_progress(request, &mut |_| true)`（進捗を使わない呼び出し＝起動時・終了時の自動同期）。`SyncProgress` は `phase`（`Download` / `Upload` / `Backup`）+ 名前・何件目/全件（`0` = 総数不明）・受信バイト数を持つ。ダウンロードの分母 `count` は**その回に転送する pack の総数**で、md5 一致でスキップした pack は数えない（先に転送対象を確定してから回す）。**中止が効くのはこの 3 つの区切りだけ**（取得中はその場、アップロードは次のファイルの直前、バックアップは書き出す前）。
 - 戻り値 `SyncOutcome` `crates/core/src/drive/sync.rs:31-43`: `downloaded` / `uploaded` / `skipped` / `conflicts`（pack_id の Vec）, `file_count`（Drive フォルダ内の全ファイル数）, `total_bytes`（Σ size、bytes）, `database_backed_up`, `database_restored`。
-- エラー型 `SyncError` `crates/core/src/drive/sync.rs:47-69`: `Drive` / `Io` / `Db` / `Pack` / `InvalidPack` / **`PackKeyRequired`**（暗号化 pack だが PRK が無い。fail-closed） / **`UnsupportedPackVersion { pack_id, version }`**（v2 以前の pack。再取り込みを案内） / **`BackupKeyRequired(owner_id)`**（暗号化された DB バックアップだが鍵が無い） / **`Backup(BackupError)`**（バックアップの形式不正・復号失敗）。
+- エラー型 `SyncError`: `Drive` / `Io` / **`Cancelled`**（進捗コールバックが中止を要求した。利用者操作なので UI はエラーではなく通知で伝える） / `Db` / `Pack` / `InvalidPack` / **`PackKeyRequired`**（暗号化 pack だが PRK が無い。fail-closed） / **`UnsupportedPackVersion { pack_id, version }`**（v2 以前の pack。再取り込みを案内） / **`BackupKeyRequired(owner_id)`**（暗号化された DB バックアップだが鍵が無い） / **`Backup(BackupError)`**（バックアップの形式不正・復号失敗）。
 - **削除は双方向とも伝播しない**（モジュールコメント `crates/core/src/drive/sync.rs:1-16`、`docs/features.md:447-450`）。
 - 注意（実装依存）: ダウンロード方向は `HashMap` を反復するため処理順は不定 `crates/core/src/drive/sync.rs:239-245`。
 
