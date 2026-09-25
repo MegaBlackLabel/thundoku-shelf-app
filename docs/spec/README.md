@@ -125,10 +125,16 @@ flowchart LR
 | 箇所 | 内容 |
 |---|---|
 | 実装（既知の制約） | Drive の保存先フォルダはアカウント別ではない（単一キー。`docs/account-switch.md` に明記済み） |
+| セキュリティ（未対応） | **F02**: ローカル SQLite（書誌・抽出本文・WAL）は平文。仕様では「ディスク暗号化 + OS アカウント分離が前提」と明記（`docs/spec/10-pack-keys.md` §11.1）。恒久対策は端末鍵での選択暗号化 |
+| セキュリティ（未対応） | **F03**: 未ログイン時の取り込みは平文 `.opfspack`（`crates/app/src/pack_keys.rs` の `import_root_key`）。ログイン中の鍵欠落は取り込み失敗（fail-closed）。README に例外の明示が必要 |
+| セキュリティ（未対応） | **F05**: 技術書典のセッションは共通 Vault の 7 日期限・削除失敗対策の対象外（`TbfSession` に保存時刻が無く、ログアウトの keyring 削除結果も握り潰している。WebView も永続プロファイル） |
+| セキュリティ（未対応） | **F06**: 取り込みの総量・KDF 計算量の上限が不足（`import_file` はサイズ検査前に全体を読む、パスフレーズラップの `iterations` に上限が無い） |
+| セキュリティ（設計判断待ち） | **F01 の本丸**: `sub` ラップを消す「パスフレーズ必須モード」（`docs/spec/10-pack-keys.md` §9）。現行の説明文は実装に合わせて訂正済み（同 §1.2） |
 | 実装（Web 版のみ未対応） | pack の鍵は **v3（乱数ルート鍵 + `sub`／パスフレーズのラップ）へ移行済み**（`docs/spec/03-import-and-pack.md` §4.5 / `docs/spec/10-pack-keys.md`）。**v2 の pack は読めない**（`PackError::Version(2)`）ので、旧 pack は再取り込みが要る。残るのは **Web 版（`thundoku-shelf` モノレポの `packages/opfspack`）の対応**（§10 §7 のチェックリスト。Web が書く v2 pack はデスクトップでは開けない） |
 | 運用（公開前の確認） | Google Cloud のクライアント種別・Web 版との secret 共用・同意画面の設定は**コードからは確認できない**。公開前に `docs/spec/06-sync-auth-drive.md` §2.5 の表で確認する |
 | 運用（継続） | macOS 配布物は **Developer ID で署名し、Apple の公証（Notarization）を受ける**（v0.2.6 以降。`release.yml` の Import signing certificate / Package (macOS)。鍵は GitHub Secrets から一時キーチェーンへ入れ、`if: always()` で必ず削除する）。**Windows の Authenticode 署名は証明書が要るため未実施**。配布物のハッシュは `release.yml` が発行する |
 | 運用（継続） | 依存の脆弱性は CI の `cargo audit` ジョブで確認する（2026-09-22 時点で**脆弱性 0 件**）。無視する例外は `.cargo/audit.toml` に理由と見直し時期つきで列挙（現在は `rsa` の 1 件のみ）。**脆弱性ではない警告 13 件**（未保守 11・unsound 2）は `docs/spec/07-decisions.md` §6.1 で「配布物に入るか」つきで分類済み。Actions はコミット SHA 固定、ビルド・テストは `--locked` |
+| 運用（継続） | **公開はテスト・監査の合格に依存させる**（セキュリティ評価 F07）: `release.yml` の `checks` ジョブが `ci.yml` を再利用可能ワークフローとして呼び、`build` → `release` が `needs` で連なる。同じコミットでテストと `cargo audit` が通らなければ**ビルドも公開もしない**。Actions は全て完全なコミット SHA で固定（`upload-artifact` の例外も解消） |
 | 運用（継続） | リリースごとに **SBOM（CycloneDX JSON）** を生成して配布物へ添付し、**zip と SBOM の両方に署名つきビルド来歴（attestation）** を付ける（`release.yml`。Sigstore の鍵レス署名。公開リポジトリは全プランで利用可）。検証は `gh attestation verify <zip> --repo MegaBlackLabel/thundoku-shelf-app`（SBOM は `--predicate-type https://cyclonedx.org/bom`）。SBOM は Rust の依存のみで、同梱する `pdfium.dll` 等のネイティブ部品は `release.yml` の SHA256 固定で追跡する |
 | `docs/features.md` | 解消済み（検索対象を著者込みに更新。「書籍のバックアップ」ON/OFF は未実装の残件として明記し、実装は `drive.sync.enabled` に連動して pack を常時同期する） |
 | コード内コメント | 解消済み（通知の 3 秒 → 5 秒、`pdf.rs` の 800px → 1000px） |

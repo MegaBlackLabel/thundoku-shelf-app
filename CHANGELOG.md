@@ -4,6 +4,39 @@
 
 ## [Unreleased]
 
+### Security
+
+- **パスフレーズの説明文を実装に合わせる（追加防御ではない）**:
+  README・説明画面・仕様書が「パスフレーズを設定すれば Google アカウントを乗っ取られても本の中身は
+  守られる」と案内していたが、`set_passphrase` はパスフレーズラップを**追加するだけ**で `sub`
+  ラップを消さないため、`thundoku-keys.json` と `sub` の両方を取得された相手はパスフレーズ無しで
+  鍵を解ける（セキュリティ評価 F01）。説明を「Google に依存しない**復元手段**」に訂正し、限界を
+  明記する（`docs/spec/10-pack-keys.md` §1.2 の強度表も実装に合わせ、§9 に「パスフレーズ必須
+  モード」の代償を書いた）。説明画面のテストで限界の記述を固定する。
+  `README.md`、`crates/app/src/views/about.rs`、`docs/spec/{10-pack-keys,07-decisions,README}.md`
+
+### Fixed
+
+- **Google ログアウトの削除に失敗したとき、同じ起動でトークンを復元してしまう**:
+  前回のログアウトで残った資格情報を復元しないための印（`session-purge.pending`）を、削除の
+  成否に関わらず消していたため、keyring の削除が失敗するとその起動で保存済みトークンを
+  読み戻していた（＝ログアウトしたのにログイン状態で起動する。セキュリティ評価 F04）。
+  **削除に成功したときだけ**印を外し、失敗したら印を残してトークンもプロフィールも復元しない
+  （次の起動で再試行）。プロフィール削除の成否も判定に含めるため、
+  `google::delete_saved_profile` が成否を返すようにした。
+  `crates/app/src/app_state.rs`、`crates/core/src/google.rs`、`docs/logout.md`
+
+### Changed
+
+- **リリースの公開をテストと監査の合格に依存させる**:
+  `release.yml` の公開ジョブは `needs: build` だけで、同じタグの CI（テスト・`cargo audit`）が
+  失敗していても公開・署名が進む構成だった（セキュリティ評価 F07）。`ci.yml` を再利用可能
+  ワークフローにして `release.yml` の `checks` ジョブから呼び、`checks → build → release` の
+  依存にした（同じコミットでテストと監査が通らなければビルドも公開もしない）。あわせて
+  `actions/upload-artifact@v4` の可変タグ参照を完全なコミット SHA に固定した（これで
+  ワークフロー内の Action はすべて SHA 固定）。
+  `.github/workflows/ci.yml`、`.github/workflows/release.yml`、`docs/spec/README.md`
+
 ## [0.2.9] - 2026-09-25
 
 ### Security
