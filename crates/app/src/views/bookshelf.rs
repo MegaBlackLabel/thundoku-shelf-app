@@ -3067,9 +3067,15 @@ impl BookshelfView {
         }
         match self.effective_read_filter() {
             ReadFilter::All => true,
-            // 未読 / 読書中 / 既読（読了）は `ReadingState` の 3 状態で分ける
+            // 未読 / 読書中 / 既読（読了）は `ReadingState` の 3 状態で分ける。
+            // 未ダウンロードの本はカード上「未読」バッジ（表示側も `unwrap_or(Unread)`）なので、
+            // 未読として扱う。サイドバーの未読バッジ（`refresh_unread_count`）と同じ数え方。
             ReadFilter::Unread => {
-                card.local.as_ref().map(|e| e.reading_state) == Some(progress::ReadingState::Unread)
+                card.local
+                    .as_ref()
+                    .map(|e| e.reading_state)
+                    .unwrap_or(progress::ReadingState::Unread)
+                    == progress::ReadingState::Unread
             }
             ReadFilter::Reading => {
                 card.local.as_ref().map(|e| e.reading_state)
@@ -12991,6 +12997,46 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(unread, vec!["db-3".to_string()]);
+    }
+
+    /// 未ダウンロードの本（まだ取り込んでいない本）はカード上「未読」バッジなので、
+    /// 未読フィルタにも出す。サイドバーの未読バッジ（`refresh_unread_count`）は元から
+    /// 未ダウンロード本を未読として数えており、フィルタだけが食い違っていた。
+    #[gpui_kit::test]
+    async fn unread_filter_includes_not_downloaded_books(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // db-1: 未ダウンロード（ローカル本が無い＝カード上は「未読」）
+        seed_shelf_item(cx, "db-1", "未ダウンロード本", "サークルA", None);
+        // db-2: ダウンロード済み + 読了（未読には出ない）
+        seed_book(cx, "b2", "読了本", "サークルB");
+        seed_progress(cx, "b2", 10, Some(10));
+        seed_shelf_item(cx, "db-2", "読了本", "サークルB", None);
+        link_shelf_item_to_book(cx, "db-2", "b2");
+        let view = cx.new(BookshelfView::new);
+
+        cx.update(|cx| view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Unread)));
+        let unread = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            unread,
+            vec!["db-1".to_string()],
+            "未ダウンロード本が未読フィルタに出ていない"
+        );
+
+        // 既読フィルタの判定は変わらない
+        cx.update(|cx| view.update(cx, |this, cx| this.set_read_filter(cx, ReadFilter::Read)));
+        let read = view.read_with(cx, |this, cx| {
+            this.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(read, vec!["db-2".to_string()]);
     }
 
     #[test]
