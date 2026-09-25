@@ -185,6 +185,15 @@ const TBF_DOWNLOAD_RULES: &[crate::download_url::HostRule] = &[
     crate::download_url::HostRule::exact("storage.googleapis.com", Some("/tbf-tokyo-product-dlc/")),
 ];
 
+/// 自サイトの画像（`/api/image/`）を取得してよいホスト。**試し読みページと表紙**が該当する。
+///
+/// 本体用の [`TBF_DOWNLOAD_RULES`] とは**別のリスト**にする。本体は `/api/product-dlc/`
+/// だけを許可しているため、そのまま使うと画像が全部ブロックされる（実測で再現）。
+/// 逆に画像パスを本体用に混ぜると「画像取得のつもりで本体の URL を渡す」経路ができるので、
+/// 入口ごとに分ける。同じサイトの画像なので [`download_headers`] が Cookie を付ける。
+const TBF_SITE_IMAGE_RULES: &[crate::download_url::HostRule] =
+    &[crate::download_url::HostRule::exact(SITE_HOST, Some("/api/image/"))];
+
 pub struct TbfClient {
     transport: Box<dyn Transport>,
     cookies: Vec<(String, String)>,
@@ -619,14 +628,44 @@ impl TbfClient {
     /// Download a file while reporting `(downloaded, total)` bytes to
     /// `on_progress` (called from the background executor). The callback
     /// returns whether to continue; `false` aborts with [`TbfError::Cancelled`].
+    ///
+    /// 許可先は [`TBF_DOWNLOAD_RULES`]（本体 = `/api/product-dlc/` と署名付き GCS）。
+    /// 自サイトの画像（試し読みページ・表紙）は [`Self::download_site_image_with_progress`] を使う。
     pub fn download_with_progress(
         &mut self,
         url: &str,
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, TbfError> {
+        self.download_with_rules(url, TBF_DOWNLOAD_RULES, on_progress)
+    }
+
+    /// 自サイトの画像を取得する（試し読みページ = `product_sample_pages` の URL、表紙）。
+    ///
+    /// 許可先は [`TBF_SITE_IMAGE_RULES`]（自サイトの `/api/image/` だけ）。本体用の
+    /// 許可リストとは別にしてある（本体の URL を画像取得の入口へ渡せない）。
+    pub fn download_site_image(&mut self, url: &str) -> Result<Vec<u8>, TbfError> {
+        self.download_site_image_with_progress(url, &mut |_, _| true)
+    }
+
+    /// 進捗つきの自サイト画像取得（画像ごとの `(downloaded, total)`）。
+    pub fn download_site_image_with_progress(
+        &mut self,
+        url: &str,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<Vec<u8>, TbfError> {
+        self.download_with_rules(url, TBF_SITE_IMAGE_RULES, on_progress)
+    }
+
+    /// 許可リストを差し替えて取得する共通の実装。
+    fn download_with_rules(
+        &mut self,
+        url: &str,
+        rules: &[crate::download_url::HostRule],
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<Vec<u8>, TbfError> {
         // 本体取得も認証付き。起点を検証し、リダイレクトは**各ホップ検証**して追う
         // （許可外ホストへ Cookie / XSRF トークンを残さない）。
-        let parsed = crate::download_url::check(url, TBF_DOWNLOAD_RULES)
+        let parsed = crate::download_url::check(url, rules)
             .map_err(|error| TbfError::BlockedUrl(format!("{url}: {error}")))?;
         let cookie_header = self.cookie_header();
         let xsrf_token = self.xsrf_token.clone();
@@ -648,7 +687,7 @@ impl TbfClient {
                 redirects: 0,
             },
             TBF_REDIRECT_LIMIT,
-            TBF_DOWNLOAD_RULES,
+            rules,
             &mut credentials,
             on_progress,
         )?;

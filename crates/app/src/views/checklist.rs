@@ -23,6 +23,7 @@ use thundoku_core::tbf;
 
 use crate::app_state::AppState;
 use crate::icons::AppIcon;
+use crate::views::bookshelf::progress_ring_image;
 use image::GenericImageView as _;
 
 /// デコード済みサムネイルの保持上限（1 ページ = 50 件 + 余裕を持たせた値）。
@@ -37,10 +38,33 @@ pub enum SortField {
     SpaceNumber,
 }
 
+/// 試し読みの進捗（0.0..=1.0）。`page_index` は 0 始まりの取得中ページ。
+///
+/// リングはページ単位で進める（`total_bytes` が 0 = `Content-Length` 無しのときは
+/// そのページの先頭に留める。割合を偽らない）。
+fn sample_progress_fraction(
+    page_index: usize,
+    page_count: usize,
+    downloaded: u64,
+    total_bytes: u64,
+) -> f32 {
+    if page_count == 0 {
+        return 0.0;
+    }
+    let inner = if total_bytes > 0 {
+        (downloaded as f32 / total_bytes as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ((page_index as f32 + inner) / page_count as f32).clamp(0.0, 1.0)
+}
+
 pub struct ChecklistView {
     events: Vec<TbfEvent>,
     selected_slug: Option<String>,
     items: Vec<CheckedItem>,
+    /// 試し読みの取得進捗（チェック項目 id → 0.0..=1.0）。render は DB を読まない。
+    sample_progress: HashMap<String, f32>,
     busy: bool,
     error: Option<String>,
     toast: Option<String>,
@@ -78,6 +102,7 @@ impl ChecklistView {
             events: Vec::new(),
             selected_slug: None,
             items: Vec::new(),
+            sample_progress: HashMap::new(),
             busy: false,
             error: None,
             toast: None,
@@ -575,6 +600,9 @@ impl ChecklistView {
         let db = state.db_pool.clone();
         let item_id = item.id.clone();
         let open_item_id = item_id.clone();
+        // 取得中はその行の表紙に進捗リングを出す（0.0 から始めて完了時に消す）
+        self.sample_progress.insert(item_id.clone(), 0.0);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(String, f32)>();
         type SamplePages = Vec<(String, u32, u32)>;
         let task: gpui_kit::Task<Result<SamplePages, String>> =
             cx.background_executor().spawn(async move {
@@ -582,13 +610,30 @@ impl ChecklistView {
                 let pages = client
                     .product_sample_pages(&product_id)
                     .map_err(|e| e.to_string())?;
+                let page_count = pages.len();
                 let mut stored: Vec<(String, u32, u32)> = Vec::new();
                 // 旧ページを先に 1 回だけ削除してから全ページを保存する
                 {
                     let _ = db::samples::delete_for_item(&db, &item_id);
                 }
-                for page in pages {
-                    let bytes = client.download(&page.url).map_err(|e| e.to_string())?;
+                for (index, page) in pages.into_iter().enumerate() {
+                    // 試し読み画像は本体（`/api/product-dlc/`）とは別の許可リストを通す
+                    // （自サイトの画像 `/api/image/`。本体用のリストでは全部ブロックされる）
+                    let bytes = {
+                        let report_tx = progress_tx.clone();
+                        let report_id = item_id.clone();
+                        let mut on_progress = move |downloaded: u64, total: u64| {
+                            report_tx
+                                .send((
+                                    report_id.clone(),
+                                    sample_progress_fraction(index, page_count, downloaded, total),
+                                ))
+                                .is_ok()
+                        };
+                        client
+                            .download_site_image_with_progress(&page.url, &mut on_progress)
+                            .map_err(|e| e.to_string())?
+                    };
                     use base64::Engine;
                     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     let (width, height) = match (page.width, page.height) {
@@ -613,14 +658,48 @@ impl ChecklistView {
                             },
                         );
                     }
+                    // ページを読み切ったぶんを確定させる（`Content-Length` が無い画像でも進む）
+                    let _ = progress_tx.send((
+                        item_id.clone(),
+                        sample_progress_fraction(index + 1, page_count, 0, 1),
+                    ));
                     stored.push((data, width as u32, height as u32));
                 }
                 Ok(stored)
             });
         cx.spawn(async move |_window, cx| {
+            // worker の進捗を UI へ流す（チャネルが閉じるまで）。値が変わったときだけ描き直す。
+            let mut disconnected = false;
+            while !disconnected {
+                let mut latest: Option<(String, f32)> = None;
+                loop {
+                    match progress_rx.try_recv() {
+                        Ok(progress) => latest = Some(progress),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some((id, fraction)) = latest {
+                    handle.update(cx, |this, cx| {
+                        if this.sample_progress.get(&id).copied() != Some(fraction) {
+                            this.sample_progress.insert(id, fraction);
+                            cx.notify();
+                        }
+                    });
+                }
+                if !disconnected {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                }
+            }
             let result = task.await;
             handle.update(cx, |this, cx| {
                 this.busy = false;
+                this.sample_progress.remove(&open_item_id);
                 match result {
                     Ok(pages) if !pages.is_empty() => {
                         // 同じウィンドウのリーダーで開く（workspace が処理）
@@ -1011,6 +1090,8 @@ impl ChecklistView {
             let purchased = item.is_purchased != 0;
             let has_product = item.product_id.is_some();
             let sample_fetched = item.sample_fetch_attempted_at.is_some();
+            // 取得中の行だけ表紙に進捗リングを出す
+            let sample_fraction = self.sample_progress.get(&item.id).copied();
             let item_for_sample = item.clone();
             // render では毎回デコードせず、バックグラウンドで用意した
             // キャッシュ（thumbnail_images）だけを参照する
@@ -1090,6 +1171,44 @@ impl ChecklistView {
                                 } else {
                                     "サンプル未取得"
                                 })
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        })
+                        // 試し読みの取得中: 進捗リング（Web の CircularProgress 相当）
+                        .child(if let Some(fraction) = sample_fraction {
+                            div()
+                                .debug_selector({
+                                    let id = item.id.clone();
+                                    move || format!("sample-progress-{id}")
+                                })
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(gpui_kit::rgba(0x00000080))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            img(progress_ring_image(fraction))
+                                                .w(px(36.0))
+                                                .h(px(36.0)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(gpui_kit::white())
+                                                .text_size(px(10.0))
+                                                .child(format!(
+                                                    "{}%",
+                                                    (fraction * 100.0).round() as u32
+                                                )),
+                                        ),
+                                )
                                 .into_any_element()
                         } else {
                             div().into_any_element()
@@ -1513,6 +1632,7 @@ fn truncate_text(text: &str, max_length: usize) -> String {
 mod tests {
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use thundoku_core::db::checklist as checklist_db;
@@ -1722,6 +1842,7 @@ mod tests {
             events: Vec::new(),
             selected_slug: Some("tbf20".into()),
             items,
+            sample_progress: HashMap::new(),
             busy: false,
             error: None,
             toast: None,
@@ -1917,6 +2038,174 @@ mod tests {
         });
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].image_data.as_deref(), Some("aGVsbG8="));
+    }
+
+    /// 試し読みの進捗（純関数）: 何ページ目をどれだけ落としたか。
+    #[test]
+    fn sample_progress_fraction_covers_all_pages() {
+        // 6 ページ中 1 ページ目の半分 = 1/12
+        assert!((sample_progress_fraction(0, 6, 50, 100) - 1.0 / 12.0).abs() < 1e-5);
+        // 4 ページ目を読み切った = 4/6
+        assert!((sample_progress_fraction(3, 6, 10, 10) - 4.0 / 6.0).abs() < 1e-5);
+        // 総数不明（Content-Length なし）は「そのページの先頭」＝進めない
+        assert_eq!(sample_progress_fraction(0, 6, 1024, 0), 0.0);
+        // ページ 0 件でも割り算で壊れない
+        assert_eq!(sample_progress_fraction(0, 0, 0, 0), 0.0);
+        // 端は 0..1 に収める
+        assert_eq!(sample_progress_fraction(5, 6, 999, 10), 1.0);
+    }
+
+    /// 取得中はその行の表紙に進捗リングを出し、終わったら消す。
+    #[gpui_kit::test]
+    async fn sample_progress_ring_is_shown_while_fetching(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(|_| view_with_items(vec![test_item("item-1", 0)]));
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let draw = |visual: &mut gpui_kit::VisualTestContext| {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        };
+        draw(visual);
+        assert!(
+            visual.debug_bounds("sample-progress-item-1").is_none(),
+            "取得していない行にリングを出している"
+        );
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.sample_progress.insert("item-1".into(), 0.5);
+                cx.notify();
+            })
+        });
+        draw(visual);
+        assert!(
+            visual.debug_bounds("sample-progress-item-1").is_some(),
+            "取得中にリングが出ていない"
+        );
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.sample_progress.remove("item-1");
+                cx.notify();
+            })
+        });
+        draw(visual);
+        assert!(
+            visual.debug_bounds("sample-progress-item-1").is_none(),
+            "取得後にリングが残っている"
+        );
+    }
+
+    /// 試し読みは `/api/image/` の画像を取得して保存し、進捗を片付ける。
+    ///
+    /// 本体ダウンロード用の許可リスト（`/api/product-dlc/`）をそのまま使うと
+    /// **画像が全部ブロックされて試し読みが開けない**（実測で再現した不具合）。
+    #[gpui_kit::test]
+    async fn fetch_sample_stores_pages_from_the_image_path(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_event(cx, "tbf20", "技術書典20");
+        seed_item(cx, "item-1", "tbf20", "サークルA");
+        let fetched = Arc::new(Mutex::new(Vec::new()));
+        login_with(
+            cx,
+            mock_tbf_with_samples(vec!["/api/image/1.png"], fetched.clone()),
+        );
+        let view = cx.new(|_| view_with_items(vec![test_item("item-1", 0)]));
+        let item = test_item("item-1", 0);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| this.fetch_sample(cx, item));
+        });
+        // worker（ページ取得）を進める
+        for _ in 0..40 {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            fetched.lock().unwrap().clone(),
+            vec!["https://techbookfest.org/api/image/1.png".to_string()],
+            "試し読み画像を取得していない（許可リストで弾かれている）"
+        );
+        let rows = cx.read(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::samples::list_for_item(db, "item-1").unwrap()
+        });
+        assert_eq!(rows.len(), 1, "取得したページを保存していない");
+        assert_eq!(
+            cx.read(|cx| view.read(cx).sample_progress.len()),
+            0,
+            "取得後に進捗が残っている"
+        );
+    }
+
+    /// 試し読み画像と ProductImagesQuery だけを返すモック（実通信しない）。
+    fn mock_tbf_with_samples(
+        image_urls: Vec<&'static str>,
+        fetched: Arc<Mutex<Vec<String>>>,
+    ) -> tbf::TbfClient {
+        use tbf::{RequestSpec, ResponseSpec, TbfError, Transport};
+
+        struct MockTransport {
+            image_urls: Vec<&'static str>,
+            fetched: Arc<Mutex<Vec<String>>>,
+        }
+        impl Transport for MockTransport {
+            fn send(&mut self, spec: RequestSpec) -> Result<ResponseSpec, TbfError> {
+                if spec.url.contains("operationName=ProductImagesQuery") {
+                    let edges: Vec<serde_json::Value> = self
+                        .image_urls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, url)| {
+                            serde_json::json!({ "node": {
+                                "id": format!("img-{index}"),
+                                "url": url,
+                                "width": 100,
+                                "height": 140
+                            }})
+                        })
+                        .collect();
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "data": { "product": { "images": { "edges": edges } } }
+                    }))
+                    .expect("fixture json");
+                    return Ok(ResponseSpec {
+                        status: 200,
+                        headers: Vec::new(),
+                        body,
+                    });
+                }
+                if spec.url.contains("/api/image/") {
+                    self.fetched.lock().unwrap().push(spec.url.clone());
+                    return Ok(ResponseSpec {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: b"IMAGE".to_vec(),
+                    });
+                }
+                Ok(ResponseSpec {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+            }
+        }
+        tbf::TbfClient::with_transport(Box::new(MockTransport {
+            image_urls,
+            fetched,
+        }))
     }
 
     /// 技術書典のチェックリスト応答を差し替えたクライアント（実通信しない）。

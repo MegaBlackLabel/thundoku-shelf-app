@@ -8712,7 +8712,8 @@ pub(crate) fn fetch_cover_bytes(
             Some(bytes) => Some(bytes),
             None => {
                 log::warn!("TBF 表紙を直接取得できずフォールバック: {resolved}");
-                tbf_client.lock().download(&resolved).ok()
+                // 表紙も自サイトの画像（`/api/image/`）。本体用の許可リストでは弾かれる
+                tbf_client.lock().download_site_image(&resolved).ok()
             }
         }
     }
@@ -8916,7 +8917,7 @@ pub(crate) fn placeholder_cover(title: &str, circle: &str) -> Option<Arc<RenderI
 
 /// Web の `CircularProgress` と同じ円形リング（SVG）を RGBA に rasterize する。
 /// パーセント単位でキャッシュし、進捗更新ごとの再 rasterize を防ぐ。
-fn progress_ring_image(fraction: f32) -> Arc<RenderImage> {
+pub(crate) fn progress_ring_image(fraction: f32) -> Arc<RenderImage> {
     let percentage = (fraction.clamp(0.0, 1.0) * 100.0).round() as u32;
     static CACHE: LazyLock<std::sync::Mutex<HashMap<u32, Arc<RenderImage>>>> =
         LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));

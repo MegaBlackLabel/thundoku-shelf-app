@@ -13,7 +13,7 @@ use thundoku_core::booth::{BoothClient, BoothError, BoothSession};
 use thundoku_core::dlsite::client::{DlsiteClient, DlsiteError, DlsiteSession};
 use thundoku_core::fanza::client::{FanzaClient, FanzaError, FanzaSession};
 use thundoku_core::tbf::transport::{RequestSpec, ResponseSpec, Transport};
-use thundoku_core::tbf::{TbfClient, TbfError};
+use thundoku_core::tbf::{TbfClient, TbfError, TbfSession};
 
 type Log = Arc<Mutex<Vec<RequestSpec>>>;
 
@@ -182,6 +182,72 @@ fn tbf_rejects_a_foreign_download_target_without_sending() {
     ] {
         let error = client
             .download_with_progress(url, &mut |_, _| true)
+            .expect_err("許可リスト外の取得先は拒否される");
+        assert!(matches!(error, TbfError::BlockedUrl(_)), "{url}: {error}");
+    }
+    assert!(sent_urls(&log).is_empty(), "1 件も送ってはいけない");
+}
+
+/// 技術書典: 本体用の入口は**画像のパスを受け付けない**（許可リストを混ぜない）。
+#[test]
+fn tbf_product_download_still_rejects_the_image_path() {
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let mut client = TbfClient::with_transport(Box::new(Recording::new(&log, None)));
+
+    let error = client
+        .download("https://techbookfest.org/api/image/1.png")
+        .expect_err("本体用の入口で画像パスは拒否される");
+    assert!(matches!(error, TbfError::BlockedUrl(_)), "{error}");
+    assert!(sent_urls(&log).is_empty(), "1 件も送ってはいけない");
+}
+
+/// 技術書典: **自サイトの画像（`/api/image/` = 試し読みページ・表紙）は取得できる**。
+///
+/// 本体用の許可リスト（`/api/product-dlc/`）をそのまま使うと、`product_sample_pages` が
+/// 返す `https://techbookfest.org/api/image/{id}.png` が全部ブロックされ、試し読みが
+/// 開けなくなる（実測で再現）。同じサイトの画像なので Cookie を付けるのは正しい。
+#[test]
+fn tbf_allows_site_images_on_the_image_path() {
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let mut client = TbfClient::with_transport(Box::new(Recording::new(&log, None)));
+    client.restore_session(TbfSession::from_cookies(vec![(
+        "session".to_string(),
+        "secret-cookie".to_string(),
+    )]));
+
+    let url = "https://techbookfest.org/api/image/906yUEHz2RxXyZ2xDrnQtq.png";
+    let bytes = client
+        .download_site_image(url)
+        .expect("自サイトの画像は取得できる");
+    assert_eq!(bytes, b"ok");
+
+    let sent = log.lock();
+    assert_eq!(sent.len(), 1, "1 回だけ送る: {:?}", sent_urls(&log));
+    assert_eq!(sent[0].url, url);
+    assert!(
+        sent[0]
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Cookie" && value.contains("secret-cookie")),
+        "同じホストの画像にセッションが付いていない: {:?}",
+        sent[0].headers
+    );
+}
+
+/// 技術書典: 画像用の入口でも、別ホスト・本体のパスへは送らない。
+#[test]
+fn tbf_site_image_download_rejects_other_hosts_and_paths_without_sending() {
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let mut client = TbfClient::with_transport(Box::new(Recording::new(&log, None)));
+
+    for url in [
+        "https://evil.example.com/api/image/1.png",
+        "https://techbookfest.org.evil.example.com/api/image/1.png",
+        "https://storage.googleapis.com/tbf-tokyo-product-dlc/1.zip",
+        "https://techbookfest.org/api/product-dlc/1/download",
+    ] {
+        let error = client
+            .download_site_image(url)
             .expect_err("許可リスト外の取得先は拒否される");
         assert!(matches!(error, TbfError::BlockedUrl(_)), "{url}: {error}");
     }
