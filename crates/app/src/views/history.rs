@@ -16,7 +16,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, App, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement, ReadGlobal as _, Render, RenderImage, ScrollHandle, SharedString,
+    KeyDownEvent, ParentElement, ReadGlobal as _, Render, RenderImage, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, img, px, relative,
 };
 
@@ -163,6 +163,110 @@ struct HistoryDay {
     items: Vec<HistoryItem>,
 }
 
+/// 一覧の仮想化 1 行（`gpui_kit::list` の 1 行）。
+///
+/// 一覧は日付ごとに「日付バー + その日の本」を積む。カード表示では 1 行に
+/// 最大 `columns` 件、リスト表示では 1 件を並べる。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HistoryRow {
+    /// 日付ヘッダのバー。
+    Day { day_index: usize },
+    /// その日の本の行（`days[day_index].items[first_item_index..][..len]`）。
+    Items {
+        day_index: usize,
+        first_item_index: usize,
+        len: usize,
+    },
+}
+
+/// 1 行に並べる件数（カードは列数、リストは 1）。
+fn row_items(view_mode: ViewMode, columns: usize) -> usize {
+    match view_mode {
+        ViewMode::Card => columns.max(1),
+        ViewMode::List => 1,
+    }
+}
+
+/// 日付バー + 本の行（カードは 1 行 `columns` 件）の順に、仮想化リストの行を組み立てる。
+fn build_rows(days: &[HistoryDay], view_mode: ViewMode, columns: usize) -> Vec<HistoryRow> {
+    let per_row = row_items(view_mode, columns);
+    let mut rows = Vec::new();
+    for (day_index, day) in days.iter().enumerate() {
+        rows.push(HistoryRow::Day { day_index });
+        for first_item_index in (0..day.items.len()).step_by(per_row) {
+            rows.push(HistoryRow::Items {
+                day_index,
+                first_item_index,
+                // 末尾の行は `per_row` に満たない
+                len: per_row.min(day.items.len() - first_item_index),
+            });
+        }
+    }
+    rows
+}
+
+/// 仮想化 1 行の高さの見積もり。
+///
+/// 未計測の行の高さは 0 として扱われるため、ヒントを与えないと全体の高さが
+/// 可視行のぶんしか無く、スクロールできる範囲が足りなくなる。実際に描いた行は
+/// 実測値に置き換わる（行の種類で高さが違うので、見積もりは凡その値でよい）。
+fn row_height_hint(view_mode: ViewMode, card_width: f32) -> f32 {
+    match view_mode {
+        // カード: 表紙（幅の 3/4。`render_card` と同じクランプ）+ 情報 + タグ行
+        ViewMode::Card => (card_width * 0.75).clamp(120.0, 320.0) + CARD_INFO_H,
+        // リスト: 表紙枠（200x133）+ 行の余白（`render_row` の `p_2`）
+        ViewMode::List => LIST_COVER_MIN_H + LIST_ROW_CHROME_H,
+    }
+}
+
+/// カード 1 枚の表紙より下（タイトル・イベント名・チップ・進捗・タグ行）の高さの見積もり。
+const CARD_INFO_H: f32 = 170.0;
+
+/// リスト 1 行の表紙枠以外（`p_2` の余白）の高さの見積もり。
+const LIST_ROW_CHROME_H: f32 = 24.0;
+
+/// 仮想化リストで可視域の外に先読みする高さ（本棚のリストと同じ）。
+const LIST_ROW_OVERDRAW: f32 = 300.0;
+
+/// リストのスクロール位置を「先頭からの割合（0.0..=1.0）」で表す。
+///
+/// 件数が変わっても同じ位置を指せるように、アイテム番号ではなく割合で持つ
+/// （本棚の `list_scroll_fraction` と同じ。行の高さが揃っていれば割合 = 見た目の位置）。
+fn list_scroll_fraction(state: &gpui_kit::ListState) -> f32 {
+    let count = state.item_count();
+    if count <= 1 {
+        return 0.0;
+    }
+    let top = state.logical_scroll_top();
+    (top.item_ix as f32 / (count - 1) as f32).clamp(0.0, 1.0)
+}
+
+/// 仮想化リストの件数を差し替えつつ、スクロール位置を保つ。
+///
+/// `ListState::reset` はスクロールのアンカーを捨てる（＝先頭に戻る）ため、差し替えの
+/// 直前に位置を控え、差し替え後に同じ割合の位置を指し直す（本棚の
+/// `set_list_count_keeping_scroll` と同じ考え方）。
+///
+/// 行の高さには一律のヒント `row_height` を入れる: 未計測の行は高さ 0 として扱われ、
+/// 全体の高さが可視行のぶんしか無いとスクロールできる範囲が足りなくなる
+/// （実際に描いた行は実測値に置き換わる）。件数が変わらないときは位置に触らない。
+fn set_list_rows(state: &gpui_kit::ListState, count: usize, row_height: f32) {
+    if state.item_count() == count {
+        return;
+    }
+    // `reset` は件数（＝割合の基準）を変えるため、控えるのは差し替えの前
+    let fraction = list_scroll_fraction(state);
+    state.reset_with_uniform_height(count, px(row_height));
+    if count == 0 {
+        return;
+    }
+    let item_ix = ((count - 1) as f32 * fraction).round() as usize;
+    state.scroll_to(gpui_kit::ListOffset {
+        item_ix,
+        offset_in_item: px(0.0),
+    });
+}
+
 pub struct HistoryView {
     days: Vec<HistoryDay>,
     /// 履歴に含まれるサイト（`すべてのサイト` + 各サイト）。
@@ -185,11 +289,21 @@ pub struct HistoryView {
     expanded_tag_rows: std::collections::HashSet<String>,
     /// キーボード操作の選択位置（日付 → 本の順に平坦化したインデックス）。
     selected_index: Option<usize>,
+    /// 一覧の仮想化行（日付バー + 本の行）。`days` と列数から組む。
+    rows: Vec<HistoryRow>,
+    /// `rows` を組んだときの 1 行あたりの件数（リスト表示は 1）。
+    /// ウィンドウ幅で列数が変わったら組み直す。
+    rows_columns: usize,
+    /// `rows` が古いか（`days` が入れ替わった / まだ組んでいない）。
+    rows_stale: bool,
+    /// 一覧の行単位の仮想化（可視行だけを構築する）。本棚の `list_rows_state` と同じ。
+    list_state: gpui_kit::ListState,
     focus_handle: FocusHandle,
     /// 初回描画でフォーカスを取る（本棚と同じ）。
     focus_initialized: bool,
-    /// 選択に合わせたスクロール（日付セクションへ寄せる）。
-    scroll_handle: ScrollHandle,
+    /// テスト専用: 仮想化の行を実際に構築した回数（可視行だけであることを確かめる）。
+    #[cfg(test)]
+    built_rows: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HistoryView {
@@ -208,9 +322,19 @@ impl HistoryView {
             tag_counts: std::sync::Arc::new(std::collections::HashMap::new()),
             expanded_tag_rows: std::collections::HashSet::new(),
             selected_index: None,
+            rows: Vec::new(),
+            rows_columns: 0,
+            rows_stale: true,
+            // 行単位の仮想化（可視行のみ構築）。高さは行を組むときにヒントを入れる
+            list_state: gpui_kit::ListState::new(
+                0,
+                gpui_kit::ListAlignment::Top,
+                px(LIST_ROW_OVERDRAW),
+            ),
             focus_handle: cx.focus_handle(),
             focus_initialized: false,
-            scroll_handle: ScrollHandle::new(),
+            #[cfg(test)]
+            built_rows: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         view.reload(cx);
         view
@@ -341,6 +465,8 @@ impl HistoryView {
         ));
         self.days = days;
         self.sites = sites;
+        // 行モデルは `days` から組むので、次の描画で組み直す（列数は描画時に分かる）
+        self.rows_stale = true;
         // 選択位置を表示中の件数に合わせる（初回・範囲外は先頭）
         let len = self.flat_book_ids().len();
         if len == 0 {
@@ -362,6 +488,43 @@ impl HistoryView {
             .iter()
             .flat_map(|day| day.items.iter().map(|item| item.book.id.clone()))
             .collect()
+    }
+
+    /// 仮想化行を組み直し、リストの件数を合わせる（スクロール位置は保つ）。
+    ///
+    /// `columns` はカード表示の列数（リスト表示は無視して 1 行 1 件）。`card_width` は
+    /// 行の高さのヒントに使う（幅で表紙の高さが変わるため）。
+    fn rebuild_rows(&mut self, columns: usize, card_width: f32) {
+        self.rows_columns = row_items(self.view_mode, columns);
+        self.rows = build_rows(&self.days, self.view_mode, columns);
+        self.rows_stale = false;
+        set_list_rows(
+            &self.list_state,
+            self.rows.len(),
+            row_height_hint(self.view_mode, card_width),
+        );
+    }
+
+    /// 平坦化した位置の本を含む仮想化行の番号（選択を画面内へ寄せるのに使う）。
+    fn row_index_of_item(&self, flat_index: usize) -> Option<usize> {
+        let mut offset = 0;
+        for (day_index, day) in self.days.iter().enumerate() {
+            if flat_index >= offset + day.items.len() {
+                offset += day.items.len();
+                continue;
+            }
+            let item_index = flat_index - offset;
+            // 行は日付バー → 本の行の順。同じ日の中では先頭の出現位置で並んでいる
+            return self.rows.iter().position(|row| {
+                matches!(
+                    row,
+                    HistoryRow::Items { day_index: row_day, first_item_index, len }
+                        if *row_day == day_index
+                            && (*first_item_index..*first_item_index + *len).contains(&item_index)
+                )
+            });
+        }
+        None
     }
 
     /// 絞り込み中か（ESC で解除する対象があるか）。
@@ -412,24 +575,12 @@ impl HistoryView {
         };
         if Some(next) != self.selected_index {
             self.selected_index = Some(next);
-            // 選択した本が入る日付セクションへスクロールを寄せる
-            if let Some(day_index) = self.day_index_of(next) {
-                self.scroll_handle.scroll_to_item(day_index);
+            // 選択した本の行が見える位置へスクロールを寄せる
+            if let Some(row_index) = self.row_index_of_item(next) {
+                self.list_state.scroll_to_reveal_item(row_index);
             }
             cx.notify();
         }
-    }
-
-    /// 平坦化した位置が何番目の日付セクションに入るか。
-    fn day_index_of(&self, flat_index: usize) -> Option<usize> {
-        let mut offset = 0;
-        for (index, day) in self.days.iter().enumerate() {
-            offset += day.items.len();
-            if flat_index < offset {
-                return Some(index);
-            }
-        }
-        None
     }
 
     /// 絞り込みを全部解除する（ESC / 「全項目」）。
@@ -1422,6 +1573,125 @@ impl HistoryView {
             )
             .into_any_element()
     }
+
+    /// 仮想化リストの 1 行（日付バー / その日のカード・リストの行）を構築する。
+    /// `gpui_kit::list` の行クロージャから可視行ぶんだけ呼ばれる。
+    ///
+    /// `theme` / `tag_order` / `selected` / `card_width` は描画時の値をクロージャから
+    /// 受け取る（借用を閉じるため、ここではビューの一部＝ `rows` / `days` を読む）。
+    #[allow(clippy::too_many_arguments)]
+    fn render_list_row(
+        &self,
+        window: &mut Window,
+        theme: &gpui_kit::component::Theme,
+        handle: &Entity<Self>,
+        row_ix: usize,
+        tag_order: &TagOrder,
+        selected: Option<(usize, usize)>,
+        view_mode: ViewMode,
+        card_width: f32,
+    ) -> AnyElement {
+        let Some(row) = self.rows.get(row_ix) else {
+            return div().into_any_element();
+        };
+        match *row {
+            // 日付は背景色を変えた「バー」にする（カードと同じ色にしない）
+            HistoryRow::Day { day_index } => {
+                let Some(day) = self.days.get(day_index) else {
+                    return div().into_any_element();
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    // バーと本文の間隔（以前の `gap_2`）
+                    .pb_2()
+                    .w_full()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("history-day-{}", day.date)))
+                            // デバッグ用の id は「何番目の日か」で固定する（テストが
+                            // 日付に依存せずに検証できるように）
+                            .debug_selector({
+                                let selector = format!("history-day-{day_index}");
+                                move || selector.clone()
+                            })
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(day_bar_bg(theme))
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .child(day.label.clone()),
+                    )
+                    .into_any_element()
+            }
+            HistoryRow::Items {
+                day_index,
+                first_item_index,
+                len,
+            } => {
+                let Some(day) = self.days.get(day_index) else {
+                    return div().into_any_element();
+                };
+                let Some(items) = day.items.get(first_item_index..first_item_index + len) else {
+                    return div().into_any_element();
+                };
+                // 出現キー（`{日付}-{その日の連番}`）。同じ本が複数の日に出ても
+                // 要素 id が重複しないように、カード / 行が描く id へ前置する。
+                let item_state = |item_index: usize, item: &HistoryItem| {
+                    // 展開状態も出現ごと（`render_tag_row` と同じ要素 id の組み立て）
+                    let element_id = format!("{}-{item_index}-{}", day.date, item.book.id);
+                    ItemState {
+                        tag_order,
+                        tags_expanded: self.expanded_tag_rows.contains(&element_id),
+                        selected: selected == Some((day_index, item_index)),
+                        favorite_circles: &self.favorite_circles,
+                        favorite_authors: &self.favorite_authors,
+                    }
+                };
+                let key = |offset: usize| format!("{}-{}", day.date, first_item_index + offset);
+                match view_mode {
+                    ViewMode::Card => div()
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        // カードの行の間隔（以前の折り返しの `gap_3`）
+                        .pb_3()
+                        .w_full()
+                        .children(items.iter().enumerate().map(|(offset, item)| {
+                            HistoryView::render_card(
+                                window,
+                                theme,
+                                handle,
+                                item,
+                                &key(offset),
+                                card_width,
+                                &item_state(first_item_index + offset, item),
+                            )
+                        }))
+                        .into_any_element(),
+                    ViewMode::List => div()
+                        .flex()
+                        .flex_col()
+                        // 行の間隔（以前の `gap_2`）
+                        .pb_2()
+                        .w_full()
+                        .children(items.iter().enumerate().map(|(offset, item)| {
+                            HistoryView::render_row(
+                                window,
+                                theme,
+                                handle,
+                                item,
+                                &key(offset),
+                                &item_state(first_item_index + offset, item),
+                            )
+                        }))
+                        .into_any_element(),
+                }
+            }
+        }
+    }
 }
 
 /// 履歴カードの表紙に重ねるバッジ（本棚のカードと同じ `CoverBadge` を共有する）。
@@ -1503,94 +1773,45 @@ impl Render for HistoryView {
             self.tag_counts.clone(),
         );
         let window_width = window.bounds().size.width.as_f32();
-        let columns = crate::views::bookshelf::BookshelfView::columns_for_width(window_width);
+        // カードの列数（リスト表示は 1 行 1 件なので 1 列として扱う）
+        let columns = match view_mode {
+            ViewMode::Card => {
+                crate::views::bookshelf::BookshelfView::columns_for_width(window_width)
+            }
+            ViewMode::List => 1,
+        };
         let content_width = window_width - SIDEBAR_W - 24.0;
         let card_width =
             ((content_width - (columns as f32 - 1.0) * 12.0) / columns as f32).max(160.0);
+        // 仮想化: 行（日付バー + カード/リストの行）を組み直して、可視行だけを構築する。
+        // 列数はウィンドウ幅で決まるので、幅が変われば行数も変わる
+        if self.rows_stale || self.rows_columns != columns {
+            self.rebuild_rows(columns, card_width);
+        }
 
         // 選択中の出現（何日目の何冊目か）。同じ本が複数の日に出ても、選択枠はその出現だけ。
         let selected = selected_occurrence(self.selected_index, &self.days);
-        let days: Vec<AnyElement> = self
-            .days
-            .iter()
-            .enumerate()
-            .map(|(day_index, day)| {
-                // 出現キー（`{日付}-{その日の連番}`）。同じ本が複数の日に出ても
-                // 要素 id が重複しないように、カード / 行が描く id へ前置する。
-                let item_state = |item_index: usize, item: &HistoryItem| {
-                    // 展開状態も出現ごと（`render_tag_row` と同じ要素 id の組み立て）
-                    let element_id = format!("{}-{item_index}-{}", day.date, item.book.id);
-                    ItemState {
-                        tag_order: &tag_order,
-                        tags_expanded: self.expanded_tag_rows.contains(&element_id),
-                        selected: selected == Some((day_index, item_index)),
-                        favorite_circles: &self.favorite_circles,
-                        favorite_authors: &self.favorite_authors,
-                    }
-                };
-                let body: AnyElement = match view_mode {
-                    ViewMode::Card => div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap_3()
-                        .children(day.items.iter().enumerate().map(|(item_index, item)| {
-                            HistoryView::render_card(
-                                window,
-                                &theme,
-                                &handle,
-                                item,
-                                &format!("{}-{item_index}", day.date),
-                                card_width,
-                                &item_state(item_index, item),
-                            )
-                        }))
-                        .into_any_element(),
-                    ViewMode::List => div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .children(day.items.iter().enumerate().map(|(item_index, item)| {
-                            HistoryView::render_row(
-                                window,
-                                &theme,
-                                &handle,
-                                item,
-                                &format!("{}-{item_index}", day.date),
-                                &item_state(item_index, item),
-                            )
-                        }))
-                        .into_any_element(),
-                };
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        // 日付は背景色を変えた「バー」にする（カードと同じ色にしない）
-                        div()
-                            .id(SharedString::from(format!("history-day-{}", day.date)))
-                            // デバッグ用の id は「何番目の日か」で固定する（テストが
-                            // 日付に依存せずに検証できるように）
-                            .debug_selector({
-                                let selector = format!("history-day-{day_index}");
-                                move || selector.clone()
-                            })
-                            .w_full()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(day_bar_bg(&theme))
-                            .text_sm()
-                            .font_weight(gpui_kit::FontWeight::BOLD)
-                            .child(day.label.clone()),
-                    )
-                    .child(body)
-                    .into_any_element()
-            })
-            .collect();
-
         let empty = self.days.is_empty();
+        let list_state = self.list_state.clone();
+        let row_theme = theme.clone();
+        let rows = gpui_kit::list(list_state, move |row_ix, window, cx| {
+            // 借用を閉じるため、可視行に必要なものは view から読む
+            // （可視行のみなので、全行を組むより桁違いに軽い）
+            let view = handle.read(cx);
+            #[cfg(test)]
+            view.built_rows
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            view.render_list_row(
+                window,
+                &row_theme,
+                &handle,
+                row_ix,
+                &tag_order,
+                selected,
+                view_mode,
+                card_width,
+            )
+        });
 
         div()
             .id("history-root")
@@ -1610,16 +1831,13 @@ impl Render for HistoryView {
             .bg(cx.theme().background)
             .child(self.render_header(cx))
             .child(
+                // 仮想化リストの親。高さを親（`history-root` = `flex_1`）に束縛する
+                // （指定しないと内容高さまで伸び、リストがスクロールできない）
                 div()
                     .id("history-scroll")
                     .debug_selector(|| "history-scroll".into())
                     .flex_1()
                     .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .gap_5()
-                    .track_scroll(&self.scroll_handle)
-                    .overflow_y_scroll()
                     .when(empty, |this| {
                         this.child(
                             div()
@@ -1628,7 +1846,7 @@ impl Render for HistoryView {
                                 .child("まだ閲覧履歴がありません"),
                         )
                     })
-                    .children(days),
+                    .when(!empty, |this| this.child(rows.h_full().w_full())),
             )
     }
 }
@@ -2053,6 +2271,122 @@ mod tests {
         assert_eq!(next_selection_index(Some(5), 10, 0, -1, 4), Some(1));
     }
 
+    /// 仮想化の行モデル: 日付バー + カードの行（1 行 `columns` 件）。リストは 1 行 1 件。
+    #[test]
+    fn rows_are_day_bars_and_item_rows() {
+        let days = vec![
+            test_history_day("2026-09-13", 5),
+            test_history_day("2026-09-12", 1),
+        ];
+        // カード 2 列: 5 件は 2 + 2 + 1 の 3 行に割れる
+        assert_eq!(
+            build_rows(&days, ViewMode::Card, 2),
+            vec![
+                HistoryRow::Day { day_index: 0 },
+                HistoryRow::Items {
+                    day_index: 0,
+                    first_item_index: 0,
+                    len: 2,
+                },
+                HistoryRow::Items {
+                    day_index: 0,
+                    first_item_index: 2,
+                    len: 2,
+                },
+                HistoryRow::Items {
+                    day_index: 0,
+                    first_item_index: 4,
+                    len: 1,
+                },
+                HistoryRow::Day { day_index: 1 },
+                HistoryRow::Items {
+                    day_index: 1,
+                    first_item_index: 0,
+                    len: 1,
+                },
+            ],
+            "日付バー + カードの行になっていない"
+        );
+        // 列数が増えれば行数は減る（日付バーは日の数だけ残る）
+        assert_eq!(
+            build_rows(&days, ViewMode::Card, 5).len(),
+            2 + 1 + 1,
+            "列数が変わっても行数が変わっていない"
+        );
+        // リスト表示は列数を無視して 1 行 1 件
+        assert_eq!(
+            build_rows(&days, ViewMode::List, 5),
+            vec![
+                HistoryRow::Day { day_index: 0 },
+                HistoryRow::Items {
+                    day_index: 0,
+                    first_item_index: 0,
+                    len: 1,
+                },
+                HistoryRow::Items {
+                    day_index: 0,
+                    first_item_index: 1,
+                    len: 1,
+                },
+                HistoryRow::Items {
+                    day_index: 0,
+                    first_item_index: 2,
+                    len: 1,
+                },
+                HistoryRow::Items {
+                    day_index: 0,
+                    first_item_index: 3,
+                    len: 1,
+                },
+                HistoryRow::Items {
+                    day_index: 0,
+                    first_item_index: 4,
+                    len: 1,
+                },
+                HistoryRow::Day { day_index: 1 },
+                HistoryRow::Items {
+                    day_index: 1,
+                    first_item_index: 0,
+                    len: 1,
+                },
+            ],
+            "リスト表示が 1 行 1 件になっていない"
+        );
+        // 履歴が無ければ行も無い（空状態の文言だけを出す）
+        assert!(build_rows(&[], ViewMode::Card, 3).is_empty());
+        assert!(build_rows(&[], ViewMode::List, 1).is_empty());
+    }
+
+    /// 列数（＝ウィンドウ幅）が変わったら行を組み直し、仮想化リストの件数も追従する。
+    #[gpui_kit::test]
+    async fn rows_are_rebuilt_when_the_column_count_changes(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        let view = cx.new(HistoryView::new);
+        view.update(cx, |this, _| {
+            this.days = vec![test_history_day("2026-09-13", 5)];
+            this.rebuild_rows(2, 200.0);
+            assert_eq!(this.rows_columns, 2, "組んだときの列数を覚えていない");
+            assert_eq!(this.rows.len(), 1 + 3, "2 列で 5 件が 3 行になっていない");
+            assert_eq!(
+                this.list_state.item_count(),
+                this.rows.len(),
+                "仮想化リストの件数が行数と合っていない"
+            );
+            // 列数が変われば行数も変わる（仮想化リストへも差し替わる）
+            this.rebuild_rows(3, 200.0);
+            assert_eq!(this.rows_columns, 3);
+            assert_eq!(this.rows.len(), 1 + 2, "3 列で 5 件が 2 行になっていない");
+            assert_eq!(this.list_state.item_count(), this.rows.len());
+            // リスト表示は列数に関わらず 1 行 1 件（有効な列数は 1）
+            this.view_mode = ViewMode::List;
+            this.rebuild_rows(3, 200.0);
+            assert_eq!(this.rows_columns, 1, "リスト表示の列数が 1 になっていない");
+            assert_eq!(this.rows.len(), 1 + 5);
+            assert_eq!(this.list_state.item_count(), this.rows.len());
+        });
+    }
+
     /// キーボード操作: ←→↑↓ / hjkl で選択が動き、ESC で絞り込みが解除される。
     #[gpui_kit::test]
     async fn history_keyboard_moves_selection_and_clears_filters(
@@ -2274,6 +2608,57 @@ mod tests {
             )
             .unwrap();
         });
+    }
+
+    /// テスト用の履歴 1 件（仮想化の行モデルを組むのに使う。本 id 以外は表示に使わない）。
+    fn test_history_item(id: &str) -> HistoryItem {
+        HistoryItem {
+            book: books::Book {
+                id: id.into(),
+                title: format!("本{id}"),
+                author: "作者".into(),
+                circle_name: "サークル".into(),
+                purchase_date: None,
+                file_name: format!("{id}.pdf"),
+                file_size: 1,
+                opfs_path: format!("{id}.opfspack"),
+                cover_thumbnail: None,
+                tbf_product_id: None,
+                site_id: Some("techbookfest".into()),
+                tags_fetched: 1,
+                pack_id: None,
+                is_favorite: 0,
+                is_hidden: 0,
+                created_at: "2026-08-21 00:00:00".into(),
+                updated_at: "2026-08-21 00:00:00".into(),
+                media_category: None,
+                ai_type: None,
+                is_drm: 0,
+                release_date: None,
+                description: None,
+                theme: None,
+                maker_id: None,
+                page_count: None,
+                age_rating: None,
+                series_name: None,
+            },
+            event_text: "イベント不明".into(),
+            reading_state: progress::ReadingState::Unread,
+            progress: None,
+            tags: Vec::new(),
+            cover: None,
+        }
+    }
+
+    /// テスト用の履歴 1 日ぶん（`count` 件）。
+    fn test_history_day(date: &str, count: usize) -> HistoryDay {
+        HistoryDay {
+            date: date.into(),
+            label: day_label(date),
+            items: (0..count)
+                .map(|index| test_history_item(&format!("{date}-{index}")))
+                .collect(),
+        }
     }
 
     /// 閲覧セッションを入れる（`started_at` / `ended_at` は UTC の `YYYY-MM-DD HH:MM:SS`）。
@@ -2698,6 +3083,19 @@ mod tests {
             "日付がバーになっていない（幅 {}）",
             bar.size.width.as_f32()
         );
+        // 仮想化しても並びは同じ: 今日の日付バー → 今日のカード → 昨日の日付バー
+        let yesterday_bar = visual.debug_bounds("history-day-1").expect("昨日の日付バー");
+        let today_card = visual
+            .debug_bounds(interned(format!("history-card-{today_key}-b1")))
+            .expect("今日のカード");
+        assert!(
+            bar.origin.y < today_card.origin.y
+                && today_card.origin.y < yesterday_bar.origin.y,
+            "日付バーとカードの並びが崩れている（今日 {} / カード {} / 昨日 {}）",
+            bar.origin.y.as_f32(),
+            today_card.origin.y.as_f32(),
+            yesterday_bar.origin.y.as_f32()
+        );
         // 本棚と同じ情報: 紐づく本棚アイテムのイベント名が出る
         assert_eq!(
             view.read_with(cx, |this, _| this.days[0]
@@ -2874,6 +3272,113 @@ mod tests {
                 .flat_map(|day| day.items.iter())
                 .all(|item| item.book.site_id.as_deref() == Some("fanza"))),
             "他サイトの本が残っている"
+        );
+    }
+
+    /// 仮想化: 可視行だけを構築する。1 日 2 冊 × 60 日（120 件 / 120 行）を入れて、
+    /// 行クロージャが構築した行数が総行数より十分少ないことを確かめる
+    /// （全行を毎フレーム構築する実装に戻すと落ちる）。
+    #[gpui_kit::test]
+    async fn history_builds_only_visible_rows(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::Duration;
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        // ローカルの正午から 1 日ずつ遡る（実行時刻で日付がずれないように）
+        let noon = local_noon();
+        for day in 0..60 {
+            for index in 0..2 {
+                let id = format!("b{day}-{index}");
+                seed_book(cx, &id, "本", "techbookfest");
+                add_session(
+                    cx,
+                    &format!("s{day}-{index}"),
+                    &id,
+                    noon - Duration::days(day),
+                    5,
+                );
+            }
+        }
+
+        let view = cx.new(HistoryView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let (total, built) = view.read_with(cx, |this, _| {
+            (
+                this.rows.len(),
+                this.built_rows.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
+        assert!(total >= 100, "行モデルが組み上がっていない（{total} 行）");
+        assert!(built > 0, "行を 1 つも構築していない（全 {total} 行）");
+        assert!(
+            built * 2 < total,
+            "全行を構築している（4 回の描画で {built} 行 / 全 {total} 行）"
+        );
+    }
+
+    /// 選択移動は「選択した本の行が見える位置」へリストを寄せる
+    /// （以前は日付セクション単位でスクロール位置を計算していた）。
+    #[gpui_kit::test]
+    async fn moving_the_selection_scrolls_the_list(cx: &mut gpui_kit::TestAppContext) {
+        use chrono::Duration;
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        // 1 日 1 冊 × 30 日（リスト表示で 1 冊ずつ下へ動かす）
+        let noon = local_noon();
+        for day in 0..30 {
+            let id = format!("b{day}");
+            seed_book(cx, &id, "本", "techbookfest");
+            add_session(cx, &format!("s{day}"), &id, noon - Duration::days(day), 5);
+        }
+
+        let view = cx.new(HistoryView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        view.update(cx, |this, cx| {
+            this.view_mode = ViewMode::List;
+            cx.notify();
+        });
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        assert_eq!(
+            view.read_with(cx, |this, _| this.list_state.logical_scroll_top().item_ix),
+            0,
+            "初期は先頭のはず"
+        );
+        // 画面に収まらない位置（20 冊目）まで選択を動かす
+        for _ in 0..20 {
+            visual.simulate_keystrokes("down");
+        }
+        assert_eq!(
+            view.read_with(cx, |this, _| this.selected_index),
+            Some(20),
+            "選択が 20 冊目まで動いていない"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.list_state.logical_scroll_top().item_ix) > 0,
+            "選択した本の行が見える位置へスクロールしていない（先頭のまま）"
         );
     }
 
