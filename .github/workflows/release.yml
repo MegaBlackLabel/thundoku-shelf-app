@@ -12,7 +12,16 @@ permissions:
   contents: read
 
 jobs:
+  # 公開の前提: 同じコミットでテストと監査を通す。
+  #
+  # `ci.yml` はタグ push でも単独で走るが、**別ワークフローの成功を公開の前提にはできない**
+  # （`needs` は同じファイル内のジョブしか指せない）。そこで再利用可能ワークフローとして
+  # 呼び、失敗したら build / release へ進まないようにする（セキュリティ評価 F07）。
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: checks
     # 署名つきの来歴（attestation）を作るために OIDC と証明の保存権限が要る。
     # ジョブの `permissions` はワークフロー既定を**置き換える**ので `contents` も書く。
     permissions:
@@ -408,7 +417,7 @@ jobs:
           ditto -c -k --keepParent "$APP" "signed-app-${{ steps.ver.outputs.v }}-${{ matrix.arch }}.zip"
           ls -l signed-app-*.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always() && runner.os == 'macOS'
         with:
           name: signed-app-${{ steps.ver.outputs.v }}-${{ matrix.arch }}
