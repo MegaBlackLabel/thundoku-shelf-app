@@ -304,9 +304,23 @@ impl DlsiteClient {
     /// DLsite は store を跨いでも作品ページが解決されるため maniax 固定でよい
     /// （`product_info` も maniax 固定）。作者行が無い作品は `None`。
     pub fn work_page_author(&mut self, content_id: &str) -> Result<Option<String>, DlsiteError> {
+        Ok(self.work_page_meta(content_id)?.author)
+    }
+
+    /// 作品ページから「作者」と「ファイル容量」をまとめて取る（**取得は 1 回**）。
+    ///
+    /// ダウンロード前のサイズ確認（2 GiB 超）に使う。容量が読めない作品は `None`
+    /// （＝サイズ不明。確認は出さない）。
+    pub fn work_page_meta(
+        &mut self,
+        content_id: &str,
+    ) -> Result<DlsiteWorkPageMeta, DlsiteError> {
         let url = format!("https://www.dlsite.com/maniax/work/=/product_id/{content_id}.html");
         let html = self.get_html(&url)?;
-        Ok(parse_work_page_author(&html))
+        Ok(DlsiteWorkPageMeta {
+            author: parse_work_page_author(&html),
+            file_size: parse_work_file_size(&html),
+        })
     }
 
     /// `down_url` を 302 追跡して `download.dlsite.com` の実 ZIP を取得する。
@@ -537,6 +551,19 @@ fn parse_row(s: &str) -> Option<DlsitePurchase> {
     })
 }
 
+/// 作品ページ HTML の「ファイル容量」（例 `107.84MB`）をバイト数へ直す。
+///
+/// 行が無い / 値が読めない作品は `None`（＝サイズ不明。確認は出さない）。
+/// 実機 HTML（2026-09-26 / RJ01412386）で検証済み:
+/// `<th>ファイル容量</th><td><div class="main_genre">107.84MB</div></td>`
+pub fn parse_work_file_size(html: &str) -> Option<u64> {
+    // 「ファイル容量」行の `<td>` ブロックに限定する（他の行の数値と混ざらないように）。
+    let row = regex::Regex::new(r"(?s)<th>\s*ファイル容量\s*</th>\s*<td>(.*?)</td>").ok()?;
+    let block = row.captures(html)?.get(1)?.as_str();
+    let value = regex::Regex::new(r"([0-9]+(?:\.[0-9]+)?\s*[KMGT]?B)").ok()?.captures(block)?;
+    crate::store_size::parse_store_size(&value[1])
+}
+
 /// 作品ページ HTML の「作者」行（`<th>作者</th>` の直後の `<a>` テキスト）を抽出する。
 /// 実機 HTML（2026-09-11 / RJ01412386）で検証済み。行が無い / 空の作品は `None`。
 pub fn parse_work_page_author(html: &str) -> Option<String> {
@@ -544,6 +571,16 @@ pub fn parse_work_page_author(html: &str) -> Option<String> {
     re.captures(html)
         .map(|cap| cap[1].trim().to_string())
         .filter(|author| !author.is_empty())
+}
+
+/// 作品ページから取れる補足情報（作者とファイル容量）。
+///
+/// 作者は取り込み時に本棚へ入れ、ファイル容量はダウンロード前の確認（2 GiB 超）に使う。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DlsiteWorkPageMeta {
+    pub author: Option<String>,
+    /// 宣言されたファイル容量（バイト）。読めなければ `None`。
+    pub file_size: Option<u64>,
 }
 
 /// 作品ページ HTML の `product/info/ajax` レスポンス（JSON）を解析する。
@@ -751,6 +788,35 @@ mod tests {
         assert_eq!(parse_work_page_author(html).as_deref(), Some("ととねろ"));
         // 作者行が無い作品は None
         assert_eq!(parse_work_page_author("<table></table>"), None);
+    }
+
+    /// 作品ページ HTML の「ファイル容量」を抽出する（実機 HTML 2026-09-26 / RJ01412386 と同じ整形）。
+    #[test]
+    fn parse_work_file_size_extracts_capacity() {
+        let html = r#"<tr>
+    <th>ジャンル</th>
+    <td><div class="main_genre"><a href="/x">男の娘</a></div></td>
+  </tr>
+          <tr>
+    <th>ファイル容量</th>
+    <td>
+      <div class="main_genre">
+                              107.84MB
+                        </div>
+    </td>
+  </tr>
+    </table>"#;
+        assert_eq!(
+            parse_work_file_size(html),
+            crate::store_size::parse_store_size("107.84MB"),
+            "「ファイル容量」をバイト数へ直していない"
+        );
+        // 該当行が無い / 値が空の作品は None（＝サイズ不明として扱う）
+        assert_eq!(parse_work_file_size("<table></table>"), None);
+        assert_eq!(
+            parse_work_file_size("<th>ファイル容量</th><td><div class=\"main_genre\"></div></td>"),
+            None
+        );
     }
 
     /// `product/info/ajax` JSON をフィールドへマップする。

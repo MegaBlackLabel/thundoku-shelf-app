@@ -1,8 +1,12 @@
 //! `imported_documents` / `document_images` / `document_text` repository.
+//!
+//! ページ本文（`document_text.text_content`）と形態素解析（`token_analysis` の
+//! `token` / `pos` / `base_form` / `reading`）は**平文で保存しない**。書き込みは
+//! [`column_crypto`] で暗号化し、読み出しは復号する（セキュリティ評価 F02）。
 
 use sqlx::Row;
 
-use crate::db::SqlitePool;
+use crate::db::{SqlitePool, column_crypto};
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ImportedDocument {
@@ -236,6 +240,14 @@ pub fn delete_for_book(pool: &SqlitePool, book_id: &str) -> Result<(), sqlx::Err
 }
 
 pub fn insert_text(pool: &SqlitePool, text: &DocumentText) -> Result<(), sqlx::Error> {
+    // 抽出したページ本文は平文で残さない（セキュリティ評価 F02）。鍵が取れないときは
+    // **平文で書かず**にエラーにする（fail-closed）。
+    let key = column_crypto::db_key()?;
+    let stored = column_crypto::encrypt_str(
+        &key,
+        &column_crypto::aad_document_text(&text.id, "text_content"),
+        &text.text_content,
+    )?;
     crate::db::block_on(async {
         sqlx::query(
             "INSERT INTO document_text (id, document_id, page_number, text_content, created_at) \
@@ -244,7 +256,7 @@ pub fn insert_text(pool: &SqlitePool, text: &DocumentText) -> Result<(), sqlx::E
         .bind(&text.id)
         .bind(&text.document_id)
         .bind(text.page_number)
-        .bind(&text.text_content)
+        .bind(&stored)
         .bind(&text.created_at)
         .execute(pool)
         .await?;
@@ -297,10 +309,12 @@ pub fn insert_images_batch(pool: &SqlitePool, images: &[DocumentImage]) -> Resul
 }
 
 /// ページテキストを一括 INSERT する（取り込み時の負荷改善）。
+/// 本文は暗号化して保存する（[`column_crypto`]）。鍵が取れないときは書かない。
 pub fn insert_texts_batch(pool: &SqlitePool, texts: &[DocumentText]) -> Result<(), sqlx::Error> {
     if texts.is_empty() {
         return Ok(());
     }
+    let key = column_crypto::db_key()?;
     crate::db::block_on(async {
         let mut tx = pool.begin().await?;
         for chunk in texts.chunks(200) {
@@ -315,11 +329,16 @@ pub fn insert_texts_batch(pool: &SqlitePool, texts: &[DocumentText]) -> Result<(
             sql.push_str(&values.join(", "));
             let mut q = sqlx::query(&sql);
             for t in chunk {
+                let text_content = column_crypto::encrypt_str(
+                    &key,
+                    &column_crypto::aad_document_text(&t.id, "text_content"),
+                    &t.text_content,
+                )?;
                 q = q
                     .bind(&t.id)
                     .bind(&t.document_id)
                     .bind(t.page_number)
-                    .bind(&t.text_content)
+                    .bind(text_content)
                     .bind(&t.created_at);
             }
             q.execute(&mut *tx).await?;
@@ -332,10 +351,12 @@ pub fn insert_texts_batch(pool: &SqlitePool, texts: &[DocumentText]) -> Result<(
 /// トークンを一括 INSERT する（取り込み時の負荷改善）。
 /// 抽出トークンは 1 ページ数百件 × 数百ページで数万行になるため、
 /// 1 件 1 クエリだと取り込みが著しく遅くなる。
+/// 4 列とも暗号化して保存する（[`column_crypto`]。列ごとに AAD を変えて入れ替えを検知する）。
 pub fn insert_tokens_batch(pool: &SqlitePool, tokens: &[TokenRow]) -> Result<(), sqlx::Error> {
     if tokens.is_empty() {
         return Ok(());
     }
+    let key = column_crypto::db_key()?;
     crate::db::block_on(async {
         let mut tx = pool.begin().await?;
         for chunk in tokens.chunks(500) {
@@ -354,10 +375,26 @@ pub fn insert_tokens_batch(pool: &SqlitePool, tokens: &[TokenRow]) -> Result<(),
                     .bind(&t.id)
                     .bind(&t.document_id)
                     .bind(t.page_number)
-                    .bind(&t.token)
-                    .bind(&t.pos)
-                    .bind(&t.base_form)
-                    .bind(&t.reading)
+                    .bind(column_crypto::encrypt_str(
+                        &key,
+                        &column_crypto::aad_token_analysis(&t.id, "token"),
+                        &t.token,
+                    )?)
+                    .bind(column_crypto::encrypt_str(
+                        &key,
+                        &column_crypto::aad_token_analysis(&t.id, "pos"),
+                        &t.pos,
+                    )?)
+                    .bind(column_crypto::encrypt_opt_str(
+                        &key,
+                        &column_crypto::aad_token_analysis(&t.id, "base_form"),
+                        t.base_form.as_deref(),
+                    )?)
+                    .bind(column_crypto::encrypt_opt_str(
+                        &key,
+                        &column_crypto::aad_token_analysis(&t.id, "reading"),
+                        t.reading.as_deref(),
+                    )?)
                     .bind(t.frequency)
                     .bind(&t.created_at);
             }
@@ -368,26 +405,38 @@ pub fn insert_tokens_batch(pool: &SqlitePool, tokens: &[TokenRow]) -> Result<(),
     })
 }
 
+/// ドキュメントのページ本文を（復号して）返す。復号できない行は含めない
+/// （**暗号文を本文として返さない**。鍵違い・改ざんは空として扱う）。
 pub fn all_text_for_document(
     pool: &SqlitePool,
     document_id: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
+    let key = column_crypto::db_key()?;
     crate::db::block_on(async {
         let rows = sqlx::query(
-            "SELECT text_content FROM document_text WHERE document_id = ?1 ORDER BY page_number",
+            "SELECT id, text_content FROM document_text WHERE document_id = ?1 ORDER BY page_number",
         )
         .bind(document_id)
         .fetch_all(pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            out.push(row.get::<String, _>("text_content"));
+            let id: String = row.get("id");
+            let stored: String = row.get("text_content");
+            let aad = column_crypto::aad_document_text(&id, "text_content");
+            if let Some(text) = column_crypto::decrypt_str(&key, &aad, &stored)? {
+                out.push(text);
+            } else {
+                log::warn!("document_text {id}: 本文を復号できないため読み飛ばします");
+            }
         }
         Ok(out)
     })
 }
 
 pub fn insert_token(pool: &SqlitePool, token: &TokenRow) -> Result<(), sqlx::Error> {
+    // 形態素解析の 4 列も平文で残さない（セキュリティ評価 F02）。
+    let key = column_crypto::db_key()?;
     crate::db::block_on(async {
         sqlx::query(
             "INSERT INTO token_analysis (id, document_id, page_number, token, pos, base_form, \
@@ -396,10 +445,26 @@ pub fn insert_token(pool: &SqlitePool, token: &TokenRow) -> Result<(), sqlx::Err
         .bind(&token.id)
         .bind(&token.document_id)
         .bind(token.page_number)
-        .bind(&token.token)
-        .bind(&token.pos)
-        .bind(&token.base_form)
-        .bind(&token.reading)
+        .bind(column_crypto::encrypt_str(
+            &key,
+            &column_crypto::aad_token_analysis(&token.id, "token"),
+            &token.token,
+        )?)
+        .bind(column_crypto::encrypt_str(
+            &key,
+            &column_crypto::aad_token_analysis(&token.id, "pos"),
+            &token.pos,
+        )?)
+        .bind(column_crypto::encrypt_opt_str(
+            &key,
+            &column_crypto::aad_token_analysis(&token.id, "base_form"),
+            token.base_form.as_deref(),
+        )?)
+        .bind(column_crypto::encrypt_opt_str(
+            &key,
+            &column_crypto::aad_token_analysis(&token.id, "reading"),
+            token.reading.as_deref(),
+        )?)
         .bind(token.frequency)
         .bind(&token.created_at)
         .execute(pool)

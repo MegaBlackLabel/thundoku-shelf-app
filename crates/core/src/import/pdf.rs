@@ -125,6 +125,14 @@ pub fn render_pdf_pages(
     if total == 0 {
         return Ok(Vec::new());
     }
+    // **描画の前**にページ数を見る（上限内のページが数万ある PDF で、レンダリングと
+    // WebP エンコードを長時間走らせてから pack の上限で落ちるのを避ける。F06）。
+    if total > crate::import::MAX_PDF_PAGES {
+        return Err(ImportError::Pdf(format!(
+            "PDF のページ数 {total} が上限 {} を超えています",
+            crate::import::MAX_PDF_PAGES
+        )));
+    }
 
     // ページ幅を 1000px に（アスペクト比維持）。高さの上限は設けない
     // （縦長ページでも幅 1000px を維持する。`set_maximum_height` を入れると
@@ -138,6 +146,8 @@ pub fn render_pdf_pages(
     let done = std::sync::atomic::AtomicUsize::new(0);
     let progress = std::sync::Mutex::new(progress);
     let mut rendered = Vec::with_capacity(total);
+    // エンコード済みページの累積バイト数（上限を超えたら打ち切る）。
+    let mut output_bytes = 0u64;
     let mut first_error: Option<ImportError> = None;
     // ページのハンドルは 1 つ作って使い回す。`document.pages().iter().skip(n)` を窓ごとに
     // 作り直すと、手前のページを毎回ロードして捨てる（`PdfPagesIterator::next` が
@@ -215,7 +225,10 @@ pub fn render_pdf_pages(
 
         for (offset, result) in results.into_inner().unwrap().into_iter().enumerate() {
             match result.and_then(|r| r.ok()) {
-                Some(page) => rendered.push(page),
+                Some(page) => {
+                    output_bytes = output_bytes.saturating_add(page.data.len() as u64);
+                    rendered.push(page);
+                }
                 None => {
                     let index = window_start + offset;
                     log::error!("render_pdf_pages: ページ {index} のエンコードに失敗");
@@ -229,6 +242,15 @@ pub fn render_pdf_pages(
         }
         if first_error.is_some() {
             break;
+        }
+        // **累積の出力量**も見る（1 ページ 16MPix の検査は「1 ページ」の上限で、
+        // 全体の量は制約しない。pack の上限（`MAX_TOTAL_SIZE`）を超える分を
+        // エンコードし続けないよう、ここで打ち切る。F06）。
+        if output_bytes > opfspack::MAX_TOTAL_SIZE {
+            return Err(ImportError::Pdf(format!(
+                "PDF の出力が上限を超えています（{output_bytes} バイト > {} バイト）",
+                opfspack::MAX_TOTAL_SIZE
+            )));
         }
     }
 

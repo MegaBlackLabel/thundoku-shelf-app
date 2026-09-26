@@ -9,6 +9,7 @@ pub mod backup;
 pub mod books;
 pub mod bookshelf;
 pub mod checklist;
+pub mod column_crypto;
 pub mod contents;
 pub mod documents;
 pub mod favorites;
@@ -520,8 +521,62 @@ pub fn migrate_drm_status_once(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
     Ok(true)
 }
 
+/// 機密列（`document_text.text_content` / `token_analysis` の 4 列 / `page_notes.memo`）の
+/// 平文を**一度だけ**暗号化する（セキュリティ評価 F02）。
+///
+/// 以前のバージョンはこれらを平文で書いていた。起動時に一度だけ暗号化して置き換え、
+/// フラグ（`app_settings['column_crypto.v1_migrated']`）で 2 回目以降は何もしない。
+/// **鍵が取れない・書き込みに失敗したときはフラグを立てない**ので次回起動で再試行する
+/// （移行前の平文は読み取りでは平文として読めるので、失敗しても表示は壊れない）。
+/// 平文の行が 1 つも無ければ**鍵（keyring）に触れずに**フラグだけ立てる。
+///
+/// 戻り値: 暗号化した行数。
+pub fn migrate_column_crypto_once(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let key = "column_crypto.v1_migrated";
+    let migrated: i64 = block_on(async {
+        sqlx::query_scalar("SELECT COUNT(*) FROM app_settings WHERE key = ?1")
+            .bind(key)
+            .fetch_one(pool)
+            .await
+    })?;
+    if migrated > 0 {
+        return Ok(0);
+    }
+    if !block_on(column_crypto::has_plaintext_rows(pool))? {
+        settings::set(pool, key, "1")?;
+        return Ok(0);
+    }
+    // 鍵が無いなら**平文のまま放置せず**移行を失敗させる（フラグも立てない）。
+    let crypto_key = column_crypto::db_key()?;
+    let updated = block_on(async {
+        let mut tx = pool.begin().await?;
+        let updated = column_crypto::encrypt_plaintext_rows(&mut tx, &crypto_key).await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(updated)
+    })?;
+    settings::set(pool, key, "1")?;
+    if updated > 0 {
+        // 書き換える前の平文は WAL に残る（データディレクトリのコピーに含まれる）。
+        // 本体へ反映して WAL を切り詰め、平文の残骸を残さない。失敗しても移行自体は
+        // 成立するのでエラーにはしない（次の書き込みで上書きされる）。
+        if let Err(error) = block_on(async {
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_all(pool)
+                .await
+        }) {
+            log::warn!("column crypto: WAL の切り詰めに失敗: {error}");
+        }
+    }
+    Ok(updated)
+}
+
 /// テスト用のインメモリプール（1 接続固定で同一メモリを共有）＋マイグレーション適用。
 pub fn test_pool() -> SqlitePool {
+    // 機密列の暗号化（`column_crypto`）が keyring に触れないようにする。テストは暗号鍵の
+    // 生成・読み出しの経路で OS の許可ダイアログ（開発機）や keyring の不在（CI）に当たる。
+    // プロセス内メモリのバックエンドに固定する（`secrets` のテストと app の
+    // `AppState::init_test` と同じ扱い）。
+    crate::secrets::SecretStore::use_memory_backend();
     let pool = block_on(async {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(":memory:")

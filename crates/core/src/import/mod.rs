@@ -14,8 +14,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use opfspack::{PackBuilder, PackRootKey};
-use sha2::{Digest, Sha256};
+use opfspack::{PackBuilder, PackRead, PackRootKey};
 
 use crate::db::{SqlitePool, books, contents, documents, tags as tags_repo};
 use crate::google::GoogleProfile;
@@ -52,6 +51,26 @@ pub enum ImportError {
     /// アプリ側が出し分けるための識別子（文言は UI が決める。§11.2 R3）。
     #[error("not a readable work")]
     NotAReadableWork,
+    /// 未ログイン（Google のプロフィールが無い）で取り込みを要求された。
+    ///
+    /// v3 の pack 鍵（PRK）は Google アカウント（`sub`）ごとに作るため、未ログインでは
+    /// 鍵を用意できない。ここで平文 pack に落とすと、所有者（`owner_sub`）を持たない
+    /// 本が増えて Drive 同期の対象にもならず（別端末から復元できない）、ログイン後に
+    /// 同じ本を取り込んでも別の本として二重になる。**平文に落とさず取り込みを失敗
+    /// させる**（fail-closed。セキュリティ評価 F03）。文言はそのまま画面に出る。
+    #[error(
+        "本を取り込むには Google にログインしてください（本はアカウントごとの鍵で暗号化されます）"
+    )]
+    LoginRequired,
+    /// ZIP のエントリ数・展開後の合計が上限を超える（**展開の前**に弾いた）。
+    /// 個別上限（`MAX_ZIP_ENTRY_BYTES`）だけでは、上限内のエントリが大量にある
+    /// アーカイブで変換を走らせてしまう（セキュリティ評価 F06）。
+    #[error("この ZIP は大きすぎて取り込めません（{detail}）")]
+    ZipTooLarge { detail: String },
+    /// 取り込み元のファイルが大きすぎる（**読む前に**弾いた。セキュリティ評価 F06）。
+    /// 文言はそのまま画面に出る。
+    #[error("この本は大きすぎて取り込めません（{size} バイト。上限は {limit} バイト）")]
+    SourceTooLarge { size: u64, limit: u64 },
     /// Google にログイン済みなのに pack の鍵（v3 のルート鍵 = PRK）を用意できない。
     ///
     /// v3 の鍵材料は乱数のルート鍵で、端末の keyring と Drive の
@@ -100,11 +119,6 @@ impl From<crate::pack_keys::PackKeysError> for ImportError {
 
 fn now() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// 幅が `min_width` 未満の画像を Lanczos3 で拡大する（元が小さい画像の表示
@@ -221,9 +235,9 @@ fn book_id_for(reuse_book_id: Option<&str>) -> String {
 
 /// 取り込みで pack を作る鍵（v3 の PRK）を決める（**fail-closed**）。
 ///
-/// - 未ログイン（`profile` = `None`）: 平文 pack を許可する（`Ok(None)`）。
-///   これは現行の正規経路（`owner_sub` を持たない本として保存する）。
-/// - ログイン済み + 鍵あり: `Ok(Some(prk))`。実際の pack 鍵は冊ごとに
+/// - 未ログイン（`profile` = `None`）: **エラー**（[`ImportError::LoginRequired`]）。
+///   平文 pack の取り込みは行わない（セキュリティ評価 F03）。
+/// - ログイン済み + 鍵あり: `Ok(prk)`。実際の pack 鍵は冊ごとに
 ///   `prk.derive_pack_key(&book_id)` で導出する（`finish_import` が行う）。
 /// - ログイン済み + 鍵なし: **平文に落とさずエラー**。ログイン中の閲覧は暗号化
 ///   pack 前提（`reader.rs`）なので、平文で作ると `owner_sub` 付きの行が
@@ -237,22 +251,36 @@ fn book_id_for(reuse_book_id: Option<&str>) -> String {
 pub fn pack_root_key_for_import(
     profile: Option<&GoogleProfile>,
     resolve_root: impl FnOnce(&str) -> Result<PackRootKey, ImportError>,
-) -> Result<Option<PackRootKey>, ImportError> {
+) -> Result<PackRootKey, ImportError> {
     let Some(profile) = profile else {
-        // 未ログインは平文 pack（従来どおり）
-        return Ok(None);
+        // 未ログインでは鍵を作れない（平文 pack は作らない）
+        return Err(ImportError::LoginRequired);
     };
     let sub = profile.sub.trim();
     if sub.is_empty() {
         return Err(ImportError::IdentitySubMissing);
     }
-    Ok(Some(resolve_root(sub)?))
+    resolve_root(sub)
 }
 
 /// ZIP エントリパスからファイル名部分を取り出す（`dir/book.pdf` → `book.pdf`）。
 fn entry_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
+
+/// 1 冊の PDF のページ数上限（9000）。
+///
+/// `opfspack::MAX_ENTRY_COUNT`（10000）から metadata / サムネイル分を引いた値。
+/// これを超える PDF は 1 エントリ 16MPix の検査を通っても、レンダリングと
+/// WebP エンコードに長時間かけてから pack の上限で落ちる（セキュリティ評価 F06）。
+pub const MAX_PDF_PAGES: usize = 9000;
+
+/// 取り込み元ファイルの上限（2 GiB）。**読む前に**検査する。
+///
+/// `import_file` は変換のために全体をメモリへ読む（`import_*_bytes` 系の API）。
+/// 読んでから大きさに気付くとその時点で RAM を食い潰すため、メタデータだけで先に弾く
+/// （セキュリティ評価 F06）。これを超える本は、変換をストリーム化してから対応する。
+pub const MAX_IMPORT_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// 入れ子 ZIP の再帰展開の上限（決定 D5 / `docs/import-patterns.md` §11.2 R1）。
 ///
@@ -277,6 +305,8 @@ struct EntryMeta {
     /// 読み出し先のアーカイブ内の索引（`nested` があればその入れ子内の索引）。
     index: usize,
     name: String,
+    /// 中央ディレクトリが宣言する展開後サイズ（**信用はしない**。上限の事前検査にだけ使う）。
+    declared_size: u64,
     /// 入れ子 ZIP 由来のとき、その入れ子アーカイブの生バイト。
     /// 同じ入れ子のエントリ間で `Arc` を共有し、外側から読み直さない。
     nested: Option<Arc<[u8]>>,
@@ -300,6 +330,7 @@ fn collect_entry_metas<R: std::io::Read + std::io::Seek>(
         metas.push(EntryMeta {
             index,
             name: zip_names::decode_entry_name(entry.name_raw()),
+            declared_size: entry.size(),
             nested: None,
         });
     }
@@ -314,6 +345,16 @@ fn read_zip_entry_capped<R: std::io::Read + std::io::Seek>(
     index: usize,
     limit: u64,
 ) -> Result<Option<Vec<u8>>, ImportError> {
+    Ok(read_zip_entry_capped_detail(archive, index, limit)?.0)
+}
+
+/// 上限付き読み出しの本体。`(読めたデータ, 実際に読めた長さ)` を返す
+/// （上限超過は `None` と読めた長さ。エラーの内訳表示に使う）。
+fn read_zip_entry_capped_detail<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: usize,
+    limit: u64,
+) -> Result<(Option<Vec<u8>>, u64), ImportError> {
     let mut entry = archive
         .by_index(index)
         .map_err(|e| ImportError::Zip(e.to_string()))?;
@@ -323,40 +364,54 @@ fn read_zip_entry_capped<R: std::io::Read + std::io::Seek>(
         .take(limit + 1)
         .read_to_end(&mut data)
         .map_err(|e| ImportError::Zip(e.to_string()))?;
-    if data.len() as u64 > limit {
-        return Ok(None);
+    let read = data.len() as u64;
+    if read > limit {
+        return Ok((None, read));
     }
-    Ok(Some(data))
+    Ok((Some(data), read))
 }
 
-/// 通常 ZIP エントリ 1 件の非圧縮サイズ上限（解凍爆弾対策）。
+/// 通常 ZIP エントリ 1 件の非圧縮サイズ上限（2 GiB。解凍爆弾対策）。
 ///
-/// 入れ子 ZIP を合流させるときの上限（[`MAX_NESTED_BYTES`]）と揃える。1 冊に
-/// 含まれる 1 ファイルとしては十分大きく、数百 GB を展開させる細工を弾ける。
-/// 宣言サイズではなく**実際に読めたバイト数**で判定する。
-pub const MAX_ZIP_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+/// **展開後**のサイズで判定する（宣言サイズは信用しない）。取り込み元ファイルの上限
+/// （[`MAX_IMPORT_SOURCE_BYTES`]）と同じ値にしてある: ここで許すのは
+/// 「そのサイズの 1 エントリをメモリに読んでよい」という意味で、それ以上は
+/// 取り込み側（`import_*_bytes`）が扱えない。
+///
+/// 512 MiB にしていたときは、**142 MB の ZIP に含まれる PDF が展開後 512 MiB を
+/// 超える**（スキャン画像を多く含む PDF は deflate がよく効く）という正当な本を
+/// 弾いていた。ページ画像として pack に入るのは**レンダリング後**の小さな webp なので、
+/// 元 PDF の大きさが pack の上限に効くことはない。
+pub const MAX_ZIP_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 上限超過エントリのエラー文言。
+///
+/// 内訳（宣言サイズ・実際に読めた長さ）を出すのは、**上限に当たったのか
+/// データが壊れているのか**を切り分けるため（宣言より実際がはるかに大きい＝
+/// 展開爆弾か壊れた ZIP。どちらも同じ上限で弾くが、原因を追える）。
+fn zip_entry_too_large_error(name: &str, declared: u64, read: u64) -> ImportError {
+    ImportError::Zip(format!(
+        "エントリがサイズ上限（{MAX_ZIP_ENTRY_BYTES} バイト）を超えています: {name}（宣言 {declared} バイト / 実際に読めた {read} バイト）"
+    ))
+}
 
 /// `EntryMeta` が指すエントリを 1 件読み出す（入れ子 ZIP の中身にも対応）。
 fn read_entry<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     meta: &EntryMeta,
 ) -> Result<Vec<u8>, ImportError> {
-    // 上限超過のエントリは取り込まない（部分的なデータで先へ進めない）。
-    let too_large = || {
-        ImportError::Zip(format!(
-            "エントリがサイズ上限（{MAX_ZIP_ENTRY_BYTES} バイト）を超えています: {}",
-            meta.name
-        ))
-    };
     match &meta.nested {
         None => {
-            read_zip_entry_capped(archive, meta.index, MAX_ZIP_ENTRY_BYTES)?.ok_or_else(too_large)
+            let (data, read) =
+                read_zip_entry_capped_detail(archive, meta.index, MAX_ZIP_ENTRY_BYTES)?;
+            data.ok_or_else(|| zip_entry_too_large_error(&meta.name, meta.declared_size, read))
         }
         Some(bytes) => {
             let mut nested = zip::ZipArchive::new(std::io::Cursor::new(Arc::clone(bytes)))
                 .map_err(|e| ImportError::Zip(e.to_string()))?;
-            read_zip_entry_capped(&mut nested, meta.index, MAX_ZIP_ENTRY_BYTES)?
-                .ok_or_else(too_large)
+            let (data, read) =
+                read_zip_entry_capped_detail(&mut nested, meta.index, MAX_ZIP_ENTRY_BYTES)?;
+            data.ok_or_else(|| zip_entry_too_large_error(&meta.name, meta.declared_size, read))
         }
     }
 }
@@ -407,7 +462,7 @@ fn expand_nested_archives<R: std::io::Read + std::io::Seek>(
         };
         if declared > MAX_NESTED_BYTES {
             warnings.push(format!(
-                "{name}: nested zip is larger than the size limit ({MAX_NESTED_BYTES} bytes)"
+                "{name}: nested zip is larger than the size limit ({MAX_NESTED_BYTES} bytes)（宣言 {declared} バイト）"
             ));
             continue;
         }
@@ -454,6 +509,7 @@ fn expand_nested_archives<R: std::io::Read + std::io::Seek>(
             count += 1;
             total = total.saturating_add(entry.size());
             pending.push(EntryMeta {
+                declared_size: entry.size(),
                 index: inner_index,
                 name: format!("{prefix}/{inner_name}"),
                 nested: Some(Arc::clone(&bytes)),
@@ -918,8 +974,8 @@ fn single_content(
 }
 
 struct PackSpec {
-    /// (entry path, data, mime, compress)
-    entries: Vec<(String, Vec<u8>, String, bool)>,
+    /// 取り込み中のページデータ（合計が閾値を超えたら一時ファイルへ逃がす）。
+    entries: PackEntryStore,
     page_rows: Vec<PageRow>,
     /// (page_number, text) — PDF の抽出テキストや `_export.txt` の中身。
     texts: Vec<(i64, String)>,
@@ -930,6 +986,177 @@ struct PackSpec {
     source_type: String,
     /// 既定表示（primary）コンテンツのページ数。
     total_pages: i64,
+}
+
+/// 取り込み中にページデータを保持する場所。
+///
+/// 小さい本はメモリに持ち（速い）、**合計が [`SPILL_THRESHOLD_BYTES`] を超えたらそれ以降は
+/// 一時ファイルへ**書く。これで pack を組み立てるときのピークメモリが「閾値 + 1 ページ」に
+/// 収まり、大きい本（数 GiB）でも RAM を食い潰さない（セキュリティ評価 F06 の
+/// 「変換は一時ファイルへ逐次出力」）。一時ファイルは `Drop` で必ず消す。
+struct PackEntryStore {
+    /// (entry path, stored data, mime, compress)
+    entries: Vec<(String, StoredData, String, bool)>,
+    /// 受け取ったデータの合計（閾値判定に使う）。
+    total_bytes: u64,
+    /// 一時ファイルを置くディレクトリ（最初に必要になったときに作る）。
+    spill_dir: Option<std::path::PathBuf>,
+    /// 一時ファイルの連番（同じディレクトリで衝突させない）。
+    spill_index: usize,
+    /// これを超えたら一時ファイルへ逃がす（テストで小さくできるようにフィールドにしてある）。
+    threshold: u64,
+}
+
+/// 1 エントリ分のデータの置き場所。
+enum StoredData {
+    /// まだ取り出していないメモリ上のデータ。
+    Memory(Option<Vec<u8>>),
+    /// 一時ファイル（取り出したら消す）。
+    File(std::path::PathBuf),
+    /// すでに builder へ渡した。
+    Taken,
+}
+
+/// これを超えたら一時ファイルへ逃がす（小さい本はメモリのままにして I/O を増やさない）。
+const SPILL_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
+impl PackEntryStore {
+    fn new() -> Self {
+        Self::with_threshold(SPILL_THRESHOLD_BYTES)
+    }
+
+    fn with_threshold(threshold: u64) -> Self {
+        Self {
+            entries: Vec::new(),
+            total_bytes: 0,
+            spill_dir: None,
+            spill_index: 0,
+            threshold,
+        }
+    }
+
+    /// すでにメモリ上にあるエントリ群から作る（小さい本・画像 1 枚などの経路）。
+    fn from_entries(entries: Vec<(String, Vec<u8>, String, bool)>) -> Self {
+        let total_bytes: u64 = entries.iter().map(|(_, data, _, _)| data.len() as u64).sum();
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|(path, data, mime_type, compress)| {
+                    (path, StoredData::Memory(Some(data)), mime_type, compress)
+                })
+                .collect(),
+            total_bytes,
+            spill_dir: None,
+            spill_index: 0,
+            threshold: SPILL_THRESHOLD_BYTES,
+        }
+    }
+
+    /// path のデータを取り出す（**コピー**。サムネイルの寸法確認など、小さくて
+    /// 1 回しか使わない用途向け）。無ければ `None`。
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, ImportError> {
+        for (entry_path, stored, _, _) in &self.entries {
+            if entry_path != path {
+                continue;
+            }
+            return match stored {
+                StoredData::Memory(Some(data)) => Ok(Some(data.clone())),
+                StoredData::File(file) => Ok(Some(std::fs::read(file)?)),
+                StoredData::Memory(None) | StoredData::Taken => Ok(None),
+            };
+        }
+        Ok(None)
+    }
+
+    /// 1 エントリ分を受け取る（閾値を超えていれば一時ファイルへ書く）。
+    fn push(
+        &mut self,
+        path: String,
+        data: Vec<u8>,
+        mime_type: String,
+        compress: bool,
+    ) -> Result<(), ImportError> {
+        self.total_bytes += data.len() as u64;
+        let stored = if self.total_bytes > self.threshold {
+            self.spill(data)?
+        } else {
+            StoredData::Memory(Some(data))
+        };
+        self.entries.push((path, stored, mime_type, compress));
+        Ok(())
+    }
+
+    /// データを一時ファイルへ書く（ディレクトリは必要になったときに作る）。
+    fn spill(&mut self, data: Vec<u8>) -> Result<StoredData, ImportError> {
+        let dir = match &self.spill_dir {
+            Some(dir) => dir.clone(),
+            None => {
+                let dir = std::env::temp_dir().join(format!(
+                    "thundoku-import-spill-{}-{}",
+                    std::process::id(),
+                    chrono::Utc::now().timestamp_millis()
+                ));
+                std::fs::create_dir_all(&dir)?;
+                self.spill_dir = Some(dir.clone());
+                dir
+            }
+        };
+        let file = dir.join(format!("{:06}.bin", self.spill_index));
+        self.spill_index += 1;
+        std::fs::write(&file, &data)?;
+        Ok(StoredData::File(file))
+    }
+
+    /// pack へ書き出すエントリ（path と MIME と圧縮指定）。
+    fn specs(&self) -> Vec<opfspack::EntrySpec> {
+        self.entries
+            .iter()
+            .map(|(path, _, mime_type, compress)| opfspack::EntrySpec {
+                path: path.clone(),
+                mime_type: mime_type.clone(),
+                compress: *compress,
+            })
+            .collect()
+    }
+
+    /// path ごとのエントリ位置（同じ path が複数ある場合は受け取った順）。
+    fn index_by_path(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::VecDeque<usize>> {
+        let mut map: std::collections::HashMap<String, std::collections::VecDeque<usize>> =
+            std::collections::HashMap::new();
+        for (index, (path, _, _, _)) in self.entries.iter().enumerate() {
+            map.entry(path.clone()).or_default().push_back(index);
+        }
+        map
+    }
+
+    /// 1 エントリ分のデータを取り出す（メモリなら move、一時ファイルなら読んで消す）。
+    fn take(&mut self, index: usize) -> Result<Vec<u8>, ImportError> {
+        let (_, stored, _, _) = self
+            .entries
+            .get_mut(index)
+            .ok_or_else(|| ImportError::Zip("entry index out of range".into()))?;
+        match std::mem::replace(stored, StoredData::Taken) {
+            StoredData::Memory(Some(data)) => Ok(data),
+            StoredData::File(path) => {
+                let data = std::fs::read(&path)?;
+                let _ = std::fs::remove_file(&path);
+                Ok(data)
+            }
+            StoredData::Memory(None) | StoredData::Taken => Err(ImportError::Zip(
+                "pack entry already taken".into(),
+            )),
+        }
+    }
+}
+
+impl Drop for PackEntryStore {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.spill_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 struct PageRow {
@@ -997,16 +1224,23 @@ fn finish_import(
 
     // Build the pack first (metadata + pages), so document.file_hash can
     // reference the real pack bytes.
-    let mut builder = PackBuilder::new(chrono::Utc::now().timestamp_millis() as u64);
     let (metadata, metadata_path) = metadata_entry(&title, Some(spec.total_pages), &spec.contents);
-    builder.add_entry(&metadata_path, metadata, "application/json", false);
-    for (path, data, mime, compress) in &spec.entries {
-        builder.add_entry(path, data.clone(), mime, *compress);
-    }
+    // **エントリを 1 件ずつ供給して組み立てる**: ページデータは `PackEntryStore` から
+    // 必要なときに取り出す（メモリか一時ファイル）。全ページを同時に持たない。
+    let mut entries = vec![opfspack::EntrySpec {
+        path: metadata_path.clone(),
+        mime_type: "application/json".to_string(),
+        compress: false,
+    }];
+    entries.extend(spec.entries.specs());
+    // サムネイルの寸法は DB 行に要るので、`store` を動かす前に読んでおく（小さい）。
+    let thumbnail_entry = spec.entries.get("thumbnail.webp")?;
+    let mut store = spec.entries;
+    let by_path = store.index_by_path();
+    let metadata_for_build = metadata.clone();
     // v3 の pack 鍵は book id から導出する（冊ごとに別鍵）。
     // `root_key` が無い（未ログイン）ときは平文 pack。
     let pack_key = root_key.map(|root| root.derive_pack_key(&book_id));
-    let pack_bytes = builder.build(pack_key.as_ref(), true)?;
     std::fs::create_dir_all(packs_dir)?;
     // 書き出し先は保存領域内に収まることを検証する（`book_id` は再利用 id や
     // 復元 id 由来でも同じ検査を通す）。
@@ -1016,8 +1250,43 @@ fn finish_import(
             error.to_string(),
         ))
     })?;
-    std::fs::write(&pack_file, &pack_bytes)?;
+    // **ファイルへ直接組み立てる**（pack 全体を RAM に持たない）。書き込み途中の
+    // クラッシュで壊れた pack が残らないよう、一時ファイル → rename（原子的）で置換する。
+    let temp_file = pack_file.with_file_name(format!("{book_id}.{}.tmp", crate::pack_path::PACK_EXTENSION));
+    let mut remainder = by_path;
+    let built = PackBuilder::new(chrono::Utc::now().timestamp_millis() as u64)
+        .build_to_file_streaming(
+            &temp_file,
+            entries,
+            pack_key.as_ref(),
+            true,
+            |path| {
+                if path == metadata_path {
+                    return Ok(metadata_for_build.clone());
+                }
+                let index = remainder
+                    .get_mut(path)
+                    .and_then(std::collections::VecDeque::pop_front)
+                    .ok_or_else(|| {
+                        opfspack::PackError::Io(format!("import entry missing: {path}"))
+                    })?;
+                store
+                    .take(index)
+                    .map_err(|error| opfspack::PackError::Io(error.to_string()))
+            },
+        );
+    drop(store);
+    built?;
+    if let Err(error) = std::fs::rename(&temp_file, &pack_file) {
+        let _ = std::fs::remove_file(&temp_file);
+        return Err(ImportError::Io(error));
+    }
     log::info!("finish_import: パック作成（{:?}）", save_start.elapsed());
+    // pack 全体のハッシュは**ファイルを順に読んで**計算する（大きい pack を RAM に載せない）。
+    let pack_hash = {
+        let reader = opfspack::PackFileReader::open(&pack_file)?;
+        reader.source_sha256()?
+    };
 
     let book = books::Book {
         id: book_id.clone(),
@@ -1075,7 +1344,7 @@ fn finish_import(
         id: uuid::Uuid::new_v4().to_string(),
         book_id: book_id.clone(),
         source_type: spec.source_type.clone(),
-        file_hash: sha256_hex(&pack_bytes),
+        file_hash: pack_hash,
         total_pages: spec.total_pages,
         metadata: None,
         status: "completed".to_string(),
@@ -1161,12 +1430,8 @@ fn finish_import(
                     .map(|format| format.format_id.clone()),
             )
         });
-    if let Some((_, data, _, _)) = spec
-        .entries
-        .iter()
-        .find(|(path, ..)| path == "thumbnail.webp")
-    {
-        let (width, height) = image::load_from_memory(data)
+    if let Some(data) = thumbnail_entry {
+        let (width, height) = image::load_from_memory(&data)
             .map(|d| (d.width() as i64, d.height() as i64))
             .unwrap_or((0, 0));
         image_rows.push(documents::DocumentImage {
@@ -1265,6 +1530,14 @@ pub fn import_file(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    // **読む前に**大きさを見る（読んでから気付くと、その時点で RAM を食っている）。
+    let size = std::fs::metadata(source_path)?.len();
+    if size > MAX_IMPORT_SOURCE_BYTES {
+        return Err(ImportError::SourceTooLarge {
+            size,
+            limit: MAX_IMPORT_SOURCE_BYTES,
+        });
+    }
     let bytes = std::fs::read(source_path)?;
     match extension.as_str() {
         "pdf" => import_pdf_bytes(
@@ -1363,7 +1636,7 @@ pub fn import_rendered_pdf_pages(
         file_name,
         file_size,
         PackSpec {
-            entries,
+            entries: PackEntryStore::from_entries(entries),
             page_rows,
             texts,
             warnings: Vec::new(),
@@ -1392,12 +1665,12 @@ pub fn import_epub_bytes(
         file_name,
         bytes.len() as i64,
         PackSpec {
-            entries: vec![(
+            entries: PackEntryStore::from_entries(vec![(
                 entry_path,
                 bytes.to_vec(),
                 "application/epub+zip".to_string(),
                 false,
-            )],
+            )]),
             page_rows: Vec::new(),
             texts: Vec::new(),
             warnings: Vec::new(),
@@ -1517,6 +1790,30 @@ pub fn analyze_zip(bytes: &[u8]) -> Result<ImportPlan, ImportError> {
     if metas.is_empty() {
         return Err(ImportError::EmptyArchive);
     }
+    // **展開の前**に外側全体の件数と宣言サイズの合計を見る（セキュリティ評価 F06）。
+    // 個別の上限（`MAX_ZIP_ENTRY_BYTES`）だけでは、上限内のエントリが大量にある
+    // アーカイブで変換を走らせてしまう。宣言サイズは信用しない（実際の長さは
+    // 読み出し時に別途上限で見る）が、事前に弾ける分はここで弾く。
+    let declared_total: u64 = metas
+        .iter()
+        .fold(0u64, |acc, meta| acc.saturating_add(meta.declared_size));
+    if metas.len() > opfspack::MAX_ENTRY_COUNT as usize {
+        return Err(ImportError::ZipTooLarge {
+            detail: format!(
+                "エントリ数 {} が上限 {} を超えています",
+                metas.len(),
+                opfspack::MAX_ENTRY_COUNT
+            ),
+        });
+    }
+    if declared_total > opfspack::MAX_TOTAL_SIZE {
+        return Err(ImportError::ZipTooLarge {
+            detail: format!(
+                "展開後の合計 {declared_total} バイトが上限 {} バイトを超えています",
+                opfspack::MAX_TOTAL_SIZE
+            ),
+        });
+    }
     let contents = build_contents(&metas);
     let primary = choose_primary(&contents);
 
@@ -1584,7 +1881,7 @@ pub fn commit_zip(
     // 旧実装は全エントリを `Vec<(String, Vec<u8>)>` に読み込んでいたため、
     // 巨大 ZIP（実データ最大 1.19GB / 展開後 1.33GB）で展開後のデータを
     // 同時に保持していた。ここでは 1 件ずつ伸長して使い終わったら捨てる。
-    let mut pack_entries: Vec<(String, Vec<u8>, String, bool)> = Vec::new();
+    let mut pack_entries = PackEntryStore::new();
     let mut page_rows: Vec<PageRow> = Vec::new();
     let mut warnings = plan.warnings.clone();
     let mut contents_spec: Vec<ContentSpec> = Vec::new();
@@ -1637,12 +1934,12 @@ pub fn commit_zip(
                             }
                             let page_number = (page_rows.len() - start) as i64 + 1;
                             let entry_path = format!("{prefix}/page_{page_number:04}.webp");
-                            pack_entries.push((
+                            pack_entries.push(
                                 entry_path.clone(),
                                 webp.clone(),
                                 "image/webp".to_string(),
                                 false,
-                            ));
+                            )?;
                             page_rows.push(PageRow {
                                 content_id: Some(content_id.clone()),
                                 format_id: Some(format_id.clone()),
@@ -1669,12 +1966,12 @@ pub fn commit_zip(
                     for (index, page) in pages.iter().enumerate() {
                         let page_number = index as i64 + 1;
                         let entry_path = format!("{prefix}/page_{page_number:04}.webp");
-                        pack_entries.push((
+                        pack_entries.push(
                             entry_path.clone(),
                             page.data.clone(),
                             "image/webp".to_string(),
                             false,
-                        ));
+                        )?;
                         page_rows.push(PageRow {
                             content_id: Some(content_id.clone()),
                             format_id: Some(format_id.clone()),
@@ -1702,12 +1999,12 @@ pub fn commit_zip(
                     } else {
                         format!("{prefix}/{}", entry_file_name(&meta.name))
                     };
-                    pack_entries.push((
+                    pack_entries.push(
                         entry_path,
                         data,
                         "application/epub+zip".to_string(),
                         false,
-                    ));
+                    )?;
                     0
                 }
                 // 音声・動画はページを持たない（構造だけ記録する）
@@ -1744,20 +2041,20 @@ pub fn commit_zip(
     }
     if let Some(thumbnail_source) = &primary_thumbnail {
         if let Some(cover_source) = &primary_cover {
-            pack_entries.push((
+            pack_entries.push(
                 "cover.webp".to_string(),
                 cover_source.clone(),
                 "image/webp".to_string(),
                 false,
-            ));
+            )?;
         }
         let (thumb, _, _) = thumbnail_of(thumbnail_source)?;
-        pack_entries.push((
+        pack_entries.push(
             "thumbnail.webp".to_string(),
             thumb,
             "image/webp".to_string(),
             false,
-        ));
+        )?;
     }
 
     let source_type = match primary.media_kind {
@@ -1818,13 +2115,12 @@ pub fn import_zip_bytes(
 pub fn rebuild_from_pack(
     pool: &SqlitePool,
     pack_id: &str,
-    pack_bytes: &[u8],
+    reader: &dyn PackRead,
     root_key: Option<&PackRootKey>,
 ) -> Result<bool, ImportError> {
     if documents::get_document_by_book_id(pool, pack_id)?.is_some() {
         return Ok(false);
     }
-    let reader = opfspack::PackReader::open(pack_bytes)?;
     // v3 の pack 鍵は pack id（= book id）から導出する。
     let pack_key = root_key.map(|root| root.derive_pack_key(pack_id));
     let timestamp = now();
@@ -1946,7 +2242,7 @@ pub fn rebuild_from_pack(
         id: document_id.clone(),
         book_id: pack_id.to_string(),
         source_type: source_type.to_string(),
-        file_hash: sha256_hex(pack_bytes),
+        file_hash: reader.source_sha256()?,
         total_pages: primary_pages,
         metadata: None,
         status: "completed".to_string(),
@@ -2176,7 +2472,7 @@ pub fn import_image_bytes(
         file_name,
         bytes.len() as i64,
         PackSpec {
-            entries: vec![
+            entries: PackEntryStore::from_entries(vec![
                 (
                     "pages/page_0001.webp".to_string(),
                     webp.clone(),
@@ -2189,7 +2485,7 @@ pub fn import_image_bytes(
                     "image/webp".to_string(),
                     false,
                 ),
-            ],
+            ]),
             page_rows: vec![PageRow {
                 content_id: Some(content_id),
                 format_id: Some(format_id),
@@ -2265,8 +2561,7 @@ mod pack_root_key_tests {
             assert_eq!(sub, "sub-1", "解決には本人の sub を渡す");
             Ok(root)
         })
-        .expect("鍵があるので暗号化できる")
-        .expect("ログイン中は PRK あり");
+        .expect("鍵があるので暗号化できる");
 
         assert_eq!(resolved.as_bytes(), expected.as_bytes());
     }
@@ -2292,12 +2587,22 @@ mod pack_root_key_tests {
         assert!(!message.contains("ImportError"), "{message}");
     }
 
-    /// 未ログインは従来どおり平文 pack（`root_key = None`）を作れる。
+    /// 未ログインの取り込みは**失敗させる**（平文 pack を作らない — F03 fail-closed）。
+    ///
+    /// v3 の pack 鍵は Google アカウント（`sub`）ごとに作るため、未ログインでは
+    /// 用意できない。平文で作り続けると所有者（`owner_sub`）を持たない本が増え、
+    /// Drive 同期の対象にもならない（読めるのはその端末だけになる）。
     #[test]
-    fn logged_out_stays_plaintext() {
-        let root = pack_root_key_for_import(None, |_| panic!("未ログインでは解決しない"))
-            .expect("未ログインの平文取り込みは従来どおり許可する");
-        assert!(root.is_none());
+    fn logged_out_requires_login() {
+        let error = pack_root_key_for_import(None, |_| panic!("未ログインでは解決しない"))
+            .expect_err("未ログインでは平文 pack を作らない");
+
+        // 利用者に伝わる文言（内部型名や空文字を出さない）。
+        let message = error.to_string();
+        assert!(matches!(error, ImportError::LoginRequired), "{error:?}");
+        assert!(message.contains("Google"), "{message}");
+        assert!(message.contains("ログイン"), "{message}");
+        assert!(!message.contains("ImportError"), "{message}");
     }
 
     /// 空の `sub` では暗号化しない（`owner_id` と `sub` ラップの材料が空になる）。
@@ -2311,5 +2616,136 @@ mod pack_root_key_tests {
             .expect_err("空の sub で暗号化しない");
             assert!(matches!(error, ImportError::IdentitySubMissing), "{error:?}");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod pack_entry_store_tests {
+    use super::{PackEntryStore, SPILL_THRESHOLD_BYTES};
+
+    fn entries(store: &PackEntryStore) -> Vec<(String, String, bool)> {
+        store
+            .specs()
+            .into_iter()
+            .map(|spec| (spec.path, spec.mime_type, spec.compress))
+            .collect()
+    }
+
+    /// 閾値まではメモリに持ち、一時ファイルを作らない（小さい本で I/O を増やさない）。
+    #[test]
+    fn keeps_small_entries_in_memory() {
+        let mut store = PackEntryStore::new();
+        store
+            .push("a".into(), vec![1u8; 10], "image/webp".into(), false)
+            .unwrap();
+        assert!(store.spill_dir.is_none(), "一時ファイルを作らない");
+        assert_eq!(
+            entries(&store),
+            vec![("a".to_string(), "image/webp".to_string(), false)]
+        );
+        assert_eq!(store.get("a").unwrap(), Some(vec![1u8; 10]));
+        // index は受け取った順に同じ path を複数扱える
+        store
+            .push("a".into(), vec![2u8; 10], "image/webp".into(), true)
+            .unwrap();
+        let index = store.index_by_path();
+        assert_eq!(index["a"].clone().into_iter().collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(store.specs().len(), 2);
+    }
+
+    /// 閾値を超えたら一時ファイルへ書き、取り出したら消す（合計メモリを抑える）。
+    #[test]
+    fn spills_entries_over_the_threshold_to_a_temp_file() {
+        let mut store = PackEntryStore::with_threshold(100);
+        store
+            .push("small".into(), vec![1u8; 10], "image/webp".into(), false)
+            .unwrap();
+        assert!(store.spill_dir.is_none(), "閾値まではメモリ");
+        // 合計 10 + 200 > 100 → こちらはファイルへ。
+        store
+            .push("big".into(), vec![9u8; 200], "image/webp".into(), false)
+            .unwrap();
+        let dir = store.spill_dir.clone().expect("一時ディレクトリを作る");
+        assert!(dir.exists());
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1, "大きいエントリだけファイルへ");
+
+        // メモリ側もファイル側も同じ内容が取り出せる。
+        assert_eq!(store.get("small").unwrap(), Some(vec![1u8; 10]));
+        assert_eq!(store.get("big").unwrap(), Some(vec![9u8; 200]));
+
+        let index = store.index_by_path();
+        let small_index = index["small"].clone().pop_front().unwrap();
+        let big_index = index["big"].clone().pop_front().unwrap();
+        assert_eq!(store.take(small_index).unwrap(), vec![1u8; 10]);
+        assert_eq!(store.take(big_index).unwrap(), vec![9u8; 200]);
+        // 2 回目は取れない（builder が同じエントリを二度要求していないことの検査）
+        assert!(store.take(big_index).is_err());
+
+        drop(store);
+        assert!(!dir.exists(), "drop で一時ディレクトリを消す");
+    }
+
+    /// 一時ファイルを消しても（= drop しても）網羅的に残らない。
+    #[test]
+    fn default_threshold_is_the_documented_value() {
+        assert_eq!(SPILL_THRESHOLD_BYTES, 64 * 1024 * 1024);
+        let store = PackEntryStore::new();
+        assert_eq!(store.threshold, SPILL_THRESHOLD_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod zip_entry_limit_tests {
+    use super::{
+        ImportError, MAX_ZIP_ENTRY_BYTES, read_zip_entry_capped_detail,
+        zip_entry_too_large_error,
+    };
+    use std::io::Write as _;
+
+    /// 上限ちょうどは読めて、1 バイト超は `None` + 実際に読めた長さを返す。
+    ///
+    /// 実際の上限（2 GiB）を試すのは非現実的なので、小さな上限で同じ判定を通す
+    /// （`limit` を受け取る形にしてある）。
+    #[test]
+    fn capped_read_reports_the_actual_length_when_over_the_limit() {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            writer.start_file("pages/page_0001.webp", options).unwrap();
+            writer.write_all(&vec![7u8; 2000]).unwrap();
+            writer.finish().unwrap();
+        }
+        let bytes = buffer.into_inner();
+
+        // 上限内（2000 バイトちょうど）は読める
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+        let (data, read) = read_zip_entry_capped_detail(&mut archive, 0, 2000).unwrap();
+        assert_eq!(read, 2000);
+        assert_eq!(data.map(|d| d.len()), Some(2000));
+
+        // 上限 1999 では読めない（読み切った長さ 2000 を報告する）
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let (data, read) = read_zip_entry_capped_detail(&mut archive, 0, 1999).unwrap();
+        assert!(data.is_none(), "上限を超えたらデータを返さない");
+        assert_eq!(read, 2000, "実際に読めた長さを報告する");
+    }
+
+    /// エラー文言に内訳（宣言サイズ・実際に読めた長さ）と上限値が入る。
+    #[test]
+    fn too_large_error_includes_the_numbers() {
+        let error = zip_entry_too_large_error("book.pdf", 1_000, 700_000_000);
+        let ImportError::Zip(message) = &error else {
+            panic!("Zip エラーになる: {error}");
+        };
+        assert!(message.contains("book.pdf"), "{message}");
+        assert!(
+            message.contains(&MAX_ZIP_ENTRY_BYTES.to_string()),
+            "上限値が入る: {message}"
+        );
+        assert!(message.contains("宣言 1000 バイト"), "{message}");
+        assert!(message.contains("実際に読めた 700000000 バイト"), "{message}");
     }
 }

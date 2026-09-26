@@ -341,10 +341,18 @@ impl TbfClient {
             ));
         }
         // サイト側のセッション破棄が完了したらローカルも破棄する
+        self.clear_session();
+        Ok(())
+    }
+
+    /// メモリ上のセッションを破棄する（ログアウト）。
+    ///
+    /// Cookie も XSRF トークンも残さない（空の `TbfSession` を `restore_session` すると
+    /// `session()` が空のセッションを返し続けるため、必ずこれを使う）。
+    pub fn clear_session(&mut self) {
         self.cookies.clear();
         self.xsrf_raw = None;
         self.xsrf_token = None;
-        Ok(())
     }
 
     /// Fetch the bookshelf with cursor pagination (BookShelfQuery).

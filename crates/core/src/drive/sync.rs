@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use opfspack::{PackError, PackReader, PackRootKey, pack_flags};
+use opfspack::{PackError, PackRootKey, pack_flags};
 
 use crate::db::{SqlitePool, books, sync_state};
 use crate::drive::{DriveApi, DriveError, DriveFile};
@@ -76,6 +76,33 @@ pub enum SyncError {
     Backup(#[from] crate::db::backup::BackupError),
 }
 
+/// ファイルを順に読んで md5 を計算する（pack 全体を RAM に載せない）。
+fn md5_file(path: &std::path::Path) -> Result<String, SyncError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut context = md5::Context::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        context.consume(&buf[..read]);
+    }
+    Ok(format!("{:x}", context.compute()))
+}
+
+/// pack を開けなかった理由を同期エラーへ（v2 は再取り込みを案内）。
+fn pack_open_error(pack_id: &str, error: PackError) -> SyncError {
+    match error {
+        PackError::Version(version) => SyncError::UnsupportedPackVersion {
+            pack_id: pack_id.to_string(),
+            version,
+        },
+        other => SyncError::InvalidPack(format!("{pack_id}: {other}")),
+    }
+}
+
 fn pack_id_from_name(name: &str) -> Option<&str> {
     name.strip_suffix(&format!(".{PACK_EXTENSION}"))
         .filter(|id| crate::pack_path::is_safe_id(id))
@@ -111,11 +138,10 @@ fn local_newer_than(path: &Path, last_synced_at: &str) -> bool {
 /// Import a downloaded pack into `books`, preferring `metadata.json` fields.
 fn import_book(
     pool: &SqlitePool,
-    reader: &PackReader,
+    reader: &dyn opfspack::PackRead,
     pack_id: &str,
     root_key: Option<&PackRootKey>,
     file_size: i64,
-    pack_bytes: &[u8],
 ) -> Result<(), SyncError> {
     let mut title = pack_id.to_string();
     let mut author = String::new();
@@ -181,9 +207,7 @@ fn import_book(
     )?;
     // pack から取り込み状態（ドキュメント・コンテンツ・ページ行）を再構築する。
     // DB だけ失った / 別端末での復元用。すでに取り込み済みなら何もしない。
-    if let Err(error) =
-        crate::import::rebuild_from_pack(pool, pack_id, pack_bytes, root_key)
-    {
+    if let Err(error) = crate::import::rebuild_from_pack(pool, pack_id, reader, root_key) {
         log::warn!("drive restore: pack からの再構築に失敗 ({pack_id}): {error}");
     }
     Ok(())
@@ -327,9 +351,16 @@ pub fn sync_with_progress(
         let local_path = crate::pack_path::pack_path(packs_dir, pack_id)
             .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
 
+        std::fs::create_dir_all(downloads_dir)?;
+        std::fs::create_dir_all(packs_dir)?;
+        let temp = crate::pack_path::pack_path(downloads_dir, pack_id)
+            .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
+
         // 進捗つきの取得（16MiB の API 上限ではなく 2GiB のダウンロード経路）。
-        let bytes = drive
-            .download_with_progress(&file.id, &mut |received, total| {
+        // **一時ファイルへ直接ストリーム**するので、pack 全体を RAM に載せない
+        // （2GiB を超える pack でもメモリ使用量は一定）。
+        let written = drive
+            .download_to_file(&file.id, &temp, &mut |received, total| {
                 if cancelled {
                     return false;
                 }
@@ -348,19 +379,26 @@ pub fn sync_with_progress(
                 DriveError::Cancelled => SyncError::Cancelled,
                 other => SyncError::Drive(other),
             })?;
-        let reader = PackReader::open(&bytes).map_err(|error| match error {
-            // v2 以前の pack（v3 では開けない）。再取り込みを案内する。
-            PackError::Version(version) => SyncError::UnsupportedPackVersion {
-                pack_id: (*pack_id).to_string(),
-                version,
-            },
-            other => SyncError::InvalidPack(format!("{pack_id}: {other}")),
-        })?;
-        // v3 の暗号化は header / entry の `ENCRYPTED` で判定する
-        // （v2 の `IDENTITY_BOUND` は v3 に存在しない）。
-        let encrypted = reader.header().flags & pack_flags::ENCRYPTED != 0;
-        if encrypted && pack_root_key.is_none() {
-            return Err(SyncError::PackKeyRequired((*pack_id).to_string()));
+
+        // 検証も**ファイル裏打ち**で行う（全体を読まない）。失敗したら一時ファイルを消す
+        // （壊れた pack を置き場に残さない）。
+        {
+            let reader = match opfspack::PackFileReader::open(&temp) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(pack_open_error(pack_id, error));
+                }
+            };
+            // v3 の暗号化は header / entry の `ENCRYPTED` で判定する
+            // （v2 の `IDENTITY_BOUND` は v3 に存在しない）。
+            let encrypted = reader.header().flags & pack_flags::ENCRYPTED != 0;
+            if encrypted && pack_root_key.is_none() {
+                let _ = std::fs::remove_file(&temp);
+                return Err(SyncError::PackKeyRequired((*pack_id).to_string()));
+            }
+            // ここで reader（開いているファイル）を落とす: Windows では開いている
+            // ファイルを rename できないため。
         }
 
         // sync_state 行が無い場合（新規ダウンロード直後・state クリア後・DB 復元後）は
@@ -372,22 +410,18 @@ pub fn sync_with_progress(
             std::fs::copy(&local_path, &backup)?;
             outcome.conflicts.push((*pack_id).to_string());
         }
-        std::fs::create_dir_all(downloads_dir)?;
-        std::fs::create_dir_all(packs_dir)?;
-        let temp = crate::pack_path::pack_path(downloads_dir, pack_id)
-            .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
-        std::fs::write(&temp, &bytes)?;
         // 直接 write だと書き込み途中のクラッシュで pack が壊れるため、
         // 同一ファイルシステム内の rename で置換する（原子的）。
-        std::fs::rename(&temp, &local_path)?;
-        import_book(
-            pool,
-            &reader,
-            pack_id,
-            pack_root_key,
-            bytes.len() as i64,
-            &bytes,
-        )?;
+        if let Err(error) = std::fs::rename(&temp, &local_path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(SyncError::Io(error));
+        }
+        // 取り込みは最終パスから開き直す（この時点で開いているハンドルは無い）。
+        let reader = match opfspack::PackFileReader::open(&local_path) {
+            Ok(reader) => reader,
+            Err(error) => return Err(pack_open_error(pack_id, error)),
+        };
+        import_book(pool, &reader, pack_id, pack_root_key, written as i64)?;
         // ダウンロードした pack は現在 sub の所有として記録する（フォルダ分離前提で帰属を信頼）。
         if let (Some(sub), Some(key)) = (identity_sub, owner_key) {
             books::set_owner_sub(pool, pack_id, Some(crate::owner::encrypt(key, sub)))?;
@@ -437,30 +471,45 @@ pub fn sync_with_progress(
             }
         };
         if should_upload {
-            // アップロードは進捗 API が無いので、ファイルごとの開始だけを報告する。
-            // ここが中止の区切り（戻り値が `false` なら**このファイルは上げない**）。
+            let file_name = format!("{pack_id}.{PACK_EXTENSION}");
+            let total = std::fs::metadata(&local_path).map(|meta| meta.len()).ok();
+            // ファイルごとの開始を報告する。ここが中止の区切り
+            // （戻り値が `false` なら**このファイルは上げない**）。
             if !on_progress(&SyncProgress {
                 phase: SyncPhase::Upload,
-                name: format!("{pack_id}.{PACK_EXTENSION}"),
+                name: file_name.clone(),
                 index: 0,
                 count: 0,
                 bytes: 0,
-                total_bytes: None,
+                total_bytes: total,
             }) {
                 return Err(SyncError::Cancelled);
             }
-            let bytes = std::fs::read(&local_path)?;
-            let file_id = drive.upload_multipart(
-                &format!("{pack_id}.{PACK_EXTENSION}"),
+            // **ファイルからストリームして上げる**（pack 全体を RAM に載せない）。
+            // 送れたバイト数をそのまま報告する（中止は `false` を返して伝える）。
+            let file_id = drive.upload_resumable_from_file_with_progress(
+                &file_name,
                 folder_id,
-                &bytes,
+                &local_path,
+                &mut |sent, total| {
+                    on_progress(&SyncProgress {
+                        phase: SyncPhase::Upload,
+                        name: file_name.clone(),
+                        index: 0,
+                        count: 0,
+                        bytes: sent,
+                        total_bytes: Some(total),
+                    })
+                },
             )?;
+            // md5 もファイルを順に読んで計算する（大きい pack を RAM に載せない）。
+            let local_md5 = md5_file(&local_path)?;
             sync_state::upsert(
                 pool,
                 &sync_state::DriveSyncState {
                     pack_id: pack_id.clone(),
                     drive_file_id: file_id,
-                    md5: format!("{:x}", md5::compute(&bytes)),
+                    md5: local_md5,
                     modified_time: None,
                     last_synced_at: now(),
                 },
@@ -560,7 +609,16 @@ pub fn sync_with_progress(
             // 先に新しいバックアップを上げてから旧ファイルを消す。
             // 削除→アップロードの順だと、途中で失敗したときに Drive 上の
             // バックアップが消えたままになる（唯一のオフサイト退避を失う）。
-            drive.upload_multipart(DB_BACKUP_NAME, folder_id, bytes)?;
+            drive.upload_multipart_with_progress(DB_BACKUP_NAME, folder_id, bytes, &mut |sent, total| {
+                on_progress(&SyncProgress {
+                    phase: SyncPhase::Upload,
+                    name: DB_BACKUP_NAME.to_string(),
+                    index: 0,
+                    count: 0,
+                    bytes: sent,
+                    total_bytes: Some(total),
+                })
+            })?;
             if let Some(file) = existing
                 && let Err(e) = drive.delete(&file.id)
             {

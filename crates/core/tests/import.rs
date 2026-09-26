@@ -713,10 +713,11 @@ fn image_zip_with_export_text_imports_page_text() {
     let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
     assert_eq!(imported.document.total_pages, 2);
 
-    // マーカーのページ番号がそのまま document_text に入る（2 ページ目は欠番）
-    let rows: Vec<(i64, String)> = thundoku_core::db::block_on(async {
+    // マーカーのページ番号がそのまま document_text に入る（2 ページ目は欠番）。
+    // 本文は平文で保存されない（セキュリティ評価 F02）ので、生の列を復号して確かめる。
+    let rows: Vec<(String, i64, String)> = thundoku_core::db::block_on(async {
         sqlx::query_as(
-            "SELECT page_number, text_content FROM document_text \
+            "SELECT id, page_number, text_content FROM document_text \
              WHERE document_id = ?1 ORDER BY page_number",
         )
         .bind(&imported.document.id)
@@ -724,6 +725,23 @@ fn image_zip_with_export_text_imports_page_text() {
         .await
     })
     .unwrap();
+    let key = thundoku_core::db::column_crypto::db_key().unwrap();
+    let rows: Vec<(i64, String)> = rows
+        .into_iter()
+        .map(|(id, page_number, stored)| {
+            assert!(
+                stored.starts_with(thundoku_core::db::column_crypto::PREFIX),
+                "本文が平文で保存されている: {stored}"
+            );
+            let text = thundoku_core::db::column_crypto::decrypt(
+                &key,
+                &thundoku_core::db::column_crypto::aad_document_text(&id, "text_content"),
+                &stored,
+            )
+            .expect("復号できること");
+            (page_number, text)
+        })
+        .collect();
     assert_eq!(
         rows,
         vec![
@@ -1634,4 +1652,151 @@ fn image_pages_keep_their_order_with_parallel_rendering() {
             "ページ {page} の赤が {red}（期待 {expected} 前後）。並列処理で順序がずれた可能性"
         );
     }
+}
+
+/// 取り込み元のファイルは**読む前に**大きさを検査する。
+///
+/// `import_file` は変換のために全体をメモリへ読む（`import_*_bytes`）。読んでから
+/// 大きさに気付くと、その時点で RAM を食い潰す（セキュリティ評価 F06）。
+/// ここではスパースファイル（実体を持たない巨大ファイル）で、**読まずに**弾くことを見る。
+#[test]
+fn import_file_rejects_a_source_larger_than_the_limit_without_reading_it() {
+    let env = TestEnv::new("too-large-source");
+    let path = env.root.join("huge.zip");
+
+    // 実データを書かずに長さだけ大きくする（読み込めばゼロ埋めが返る）。
+    let limit = thundoku_core::import::MAX_IMPORT_SOURCE_BYTES;
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(limit + 1024 * 1024).unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let error = import_file(&env.pool, &path, &env.packs(), None, &mut no_progress)
+        .expect_err("大きすぎるファイルは弾く");
+    let elapsed = started.elapsed();
+
+    match error {
+        ImportError::SourceTooLarge { size, limit: reported } => {
+            assert_eq!(reported, limit);
+            assert!(size > limit, "実サイズを報告する（{size}）");
+        }
+        other => panic!("SourceTooLarge を期待した: {other}"),
+    }
+    // 読んでいたら数 GiB のゼロ埋めで 1 秒では終わらない。
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "読む前に弾く（{elapsed:?}）"
+    );
+}
+
+/// 外側 ZIP の**エントリ数**は展開の前に上限で弾く（セキュリティ評価 F06）。
+///
+/// 個別サイズの上限だけでは、上限内の小さなエントリが大量にあるアーカイブで
+/// 変換（画像の伸長・WebP 再エンコード）を走らせてしまう。
+#[test]
+fn analyze_zip_rejects_more_entries_than_the_limit() {
+    use std::io::Write as _;
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        for index in 0..=opfspack::MAX_ENTRY_COUNT {
+            writer
+                .start_file(format!("pages/{index:05}.txt"), options)
+                .unwrap();
+            writer.write_all(b"x").unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let error = analyze_zip(&buffer.into_inner()).expect_err("件数超過は弾く");
+    assert!(
+        matches!(error, ImportError::ZipTooLarge { .. }),
+        "ZipTooLarge を期待した: {error}"
+    );
+}
+
+/// 宣言サイズの合計が上限を超える ZIP も、展開の前に弾く。
+///
+/// 中央ディレクトリの「展開後サイズ」を巨大に細工した 1 エントリの ZIP を作る
+/// （実際には 1 バイトしか入っていない = 宣言を信用しないことも同時に確かめる）。
+#[test]
+fn analyze_zip_rejects_a_declared_total_over_the_limit() {
+    use std::io::Write as _;
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        // 1 エントリの宣言サイズは u32 までなので、合計で上限（10 GiB）を超えるには
+        // 複数エントリが要る（u32::MAX を 3 件で約 12 GiB）。
+        for index in 0..3 {
+            writer
+                .start_file(format!("pages/page_{index:04}.webp"), options)
+                .unwrap();
+            writer.write_all(b"x").unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let mut bytes = buffer.into_inner();
+    // 中央ディレクトリのヘッダー（PK\x01\x02）の 24 バイト目が展開後サイズ（u32 LE）。
+    let mut patched = 0;
+    for offset in 0..bytes.len().saturating_sub(4) {
+        if &bytes[offset..offset + 4] == b"PK\x01\x02" {
+            bytes[offset + 24..offset + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 3, "中央ディレクトリのエントリ数");
+
+    let error = analyze_zip(&bytes).expect_err("宣言合計の超過は弾く");
+    match error {
+        ImportError::ZipTooLarge { detail } => assert!(detail.contains("展開後"), "{detail}"),
+        other => panic!("ZipTooLarge を期待した: {other}"),
+    }
+}
+
+/// PDF の**総ページ数**は描画の前に上限で弾く（セキュリティ評価 F06）。
+///
+/// 1 ページ 16MPix の検査だけでは、上限内のページが数万ある PDF で
+/// レンダリング（+ WebP エンコード）を走らせ続けてしまう。
+#[test]
+fn import_pdf_rejects_more_pages_than_the_limit() {
+    let env = TestEnv::new("too-many-pages");
+    let pages = thundoku_core::import::MAX_PDF_PAGES + 1;
+    let kids: Vec<String> = (0..pages).map(|index| format!("{} 0 R", index + 3)).collect();
+    let mut objects: Vec<Vec<u8>> = Vec::new();
+    objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    objects.push(
+        format!(
+            "<< /Type /Pages /Count {pages} /Kids [{}] >>",
+            kids.join(" ")
+        )
+        .into_bytes(),
+    );
+    for _ in 0..pages {
+        objects.push(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>".to_vec());
+    }
+    let pdf = build_pdf(&objects);
+
+    let started = std::time::Instant::now();
+    let error = import_pdf_bytes(
+        &env.pool,
+        "many-pages.pdf",
+        &pdf,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .expect_err("ページ数超過は弾く");
+    match error {
+        ImportError::Pdf(message) => assert!(message.contains("ページ数"), "{message}"),
+        other => panic!("Pdf を期待した: {other}"),
+    }
+    // 描画を始めていたら数万ページ分の時間がかかる。
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "描画の前に弾く（{:?}）",
+        started.elapsed()
+    );
 }

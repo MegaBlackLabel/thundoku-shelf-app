@@ -2112,3 +2112,445 @@ fn sync_does_not_clobber_a_verified_drm_status() {
     bookshelf::upsert(&pool, &no_drm).unwrap();
     assert_eq!(shelf_is_drm(&pool, "RJ5"), 1, "新しい判定結果を反映していない");
 }
+
+// ---- 機密列の暗号化（セキュリティ評価 F02） ------------------------------------
+//
+// ページ本文（`document_text.text_content`）・形態素解析（`token_analysis` の 4 列）・
+// 付箋メモ（`page_notes.memo`）は平文で保存しない。**生 SQL** で保存値そのものを
+// 確かめ（平文が残っていないこと）、復号した値が元に戻ることも確かめる。
+
+fn seed_crypto_book(pool: &thundoku_core::db::SqlitePool, id: &str) {
+    books::insert(
+        pool,
+        &books::Book {
+            id: id.into(),
+            title: "t".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "t.pdf".into(),
+            file_size: 1,
+            opfs_path: format!("{id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: None,
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-09-26 00:00:00".into(),
+            updated_at: "2026-09-26 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+}
+
+/// `document_text` / `token_analysis` の親（`books` → `imported_documents`）を用意する。
+fn seed_crypto_document(pool: &thundoku_core::db::SqlitePool, book_id: &str, document_id: &str) {
+    use thundoku_core::db::documents;
+
+    seed_crypto_book(pool, book_id);
+    documents::insert_document(
+        pool,
+        &documents::ImportedDocument {
+            id: document_id.into(),
+            book_id: book_id.into(),
+            source_type: "image".into(),
+            file_hash: "hash".into(),
+            total_pages: 1,
+            metadata: None,
+            status: "completed".into(),
+            created_at: "2026-09-26 00:00:00".into(),
+            updated_at: "2026-09-26 00:00:00".into(),
+        },
+    )
+    .unwrap();
+}
+
+/// 生 SQL で 1 つの文字列列を読む（保存値そのものを見る）。
+fn raw_column(pool: &thundoku_core::db::SqlitePool, sql: &str) -> String {
+    thundoku_core::db::block_on(async {
+        sqlx::query_scalar::<_, String>(sql).fetch_one(pool).await
+    })
+    .unwrap()
+}
+
+fn raw_exec(pool: &thundoku_core::db::SqlitePool, sql: &str) {
+    thundoku_core::db::block_on(async { sqlx::query(sql).execute(pool).await }).unwrap();
+}
+
+/// ページ本文は平文で保存されない（鍵なしでは読めない）。
+#[test]
+fn document_text_is_encrypted_at_rest() {
+    use thundoku_core::db::column_crypto;
+    use thundoku_core::db::documents;
+
+    let pool = memory_db();
+    seed_crypto_document(&pool, "b1", "doc-1");
+    documents::insert_text(
+        &pool,
+        &documents::DocumentText {
+            id: "dt-1".into(),
+            document_id: "doc-1".into(),
+            page_number: 1,
+            text_content: "ページの本文".into(),
+            created_at: "2026-09-26 00:00:00".into(),
+        },
+    )
+    .unwrap();
+
+    let stored = raw_column(
+        &pool,
+        "SELECT text_content FROM document_text WHERE id = 'dt-1'",
+    );
+    assert!(
+        stored.starts_with(column_crypto::PREFIX),
+        "本文が平文で保存されている: {stored}"
+    );
+    assert!(!stored.contains("ページの本文"), "平文が残っている: {stored}");
+
+    // 読み出しは復号される
+    assert_eq!(
+        documents::all_text_for_document(&pool, "doc-1").unwrap(),
+        vec!["ページの本文".to_string()]
+    );
+}
+
+/// 形態素解析の 4 列も平文で保存されない。列ごとに AAD が違うので入れ替えを検知する。
+#[test]
+fn token_analysis_columns_are_encrypted_at_rest() {
+    use thundoku_core::db::column_crypto;
+    use thundoku_core::db::documents;
+
+    let pool = memory_db();
+    seed_crypto_document(&pool, "b1", "doc-1");
+    documents::insert_tokens_batch(
+        &pool,
+        &[
+            documents::TokenRow {
+                id: "tk-1".into(),
+                document_id: "doc-1".into(),
+                page_number: 1,
+                token: "秘密".into(),
+                pos: "名詞".into(),
+                base_form: Some("秘密".into()),
+                reading: None,
+                frequency: 1,
+                created_at: "2026-09-26 00:00:00".into(),
+            },
+            documents::TokenRow {
+                id: "tk-2".into(),
+                document_id: "doc-1".into(),
+                page_number: 1,
+                token: "公開".into(),
+                pos: "名詞".into(),
+                base_form: Some("公開".into()),
+                reading: Some("コウカイ".into()),
+                frequency: 2,
+                created_at: "2026-09-26 00:00:00".into(),
+            },
+        ],
+    )
+    .unwrap();
+
+    let (token, pos, base_form, reading): (String, String, Option<String>, Option<String>) =
+        thundoku_core::db::block_on(async {
+            sqlx::query_as(
+                "SELECT token, pos, base_form, reading FROM token_analysis WHERE id = 'tk-1'",
+            )
+            .fetch_one(&pool)
+            .await
+        })
+        .unwrap();
+    let key = column_crypto::db_key().unwrap();
+    for stored in [&token, &pos] {
+        assert!(
+            stored.starts_with(column_crypto::PREFIX),
+            "平文で保存されている: {stored}"
+        );
+    }
+    let base_form = base_form.expect("base_form は入っている");
+    assert!(base_form.starts_with(column_crypto::PREFIX));
+    assert_eq!(reading, None, "NULL は NULL のまま");
+
+    let decrypt = |column: &str, stored: &str| {
+        column_crypto::decrypt(
+            &key,
+            &column_crypto::aad_token_analysis("tk-1", column),
+            stored,
+        )
+    };
+    assert_eq!(decrypt("token", &token).as_deref(), Some("秘密"));
+    assert_eq!(decrypt("pos", &pos).as_deref(), Some("名詞"));
+    assert_eq!(decrypt("base_form", &base_form).as_deref(), Some("秘密"));
+    // 列を入れ替えた値は復号できない（AAD に列名を入れている）
+    assert!(
+        decrypt("pos", &token).is_none(),
+        "列の入れ替えを検知できていない"
+    );
+    // 別の行へコピーしても復号できない
+    assert!(
+        column_crypto::decrypt(
+            &key,
+            &column_crypto::aad_token_analysis("tk-2", "token"),
+            &token
+        )
+        .is_none(),
+        "行の入れ替えを検知できていない"
+    );
+}
+
+/// 付箋メモも平文で保存されない。読み出し（表示経路）は復号される。
+#[test]
+fn page_notes_memo_is_encrypted_at_rest() {
+    use thundoku_core::db::column_crypto;
+    use thundoku_core::db::notes;
+
+    let pool = memory_db();
+    seed_crypto_book(&pool, "b1");
+    notes::upsert(
+        &pool,
+        &notes::PageNoteInput {
+            id: "note-b1--3",
+            book_id: "b1",
+            content_id: "",
+            page: 3,
+            memo: "ここ重要",
+            spread_side: None,
+        },
+    )
+    .unwrap();
+
+    let stored = raw_column(&pool, "SELECT memo FROM page_notes WHERE id = 'note-b1--3'");
+    assert!(
+        stored.starts_with(column_crypto::PREFIX),
+        "メモが平文で保存されている: {stored}"
+    );
+    assert!(!stored.contains("ここ重要"), "平文が残っている: {stored}");
+
+    let note = notes::get_for_page(&pool, "b1", "", 3).unwrap().unwrap();
+    assert_eq!(note.memo, "ここ重要");
+    assert_eq!(notes::list_newest_first(&pool).unwrap()[0].memo, "ここ重要");
+
+    // 同じページの付箋は id が違っても更新・復号できる（AAD は自然キー。復元と同じ経路）
+    notes::upsert(
+        &pool,
+        &notes::PageNoteInput {
+            id: "note-from-device-a",
+            book_id: "b1",
+            content_id: "",
+            page: 3,
+            memo: "書き直したメモ",
+            spread_side: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        notes::get_for_page(&pool, "b1", "", 3).unwrap().unwrap().memo,
+        "書き直したメモ",
+        "id が違っても復号できること（自然キーを AAD にしている）"
+    );
+}
+
+/// 復号できない値（改ざん）は**画面に出さない**（空として扱う）。行は消さない。
+#[test]
+fn tampered_note_memo_is_not_shown_as_ciphertext() {
+    use thundoku_core::db::column_crypto;
+    use thundoku_core::db::notes;
+
+    let pool = memory_db();
+    seed_crypto_book(&pool, "b1");
+    notes::upsert(
+        &pool,
+        &notes::PageNoteInput {
+            id: "note-b1--3",
+            book_id: "b1",
+            content_id: "",
+            page: 3,
+            memo: "ここ重要",
+            spread_side: None,
+        },
+    )
+    .unwrap();
+
+    // 暗号文（base64）の 1 文字を別の文字に差し替える = タグ検証が落ちる
+    let stored = raw_column(&pool, "SELECT memo FROM page_notes WHERE id = 'note-b1--3'");
+    let mut chars: Vec<char> = stored.chars().collect();
+    let index = column_crypto::PREFIX.len() + 20;
+    chars[index] = if chars[index] == 'A' { 'B' } else { 'A' };
+    let tampered: String = chars.into_iter().collect();
+    assert_ne!(tampered, stored);
+    thundoku_core::db::block_on(async {
+        sqlx::query("UPDATE page_notes SET memo = ?1 WHERE id = 'note-b1--3'")
+            .bind(&tampered)
+            .execute(&pool)
+            .await
+    })
+    .unwrap();
+
+    let note = notes::get_for_page(&pool, "b1", "", 3)
+        .unwrap()
+        .expect("行は残る（付箋の ON / OFF はメモとは別）");
+    assert_eq!(note.memo, "", "復号できない値を画面に出している");
+    let list = notes::list_newest_first(&pool).unwrap();
+    assert_eq!(list.len(), 1);
+    assert!(
+        !list[0].memo.contains(column_crypto::PREFIX),
+        "暗号文が画面に出ている"
+    );
+    // 生の値はそのまま残す（黙って書き換えない）
+    assert_eq!(
+        raw_column(&pool, "SELECT memo FROM page_notes WHERE id = 'note-b1--3'"),
+        tampered
+    );
+}
+
+/// 平文の行が無ければ何もしない（フラグだけ立てる。鍵 = keyring に触れない経路）。
+#[test]
+fn migrate_column_crypto_is_a_noop_without_plaintext() {
+    let pool = memory_db();
+    assert_eq!(
+        thundoku_core::db::migrate_column_crypto_once(&pool).unwrap(),
+        0
+    );
+    assert_eq!(
+        settings::get(&pool, "column_crypto.v1_migrated").unwrap(),
+        Some("1".into()),
+        "フラグを立てて、次回起動でスキャンし直さない"
+    );
+}
+
+/// 移行で書き換える前の平文は **WAL にも残さない**（データディレクトリのコピー対策）。
+///
+/// ファイル DB（WAL モード）で平文を書いてから移行し、`-wal` に平文が残っていないことを
+/// 確かめる（移行後に `PRAGMA wal_checkpoint(TRUNCATE)` で切り詰める）。
+#[test]
+fn migrate_column_crypto_truncates_the_wal() {
+    let root = std::env::temp_dir().join(format!(
+        "thundoku-column-crypto-wal-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("thundoku-shelf.db");
+
+    // 実際の起動と同じファイル DB（`db::connect` は WAL モードにする）
+    let pool = thundoku_core::db::connect(&path).unwrap();
+    seed_crypto_document(&pool, "b1", "doc-1");
+    raw_exec(
+        &pool,
+        "INSERT INTO document_text (id, document_id, page_number, text_content) \
+         VALUES ('dt-1', 'doc-1', 1, 'WAL に残したくない本文')",
+    );
+    assert_eq!(
+        thundoku_core::db::migrate_column_crypto_once(&pool).unwrap(),
+        1
+    );
+
+    let wal = std::fs::read(root.join("thundoku-shelf.db-wal")).unwrap_or_default();
+    assert!(
+        !String::from_utf8_lossy(&wal).contains("WAL に残したくない本文"),
+        "平文が WAL に残っている"
+    );
+    // DB 本体も暗号文になっている
+    assert!(
+        raw_column(&pool, "SELECT text_content FROM document_text WHERE id = 'dt-1'")
+            .starts_with(thundoku_core::db::column_crypto::PREFIX)
+    );
+
+    drop(pool);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 旧バージョンが平文で書いた行は、起動時の移行（一度きり）で暗号化される。
+#[test]
+fn migrate_column_crypto_encrypts_plaintext_rows() {
+    use thundoku_core::db::column_crypto;
+    use thundoku_core::db::documents;
+    use thundoku_core::db::notes;
+
+    let pool = memory_db();
+    seed_crypto_document(&pool, "b1", "doc-1");
+    // 旧バージョンが書いた平文の行を生 SQL で再現する
+    raw_exec(
+        &pool,
+        "INSERT INTO document_text (id, document_id, page_number, text_content) \
+         VALUES ('dt-1', 'doc-1', 1, '平文の本文')",
+    );
+    raw_exec(
+        &pool,
+        "INSERT INTO token_analysis (id, document_id, page_number, token, pos, base_form, reading) \
+         VALUES ('tk-1', 'doc-1', 1, '秘密', '名詞', '秘密', NULL)",
+    );
+    raw_exec(
+        &pool,
+        "INSERT INTO page_notes (id, book_id, content_id, page, memo) \
+         VALUES ('note-1', 'b1', '', 3, '平文のメモ')",
+    );
+
+    assert_eq!(
+        thundoku_core::db::migrate_column_crypto_once(&pool).unwrap(),
+        3,
+        "平文の 3 行を暗号化すること"
+    );
+    for (sql, label) in [
+        (
+            "SELECT text_content FROM document_text WHERE id = 'dt-1'",
+            "本文",
+        ),
+        ("SELECT token FROM token_analysis WHERE id = 'tk-1'", "トークン"),
+        ("SELECT memo FROM page_notes WHERE id = 'note-1'", "メモ"),
+    ] {
+        let stored = raw_column(&pool, sql);
+        assert!(
+            stored.starts_with(column_crypto::PREFIX),
+            "{label}が平文のまま: {stored}"
+        );
+    }
+
+    // 読み出しは復号される
+    assert_eq!(
+        documents::all_text_for_document(&pool, "doc-1").unwrap(),
+        vec!["平文の本文".to_string()]
+    );
+    assert_eq!(
+        notes::get_for_page(&pool, "b1", "", 3).unwrap().unwrap().memo,
+        "平文のメモ"
+    );
+
+    // 2 回目は何もしない（フラグ。暗号文も置き換えない = 毎回 IV が変わらない）
+    let before = raw_column(&pool, "SELECT memo FROM page_notes WHERE id = 'note-1'");
+    assert_eq!(thundoku_core::db::migrate_column_crypto_once(&pool).unwrap(), 0);
+    assert_eq!(
+        raw_column(&pool, "SELECT memo FROM page_notes WHERE id = 'note-1'"),
+        before
+    );
+
+    // 移行後に書いた付箋はそのまま暗号化される
+    notes::upsert(
+        &pool,
+        &notes::PageNoteInput {
+            id: "note-2",
+            book_id: "b1",
+            content_id: "",
+            page: 4,
+            memo: "移行後のメモ",
+            spread_side: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        raw_column(&pool, "SELECT memo FROM page_notes WHERE id = 'note-2'")
+            .starts_with(column_crypto::PREFIX)
+    );
+}

@@ -16,6 +16,7 @@ pub mod secrets;
 pub mod session_cookies;
 pub mod session_store;
 pub mod single_instance;
+pub mod store_size;
 pub mod tags;
 pub mod tbf;
 pub mod ua;

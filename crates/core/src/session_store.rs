@@ -71,6 +71,9 @@ pub enum StoreSession {
     Booth,
     Fanza,
     Dlsite,
+    /// 技術書典（techbookfest.org）。旧版は keyring に期限なしで置いていたため、
+    /// [`SessionVault::adopt_legacy`] で vault へ移行する。
+    Techbookfest,
 }
 
 impl StoreSession {
@@ -80,6 +83,7 @@ impl StoreSession {
             Self::Booth => "booth.session",
             Self::Fanza => "fanza.session",
             Self::Dlsite => "dlsite.session",
+            Self::Techbookfest => "tbf.session",
         }
     }
 
@@ -89,6 +93,7 @@ impl StoreSession {
             Self::Booth => "booth",
             Self::Fanza => "fanza",
             Self::Dlsite => "dlsite",
+            Self::Techbookfest => "tbf",
         }
     }
 
@@ -112,6 +117,82 @@ impl SessionVault {
             key: secrets.session_key()?,
             marker: PurgeMarker::new(data_dir),
         })
+    }
+
+    /// 旧版が keyring に置いていた保存値（**期限なしの平文 JSON**）を vault へ一度だけ
+    /// 移してから復元する。技術書典がこの経路（セキュリティ評価 2026-09-25 の F05）。
+    ///
+    /// - vault に値があるときは移行しない（vault のほうが新しい）。keyring の旧値は消すだけ。
+    /// - keyring の削除に失敗したら印を残す（＝次の起動では復元しない。期限の無い旧値を
+    ///   残したまま使い続けると「保存は 7 日」という約束を破るため、再ログインを求める）。
+    /// - 印が付いている起動では移行し直さず、keyring の削除を再試行するだけにする
+    ///   （消せていない旧値は使わない。成功したら印を外す）。
+    pub fn adopt_legacy<T: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        secrets: &SecretStore,
+        pool: &SqlitePool,
+        store: StoreSession,
+        legacy_key: &str,
+    ) -> Option<T> {
+        self.adopt_legacy_value::<T>(secrets, pool, store, legacy_key);
+        self.load(pool, store)
+    }
+
+    /// [`Self::adopt_legacy`] の移行部分（復元はしない）。
+    fn adopt_legacy_value<T: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        secrets: &SecretStore,
+        pool: &SqlitePool,
+        store: StoreSession,
+        legacy_key: &str,
+    ) {
+        let label = store.label();
+        let Ok(Some(raw)) = secrets.load(legacy_key) else {
+            // 旧値は無い（移行が済んだ端末はこちら）。
+            return;
+        };
+        if self.marker.is_pending(label) {
+            // 前回のログアウトで消せなかった残骸。**移行し直さない**（期限の管理外の値を
+            // 再利用しない）。消せたら印を外す。
+            match secrets.delete(legacy_key) {
+                Ok(()) => {
+                    self.marker.clear(label);
+                    log::info!("{label} session: 前回消せなかった旧 keyring 値を削除しました");
+                }
+                Err(error) => log::warn!(
+                    "{label} session: 旧 keyring 値を削除できません（次回起動で再試行）: {error}"
+                ),
+            }
+            return;
+        }
+        // vault に値があればそちらが新しい。旧値は移行せずに消すだけ。
+        let vault_empty = settings::get(pool, store.settings_key())
+            .ok()
+            .flatten()
+            .is_none();
+        if vault_empty {
+            match serde_json::from_str::<T>(&raw) {
+                Ok(session) => match self.save(pool, store, &session) {
+                    Ok(()) => {
+                        log::info!("{label} session: keyring の旧保存値を vault へ移行しました")
+                    }
+                    Err(error) => log::warn!("{label} session: 旧保存値を移行できません: {error}"),
+                },
+                Err(error) => log::warn!(
+                    "{label} session: keyring の旧保存値を解釈できません（破棄）: {error}"
+                ),
+            }
+        }
+        match secrets.delete(legacy_key) {
+            Ok(()) => {}
+            Err(error) => {
+                // 期限の管理外の資格情報が端末に残る。次の起動では復元しない。
+                log::warn!("{label} session: keyring の旧保存値を削除できません: {error}");
+                if let Err(marker_error) = self.marker.mark(label) {
+                    log::error!("{label} session: 印の記録にも失敗しました: {marker_error}");
+                }
+            }
+        }
     }
 
     /// 暗号化して `app_settings` に保存する（保存時刻を包んで期限判定に使う）。
@@ -576,6 +657,132 @@ mod tests {
             "復元しないだけでなく行も消す"
         );
         assert!(!vault.marker.is_pending("booth"), "消せたので印は外す");
+    }
+
+    /// 技術書典の保存値にも他のストアと同じ期限（7 日）が効く。
+    ///
+    /// 旧版は keyring へ期限なしで置いていた（セキュリティ評価 2026-09-25 の F05）。
+    /// 移行先の `StoreSession::Techbookfest` が期限判定の経路に載っていることを固定する。
+    #[test]
+    fn techbookfest_session_expires_like_the_other_stores() {
+        let dir = temp_dir("tbf-expired");
+        let pool = test_pool();
+        let vault = vault(&dir);
+
+        vault
+            .save_at(
+                &pool,
+                StoreSession::Techbookfest,
+                &fake_session(),
+                now_unix() - SESSION_MAX_AGE_SECONDS - 1,
+            )
+            .unwrap();
+
+        let loaded: Option<FakeSession> = vault.load(&pool, StoreSession::Techbookfest);
+        assert!(
+            loaded.is_none(),
+            "期限切れの技術書典セッションを復元してはいけない"
+        );
+        assert!(
+            stored(&pool, StoreSession::Techbookfest).is_none(),
+            "期限切れの行が残っている"
+        );
+    }
+
+    /// 旧版の keyring 保存値（期限なし）を vault へ移し、keyring からは消す。
+    #[test]
+    fn legacy_keyring_value_is_adopted_into_the_vault() {
+        let dir = temp_dir("legacy-adopt");
+        let pool = test_pool();
+        let vault = vault(&dir);
+        let secrets = SecretStore::new();
+        let legacy_key = "legacy-techbookfest";
+        let plaintext = serde_json::to_string(&fake_session()).unwrap();
+        secrets.save(legacy_key, &plaintext).unwrap();
+
+        let adopted: Option<FakeSession> =
+            vault.adopt_legacy(&secrets, &pool, StoreSession::Techbookfest, legacy_key);
+
+        assert_eq!(adopted, Some(fake_session()), "移行した値を復元できない");
+        let raw = stored(&pool, StoreSession::Techbookfest).expect("vault へ移行されている");
+        assert!(raw.starts_with(PREFIX), "平文のまま置いている: {raw}");
+        assert!(
+            !raw.contains("secret-cookie-value"),
+            "平文の Cookie が DB に残っている: {raw}"
+        );
+        assert_eq!(
+            secrets.load(legacy_key).unwrap(),
+            None,
+            "keyring に旧値が残っている"
+        );
+    }
+
+    /// vault に値があるときは keyring の旧値で上書きしない（vault のほうが新しい）。
+    #[test]
+    fn legacy_keyring_value_does_not_replace_a_newer_vault_value() {
+        let dir = temp_dir("legacy-newer");
+        let pool = test_pool();
+        let vault = vault(&dir);
+        let secrets = SecretStore::new();
+        let legacy_key = "legacy-techbookfest-newer";
+
+        let fresh = FakeSession {
+            cookies: [("session".to_string(), "new".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let stale = FakeSession {
+            cookies: [("session".to_string(), "old".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        vault
+            .save(&pool, StoreSession::Techbookfest, &fresh)
+            .unwrap();
+        secrets
+            .save(legacy_key, &serde_json::to_string(&stale).unwrap())
+            .unwrap();
+
+        let adopted: Option<FakeSession> =
+            vault.adopt_legacy(&secrets, &pool, StoreSession::Techbookfest, legacy_key);
+
+        assert_eq!(adopted, Some(fresh), "古い keyring 値で上書きしている");
+        // 使わない旧値は残さない（期限の管理外の資格情報を端末に残さない）。
+        assert_eq!(secrets.load(legacy_key).unwrap(), None);
+    }
+
+    /// 前回のログアウトで旧 keyring 値を消せなかった端末（印あり）では、旧値を
+    /// **移行し直さない**（期限の管理外の値を再利用しない）。消せたら印を外す。
+    #[test]
+    fn legacy_keyring_value_is_not_adopted_while_its_purge_is_pending() {
+        let dir = temp_dir("legacy-pending");
+        let pool = test_pool();
+        let vault = vault(&dir);
+        let secrets = SecretStore::new();
+        let legacy_key = "legacy-techbookfest-pending";
+
+        vault.marker.mark(StoreSession::Techbookfest.label()).unwrap();
+        secrets
+            .save(legacy_key, &serde_json::to_string(&fake_session()).unwrap())
+            .unwrap();
+
+        let adopted: Option<FakeSession> =
+            vault.adopt_legacy(&secrets, &pool, StoreSession::Techbookfest, legacy_key);
+
+        assert!(adopted.is_none(), "印があるのに旧値を移行（再利用）している");
+        assert!(
+            stored(&pool, StoreSession::Techbookfest).is_none(),
+            "印があるのに vault へ書き込んでいる"
+        );
+        assert_eq!(
+            secrets.load(legacy_key).unwrap(),
+            None,
+            "削除の再試行をしていない"
+        );
+        assert!(
+            !vault.marker.is_pending(StoreSession::Techbookfest.label()),
+            "削除できたのに印が残っている"
+        );
     }
 
     /// 印は他のサービスのログアウトを巻き込まない。

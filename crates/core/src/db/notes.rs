@@ -6,10 +6,13 @@
 //!
 //! **付箋の ON / OFF はメモとは別**（`is_active`）。リーダーで付箋を外してもメモは残り、
 //! もう一度付けるとメモが戻る（誤操作でメモを失わない）。
+//!
+//! メモ本文（`page_notes.memo`）は**平文で保存しない**。書き込みは [`column_crypto`] で
+//! 暗号化し、読み出しは復号する（セキュリティ評価 F02）。
 
 use sqlx::Row;
 
-use crate::db::SqlitePool;
+use crate::db::{SqlitePool, column_crypto};
 
 /// 見開きのどちら側だったか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +87,16 @@ pub struct PageNoteInput<'a> {
 
 /// 付箋を追加 / 更新する（同じ本・コンテンツ・ページなら 1 件のまま。
 /// 作成日はそのまま、メモと見開き側・更新日を書き換える）。
+///
+/// メモは暗号化して保存する。鍵が取れないときは**平文で書かず**にエラーにする
+/// （fail-closed）。
 pub fn upsert(pool: &SqlitePool, note: &PageNoteInput<'_>) -> Result<(), sqlx::Error> {
+    let key = column_crypto::db_key()?;
+    let memo = column_crypto::encrypt_str(
+        &key,
+        &column_crypto::aad_page_notes(note.book_id, note.content_id, note.page, "memo"),
+        note.memo,
+    )?;
     crate::db::block_on(async {
         sqlx::query(
             // 付け直しは「付箋を付ける」操作なので is_active を立てる（外していた
@@ -101,7 +113,7 @@ pub fn upsert(pool: &SqlitePool, note: &PageNoteInput<'_>) -> Result<(), sqlx::E
         .bind(note.book_id)
         .bind(note.content_id)
         .bind(note.page)
-        .bind(note.memo)
+        .bind(&memo)
         .bind(note.spread_side.map(SpreadSide::as_str))
         .execute(pool)
         .await
@@ -139,6 +151,7 @@ pub fn get_for_page(
     content_id: &str,
     page: i64,
 ) -> Result<Option<PageNote>, sqlx::Error> {
+    let key = column_crypto::db_key()?;
     crate::db::block_on(async {
         sqlx::query(
             "SELECT id, book_id, content_id, page, memo, spread_side, is_active, created_at, \
@@ -151,7 +164,7 @@ pub fn get_for_page(
         .fetch_optional(pool)
         .await
     })
-    .map(|row| row.map(row_to_note))
+    .map(|row| row.map(|row| row_to_note(row, &key)))
 }
 
 /// 付箋を持つページ番号（0-indexed）の集合。リーダーがページ画像に印を出すために使う。
@@ -177,8 +190,9 @@ pub fn noted_pages(
         .collect())
 }
 
-/// 付箋を **追加が新しい順** に返す（付箋項目画面用）。
+/// 付箋を **追加が新しい順** に返す（付箋項目画面用）。メモは復号して返す。
 pub fn list_newest_first(pool: &SqlitePool) -> Result<Vec<PageNote>, sqlx::Error> {
+    let key = column_crypto::db_key()?;
     let rows = crate::db::block_on(async {
         sqlx::query(
             "SELECT id, book_id, content_id, page, memo, spread_side, is_active, created_at, \
@@ -188,7 +202,10 @@ pub fn list_newest_first(pool: &SqlitePool) -> Result<Vec<PageNote>, sqlx::Error
         .fetch_all(pool)
         .await
     })?;
-    Ok(rows.into_iter().map(row_to_note).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| row_to_note(row, &key))
+        .collect())
 }
 
 /// 付箋を消す。
@@ -202,14 +219,33 @@ pub fn delete(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-fn row_to_note(row: sqlx::sqlite::SqliteRow) -> PageNote {
+fn row_to_note(row: sqlx::sqlite::SqliteRow, key: &[u8; 32]) -> PageNote {
     let spread_side: Option<String> = row.get("spread_side");
+    let id: String = row.get("id");
+    let book_id: String = row.get("book_id");
+    let content_id: String = row.get("content_id");
+    let page: i64 = row.get("page");
+    let stored: String = row.get("memo");
+    let aad = column_crypto::aad_page_notes(&book_id, &content_id, page, "memo");
+    // 復号できない値（鍵違い・改ざん・壊れた base64）は**空文字**にする。
+    // **暗号文を画面に出さない**（fail-closed）。行そのものは残す（付箋の ON / OFF と
+    // 見開き側はメモとは別に意味を持つ）。
+    let memo = column_crypto::decrypt_str(key, &aad, &stored)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            log::warn!(
+                "付箋メモを復号できないため空として扱います（鍵違い・改ざんの可能性）: \
+                 {book_id}/{content_id}/{page}"
+            );
+            String::new()
+        });
     PageNote {
-        id: row.get("id"),
-        book_id: row.get("book_id"),
-        content_id: row.get("content_id"),
-        page: row.get("page"),
-        memo: row.get("memo"),
+        id,
+        book_id,
+        content_id,
+        page,
+        memo,
         spread_side: spread_side.as_deref().and_then(SpreadSide::parse),
         is_active: row.get::<i64, _>("is_active") != 0,
         created_at: row.get("created_at"),

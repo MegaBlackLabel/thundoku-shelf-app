@@ -81,6 +81,25 @@ impl DriveApi for FakeDrive {
             .ok_or_else(|| DriveError::Http(404, "missing".into()))
     }
 
+    /// 実際の `DriveClient` と同じく、**送れたバイト数**を報告する
+    /// （既定実装は進捗なしで委譲するため、進捗の検証にはこちらを使う）。
+    fn upload_resumable_from_file_with_progress(
+        &mut self,
+        name: &str,
+        folder_id: &str,
+        path: &std::path::Path,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<String, DriveError> {
+        let bytes = std::fs::read(path).map_err(|error| DriveError::Io(error.to_string()))?;
+        let total = bytes.len() as u64;
+        for sent in [total / 2, total] {
+            if !on_progress(sent, total) {
+                return Err(DriveError::Cancelled);
+            }
+        }
+        self.upload_multipart(name, folder_id, &bytes)
+    }
+
     fn upload_multipart(
         &mut self,
         name: &str,
@@ -291,7 +310,10 @@ fn pack_rebuild_is_idempotent_and_skips_existing_rows() {
 
     // 2 回目の再構築は何もしない（既存の取り込みを壊さない）
     assert!(
-        !thundoku_core::import::rebuild_from_pack(&env.pool, "pack-1", &bytes, None).unwrap(),
+        {
+            let reader = opfspack::PackReader::open(&bytes).unwrap();
+            !thundoku_core::import::rebuild_from_pack(&env.pool, "pack-1", &reader, None).unwrap()
+        },
         "既に行があれば何もしない"
     );
     let images = db::documents::images_for_book(&env.pool, "pack-1").unwrap();
@@ -1529,5 +1551,92 @@ fn a_v3_envelope_from_another_account_is_not_restored() {
             .open(&other_root, &opfspack::derive_owner_id(sub))
             .is_err(),
         "owner_id が違えば AAD が合わず開けない"
+    );
+}
+
+
+/// アップロードの進捗（送れたバイト数 / 全体）が `sync_with_progress` へ流れる。
+///
+/// 終了時のアップロードや「今すぐ同期」の画面が、どこまで送ったかを出せるようにする。
+#[test]
+fn upload_progress_reports_sent_bytes() {
+    let env = TestEnv::new("upload-progress");
+    let mut drive = FakeDrive::new();
+    let bytes = plain_pack("pages/page_0001.webp", b"PROGRESS");
+    std::fs::write(env.packs().join("pack-7.opfspack"), &bytes).unwrap();
+    db::books::insert(
+        &env.pool,
+        &db::books::Book {
+            id: "pack-7".into(),
+            title: "pack-7".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "pack-7.opfspack".into(),
+            file_size: bytes.len() as i64,
+            opfs_path: "pack-7.opfspack".into(),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some("pack-7".into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-08-21 00:00:00".into(),
+            updated_at: "2026-08-21 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+    let key = [11u8; 32];
+    db::books::set_owner_sub(
+        &env.pool,
+        "pack-7",
+        Some(thundoku_core::owner::encrypt(&key, "test-sub")),
+    )
+    .unwrap();
+
+    let mut uploads: Vec<SyncProgress> = Vec::new();
+    let outcome = sync_with_progress(
+        thundoku_core::drive::sync::SyncRequest {
+            pool: &env.pool,
+            drive: &mut drive,
+            packs_dir: &env.packs(),
+            downloads_dir: &env.downloads(),
+            identity_sub: Some("test-sub"),
+            pack_root_key: None,
+            owner_key: Some(&key),
+            folder_id: "folder-1",
+            db_path: None,
+        },
+        &mut |progress| {
+            if progress.phase == SyncPhase::Upload {
+                uploads.push(progress.clone());
+            }
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome.uploaded, vec!["pack-7"]);
+    let total = bytes.len() as u64;
+    let last = uploads
+        .iter()
+        .rfind(|progress| progress.bytes == total)
+        .unwrap_or_else(|| panic!("100% の進捗が無い: {uploads:?}"));
+    assert_eq!(last.total_bytes, Some(total));
+    assert_eq!(last.name, "pack-7.opfspack");
+    // 途中の経過も報告される（半分の位置）
+    assert!(
+        uploads.iter().any(|progress| progress.bytes == total / 2),
+        "途中経過が無い: {uploads:?}"
     );
 }
