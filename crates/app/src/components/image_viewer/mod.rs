@@ -97,6 +97,15 @@ pub trait PageLoader: Send + Sync + 'static {
     }
 }
 
+/// 表示用の前縮小が済んでいない（目標に対して**大きすぎる**）か。
+///
+/// 目標が決まる前に読んだページ（`display_target_width == 0` でロード）や、目標が
+/// 縮んだぶんは原寸のまま残っている。そのまま GPU に渡すと実質 1 タップの縮小で
+/// 網点（スクリーントーン）が潰れるので作り直す。
+fn display_image_is_oversized(width: i32, target_width: f32) -> bool {
+    target_width > 0.0 && width as f32 > target_width * 2.0
+}
+
 /// RenderImage（BGRA のまま）を幅 `max_width` に縮小した新しい RenderImage を返す。
 /// チャンネル順は触らない（縮小は色に依存しない）。すでに小さければそのまま返す。
 fn downscale_render_image(image: &Arc<RenderImage>, max_width: f32) -> Arc<RenderImage> {
@@ -1405,6 +1414,23 @@ impl ImageViewer {
         self.navigate(cx, -1, true);
     }
 
+    /// クリックナビ帯（画像の左右 10%）の**左**を押したときの移動。
+    ///
+    /// 左綴じ（左→右）は 前へ、右綴じ（右→左）は **次へ**。右綴じは読む向きが逆なので、
+    /// キーボード（`handle_key`）とボトムドック（`mirror_nav`）と同じ規則で左右を入れ替える。
+    /// クリック帯だけ固定だったため、右綴じで「左を押すと戻る」になっていた。
+    /// `shift` は見開きでも 1 ページだけ動かす（`navigate` が面倒を見る）。
+    fn edge_left_nav(&mut self, shift: bool, cx: &mut Context<Self>) {
+        let direction = if self.page_turn_right_to_left { 1 } else { -1 };
+        self.navigate(cx, direction, shift);
+    }
+
+    /// クリックナビ帯の**右**を押したときの移動（`edge_left_nav` の反対）。
+    fn edge_right_nav(&mut self, shift: bool, cx: &mut Context<Self>) {
+        let direction = if self.page_turn_right_to_left { -1 } else { 1 };
+        self.navigate(cx, direction, shift);
+    }
+
     fn navigate(&mut self, cx: &mut Context<Self>, direction: i64, shift: bool) {
         // 見開きは 2 ページ単位、Shift 押し（または単一/スクロール）は 1 ページ単位
         let step = if self.mode == ViewMode::Spread && !shift {
@@ -1665,12 +1691,18 @@ impl ImageViewer {
         .into_any_element()
     }
 
-    /// 表示に必要なページ幅（物理ピクセル）を更新し、解像度が足りないページを読み直す。
+    /// 表示に必要なページ幅（物理ピクセル）を更新し、大きさが合っていないページを読み直す。
     ///
     /// ページ画像は表示サイズ相当へ前縮小してキャッシュしているので、ズームや
     /// ウィンドウ拡大で必要幅が増えたときは、そのページを読み直さないとぼやける。
     /// 縮小方向（必要幅が減ったとき）と 1.2 倍以内の増加は読み直さない
     /// （ズームの端数で何度も読み込み直さないため）。
+    ///
+    /// **大きすぎるページも読み直す**: `ImageViewer::new` / `set_loader` の先読みは
+    /// 描画前（`display_target_width == 0`）に走るので、その時点のページは原寸で入る
+    /// （`downscale_for_display` は目標 0 だと原寸を返す）。作り直さないと
+    /// **フル解像度のまま GPU に渡り、実質 1 タップの縮小で網点が潰れる**
+    /// （4441px のページで 690px 幅に描画したときに発生するモアレと同じ）。
     fn update_display_target(
         &mut self,
         viewport: gpui_kit::Point<f32>,
@@ -1701,7 +1733,10 @@ impl ImageViewer {
                 // 未読み込みのページは本来の経路（ensure_loaded）に任せる
                 continue;
             };
-            if existing.size(0).width.0 as f32 * 1.2 >= target {
+            let width = existing.size(0).width.0;
+            // 足りていて、大きすぎもしないページは触らない
+            // （縮小方向と 1.2 倍以内の増加は読み直さない = ズームの端数で読み込み直さない）
+            if width as f32 * 1.2 >= target && !display_image_is_oversized(width, target) {
                 continue;
             }
             if let Some(image) = self.images[index].take() {
@@ -1732,7 +1767,22 @@ impl ImageViewer {
                 this.loading.remove(&index);
                 if index < this.images.len() {
                     match result {
-                        Ok(image) => this.images[index] = Some(image),
+                        Ok(image) => {
+                            // 目標幅が決まる**前に**読んだページ（`target_width == 0`）は
+                            // 原寸で返ってくる。目標が決まっていればその場で作り直す
+                            // （そのまま渡すと GPU が実質 1 タップで縮小して網点が潰れる）。
+                            let oversized = display_image_is_oversized(
+                                image.size(0).width.0,
+                                this.display_target_width,
+                            );
+                            this.images[index] = Some(image);
+                            if oversized {
+                                if let Some(image) = this.images[index].take() {
+                                    this.pending_image_drops.push(image);
+                                }
+                                this.ensure_loaded(cx, index);
+                            }
+                        }
                         Err(error) => {
                             this.images[index] = None;
                             if this.load_error.is_none() {
@@ -2835,15 +2885,15 @@ impl Render for ImageViewer {
                                         .size(px(28.0))
                                         .text_color(gpui_kit::rgba(0x00000099)),
                                 )
+                                // 帯の上のマウス移動で下の全画面レイヤー（オーバーレイ表示）を
+                                // 反応させない。ダブルクリックのオーバーレイ切替も帯には効かせない
+                                .on_mouse_move(|_, _, cx| cx.stop_propagation())
                                 .on_mouse_down(gpui_kit::MouseButton::Left, {
                                     let handle = handle.clone();
                                     move |event, _window, cx| {
+                                        cx.stop_propagation();
                                         handle.update(cx, |this, cx| {
-                                            if event.modifiers.shift {
-                                                this.prev_page_shift(cx);
-                                            } else {
-                                                this.prev_page(cx);
-                                            }
+                                            this.edge_left_nav(event.modifiers.shift, cx);
                                         });
                                     }
                                 }),
@@ -2868,15 +2918,15 @@ impl Render for ImageViewer {
                                         .size(px(28.0))
                                         .text_color(gpui_kit::rgba(0x00000099)),
                                 )
+                                // 帯の上のマウス移動で下の全画面レイヤー（オーバーレイ表示）を
+                                // 反応させない。ダブルクリックのオーバーレイ切替も帯には効かせない
+                                .on_mouse_move(|_, _, cx| cx.stop_propagation())
                                 .on_mouse_down(gpui_kit::MouseButton::Left, {
                                     let handle = handle.clone();
                                     move |event, _window, cx| {
+                                        cx.stop_propagation();
                                         handle.update(cx, |this, cx| {
-                                            if event.modifiers.shift {
-                                                this.next_page_shift(cx);
-                                            } else {
-                                                this.next_page(cx);
-                                            }
+                                            this.edge_right_nav(event.modifiers.shift, cx);
                                         });
                                     }
                                 }),
@@ -3059,15 +3109,15 @@ impl Render for ImageViewer {
                                 .size(px(28.0))
                                 .text_color(gpui_kit::rgba(0x00000099)),
                         )
+                        // 帯の上のマウス移動で下の全画面レイヤー（オーバーレイ表示）を
+                        // 反応させない。ダブルクリックのオーバーレイ切替も帯には効かせない
+                        .on_mouse_move(|_, _, cx| cx.stop_propagation())
                         .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |event, _window, cx| {
+                                cx.stop_propagation();
                                 handle.update(cx, |this, cx| {
-                                    if event.modifiers.shift {
-                                        this.prev_page_shift(cx);
-                                    } else {
-                                        this.prev_page(cx);
-                                    }
+                                    this.edge_left_nav(event.modifiers.shift, cx);
                                 });
                             }
                         }),
@@ -3093,15 +3143,15 @@ impl Render for ImageViewer {
                                 .size(px(28.0))
                                 .text_color(gpui_kit::rgba(0x00000099)),
                         )
+                        // 帯の上のマウス移動で下の全画面レイヤー（オーバーレイ表示）を
+                        // 反応させない。ダブルクリックのオーバーレイ切替も帯には効かせない
+                        .on_mouse_move(|_, _, cx| cx.stop_propagation())
                         .on_mouse_down(gpui_kit::MouseButton::Left, {
                             let handle = handle.clone();
                             move |event, _window, cx| {
+                                cx.stop_propagation();
                                 handle.update(cx, |this, cx| {
-                                    if event.modifiers.shift {
-                                        this.next_page_shift(cx);
-                                    } else {
-                                        this.next_page(cx);
-                                    }
+                                    this.edge_right_nav(event.modifiers.shift, cx);
                                 });
                             }
                         }),
@@ -3620,6 +3670,197 @@ mod tests {
         );
     }
 
+    /// 目標幅が決まる前に読み込まれたページは、レイアウト後に**作り直す**。
+    ///
+    /// `ImageViewer::new` は描画前（`display_target_width == 0`）に現在ページを先読みする。
+    /// 目標 0 では `downscale_for_display` が原寸を返すので、そのまま残ると GPU が
+    /// 単純サンプリングで縮小して網点が潰れる（4441px の JPEG 版だけが荒れて見えた原因。
+    /// 1000px の PDF 版は縮小率が小さく目立たない）。
+    #[gpui_kit::test]
+    async fn pages_loaded_before_the_display_target_are_redownscaled_after_layout(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| {
+            if cx.try_global::<crate::app_state::AppState>().is_none() {
+                crate::app_state::AppState::init_test(cx);
+            }
+        });
+        let view = cx.new(|cx| {
+            ImageViewer::new(
+                cx,
+                Arc::new(FakeLoader {
+                    count: 2,
+                    png: make_png(1200, 1697),
+                    size: (1200, 1697),
+                }),
+                "テスト本",
+                0,
+                None,
+            )
+        });
+        cx.run_until_parked();
+        let width = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| {
+                v.images[0]
+                    .as_ref()
+                    .map(|image| image.size(0).width.0)
+                    .unwrap_or(0)
+            })
+        };
+        // 構築時の先読みは目標 0 なので原寸で入る（この時点では仕様どおり）
+        assert_eq!(width(cx), 1200, "構築時の先読みが原寸で入っていない");
+
+        // 表示サイズが決まる（見開き・ウィンドウ幅 800 → 1 ページ 400px）
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_mode(cx, ViewMode::Spread);
+                this.update_display_target(gpui_kit::Point::new(800.0, 600.0), 1.0, cx);
+            })
+        });
+        cx.run_until_parked();
+
+        assert!(
+            width(cx) <= 800,
+            "目標幅より大きすぎるまま残っている（前縮小されていない）: {}",
+            width(cx)
+        );
+    }
+
+    /// 目標幅が決まる**前に読み込みが始まっていた**ページも、届いた時点で作り直す。
+    ///
+    /// 実機の順序はこちら: `ImageViewer::new` の先読みが走り、その完了前に最初の描画で
+    /// 目標幅が決まる。読み込みは目標 0 で始まっているので原寸で返るため、
+    /// **読み込み完了時**にも作り直しが要る（`update_display_target` だけでは間に合わない）。
+    #[gpui_kit::test]
+    async fn pages_loaded_while_the_target_was_unknown_are_redownscaled_on_arrival(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| {
+            if cx.try_global::<crate::app_state::AppState>().is_none() {
+                crate::app_state::AppState::init_test(cx);
+            }
+        });
+        // 先読みは起動するが、まだ走らせない（描画前 = 目標幅 0 の状態を作る）
+        let view = cx.new(|cx| {
+            ImageViewer::new(
+                cx,
+                Arc::new(FakeLoader {
+                    count: 2,
+                    png: make_png(1200, 1697),
+                    size: (1200, 1697),
+                }),
+                "テスト本",
+                0,
+                None,
+            )
+        });
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_mode(cx, ViewMode::Spread);
+                this.update_display_target(gpui_kit::Point::new(800.0, 600.0), 1.0, cx);
+            })
+        });
+        // ここで先読みが完了する（目標 0 で読んだので原寸）
+        cx.run_until_parked();
+
+        let width = view.read_with(cx, |v, _| {
+            v.images[0]
+                .as_ref()
+                .map(|image| image.size(0).width.0)
+                .unwrap_or(0)
+        });
+        assert!(
+            width <= 800,
+            "目標幅より大きすぎるまま届いている（届いた時点で作り直していない）: {width}"
+        );
+    }
+
+    /// ウィンドウを 1 フレーム描く（ヒットテストの対象を作る）。
+    fn draw_once(visual: &mut gpui_kit::VisualTestContext) {
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    /// マウス移動を送る（論理ピクセル）。
+    fn send_mouse_move(visual: &mut gpui_kit::VisualTestContext, x: f32, y: f32) {
+        visual.simulate_event(gpui_kit::MouseMoveEvent {
+            position: gpui_kit::Point::new(gpui_kit::px(x), gpui_kit::px(y)),
+            modifiers: Default::default(),
+            pressed_button: None,
+        });
+    }
+
+    /// 左ボタンの押下を送る（論理ピクセル）。
+    fn send_mouse_down(visual: &mut gpui_kit::VisualTestContext, x: f32, y: f32) {
+        visual.simulate_event(gpui_kit::MouseDownEvent {
+            position: gpui_kit::Point::new(gpui_kit::px(x), gpui_kit::px(y)),
+            modifiers: Default::default(),
+            button: gpui_kit::MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+    }
+
+    /// ページ送り/戻しのクリック帯の上をマウスが通っても、トップ/ボトムのメニューを出さない。
+    ///
+    /// 帯は `viewer-root` の全画面レイヤー（マウス移動でオーバーレイを表示する）より
+    /// 後に描かれていないため、移動がそのまま下の層へ届くと、**帯へ向かって動かすだけで
+    /// メニューが出る**（帯はページ送りの入口なので毎回出るのは邪魔）。
+    #[gpui_kit::test]
+    async fn hovering_the_nav_bands_does_not_show_the_overlay(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 4);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // 見開きにすると帯がウィンドウの左右端 10%（座標が素直）
+        cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
+        draw_once(visual);
+        cx.update(|cx| view.update(cx, |this, cx| this.hide_overlay(cx)));
+        draw_once(visual);
+        assert!(
+            !view.read_with(cx, |v, _| v.overlay_visible),
+            "前提: オーバーレイは非表示"
+        );
+
+        // 左の帯の上（左端 10% = 80px 以内）→ 出ない
+        send_mouse_move(visual, 8.0, 300.0);
+        assert!(
+            !view.read_with(cx, |v, _| v.overlay_visible),
+            "左の帯の上でトップ/ボトムメニューが出ている"
+        );
+        // 右の帯の上 → 出ない
+        send_mouse_move(visual, 792.0, 300.0);
+        assert!(
+            !view.read_with(cx, |v, _| v.overlay_visible),
+            "右の帯の上でトップ/ボトムメニューが出ている"
+        );
+        // ページの上（中央）→ 出る（移動で表示する動作は残っている）
+        send_mouse_move(visual, 400.0, 300.0);
+        assert!(
+            view.read_with(cx, |v, _| v.overlay_visible),
+            "ページの上でメニューが出ない（マウス移動で表示する動作が壊れている）"
+        );
+
+        // 帯のクリックは今までどおりページ送りに効く（伝播を止めても壊れていない）
+        cx.update(|cx| view.update(cx, |this, cx| this.next_page(cx)));
+        assert_eq!(view.read_with(cx, |v, _| v.current_page), 2, "見開きは 2 ページ送り");
+        send_mouse_down(visual, 8.0, 300.0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            0,
+            "左綴じでは左の帯で前へ戻れる"
+        );
+    }
+
     /// 網点（規則正しい点格子）の合成画像。縮小したときのムラを見るために使う。
     fn synthetic_screentone(width: u32, height: u32, period: u32) -> image::RgbaImage {
         let mut image = image::RgbaImage::new(width, height);
@@ -3950,6 +4191,35 @@ mod tests {
         cx.update(|cx| view.update(cx, |this, cx| this.prev_page(cx)));
         cx.update(|cx| view.update(cx, |this, cx| this.prev_page(cx)));
         assert_eq!(view.read_with(cx, |v, _| v.current_page), 0);
+    }
+
+    /// 画像の左右 10% のクリック帯は**綴じ方向に従う**。
+    ///
+    /// 左綴じ（左→右）: 左 = 前へ / 右 = 次へ。右綴じ（右→左）: **反転**して
+    /// 左 = 次へ / 右 = 前へ（読む向きが逆だから）。キーボードとボトムドックは
+    /// 綴じ方向で入れ替えていたのにクリック帯だけ固定だったため、右綴じで
+    /// **左を押すと戻る**になっていた（2026-09-27 の実機報告）。
+    #[gpui_kit::test]
+    async fn edge_click_navigation_follows_the_binding_direction(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 6);
+        let page = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.current_page);
+
+        // 左綴じ: 左 = 前へ / 右 = 次へ
+        cx.update(|cx| view.update(cx, |this, cx| this.set_binding(cx, false)));
+        cx.update(|cx| view.update(cx, |this, cx| this.next_page(cx)));
+        let start = page(cx);
+        cx.update(|cx| view.update(cx, |this, cx| this.edge_left_nav(false, cx)));
+        assert_eq!(page(cx), start - 1, "左綴じの左エッジは前へ");
+        cx.update(|cx| view.update(cx, |this, cx| this.edge_right_nav(false, cx)));
+        assert_eq!(page(cx), start, "左綴じの右エッジは次へ");
+
+        // 右綴じ: 反転する（左 = 次へ / 右 = 前へ）
+        cx.update(|cx| view.update(cx, |this, cx| this.set_binding(cx, true)));
+        cx.update(|cx| view.update(cx, |this, cx| this.edge_left_nav(false, cx)));
+        assert_eq!(page(cx), start + 1, "右綴じの左エッジは次へ");
+        cx.update(|cx| view.update(cx, |this, cx| this.edge_right_nav(false, cx)));
+        assert_eq!(page(cx), start, "右綴じの右エッジは前へ");
     }
 
     #[gpui_kit::test]
