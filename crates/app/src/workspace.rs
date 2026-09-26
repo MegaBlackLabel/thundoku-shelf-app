@@ -352,6 +352,21 @@ impl Workspace {
             NavTarget::About
         };
 
+        // 大きい pack を**一度だけ**自動で Drive バックアップ対象外にする
+        // （マーカーで二度目以降は何もしない。手動で戻した本をひっくり返さないため）。
+        {
+            let state = AppState::global(cx);
+            match thundoku_core::db::books::apply_auto_backup_exclusion_once(
+                &state.db_pool,
+                &state.packs_dir,
+            ) {
+                Ok(0) => {}
+                Ok(count) => log::info!(
+                    "startup: pack が大きい {count} 冊を Drive バックアップ対象外にした（右クリックで戻せます）"
+                ),
+                Err(error) => log::warn!("startup: バックアップ対象外の自動適用に失敗: {error}"),
+            }
+        }
         let mut this = Self {
             active,
             sidebar_open: false,

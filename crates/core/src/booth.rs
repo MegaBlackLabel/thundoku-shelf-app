@@ -88,6 +88,8 @@ pub enum BoothError {
     BlockedUrl(String),
     #[error("cancelled")]
     Cancelled,
+    #[error("io: {0}")]
+    Io(String),
 }
 
 /// ライブラリ（購入品一覧）の 1 商品。
@@ -420,11 +422,83 @@ impl BoothClient {
     /// `on_progress(downloaded, total)` — total は Content-Length が無い場合は 0。
     /// コールバックが `false` を返すと中止し（`BoothError::Cancelled`）、
     /// 途中まで読んだバイト列は返さない。
+    /// **ファイルへ直接**取得する（4 GiB 級の本を RAM に載せない）。
+    ///
+    /// 検証・リダイレクト・content-type の規則は [`Self::download_with_progress`] と同じ。
+    /// 戻り値は書いたバイト数。中止（`on_progress` が `false`）は `Cancelled`。
+    pub fn download_to_file_with_progress(
+        &self,
+        download_url: &str,
+        path: &std::path::Path,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<u64, BoothError> {
+        let response = self.fetch(download_url)?;
+        let total = response
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let file = std::fs::File::create(path).map_err(|e| BoothError::Io(e.to_string()))?;
+        let mut sink = std::io::BufWriter::new(file);
+        let mut reader = response.into_reader();
+        let mut written = 0u64;
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            use std::io::Read as _;
+            let read = reader
+                .read(&mut buf)
+                .map_err(|e| BoothError::Io(e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            written += read as u64;
+            // 上限はメモリ経路と同じ（10 GiB）。超えたら失敗して呼び出し側が一時ファイルを消す。
+            if written > crate::tbf::transport::MAX_DOWNLOAD_BODY_BYTES {
+                return Err(BoothError::Network(format!(
+                    "ダウンロードが上限（{} バイト）を超えました",
+                    crate::tbf::transport::MAX_DOWNLOAD_BODY_BYTES
+                )));
+            }
+            if !on_progress(written, total) {
+                return Err(BoothError::Cancelled);
+            }
+            std::io::Write::write_all(&mut sink, &buf[..read])
+                .map_err(|e| BoothError::Io(e.to_string()))?;
+        }
+        std::io::Write::flush(&mut sink).map_err(|e| BoothError::Io(e.to_string()))?;
+        Ok(written)
+    }
+
     pub fn download_with_progress(
         &self,
         download_url: &str,
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, BoothError> {
+        let response = self.fetch(download_url)?;
+        let total = response
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let mut reader = response.into_reader();
+        use crate::tbf::transport::BodyOutcome;
+        match crate::tbf::transport::read_body_with_progress(
+            &mut reader,
+            total,
+            crate::tbf::transport::MAX_DOWNLOAD_BODY_BYTES,
+            on_progress,
+        ) {
+            BodyOutcome::Read(body) => Ok(body),
+            BodyOutcome::Cancelled => Err(BoothError::Cancelled),
+            BodyOutcome::TooLarge(limit) => Err(BoothError::Network(format!(
+                "ダウンロードが上限（{limit} バイト）を超えました"
+            ))),
+            BodyOutcome::Io(message) => Err(BoothError::Network(format!(
+                "ダウンロードの読み出しに失敗しました: {message}"
+            ))),
+        }
+    }
+
+    /// 検証（宛先）→ リダイレクト追跡 → content-type 検査までを行い、最終応答を返す。
+    fn fetch(&self, download_url: &str) -> Result<ureq::Response, BoothError> {
         // 認証（Cookie）を付ける前に送信先を検証する。保存 URL はバックアップ由来も
         // あり得るため、外部ホストへセッションを渡さない。
         let parsed = crate::download_url::check(download_url, BOOTH_DOWNLOAD_RULES)
@@ -487,27 +561,7 @@ impl BoothClient {
                 "HTML が返りました（リンクが無効の可能性）: {download_url} (content-type={content_type})"
             )));
         }
-        let total = response
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        let mut reader = response.into_reader();
-        use crate::tbf::transport::BodyOutcome;
-        match crate::tbf::transport::read_body_with_progress(
-            &mut reader,
-            total,
-            crate::tbf::transport::MAX_DOWNLOAD_BODY_BYTES,
-            on_progress,
-        ) {
-            BodyOutcome::Read(body) => Ok(body),
-            BodyOutcome::Cancelled => Err(BoothError::Cancelled),
-            BodyOutcome::TooLarge(limit) => Err(BoothError::Network(format!(
-                "ダウンロードが上限（{limit} バイト）を超えました"
-            ))),
-            BodyOutcome::Io(message) => Err(BoothError::Network(format!(
-                "ダウンロードの読み出しに失敗しました: {message}"
-            ))),
-        }
+        Ok(response)
     }
 
     /// 商品詳細 API から表紙画像（オリジナルサイズ）を取得する。

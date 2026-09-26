@@ -480,6 +480,40 @@ pub fn backup_excluded_ids(
     })
 }
 
+/// pack が大きい本を**一度だけ**自動でバックアップ対象外にする（起動時に呼ぶ）。
+///
+/// マーカー（設定 `backup.auto_excluded_once`）で二度目以降は何もしない。
+/// こうしないと、ユーザーが手動で「対象外」を解除した本を毎回ひっくり返してしまう。
+/// 未取得（pack がローカルに無い）本は対象外（落とす必要があるので印を立てない）。
+/// 戻り値は今回印を立てた冊数。
+pub fn apply_auto_backup_exclusion_once(
+    pool: &SqlitePool,
+    packs_dir: &std::path::Path,
+) -> Result<usize, sqlx::Error> {
+    const MARKER: &str = "backup.auto_excluded_once";
+    if crate::db::settings::get(pool, MARKER)?.is_some() {
+        return Ok(0);
+    }
+    let mut excluded = 0usize;
+    for book in list(pool)? {
+        let Some(pack_id) = book.pack_id.clone().or_else(|| Some(book.id.clone())) else {
+            continue;
+        };
+        let Ok(path) = crate::pack_path::pack_path(packs_dir, &pack_id) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if crate::import::should_auto_exclude_backup(meta.len()) {
+            set_backup_excluded(pool, &book.id, true)?;
+            excluded += 1;
+        }
+    }
+    crate::db::settings::set(pool, MARKER, "1")?;
+    Ok(excluded)
+}
+
 /// 1 冊が Drive バックアップ対象外か。
 pub fn is_backup_excluded(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     crate::db::block_on(async {

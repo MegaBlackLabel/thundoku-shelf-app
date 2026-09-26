@@ -2554,3 +2554,81 @@ fn migrate_column_crypto_encrypts_plaintext_rows() {
             .starts_with(column_crypto::PREFIX)
     );
 }
+
+/// テスト用の本（pack は別途ファイルとして置く）。
+fn book_with_pack(pool: &thundoku_core::db::SqlitePool, id: &str) {
+    books::insert(
+        pool,
+        &books::Book {
+            id: id.into(),
+            title: id.into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: format!("{id}.zip"),
+            file_size: 1,
+            opfs_path: format!("{id}.opfspack"),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some(id.into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+}
+
+/// pack が大きい本だけを**一度だけ**自動でバックアップ対象外にする。
+///
+/// 「一度だけ」は重要: ユーザーが手動で解除した本を、次の起動でひっくり返さないため。
+#[test]
+fn auto_backup_exclusion_runs_once_and_spares_small_books() {
+    let pool = memory_db();
+    let packs = std::env::temp_dir().join("thundoku-auto-exclude-test");
+    let _ = std::fs::remove_dir_all(&packs);
+    std::fs::create_dir_all(&packs).unwrap();
+    for id in ["small", "big"] {
+        book_with_pack(&pool, id);
+    }
+    // 小さい pack（1 KiB）と大きい pack（sparse で 2 GiB。実体はディスクに書かない）
+    std::fs::write(packs.join("small.opfspack"), vec![0u8; 1024]).unwrap();
+    {
+        let file = std::fs::File::create(packs.join("big.opfspack")).unwrap();
+        file.set_len(2 * 1024 * 1024 * 1024).unwrap();
+    }
+
+    let excluded = books::apply_auto_backup_exclusion_once(&pool, &packs).unwrap();
+    assert_eq!(excluded, 1, "大きい本だけが対象外になるはず");
+    assert!(books::is_backup_excluded(&pool, "big").unwrap());
+    assert!(
+        !books::is_backup_excluded(&pool, "small").unwrap(),
+        "小さい本まで対象外にしている"
+    );
+
+    // 手動で解除しても、次の起動（再実行）では戻らない（マーカーで一度だけ）
+    books::set_backup_excluded(&pool, "big", false).unwrap();
+    assert_eq!(
+        books::apply_auto_backup_exclusion_once(&pool, &packs).unwrap(),
+        0,
+        "2 回目も適用している"
+    );
+    assert!(
+        !books::is_backup_excluded(&pool, "big").unwrap(),
+        "手動の解除を自動適用でひっくり返している"
+    );
+    let _ = std::fs::remove_dir_all(&packs);
+}

@@ -92,6 +92,32 @@ fn md5_file(path: &std::path::Path) -> Result<String, SyncError> {
     Ok(format!("{:x}", context.compute()))
 }
 
+/// 1 冊の pack を **Drive から削除**する（ローカルの pack は残す）。
+///
+/// 「Drive の容量を空けたい」ための操作（バックアップ対象外にした大きい本を消す等）。
+/// 同期の状態行も消すので、次に同期したとき（対象外でなければ）上げ直せる
+/// （状態行を残すと「上げ済み」と誤判定して二度と上げない）。
+/// 戻り値は Drive にあったか（無ければ `false`）。
+pub fn delete_pack_from_drive(
+    pool: &SqlitePool,
+    drive: &mut dyn DriveApi,
+    folder_id: &str,
+    pack_id: &str,
+) -> Result<bool, SyncError> {
+    let file_name = format!("{pack_id}.{PACK_EXTENSION}");
+    let files = drive.list_files(folder_id)?;
+    let target = files
+        .iter()
+        .find(|file| file.name == file_name)
+        .map(|file| file.id.clone());
+    if let Some(id) = &target {
+        drive.delete(id)?;
+        log::info!("drive sync: Drive から削除: {file_name}");
+    }
+    sync_state::delete(pool, pack_id)?;
+    Ok(target.is_some())
+}
+
 /// pack を開けなかった理由を同期エラーへ（v2 は再取り込みを案内）。
 fn pack_open_error(pack_id: &str, error: PackError) -> SyncError {
     match error {

@@ -1732,3 +1732,56 @@ fn excluded_book_is_not_uploaded() {
     .unwrap();
     assert_eq!(drive.upload_count(), 1, "戻したのに上げていない");
 }
+
+/// Drive から削除できる（ローカルの pack は残る）。同期の状態行も消える。
+///
+/// 「Drive の容量を空けたい」ための操作。消したあと（対象外でなければ）次に同期したら
+/// 上げ直せるよう、状態行は残さない（消しっぱなしで「上げ済み」と誤判定させない）。
+#[test]
+fn pack_can_be_deleted_from_drive_keeping_the_local_file() {
+    let env = TestEnv::new("drive-delete");
+    let mut drive = FakeDrive::new();
+    let bytes = plain_pack("pages/page_0001.webp", b"TO-DELETE");
+    std::fs::write(env.packs().join("pack-5.opfspack"), &bytes).unwrap();
+    // Drive に上がっていて、同期の状態行もある状態を作る
+    drive.seed("pack-5.opfspack", &bytes);
+    db::sync_state::upsert(
+        &env.pool,
+        &db::sync_state::DriveSyncState {
+            pack_id: "pack-5".into(),
+            drive_file_id: "id-pack-5.opfspack".into(),
+            md5: format!("{:x}", md5::compute(&bytes)),
+            modified_time: None,
+            last_synced_at: "2026-08-21 00:00:00".into(),
+        },
+    )
+    .unwrap();
+
+    let deleted = thundoku_core::drive::sync::delete_pack_from_drive(
+        &env.pool,
+        &mut drive,
+        "folder-1",
+        "pack-5",
+    )
+    .unwrap();
+    assert!(deleted, "Drive から消せていない");
+    assert!(!drive.files.contains_key("id-pack-5.opfspack"), "Drive に残っている");
+    assert!(
+        env.packs().join("pack-5.opfspack").exists(),
+        "ローカルの pack まで消している"
+    );
+    assert!(
+        db::sync_state::get(&env.pool, "pack-5").unwrap().is_none(),
+        "同期の状態行が残っている（上げ済みと誤判定する）"
+    );
+
+    // 2 回目は消すものが無い（false）
+    let again = thundoku_core::drive::sync::delete_pack_from_drive(
+        &env.pool,
+        &mut drive,
+        "folder-1",
+        "pack-5",
+    )
+    .unwrap();
+    assert!(!again, "無いのに true を返している");
+}

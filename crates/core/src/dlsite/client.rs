@@ -89,6 +89,8 @@ pub enum DlsiteError {
     Database(#[from] sqlx::Error),
     #[error("transport: {0}")]
     Transport(#[from] TbfError),
+    #[error("io: {0}")]
+    Io(String),
 }
 
 impl From<serde_json::Error> for DlsiteError {
@@ -330,6 +332,49 @@ impl DlsiteClient {
         down_url: &str,
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, DlsiteError> {
+        let (body, _) = self.download_common(down_url, None, on_progress)?;
+        Ok(body)
+    }
+
+    /// **ファイルへ直接**取得する（4 GiB 級の本を RAM に載せない）。
+    ///
+    /// 進捗・キャンセル・宛先検証の規則は [`Self::download_with_progress`] と同じ。
+    /// 戻り値は書いたバイト数。HTML（ログイン画面等）が 200 で返る場合も弾く。
+    pub fn download_to_file_with_progress(
+        &mut self,
+        down_url: &str,
+        path: &std::path::Path,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<u64, DlsiteError> {
+        let file = std::fs::File::create(path).map_err(|error| DlsiteError::Io(error.to_string()))?;
+        let mut sink = std::io::BufWriter::new(file);
+        let (_, bytes) = self.download_common(down_url, Some(&mut sink), on_progress)?;
+        std::io::Write::flush(&mut sink).map_err(|error| DlsiteError::Io(error.to_string()))?;
+        let head = {
+            use std::io::Read as _;
+            let mut head = [0u8; 64];
+            let mut file =
+                std::fs::File::open(path).map_err(|error| DlsiteError::Io(error.to_string()))?;
+            let read = file
+                .read(&mut head)
+                .map_err(|error| DlsiteError::Io(error.to_string()))?;
+            head[..read].to_vec()
+        };
+        if head.starts_with(b"<!doctype") || head.starts_with(b"<html") {
+            return Err(DlsiteError::Parse(
+                "HTML レスポンス（ファイルではない）".into(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// 取得の共通実装（`sink` があればファイルへ流す）。戻り値は `(本文, 書いたバイト数)`。
+    fn download_common(
+        &mut self,
+        down_url: &str,
+        sink: Option<&mut dyn std::io::Write>,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<(Vec<u8>, u64), DlsiteError> {
         // 1) down_url を manual（redirects=0）で叩いて 302 Location を取得
         //
         // 送信先は `bookshelf_items.download_url`（改変バックアップ由来もあり得る）と
@@ -411,33 +456,57 @@ impl DlsiteClient {
             ("Sec-Fetch-Mode".to_string(), "navigate".to_string()),
             ("Sec-Fetch-Site".to_string(), "cross-site".to_string()),
         ];
-        let resp = crate::tbf::redirect::send_with_validated_redirects(
-            self.transport.as_mut(),
-            RequestSpec {
-                method: "GET".into(),
-                url: cdn.url.as_str().into(),
-                headers,
-                body: None,
-                redirects: 0,
-            },
-            DLSITE_REDIRECT_LIMIT,
-            DLSITE_CDN_RULES,
-            &mut credentials,
-            on_progress,
-        )
-        .map_err(DlsiteError::Transport)?;
-        if resp.status == 401 || resp.status == 403 {
-            return Err(DlsiteError::Unauthorized(resp.status));
+        let cdn_spec = RequestSpec {
+            method: "GET".into(),
+            url: cdn.url.as_str().into(),
+            headers,
+            body: None,
+            redirects: 0,
+        };
+        match sink {
+            None => {
+                let resp = crate::tbf::redirect::send_with_validated_redirects(
+                    self.transport.as_mut(),
+                    cdn_spec,
+                    DLSITE_REDIRECT_LIMIT,
+                    DLSITE_CDN_RULES,
+                    &mut credentials,
+                    on_progress,
+                )
+                .map_err(DlsiteError::Transport)?;
+                if resp.status == 401 || resp.status == 403 {
+                    return Err(DlsiteError::Unauthorized(resp.status));
+                }
+                if resp.status != 200 {
+                    return Err(DlsiteError::Http(resp.status));
+                }
+                if resp.body.starts_with(b"<!doctype") || resp.body.starts_with(b"<html") {
+                    return Err(DlsiteError::Parse(
+                        "HTML レスポンス（ファイルではない）".into(),
+                    ));
+                }
+                Ok((resp.body, 0))
+            }
+            Some(sink) => {
+                let result = crate::tbf::redirect::send_to_sink_with_validated_redirects(
+                    self.transport.as_mut(),
+                    cdn_spec,
+                    DLSITE_REDIRECT_LIMIT,
+                    DLSITE_CDN_RULES,
+                    &mut credentials,
+                    on_progress,
+                    sink,
+                )
+                .map_err(DlsiteError::Transport)?;
+                if result.status == 401 || result.status == 403 {
+                    return Err(DlsiteError::Unauthorized(result.status));
+                }
+                if result.status != 200 {
+                    return Err(DlsiteError::Http(result.status));
+                }
+                Ok((Vec::new(), result.bytes))
+            }
         }
-        if resp.status != 200 {
-            return Err(DlsiteError::Http(resp.status));
-        }
-        if resp.body.starts_with(b"<!doctype") || resp.body.starts_with(b"<html") {
-            return Err(DlsiteError::Parse(
-                "HTML レスポンス（ファイルではない）".into(),
-            ));
-        }
-        Ok(resp.body)
     }
 
     /// HTML ページを取得する（購入履歴・作品ページ）。Cookie は**宛先 URL のホスト向け**だけを
@@ -1015,6 +1084,28 @@ mod tests {
             }),
         };
         (transport, proxy_spec)
+    }
+
+    /// **ファイルへ直接**取得できる（大きい本を RAM に載せない経路）。
+    #[test]
+    fn download_to_file_writes_the_body_and_reports_bytes() {
+        let (transport, _proxy_spec) = download_transport();
+        let mut client = DlsiteClient::with_transport(Box::new(transport), two_origin_session());
+        let dir = std::env::temp_dir().join("dlsite-download-to-file-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.zip");
+        let mut on = |_: u64, _: u64| true;
+        let bytes = client
+            .download_to_file_with_progress(
+                "https://www.dlsite.com/maniax/download/=/product_id/RJ01234567.html",
+                &path,
+                &mut on,
+            )
+            .unwrap();
+        assert_eq!(bytes, 7, "書いたバイト数を返す");
+        assert_eq!(std::fs::read(&path).unwrap(), b"PK\x03\x04zip");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ダウンロード proxy（`down_url`）へは、宛先ホスト向けの Cookie だけを送る。

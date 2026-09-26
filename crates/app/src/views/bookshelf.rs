@@ -35,8 +35,8 @@ use thundoku_core::fanza::client::FanzaClient;
 use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE, UreqTransport};
 
 use crate::actions::{
-    CancelDownload, DeleteBook, EditBookTags, HideBook, OpenAuth, OpenAuthProvider, OpenReader,
-    ToggleBackupExcluded,
+    CancelDownload, DeleteBackupFromDrive, DeleteBook, EditBookTags, HideBook, OpenAuth,
+    OpenAuthProvider, OpenReader, ToggleBackupExcluded,
     SyncDrive,
 };
 use crate::app_state::{AppState, ToastKind};
@@ -1641,8 +1641,9 @@ impl BookshelfView {
                 .ok();
         });
         // シャドウイングで元の `handle` に触れなくなるので、先に別名で確保しておく
-        // （バックアップ対象外 ON/OFF のハンドラ用）。
+        // （バックアップ対象外 ON/OFF と Drive から削除のハンドラ用）。
         let backup_handle = handle.clone();
+        let delete_backup_handle = handle.clone();
         let handle = handle.clone();
         App::on_action(cx, move |action: &HideBook, cx: &mut App| {
             let database_id = action.database_id.to_string();
@@ -1675,6 +1676,23 @@ impl BookshelfView {
                         return;
                     };
                     this.toggle_backup_excluded(cx, &card);
+                })
+                .ok();
+        });
+        App::on_action(cx, move |action: &DeleteBackupFromDrive, cx: &mut App| {
+            let database_id = action.database_id.to_string();
+            let site_id = action.site_id.to_string();
+            delete_backup_handle
+                .update(cx, |this, cx| {
+                    let Some(card) = this
+                        .shelf_cards
+                        .iter()
+                        .find(|c| c.shelf.database_id == database_id && c.shelf.site_id == site_id)
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    this.delete_backup_from_drive(cx, &card);
                 })
                 .ok();
         });
@@ -3935,6 +3953,7 @@ impl BookshelfView {
         let dlsite_session = state.dlsite_session.lock().clone();
         let db = state.db_pool.clone();
         let packs_dir = state.packs_dir.clone();
+        let downloads_dir = state.downloads_dir.clone();
         let title = item.title.clone();
         let product_id = item.database_id.clone();
         let tag_fetch_enabled = self.tag_fetch_enabled;
@@ -3977,7 +3996,10 @@ impl BookshelfView {
                 let mut genre_tags: Vec<String> = Vec::new();
                 // 作者（作品ページから取得。FANZA / DLsite のみ）
                 let mut site_author: Option<String> = None;
-                let bytes = if site_id == "booth" {
+                // ダウンロードは**一時ファイルへ**落とす（4 GiB 級の本を RAM に載せない）。
+                // 取込みはパス経由で行い、`TempDownload` が成功・失敗・中止のどの経路でも消す。
+                let temp = TempDownload::new(&downloads_dir, &product_id);
+                if site_id == "booth" {
                     let session =
                         booth_session.ok_or_else(|| "BOOTH セッションがありません".to_string())?;
                     let client = BoothClient::new(&session);
@@ -4009,8 +4031,8 @@ impl BookshelfView {
                         true
                     };
                     client
-                        .download_with_progress(&url, &mut on_download)
-                        .map_err(|error| download_failure(error, &cancel))?
+                        .download_to_file_with_progress(&url, temp.path(), &mut on_download)
+                        .map_err(|error| download_failure(error, &cancel))?;
                 } else if site_id == "fanza" {
                     // FANZA: 一覧では download_url を持たないため、details API で
                     // download_link を取得してから ZIP をダウンロードする。
@@ -4078,8 +4100,8 @@ impl BookshelfView {
                         true
                     };
                     client
-                        .download_with_progress(&url, &mut on_download)
-                        .map_err(|error| download_failure(error, &cancel))?
+                        .download_to_file_with_progress(&url, temp.path(), &mut on_download)
+                        .map_err(|error| download_failure(error, &cancel))?;
                 } else if site_id == "dlsite" {
                     // DLsite: 一覧 sync で保存した down_url（`.../download/=/product_id/{id}.html`）
                     // から 302 → download.dlsite.com（jwt 署名 Cookie）で ZIP を取得する。
@@ -4135,8 +4157,8 @@ impl BookshelfView {
                         true
                     };
                     client
-                        .download_with_progress(&url, &mut on_download)
-                        .map_err(|error| download_failure(error, &cancel))?
+                        .download_to_file_with_progress(&url, temp.path(), &mut on_download)
+                        .map_err(|error| download_failure(error, &cancel))?;
                 } else {
                     let mut client = tbf_client.lock();
                     // The bookshelf item's `downloadURL` (GraphQL
@@ -4172,14 +4194,13 @@ impl BookshelfView {
                         ));
                         true
                     };
-                    let bytes = client
-                        .download_with_progress(&resolved, &mut on_download)
+                    client
+                        .download_to_file_with_progress(&resolved, temp.path(), &mut on_download)
                         .map_err(|error| download_failure(error, &cancel))?;
                     // TBF クライアントのロックを解放してから重い処理（PDF レンダリング）
                     // に入る。保持したままだと同期等の他操作がブロックされる。
                     drop(client);
-                    bytes
-                };
+                }
                 // 転送が終わった時点で中止が確定していたら、取り込まずに中止として返す
                 // （中止かどうかはフラグで判定する。サイトごとのエラー型に依存しない）
                 if cancel.load(Ordering::SeqCst) {
@@ -4187,10 +4208,11 @@ impl BookshelfView {
                 }
                 // 取り込み元の上限はコアと同じ値を使う。**変換の前**に見るので、
                 // 大きすぎる本で PDF レンダリングや伸長を始めない（セキュリティ評価 F06）。
-                if bytes.len() as u64 > thundoku_core::import::MAX_IMPORT_SOURCE_BYTES {
+                let source_bytes = temp.size()?;
+                if source_bytes > thundoku_core::import::MAX_IMPORT_SOURCE_BYTES {
                     return Err(import_failure(
                         thundoku_core::import::ImportError::SourceTooLarge {
-                            size: bytes.len() as u64,
+                            size: source_bytes,
                             limit: thundoku_core::import::MAX_IMPORT_SOURCE_BYTES,
                         },
                     ));
@@ -4200,7 +4222,7 @@ impl BookshelfView {
                 // （既定 .pdf）で誤判定して PDF レンダリングするのを防ぐため、
                 // 実バイトのマジックナンバーから拡張子を判定する。
                 if (site_id == "fanza" || site_id == "dlsite")
-                    && let Some(ext) = sniff_extension(&bytes)
+                    && let Some(ext) = sniff_extension(&temp.head(64))
                 {
                     let stem = file_name
                         .rsplit_once('.')
@@ -4242,10 +4264,10 @@ impl BookshelfView {
                     // 中で レンダリング → pack → DB の順に進む）。**1 ページずつ** pack へ
                     // 入れるので、全ページをメモリに持たない（以前は全ページを集めてから
                     // clone していた）。
-                    let imported = thundoku_core::import::import_pdf_bytes(
+                    let imported = thundoku_core::import::import_pdf_path(
                         &db,
                         &file_name,
-                        &bytes,
+                        temp.path(),
                         &packs_dir,
                         Some(&root_key),
                         &mut on_import,
@@ -4288,18 +4310,23 @@ impl BookshelfView {
                     Ok::<_, ImportFailure>(imported)
                 } else {
                     let imported = match extension.as_str() {
-                        "epub" => thundoku_core::import::import_epub_bytes(
-                            &db,
-                            &file_name,
-                            &bytes,
-                            &packs_dir,
-                            Some(&root_key),
-                            reuse_book_id.as_deref(),
-                        ),
+                        "epub" => {
+                            // EPUB は pack に 1 エントリとして入れるだけなので全体を読む
+                            let bytes = temp.read_all()?;
+                            thundoku_core::import::import_epub_bytes(
+                                &db,
+                                &file_name,
+                                &bytes,
+                                &packs_dir,
+                                Some(&root_key),
+                                reuse_book_id.as_deref(),
+                            )
+                        }
                         "zip" => {
                             // §6.3: 曖昧な構造（コンテンツが複数 / 形式が複数）は
                             // サマリー付きモーダルで既定表示を選んでもらってから取り込む
-                            let mut plan = thundoku_core::import::analyze_zip(&bytes)
+                            let mut plan =
+                                thundoku_core::import::analyze_zip_path(temp.path())
                                 .map_err(import_failure)?;
                             if import_needs_confirmation(&plan) {
                                 match ask_import_confirmation(
@@ -4317,10 +4344,10 @@ impl BookshelfView {
                                     None => return Err(ImportFailure::Cancelled),
                                 }
                             }
-                            thundoku_core::import::commit_zip(
+                            thundoku_core::import::commit_zip_path(
                                 &db,
                                 &file_name,
-                                &bytes,
+                                temp.path(),
                                 &packs_dir,
                                 Some(&root_key),
                                 &mut on_import,
@@ -4330,6 +4357,8 @@ impl BookshelfView {
                         }
                         // BOOTH は PDF だけでなく画像ファイル（イラスト等）もある
                         "jpg" | "jpeg" | "png" | "webp" | "gif" => {
+                            // 単体画像は小さいので全体を読む
+                            let bytes = temp.read_all()?;
                             thundoku_core::import::import_image_bytes(
                                 &db,
                                 &file_name,
@@ -4698,6 +4727,81 @@ impl BookshelfView {
             },
         );
         cx.notify();
+    }
+
+    /// 右クリックメニュー「Drive から削除（この端末には残る）」。
+    ///
+    /// Drive の容量を空けるための操作。**先にバックアップ対象外にしてから** Drive の
+    /// コピーを消す（消すだけだと次の同期で上げ直してしまう）。ローカルの pack は残す。
+    /// 通信は背景で行う（UI スレッドで Google のロックを待たない）。
+    fn delete_backup_from_drive(&mut self, cx: &mut Context<Self>, card: &ShelfCard) {
+        let Some(local) = &card.local else {
+            return;
+        };
+        let pack_id = local.book.id.clone();
+        let state = Self::app_state(cx);
+        let db = state.db_pool.clone();
+        let google = state.google.clone();
+        let Some(folder_id) = db::settings::get(&db, "drive.sync.folder_id").ok().flatten() else {
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "Drive の同期が未設定です",
+            );
+            cx.notify();
+            return;
+        };
+        // 先に印を立てる（消した直後に上げ直す事故を防ぐ）
+        if let Err(error) = db::books::set_backup_excluded(&db, &pack_id, true) {
+            log::warn!("drive delete: バックアップ対象外にできない: {error}");
+            return;
+        }
+        crate::app_state::set_toast_kind(cx, ToastKind::Info, "Drive から削除しています…");
+        cx.notify();
+        let handle = cx.weak_entity();
+        let task = cx.background_executor().spawn(async move {
+            let token = {
+                let mut guard = google.lock();
+                let client = guard.as_mut().ok_or_else(|| "Google にログインしてください".to_string())?;
+                client.access_token().map_err(|e| e.to_string())?
+            };
+            let mut drive = thundoku_core::drive::DriveClient::new(
+                Box::new(thundoku_core::tbf::UreqTransport::new()),
+                token,
+            );
+            thundoku_core::drive::sync::delete_pack_from_drive(&db, &mut drive, &folder_id, &pack_id)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle
+                .update(cx, |this, cx| {
+                    match result {
+                        Ok(true) => crate::app_state::set_toast_kind(
+                            cx,
+                            ToastKind::Success,
+                            "Drive から削除しました（この端末には残っています。バックアップ対象外にしました）",
+                        ),
+                        Ok(false) => crate::app_state::set_toast_kind(
+                            cx,
+                            ToastKind::Info,
+                            "Drive にこの本のコピーはありませんでした（バックアップ対象外にしました）",
+                        ),
+                        Err(error) => {
+                            log::warn!("drive delete failed: {error}");
+                            crate::app_state::set_toast_kind(
+                                cx,
+                                ToastKind::Error,
+                                format!("Drive から削除できませんでした: {error}"),
+                            );
+                        }
+                    }
+                    this.filtered_dirty = true;
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
     }
 
     /// ローカル削除（Drive には触れない）。
@@ -6099,6 +6203,22 @@ impl BookshelfView {
                         site_id: site_id_for_menu.clone().into(),
                     }),
                 );
+                // Drive から削除（ローカルには残す）。Drive にコピーがあるときだけ有効。
+                // 容量を空けるための操作で、押すとバックアップ対象外にもする。
+                let on_drive = delete_id_for_menu.as_deref().is_some_and(|book_id| {
+                    db::sync_state::get(&AppState::global(cx).db_pool, book_id)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                });
+                menu = menu.menu_with_disabled(
+                    "Drive から削除（この端末には残る）",
+                    Box::new(DeleteBackupFromDrive {
+                        database_id: edit_id_for_menu.clone().into(),
+                        site_id: site_id_for_menu.clone().into(),
+                    }),
+                    !on_drive,
+                );
                 // Drive バックアップ対象外 ON/OFF: ON にすると同期のアップロードから外れる
                 // （**終了時のアップロードも同じ経路**なので、終了時にも上がらない）。
                 // 未取得（クラウドにしか無い）本は落とす必要があるので対象外にできない。
@@ -7400,6 +7520,22 @@ impl BookshelfView {
                         database_id: edit_id_for_menu.clone().into(),
                         site_id: site_id_for_menu.clone().into(),
                     }),
+                );
+                // Drive から削除（ローカルには残す）。Drive にコピーがあるときだけ有効。
+                // 容量を空けるための操作で、押すとバックアップ対象外にもする。
+                let on_drive = delete_id_for_menu.as_deref().is_some_and(|book_id| {
+                    db::sync_state::get(&AppState::global(cx).db_pool, book_id)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                });
+                menu = menu.menu_with_disabled(
+                    "Drive から削除（この端末には残る）",
+                    Box::new(DeleteBackupFromDrive {
+                        database_id: edit_id_for_menu.clone().into(),
+                        site_id: site_id_for_menu.clone().into(),
+                    }),
+                    !on_drive,
                 );
                 // Drive バックアップ対象外 ON/OFF: ON にすると同期のアップロードから外れる
                 // （**終了時のアップロードも同じ経路**なので、終了時にも上がらない）。
@@ -9397,6 +9533,52 @@ pub(crate) fn format_purchase_date(raw: &str) -> String {
 /// ダウンロードしたバイト列のマジックナンバーから拡張子を推定する。
 /// FANZA はファイル名由来の拡張子（既定 `.pdf`）が実際と異なることがあるため使う
 /// （画像セット ZIP が PDF として誤レンダリングされるのを防ぐ）。
+/// ダウンロードした一時ファイル。**成功・失敗・中止のどの経路でも**必ず消す（`Drop`）。
+///
+/// 4 GiB 級の本を RAM に載せないため、ダウンロードはメモリではなくこのファイルへ落とし、
+/// 取込みはパス経由（`import_pdf_path` / `analyze_zip_path` 等）で行う（2026-09-26）。
+struct TempDownload(std::path::PathBuf);
+
+impl TempDownload {
+    fn new(downloads_dir: &std::path::Path, product_id: &str) -> Self {
+        Self(downloads_dir.join(format!("{product_id}.import.part")))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    /// 先頭 `len` バイト（拡張子の判定用。読めなければ空）。
+    fn head(&self, len: usize) -> Vec<u8> {
+        use std::io::Read as _;
+        let Ok(mut file) = std::fs::File::open(&self.0) else {
+            return Vec::new();
+        };
+        let mut buf = vec![0u8; len];
+        let read = file.read(&mut buf).unwrap_or(0);
+        buf.truncate(read);
+        buf
+    }
+
+    /// 全体を読む（EPUB・単体画像のような小さい入力向け）。
+    fn read_all(&self) -> Result<Vec<u8>, ImportFailure> {
+        std::fs::read(&self.0).map_err(|error| ImportFailure::Message(error.to_string()))
+    }
+
+    /// 大きさ（取込み元の上限判定に使う）。
+    fn size(&self) -> Result<u64, ImportFailure> {
+        std::fs::metadata(&self.0)
+            .map(|meta| meta.len())
+            .map_err(|error| ImportFailure::Message(error.to_string()))
+    }
+}
+
+impl Drop for TempDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"PK\x03\x04") {
         return Some("zip");
@@ -13201,6 +13383,31 @@ mod tests {
                 "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main.jpg".to_string()
             ]
         );
+    }
+
+    /// 一時ファイルは **drop で必ず消える**（成功・失敗・中止のどの経路でも残さない）。
+    #[test]
+    fn temp_download_is_removed_on_drop_and_reads_head() {
+        let dir = std::env::temp_dir().join("thundoku-temp-download-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = {
+            let temp = super::TempDownload::new(&dir, "p1");
+            std::fs::write(temp.path(), b"PK\x03\x04abcdef").unwrap();
+            // 先頭バイトと大きさは読める（拡張子判定・上限判定に使う）
+            assert_eq!(temp.head(4), b"PK\x03\x04");
+            match temp.size() {
+                Ok(size) => assert_eq!(size, 10),
+                Err(_) => panic!("大きさを読めない"),
+            }
+            match temp.read_all() {
+                Ok(bytes) => assert_eq!(bytes, b"PK\x03\x04abcdef"),
+                Err(_) => panic!("全体を読めない"),
+            }
+            temp.path().to_path_buf()
+        };
+        assert!(!path.exists(), "drop しても一時ファイルが残っている");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 取り込み元の上限を超える本は、**転送の前に**断る（無駄なダウンロードをしない）。

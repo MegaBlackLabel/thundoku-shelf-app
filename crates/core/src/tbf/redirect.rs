@@ -25,14 +25,30 @@ const CREDENTIAL_HEADERS: &[&str] = &["cookie", "x-xsrf-token", "authorization"]
 /// `credentials` は宛先 URL ごとに資格情報ヘッダーを組み立てる（呼び出し側が
 /// 「そのホスト向けに収集した Cookie だけ」を返す）。許可リストに一致しないホストでは
 /// 呼ばれず、資格情報なしで追う（署名付き CDN / S3 への転送は壊さず、セッションは渡さない）。
-pub fn send_with_validated_redirects(
+/// 1 ホップ分の結果（メモリ版とファイル版を同じループで扱うための内部表現）。
+struct Hop {
+    status: u16,
+    headers: Vec<(String, String)>,
+    /// メモリ版: 本文。ファイル版: 2xx 以外の先頭バイト（2xx の本文は `sink` へ書いてある）。
+    body: Vec<u8>,
+    /// ファイル版: `sink` に書いたバイト数（メモリ版は 0）。
+    bytes: u64,
+}
+
+/// ホップごとに宛先を検証しながら追う共通の実装（`send` だけがメモリ / ファイルで違う）。
+fn follow_redirects(
     transport: &mut dyn Transport,
     spec: RequestSpec,
     max_hops: usize,
     rules: &[HostRule],
     credentials: &mut dyn FnMut(&Url) -> Vec<(String, String)>,
     on_progress: &mut dyn FnMut(u64, u64) -> bool,
-) -> Result<ResponseSpec, TbfError> {
+    mut send: impl FnMut(
+        &mut dyn Transport,
+        RequestSpec,
+        &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<Hop, TbfError>,
+) -> Result<Hop, TbfError> {
     let mut current = Url::parse(&spec.url)
         .map_err(|_| TbfError::BlockedUrl(format!("URL を解釈できない: {}", spec.url)))?;
     // 起点もここで検証する（呼び出し側の検証と二重の関門。送信前に止める）。
@@ -67,11 +83,16 @@ pub fn send_with_validated_redirects(
             // ここで自前で追う（`ureq` に追わせると各ホップを検証できない）
             redirects: 0,
         };
-        let response = transport.send_download(hop, on_progress)?;
+        let response = send(transport, hop, on_progress)?;
         if !(300..400).contains(&response.status) {
             return Ok(response);
         }
-        let Some(location) = response.header("location") else {
+        let location = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.clone());
+        let Some(location) = location else {
             // `Location` の無い 3xx はそのまま返す（呼び出し側が状態を見て判断する）。
             return Ok(response);
         };
@@ -82,7 +103,7 @@ pub fn send_with_validated_redirects(
         }
         remaining -= 1;
         let next = current
-            .join(location)
+            .join(&location)
             .map_err(|_| TbfError::Upstream(format!("Location を解釈できない: {location}")))?;
         // ダウングレード（`https` 以外）へは転送しない。
         if next.scheme() != "https" {
@@ -92,6 +113,79 @@ pub fn send_with_validated_redirects(
         }
         current = next;
     }
+}
+
+/// ホップごとに宛先を検証しながら取得する（本文はメモリに載る）。
+pub fn send_with_validated_redirects(
+    transport: &mut dyn Transport,
+    spec: RequestSpec,
+    max_hops: usize,
+    rules: &[HostRule],
+    credentials: &mut dyn FnMut(&Url) -> Vec<(String, String)>,
+    on_progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<ResponseSpec, TbfError> {
+    let hop = follow_redirects(
+        transport,
+        spec,
+        max_hops,
+        rules,
+        credentials,
+        on_progress,
+        |transport, hop_spec, on_progress| {
+            transport
+                .send_download(hop_spec, on_progress)
+                .map(|response| Hop {
+                    status: response.status,
+                    headers: response.headers,
+                    body: response.body,
+                    bytes: 0,
+                })
+        },
+    )?;
+    Ok(ResponseSpec {
+        status: hop.status,
+        headers: hop.headers,
+        body: hop.body,
+    })
+}
+
+/// [`send_with_validated_redirects`] の**ファイル出力版**（大きいファイルを RAM に載せない）。
+///
+/// 2xx の本文は `sink` へ書く（3xx の本文は書かないので、リダイレクトでファイルが汚れない）。
+/// 戻り値は最終応答の状態・ヘッダーと、書いたバイト数（2xx 以外は `error_body` に先頭バイト）。
+pub fn send_to_sink_with_validated_redirects(
+    transport: &mut dyn Transport,
+    spec: RequestSpec,
+    max_hops: usize,
+    rules: &[HostRule],
+    credentials: &mut dyn FnMut(&Url) -> Vec<(String, String)>,
+    on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    sink: &mut dyn std::io::Write,
+) -> Result<crate::tbf::transport::DownloadResult, TbfError> {
+    let hop = follow_redirects(
+        transport,
+        spec,
+        max_hops,
+        rules,
+        credentials,
+        on_progress,
+        move |transport, hop_spec, on_progress| {
+            transport
+                .send_download_to(hop_spec, sink, on_progress)
+                .map(|result| Hop {
+                    status: result.status,
+                    headers: result.headers,
+                    body: result.error_body,
+                    bytes: result.bytes,
+                })
+        },
+    )?;
+    Ok(crate::tbf::transport::DownloadResult {
+        status: hop.status,
+        headers: hop.headers,
+        bytes: hop.bytes,
+        error_body: hop.body,
+    })
 }
 
 #[cfg(test)]

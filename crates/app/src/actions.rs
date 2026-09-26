@@ -127,6 +127,17 @@ pub struct HideBook {
     pub site_id: SharedString,
 }
 
+/// Drive から pack を削除する（ローカルには残す。右クリックメニュー）。
+///
+/// 「Drive の容量を空けたい」ための操作。消したあとは**バックアップ対象外にする**
+/// （消しても次の同期で上げ直したら意味がないため）。
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, gpui_kit::Action)]
+#[action(namespace = thundoku, no_json)]
+pub struct DeleteBackupFromDrive {
+    pub database_id: SharedString,
+    pub site_id: SharedString,
+}
+
 /// Drive のバックアップ（pack のアップロード）の対象から外す / 戻す（右クリックメニュー）。
 ///
 /// ON の本は同期のアップロード方向で skip される。**終了時のアップロードも同じ経路**

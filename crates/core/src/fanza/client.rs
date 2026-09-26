@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use crate::fanza::classify;
 use crate::session_cookies::{CookieEntry, HostScopedCookies};
 use crate::tbf::TbfError;
-use crate::tbf::transport::{RequestSpec, ResponseSpec, Transport};
+use crate::tbf::transport::{RequestSpec, Transport};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -89,6 +89,8 @@ pub enum FanzaError {
     Database(#[from] sqlx::Error),
     #[error("transport: {0}")]
     Transport(#[from] TbfError),
+    #[error("io: {0}")]
+    Io(String),
 }
 
 impl From<serde_json::Error> for FanzaError {
@@ -247,14 +249,14 @@ impl FanzaClient {
         ]
     }
 
-    fn check_status(&self, resp: &ResponseSpec) -> Result<(), FanzaError> {
-        if resp.status == 401 || resp.status == 403 {
-            return Err(FanzaError::Unauthorized(resp.status));
+    fn check_status(&self, status: u16) -> Result<(), FanzaError> {
+        if status == 401 || status == 403 {
+            return Err(FanzaError::Unauthorized(status));
         }
-        if resp.status == 200 {
+        if status == 200 {
             return Ok(());
         }
-        Err(FanzaError::Http(resp.status))
+        Err(FanzaError::Http(status))
     }
 
     fn get_json(&mut self, url: &str) -> Result<Value, FanzaError> {
@@ -267,7 +269,7 @@ impl FanzaClient {
             redirects: 3,
         };
         let resp = self.transport.send(spec).map_err(FanzaError::Transport)?;
-        self.check_status(&resp)?;
+        self.check_status(resp.status)?;
         let json: Value = serde_json::from_slice(&resp.body)?;
         if json.get("error_code").and_then(Value::as_i64) != Some(0) {
             return Err(FanzaError::SessionExpired);
@@ -366,7 +368,7 @@ impl FanzaClient {
             redirects: 3,
         };
         let resp = self.transport.send(spec).map_err(FanzaError::Transport)?;
-        self.check_status(&resp)?;
+        self.check_status(resp.status)?;
         let html = String::from_utf8_lossy(&resp.body).to_string();
         Ok(parse_product_page(&html))
     }
@@ -382,6 +384,48 @@ impl FanzaClient {
         download_url: &str,
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, FanzaError> {
+        let (body, _) = self.download_common(download_url, None, on_progress)?;
+        Ok(body)
+    }
+
+    /// **ファイルへ直接**取得する（4 GiB 級の本を RAM に載せない）。
+    ///
+    /// 進捗・キャンセル・宛先検証の規則は [`Self::download_with_progress`] と同じ。
+    /// 戻り値は書いたバイト数。HTML（ログイン画面等）が 200 で返る場合も弾く。
+    pub fn download_to_file_with_progress(
+        &mut self,
+        download_url: &str,
+        path: &std::path::Path,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<u64, FanzaError> {
+        let file = std::fs::File::create(path).map_err(|error| FanzaError::Io(error.to_string()))?;
+        let mut sink = std::io::BufWriter::new(file);
+        let (_, bytes) = self.download_common(download_url, Some(&mut sink), on_progress)?;
+        std::io::Write::flush(&mut sink).map_err(|error| FanzaError::Io(error.to_string()))?;
+        // 2xx でも HTML が返ることがある（ログイン画面・エラーページ）→ 先頭バイトで弾く
+        let head = {
+            use std::io::Read as _;
+            let mut head = [0u8; 64];
+            let mut file =
+                std::fs::File::open(path).map_err(|error| FanzaError::Io(error.to_string()))?;
+            let read = file
+                .read(&mut head)
+                .map_err(|error| FanzaError::Io(error.to_string()))?;
+            head[..read].to_vec()
+        };
+        if head.starts_with(b"<!doctype") || head.starts_with(b"<html") {
+            return Err(FanzaError::Parse("HTML response (not a file)".into()));
+        }
+        Ok(bytes)
+    }
+
+    /// 取得の共通実装（`sink` があればファイルへ流す）。戻り値は `(本文, 書いたバイト数)`。
+    fn download_common(
+        &mut self,
+        download_url: &str,
+        sink: Option<&mut dyn std::io::Write>,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<(Vec<u8>, u64), FanzaError> {
         // 1) proxy を manual（redirects=0）で叩いて 302 Location を取得
         //
         // Cookie（セッション / 署名）を付ける前に送信先を検証する。proxy URL と
@@ -479,26 +523,45 @@ impl FanzaClient {
                 vec![("Cookie".to_string(), cookie)]
             }
         };
-        let resp = crate::tbf::redirect::send_with_validated_redirects(
-            self.transport.as_mut(),
-            RequestSpec {
-                method: "GET".into(),
-                url: cdn.url.as_str().into(),
-                headers,
-                body: None,
-                redirects: 0,
-            },
-            FANZA_REDIRECT_LIMIT,
-            FANZA_CDN_RULES,
-            &mut credentials,
-            on_progress,
-        )
-        .map_err(FanzaError::Transport)?;
-        self.check_status(&resp)?;
-        if resp.body.starts_with(b"<!doctype") || resp.body.starts_with(b"<html") {
-            return Err(FanzaError::Parse("HTML response (not a file)".into()));
+        let cdn_spec = RequestSpec {
+            method: "GET".into(),
+            url: cdn.url.as_str().into(),
+            headers,
+            body: None,
+            redirects: 0,
+        };
+        match sink {
+            None => {
+                let resp = crate::tbf::redirect::send_with_validated_redirects(
+                    self.transport.as_mut(),
+                    cdn_spec,
+                    FANZA_REDIRECT_LIMIT,
+                    FANZA_CDN_RULES,
+                    &mut credentials,
+                    on_progress,
+                )
+                .map_err(FanzaError::Transport)?;
+                self.check_status(resp.status)?;
+                if resp.body.starts_with(b"<!doctype") || resp.body.starts_with(b"<html") {
+                    return Err(FanzaError::Parse("HTML response (not a file)".into()));
+                }
+                Ok((resp.body, 0))
+            }
+            Some(sink) => {
+                let result = crate::tbf::redirect::send_to_sink_with_validated_redirects(
+                    self.transport.as_mut(),
+                    cdn_spec,
+                    FANZA_REDIRECT_LIMIT,
+                    FANZA_CDN_RULES,
+                    &mut credentials,
+                    on_progress,
+                    sink,
+                )
+                .map_err(FanzaError::Transport)?;
+                self.check_status(result.status)?;
+                Ok((Vec::new(), result.bytes))
+            }
         }
-        Ok(resp.body)
     }
 }
 
@@ -552,6 +615,7 @@ fn parse_purchase(v: &Value, purchase_date: Option<String>) -> FanzaPurchase {
 
 #[cfg(test)]
 mod tests {
+    use crate::tbf::transport::ResponseSpec;
     use super::*;
     use crate::fanza::{AiType, FanzaMeta, MediaCategory};
 
@@ -1032,6 +1096,54 @@ mod tests {
     ///
     /// `bookshelf_items.download_url` は改変したバックアップから復元され得るため、
     /// 同じ `www.dmm.co.jp` でもダウンロードと無関係なパスへセッション Cookie を送らせない。
+    /// **ファイルへ直接**取得できる（本文はファイルに落ちる。大きい本を RAM に載せない経路）。
+    #[test]
+    fn download_to_file_writes_the_body_and_reports_bytes() {
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        let _guard = Arc::new(Mutex::new(()));
+        let transport = MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                if spec.url.contains("/dc/-/proxy/") {
+                    Ok(ResponseSpec {
+                        status: 302,
+                        headers: vec![(
+                            "location".into(),
+                            "https://doujin.contents.doujin.dmm.co.jp/bb/dm_comic/x.zip".into(),
+                        )],
+                        body: vec![],
+                    })
+                } else {
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/zip".into())],
+                        body: b"PK\x03\x04zipdata".to_vec(),
+                    })
+                }
+            }),
+        };
+        let mut client = FanzaClient::with_transport(Box::new(transport), session());
+        let dir = std::env::temp_dir().join("fanza-download-to-file-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.zip");
+        let mut on = |_: u64, _: u64| true;
+        let bytes = client
+            .download_to_file_with_progress(
+                "https://www.dmm.co.jp/dc/-/proxy/=/transfer_type=download/shop=doujin/product_id=x/",
+                &path,
+                &mut on,
+            )
+            .unwrap();
+        assert_eq!(bytes, 11, "書いたバイト数を返す");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"PK\x03\x04zipdata",
+            "ファイルの中身が本文と違う"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn download_proxy_path_outside_the_allowlist_is_blocked_without_sending() {
         use parking_lot::Mutex;

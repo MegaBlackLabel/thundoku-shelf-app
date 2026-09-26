@@ -81,6 +81,8 @@ pub enum TbfError {
     BlockedUrl(String),
     #[error("cancelled")]
     Cancelled,
+    #[error("io: {0}")]
+    Io(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +649,28 @@ impl TbfClient {
         self.download_with_rules(url, TBF_DOWNLOAD_RULES, on_progress)
     }
 
+    /// **ファイルへ直接**取得する（4 GiB 級の本を RAM に載せない）。
+    ///
+    /// 進捗・キャンセル・宛先検証の規則は [`Self::download_with_progress`] と同じ。
+    /// 戻り値は書いたバイト数。
+    pub fn download_to_file_with_progress(
+        &mut self,
+        url: &str,
+        path: &std::path::Path,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<u64, TbfError> {
+        let file = std::fs::File::create(path).map_err(|error| TbfError::Io(error.to_string()))?;
+        let mut sink = std::io::BufWriter::new(file);
+        let (_, bytes) = self.download_with_rules_into(
+            url,
+            TBF_DOWNLOAD_RULES,
+            Some(&mut sink),
+            on_progress,
+        )?;
+        std::io::Write::flush(&mut sink).map_err(|error| TbfError::Io(error.to_string()))?;
+        Ok(bytes)
+    }
+
     /// 自サイトの画像を取得する（試し読みページ = `product_sample_pages` の URL、表紙）。
     ///
     /// 許可先は [`TBF_SITE_IMAGE_RULES`]（自サイトの `/api/image/` だけ）。本体用の
@@ -671,6 +695,18 @@ impl TbfClient {
         rules: &[crate::download_url::HostRule],
         on_progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<Vec<u8>, TbfError> {
+        let (body, _) = self.download_with_rules_into(url, rules, None, on_progress)?;
+        Ok(body)
+    }
+
+    /// 取得の共通実装（`sink` があればファイルへ流す）。戻り値は `(本文, 書いたバイト数)`。
+    fn download_with_rules_into(
+        &mut self,
+        url: &str,
+        rules: &[crate::download_url::HostRule],
+        sink: Option<&mut dyn std::io::Write>,
+        on_progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<(Vec<u8>, u64), TbfError> {
         // 本体取得も認証付き。起点を検証し、リダイレクトは**各ホップ検証**して追う
         // （許可外ホストへ Cookie / XSRF トークンを残さない）。
         let parsed = crate::download_url::check(url, rules)
@@ -684,28 +720,51 @@ impl TbfClient {
                 destination.as_str(),
             )
         };
-        let response = crate::tbf::redirect::send_with_validated_redirects(
-            self.transport.as_mut(),
-            RequestSpec {
-                method: "GET".to_string(),
-                url: parsed.url.as_str().to_string(),
-                // 資格情報はホップごとに `credentials` が足す
-                headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
-                body: None,
-                redirects: 0,
-            },
-            TBF_REDIRECT_LIMIT,
-            rules,
-            &mut credentials,
-            on_progress,
-        )?;
-        if !(200..300).contains(&response.status) {
-            return Err(TbfError::Upstream(format!(
-                "download status {}",
-                response.status
-            )));
+        let request = RequestSpec {
+            method: "GET".to_string(),
+            url: parsed.url.as_str().to_string(),
+            // 資格情報はホップごとに `credentials` が足す
+            headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
+            body: None,
+            redirects: 0,
+        };
+        match sink {
+            None => {
+                let response = crate::tbf::redirect::send_with_validated_redirects(
+                    self.transport.as_mut(),
+                    request,
+                    TBF_REDIRECT_LIMIT,
+                    rules,
+                    &mut credentials,
+                    on_progress,
+                )?;
+                if !(200..300).contains(&response.status) {
+                    return Err(TbfError::Upstream(format!(
+                        "download status {}",
+                        response.status
+                    )));
+                }
+                Ok((response.body, 0))
+            }
+            Some(sink) => {
+                let result = crate::tbf::redirect::send_to_sink_with_validated_redirects(
+                    self.transport.as_mut(),
+                    request,
+                    TBF_REDIRECT_LIMIT,
+                    rules,
+                    &mut credentials,
+                    on_progress,
+                    sink,
+                )?;
+                if !(200..300).contains(&result.status) {
+                    return Err(TbfError::Upstream(format!(
+                        "download status {}",
+                        result.status
+                    )));
+                }
+                Ok((Vec::new(), result.bytes))
+            }
         }
-        Ok(response.body)
     }
 
     // -- internals ---------------------------------------------------------
