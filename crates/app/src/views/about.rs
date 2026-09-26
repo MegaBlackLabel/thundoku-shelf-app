@@ -144,8 +144,10 @@ const ACCOUNT_LOGIN_METHODS: [(&str, &str); 2] = [
         "そのストアのメールアドレスとパスワードを入力します",
     ),
 ];
-const ACCOUNT_LOGIN_NOTE: &str =
-    "Google ログインは Google ドライブへのバックアップに使うもので、本を読むだけなら不要です。";
+const ACCOUNT_LOGIN_NOTE: &str = "Google ログインは Google ドライブへのバックアップと\
+                                  本の取り込み（ダウンロード）に使います（取り込んだ本は\
+                                  Google アカウントごとの鍵で暗号化するため、未ログインでは\
+                                  取り込みません）。すでに取り込んだ本を読むのには必要ありません。";
 
 /// 「本棚の基本的な使い方」の見出しと項目（見出し / 説明）。
 const SHELF_BASICS_TITLE: &str = "本棚の基本的な使い方";
@@ -175,8 +177,52 @@ const SHELF_BASICS: [(&str, &str); 6] = [
     ),
     (
         "マウスとキーボード",
-        "右クリックで「開く / ダウンロード中止 / タグ編集 / 非表示」、キーボードは \
-         ← → ↑ ↓ で選択、Enter で開く、Backspace でダウンロード中止です",
+        "キーボードは ← → ↑ ↓ で選択、Enter で開く、Backspace でダウンロード中止です。\
+         右クリックのメニューは「本の右クリックメニュー」の節を参照してください",
+    ),
+];
+
+/// 「本の右クリックメニュー」の見出しと概要。
+///
+/// 本棚のカード（リスト表示では行）を右クリックしたときに出るメニュー。項目は
+/// **実際に並ぶ順**（`bookshelf.rs` の card / row の `context_menu`）で書き、
+/// 有効・無効が本の状態で変わることも書く。
+const CONTEXT_MENU_TITLE: &str = "本の右クリックメニュー";
+const CONTEXT_MENU_LEAD: &str = "本棚のカード（リスト表示では行）を右クリックすると、その本の\
+                                 操作メニューが開きます。項目によっては本の状態で選べる・選べないが\
+                                 変わります（例: 「開く」は取り込み済みの本だけ、「Drive から削除」は\
+                                 Drive にコピーがある本だけ）。";
+/// 右クリックメニューの項目（名前 / 説明）。**実際に並ぶ順に書く**。
+const CONTEXT_MENU_ITEMS: [(&str, &str); 8] = [
+    (
+        "閲覧回数: N 回",
+        "クリックできない情報行（取り込み済みの本だけ）",
+    ),
+    (
+        "開く",
+        "ビューアーで開きます（取り込み済みの本だけ。ほかの本を取り込み中は選べません）",
+    ),
+    (
+        "ダウンロード中止",
+        "進行中のダウンロードを中断します（途中まで取得した内容は取り込みません）",
+    ),
+    ("タグ編集", "タグの追加・削除（全ストア）"),
+    (
+        "再取得",
+        "ストアから取り込み直します（読書位置・付箋・タグは残ります）",
+    ),
+    (
+        "非表示にする",
+        "本棚から隠します（設定の「非表示書籍」から戻せます）",
+    ),
+    (
+        "Drive から削除（この端末には残る）",
+        "Drive のコピーを消して容量を空けます（この端末の本は残り、バックアップ対象外になります）。\
+         Drive にコピーがある本だけ選べます",
+    ),
+    (
+        "バックアップ対象外にする / 解除",
+        "Drive へのアップロードから外す / 戻す（未ダウンロードの本は対象外にできません）",
     ),
 ];
 
@@ -223,7 +269,7 @@ const KEY_NOTICE_LOSS: &str = "鍵の控え（OS 資格情報ストアと Google
 /// 説明画面の「主な機能」に出す項目（タイトル / アイコン / 説明）。
 /// **実装済みの機能をここに並べる**（テスト `about_lists_the_implemented_features` が
 /// 主要機能の記載漏れを防ぐ）。
-const FEATURES: [(&str, AppIcon, &str); 14] = [
+const FEATURES: [(&str, AppIcon, &str); 15] = [
     (
         "本棚",
         AppIcon::LibraryBig,
@@ -296,8 +342,17 @@ const FEATURES: [(&str, AppIcon, &str); 14] = [
     (
         "自動タグ生成",
         AppIcon::Tag,
-        "タグの追加・編集は全ストアで使えます。**自動生成は技術書典の同期時のみ**（他ストアは手動）。\
-         形態素解析による名詞抽出で、書籍の分類・検索を強力にサポートします。",
+        "タグの追加・編集は全ストアで使えます。**自動生成は取り込み時**（形態素解析による\
+         名詞抽出で、全ストアが対象）。ストアにタグが無い本（技術書典・BOOTH）ではそのまま\
+         残り、FANZA同人 / DLsite はストアのジャンルタグで置き換わります。\
+         書籍の分類・検索を強力にサポートします。",
+    ),
+    (
+        "表示中のタグ取得",
+        AppIcon::Tag,
+        "本棚ヘッダーの「表示中のタグ取得」で、いま見えている本のうちタグ未取得のものだけを\
+         ストア（FANZA同人 / DLsite）から取りに行きます。ダウンロード済みの本も対象で、取り込み時に\
+         タグを取れなかった本を後から埋められます（1 回の上限は FANZA 20 件 / DLsite 100 件）。",
     ),
     (
         "複数アカウントの切替",
@@ -574,6 +629,24 @@ impl AboutView {
         self.about_section("about-shelf-basics", SHELF_BASICS_TITLE, body, cx)
     }
 
+    /// 「本の右クリックメニュー」（本棚のカード / リスト行）。
+    fn context_menu_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted_fg)
+                    .line_height(relative(1.7))
+                    .child(CONTEXT_MENU_LEAD),
+            )
+            .child(Self::about_rows(&CONTEXT_MENU_ITEMS, 220.0, muted_fg));
+        self.about_section("about-context-menu", CONTEXT_MENU_TITLE, body, cx)
+    }
+
     /// Google ドライブの注意（**ストアのログイン手順の次**に置く）。
     fn drive_notice_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let warning = cx.theme().warning;
@@ -843,6 +916,7 @@ impl AboutView {
                     .child(self.sidebar_section(cx))
                     // 本棚の基本的な使い方
                     .child(self.shelf_basics_section(cx))
+                    .child(self.context_menu_section(cx))
                     // 主な機能
                     .child(
                         div()
@@ -1521,6 +1595,7 @@ mod tests {
             "本の鍵（パスフレーズ）",
             "関連書籍のショートカット",
             "自動タグ生成",
+            "表示中のタグ取得",
             "複数アカウントの切替",
             "対応ストア",
         ] {
@@ -1609,7 +1684,10 @@ mod tests {
         );
     }
 
-    /// ストア限定の機能にはその旨を書く（チェックリストと自動タグ生成は技術書典のみ）。
+    /// ストア限定の機能にはその旨を書く（チェックリストは技術書典専用）。自動タグ生成は
+    /// **全ストア**で取り込み時に走るが、ストアのタグがある本では置き換わるので、その旨を書く
+    /// （`crates/core/src/import/mod.rs` の `finish_import` はサイト条件を持たない。
+    /// FANZA / DLsite は `set_for_book` の全置換でジャンルタグに置き換わる）。
     #[test]
     fn about_marks_store_specific_features() {
         assert!(
@@ -1619,12 +1697,47 @@ mod tests {
         );
         let tags = description("自動タグ生成");
         assert!(
-            tags.contains("技術書典") && tags.contains("自動"),
-            "自動タグ生成が技術書典のみである旨が無い: {tags}"
+            tags.contains("取り込み時") && tags.contains("全ストア"),
+            "自動タグ生成が取り込み時・全ストアである旨が無い: {tags}"
+        );
+        assert!(
+            tags.contains("FANZA") && tags.contains("BOOTH"),
+            "ストアごとのタグの扱い（FANZA / DLsite は置き換え・技術書典 / BOOTH は残る）が無い: {tags}"
         );
         assert!(
             LOGIN_SECTION_TITLE.contains("ストア"),
             "ログイン手順の見出しが技術書典限定のまま: {LOGIN_SECTION_TITLE}"
+        );
+    }
+
+    /// 右クリックメニューの説明が、実際に並ぶ項目を網羅していること
+    /// （`bookshelf.rs` の card / row の `context_menu` と同じ並び）。
+    #[gpui_kit::test]
+    async fn about_explains_the_book_context_menu(cx: &mut gpui_kit::TestAppContext) {
+        let visual = open_about(cx);
+        draw(visual);
+        // 節が描画されている（無ければ `section_top` が panic する）
+        section_top(visual, "about-context-menu");
+
+        let names: Vec<&str> = CONTEXT_MENU_ITEMS.iter().map(|(name, _)| *name).collect();
+        for expected in [
+            "閲覧回数",
+            "開く",
+            "ダウンロード中止",
+            "タグ編集",
+            "再取得",
+            "非表示にする",
+            "Drive から削除",
+            "バックアップ対象外",
+        ] {
+            assert!(
+                names.iter().any(|name| name.contains(expected)),
+                "右クリックメニューの説明に「{expected}」が無い: {names:?}"
+            );
+        }
+        assert!(
+            CONTEXT_MENU_LEAD.contains("右クリック") && CONTEXT_MENU_LEAD.contains("選べ"),
+            "右クリックメニューの概要が操作と有効/無効に触れていない: {CONTEXT_MENU_LEAD}"
         );
     }
 
