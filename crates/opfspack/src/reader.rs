@@ -318,7 +318,7 @@ fn read_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), Pack
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt as _;
-        return file.read_exact_at(buf, offset).map_err(io_error);
+        file.read_exact_at(buf, offset).map_err(io_error)
     }
     #[cfg(windows)]
     {
