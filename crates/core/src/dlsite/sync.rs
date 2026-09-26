@@ -254,6 +254,73 @@ fn save_purchase(
     Ok(true)
 }
 
+/// タグ取得の結果（DLsite 版。`fanza::sync::TagFetchOutcome` とは上限の考え方が違うので
+/// ストアごとに持つ = `PurchaseBatch` と同じ流儀）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TagFetchOutcome {
+    /// タグを取り込んだ件数（タグ 0 件も「取得済み」として数える）。
+    pub fetched: usize,
+    /// 失敗して次回に回した件数。
+    pub skipped: usize,
+    /// セッション切れ（401/403）で打ち切ったか。
+    pub stopped: bool,
+    /// 渡されたうち取得できなかった件数（通知に出す）。
+    pub remaining: usize,
+}
+
+/// 指定した作品のタグを取る（**表示中の本**の手動取得）。
+///
+/// 対象は**渡された `database_ids` だけ**（絞り込みや検索で見えている本を狙って埋める）。
+/// **ダウンロード済みの本も対象**。`product_info` は 20 件ずつ一括なので 1 回の
+/// リクエストでまとめて取れる（FANZA の 1 件 = 1 リクエストとは違う）。タグが 0 件でも
+/// 「取得済み」の印は立てる（毎回同じ作品を叩かない）。
+pub fn fetch_tags_for(
+    pool: &SqlitePool,
+    client: &mut DlsiteClient,
+    database_ids: &[String],
+) -> Result<TagFetchOutcome, DlsiteError> {
+    if database_ids.is_empty() {
+        return Ok(TagFetchOutcome::default());
+    }
+    let mut outcome = TagFetchOutcome::default();
+    let ids: Vec<&str> = database_ids.iter().map(String::as_str).collect();
+    // `product_info` が 20 件ずつにまとめて叩く（FANZA は 1 件 = 1 リクエストなので、
+    // 呼び出し側の上限もストアごとに変えている）。
+    match client.product_info(&ids) {
+        Ok(metas) => {
+            for database_id in database_ids {
+                match metas.get(database_id.as_str()) {
+                    Some(meta) => {
+                        // タグが 0 件でも「取得済み」にする（毎回同じ作品を叩かない）
+                        bookshelf::update_tags(
+                            pool,
+                            SITE_ID_DLSITE,
+                            database_id,
+                            &meta.custom_genres,
+                        )?;
+                        outcome.fetched += 1;
+                    }
+                    None => {
+                        // 応答に無い（削除済み等）は印を立てず次回に回す
+                        log::warn!("タグ取得に失敗（次回に再試行します）: {database_id}");
+                        outcome.skipped += 1;
+                    }
+                }
+            }
+        }
+        Err(error @ (DlsiteError::Unauthorized(_) | DlsiteError::SessionExpired)) => {
+            log::warn!("タグ取得を打ち切ります（セッション無効）: {error}");
+            outcome.stopped = true;
+        }
+        Err(error) => {
+            log::warn!("タグ取得に失敗（次回に再試行します）: {error}");
+            outcome.skipped = database_ids.len();
+        }
+    }
+    outcome.remaining = database_ids.len() - outcome.fetched;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,5 +814,194 @@ mod tests {
         assert_eq!(batch.pages_left, 0);
         assert_eq!(batch.next, None);
         assert_eq!(batch.remaining_runs, 0);
+    }
+
+    // ---- 表示中の本のタグ取得（手動操作） ---------------------------------------
+
+    fn seed_item(pool: &SqlitePool, database_id: &str) {
+        crate::db::block_on(async {
+            sqlx::query(
+                "INSERT INTO bookshelf_items (site_id, database_id, title) VALUES (?1, ?2, ?3)",
+            )
+            .bind(SITE_ID_DLSITE)
+            .bind(database_id)
+            .bind("タイトル")
+            .execute(pool)
+            .await
+            .unwrap();
+        });
+    }
+
+    /// 保存済みのタグと取得済みフラグ。
+    fn tags_of(pool: &SqlitePool, database_id: &str) -> (Option<String>, i64) {
+        crate::db::block_on(async {
+            sqlx::query_as::<_, (Option<String>, i64)>(
+                "SELECT tags_json, tags_fetched FROM bookshelf_items \
+                 WHERE site_id = ?1 AND database_id = ?2",
+            )
+            .bind(SITE_ID_DLSITE)
+            .bind(database_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        })
+    }
+
+    /// `product/info/ajax` が要求された ID ぶんのメタを返すモック。叩いた URL を記録する。
+    fn tags_transport(
+        calls: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        tags: &'static [&'static str],
+    ) -> MockTransport {
+        MockTransport {
+            handler: Box::new(move |spec: RequestSpec| {
+                assert!(
+                    spec.url.contains("/product/info/ajax"),
+                    "作品メタ以外を叩いた: {}",
+                    spec.url
+                );
+                calls.lock().push(spec.url.clone());
+                let ids = spec.url.split("product_id=").nth(1).unwrap_or_default();
+                let mut map = serde_json::Map::new();
+                for id in ids.split(',').filter(|id| !id.is_empty()) {
+                    map.insert(
+                        id.to_string(),
+                        json!({
+                            "site_id": "maniax", "work_type": "MNG", "maker_id": "RG1",
+                            "work_name": id, "regist_date": "2025-06-17 16:00:00", "price": 440,
+                            "down_url": "", "custom_genres": tags, "options": "JPN",
+                            "age_category": 1, "title_name": "シリーズ",
+                        }),
+                    );
+                }
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: serde_json::to_vec(&serde_json::Value::Object(map)).unwrap(),
+                })
+            }),
+        }
+    }
+
+    /// 指定した作品のタグを取る。`product/info/ajax` は 20 件ずつにまとめて叩く。
+    #[test]
+    fn fetch_tags_for_batches_twenty_ids_per_request() {
+        let pool = crate::db::test_pool();
+        let ids: Vec<String> = (1..=25).map(|i| format!("RJ{i:08}")).collect();
+        for id in &ids {
+            seed_item(&pool, id);
+        }
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let mut client = DlsiteClient::with_transport(
+            Box::new(tags_transport(calls.clone(), &["タグA", "タグB"])),
+            session(),
+        );
+
+        let outcome = fetch_tags_for(&pool, &mut client, &ids).unwrap();
+
+        assert_eq!(outcome.fetched, 25);
+        assert_eq!(outcome.skipped, 0);
+        assert!(!outcome.stopped);
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2, "20 件ずつまとめて叩いていない");
+        let count = |url: &str| {
+            url.split("product_id=")
+                .nth(1)
+                .unwrap_or_default()
+                .split(',')
+                .count()
+        };
+        assert_eq!(count(&calls[0]), 20);
+        assert_eq!(count(&calls[1]), 5);
+        drop(calls);
+        // 全部にタグと印が付く
+        assert_eq!(
+            tags_of(&pool, &ids[0]),
+            (Some(r#"["タグA","タグB"]"#.to_string()), 1)
+        );
+        assert_eq!(tags_of(&pool, &ids[24]).1, 1);
+        assert!(
+            bookshelf::unfetched_among(&pool, SITE_ID_DLSITE, &ids)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// タグが 0 件でも「取得済み」にする（毎回同じ作品を叩かない）。
+    #[test]
+    fn fetch_tags_for_marks_items_without_tags_as_fetched() {
+        let pool = crate::db::test_pool();
+        seed_item(&pool, "RJ00000001");
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let mut client =
+            DlsiteClient::with_transport(Box::new(tags_transport(calls.clone(), &[])), session());
+
+        let outcome = fetch_tags_for(&pool, &mut client, &["RJ00000001".to_string()]).unwrap();
+
+        assert_eq!(outcome.fetched, 1);
+        assert_eq!(
+            tags_of(&pool, "RJ00000001"),
+            (Some("[]".to_string()), 1)
+        );
+    }
+
+    /// 応答に無い作品（削除済み等）は印を立てず次回に回す。
+    #[test]
+    fn fetch_tags_for_retries_ids_missing_from_the_response() {
+        let pool = crate::db::test_pool();
+        let ids = vec!["RJ00000001".to_string(), "RJ00000002".to_string()];
+        for id in &ids {
+            seed_item(&pool, id);
+        }
+        let mut client = DlsiteClient::with_transport(
+            Box::new(MockTransport {
+                handler: Box::new(|_| {
+                    Ok(ResponseSpec {
+                        status: 200,
+                        headers: vec![],
+                        body: b"{}".to_vec(),
+                    })
+                }),
+            }),
+            session(),
+        );
+
+        let outcome = fetch_tags_for(&pool, &mut client, &ids).unwrap();
+
+        assert_eq!(outcome.fetched, 0);
+        assert_eq!(outcome.skipped, 2);
+        assert_eq!(outcome.remaining, 2);
+        assert_eq!(tags_of(&pool, &ids[0]), (None, 0), "失敗なのに印を立てている");
+    }
+
+    /// セッション切れ（401）は叩き続けずに打ち切る。
+    #[test]
+    fn fetch_tags_for_stops_on_unauthorized() {
+        let pool = crate::db::test_pool();
+        let ids: Vec<String> = (1..=25).map(|i| format!("RJ{i:08}")).collect();
+        for id in &ids {
+            seed_item(&pool, id);
+        }
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let recorder = calls.clone();
+        let mut client = DlsiteClient::with_transport(
+            Box::new(MockTransport {
+                handler: Box::new(move |spec: RequestSpec| {
+                    recorder.lock().push(spec.url.clone());
+                    Ok(ResponseSpec {
+                        status: 401,
+                        headers: vec![],
+                        body: Vec::new(),
+                    })
+                }),
+            }),
+            session(),
+        );
+
+        let outcome = fetch_tags_for(&pool, &mut client, &ids).unwrap();
+
+        assert!(outcome.stopped);
+        assert_eq!(outcome.fetched, 0);
+        assert_eq!(calls.lock().len(), 1, "401 のあとも叩いている");
+        assert_eq!(tags_of(&pool, &ids[0]), (None, 0));
     }
 }

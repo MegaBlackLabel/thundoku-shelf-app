@@ -1230,6 +1230,8 @@ pub struct BookshelfView {
     read_filter: ReadFilter,
     view_mode: ViewMode,
     tag_fetch_enabled: bool,
+    /// 表示中の本のタグ取得（`fetch_visible_tags`）の実行中フラグ（二重実行防止）
+    tag_fetch_busy: bool,
     /// 実行中の同期タスク数（TBF / BOOTH が並列に走るためカウンタで管理）
     sync_busy: usize,
     /// 表紙取得（fetch_remote_covers）の実行中フラグ（二重実行防止）
@@ -1371,6 +1373,20 @@ const FAVORITES_NOTE: &str =
 /// 同期できるサイトの id（本棚の絞り込み・サイドバーのサイト行と同じ表記）。
 /// 「すべての本」での同期（`sync_all`）と、ログイン直後の自動同期が同じ一覧を使う。
 const SYNC_SITE_IDS: [&str; 4] = ["techbookfest", "booth", "fanza", "dlsite"];
+
+/// タグを後から取りに行けるサイトの id（作品ページ / 作品メタにタグがあるストア）。
+///
+/// 技術書典は同期の GraphQL クエリがタグを要求しておらず、BOOTH は取得元が無いので
+/// 入れない（`fetch_visible_tags` はここに無いサイトを対象にしない）。
+const TAG_FETCH_SITES: [&str; 2] = ["fanza", "dlsite"];
+
+/// FANZA の作品ページは **1 件 = 1 リクエスト**なので、1 回の操作で叩く上限
+/// （`fanza::sync::TAG_FETCH_PER_RUN` と同じ値。bot 判定を避けて少しずつ進める）。
+const FANZA_TAG_FETCH_PER_RUN: usize = 20;
+
+/// DLsite の `product/info/ajax` は 20 件ずつ一括なので、1 回の操作で叩く上限
+/// （5 リクエストぶん。1 リクエストあたりの負荷が小さいので FANZA より多く取れる）。
+const DLSITE_TAG_FETCH_PER_RUN: usize = 100;
 
 /// 選択肢 1 行の高さ（名前 + 種別・詳細の 2 行ぶん）。
 /// リストの高さを「行数 × これ」で決めるために使う（上限で打ち切る）。
@@ -1540,6 +1556,48 @@ fn download_messages(
         Err(ImportFailure::TooLarge { .. }) => (None, None),
         Err(ImportFailure::Message(message)) => (None, Some(message.clone())),
     }
+}
+
+/// 表示中のタグ取得の対象を、サイトごとの上限までに切る。
+///
+/// FANZA は 1 件 = 1 リクエストなので少なめ、DLsite は 20 件一括なので多めに取る。
+/// 上限を超えたぶんは `remaining` として返し、通知に「残り」を出す。
+fn split_tag_targets(targets: &[(String, String)]) -> (Vec<String>, Vec<String>, usize) {
+    let mut fanza = Vec::new();
+    let mut dlsite = Vec::new();
+    let mut remaining = 0usize;
+    for (site_id, database_id) in targets {
+        match site_id.as_str() {
+            "fanza" if fanza.len() < FANZA_TAG_FETCH_PER_RUN => fanza.push(database_id.clone()),
+            "dlsite" if dlsite.len() < DLSITE_TAG_FETCH_PER_RUN => {
+                dlsite.push(database_id.clone())
+            }
+            // 上限を超えたぶんは次回に回す
+            "fanza" | "dlsite" => remaining += 1,
+            _ => {}
+        }
+    }
+    (fanza, dlsite, remaining)
+}
+
+/// 表示中のタグ取得の結果を通知文言にする（取得 0 件なら通知しない）。
+///
+/// 「見えている本のタグを埋めた」ことが目的なので、失敗だけのときは出さない。
+fn visible_tag_fetch_notice(fetched: usize, skipped: usize, remaining: usize) -> Option<String> {
+    (fetched > 0).then(|| {
+        let mut notice = format!("表示中の本のタグを {fetched} 件取得しました");
+        let mut details = Vec::new();
+        if skipped > 0 {
+            details.push(format!("失敗 {skipped} 件"));
+        }
+        if remaining > 0 {
+            details.push(format!("残り {remaining} 件"));
+        }
+        if !details.is_empty() {
+            notice.push_str(&format!("（{}）", details.join(" / ")));
+        }
+        notice
+    })
 }
 
 /// 未ダウンロード本のタグ取得の結果を通知文言にする（取得 0 件なら通知しない）。
@@ -1730,6 +1788,7 @@ impl BookshelfView {
             read_filter: ReadFilter::All,
             view_mode,
             tag_fetch_enabled: true,
+            tag_fetch_busy: false,
             sync_busy: 0,
             fetching_covers: false,
             cover_cache: CoverCache::new(COVER_CACHE_BUDGET_BYTES),
@@ -2763,6 +2822,31 @@ impl BookshelfView {
         cards
     }
 
+    /// 表示範囲（`filtered` 上の両端 inclusive）にある本のうち、**タグを取りに行けるサイト**の
+    /// ものを表示順で `(site_id, database_id)` として返す。
+    ///
+    /// 「タグ未取得かどうか」はここでは見ない（DB の印を正とするので `unfetched_among` に任せる）。
+    /// 範囲は仮想スクロールが記録した可視範囲（`visible_cards`）をそのまま渡す想定で、
+    /// 描画の先読みぶんを含むことがある。
+    fn tag_fetch_targets(&mut self, cx: &App, range: (usize, usize)) -> Vec<(String, String)> {
+        if self.filtered_dirty {
+            self.rebuild_filtered(cx);
+        }
+        let (first, last) = range;
+        // 範囲は前の描画で記録したものなので、カードが減っていても落ちないように丸める
+        let last = last.min(self.filtered.len().saturating_sub(1));
+        // カードが 0 件（描画前・絞り込みで全件外）でも落ちない
+        if self.filtered.is_empty() || first > last {
+            return Vec::new();
+        }
+        self.filtered[first..=last]
+            .iter()
+            .map(|&card_index| &self.shelf_cards[card_index].shelf)
+            .filter(|shelf| TAG_FETCH_SITES.contains(&shelf.site_id.as_str()))
+            .map(|shelf| (shelf.site_id.clone(), shelf.database_id.clone()))
+            .collect()
+    }
+
     /// ソートの比較。同じ値のときはタイトル昇順で決定的に並べる
     /// （従来の `ORDER BY ... , title ASC` と同じ）。
     fn compare_cards(&self, a: &ShelfCard, b: &ShelfCard) -> std::cmp::Ordering {
@@ -3696,6 +3780,167 @@ impl BookshelfView {
         .detach();
     }
 
+    /// 表示中の本のタグを取る（**手動**。同期ボタンとは別の操作）。
+    ///
+    /// 「同期」は購入一覧を取り直す操作なので、**見えている本のタグだけ**を埋めたいときは
+    /// こちらを使う。ダウンロード済みの本も対象（取り込み時にタグを取れなかった本を
+    /// 後から埋められる）。サイトごとの上限まで、専用スレッドで順に取る
+    /// （FANZA は 1 件 = 1 リクエストなので bot 判定を避けて少しずつ、
+    /// DLsite は `product/info/ajax` が 20 件一括）。
+    pub fn fetch_visible_tags(&mut self, cx: &mut Context<Self>) {
+        if !self.tag_fetch_enabled {
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "「タグ取得」を ON にしてから実行してください",
+            );
+            return;
+        }
+        if self.tag_fetch_busy {
+            return;
+        }
+        // 直前の描画で記録した可視範囲（描画のたびに更新される）
+        let Some(range) = self.visible_cards.get() else {
+            crate::app_state::set_toast_kind(cx, ToastKind::Info, "表示中の本がありません");
+            return;
+        };
+        let displayed = self.tag_fetch_targets(cx, range);
+        if displayed.is_empty() {
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "表示中の本にタグを取得できる本がありません",
+            );
+            return;
+        }
+        // 未取得かどうかは DB の印（`tags_fetched`）を正とする（サイト内の表示順は保つ）
+        let state = Self::app_state(cx);
+        let db = state.db_pool.clone();
+        let mut unfetched: Vec<(String, String)> = Vec::new();
+        for site_id in TAG_FETCH_SITES {
+            let ids: Vec<String> = displayed
+                .iter()
+                .filter(|(site, _)| site == site_id)
+                .map(|(_, database_id)| database_id.clone())
+                .collect();
+            let pending: std::collections::HashSet<String> =
+                bookshelf::unfetched_among(&db, site_id, &ids)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+            unfetched.extend(
+                displayed
+                    .iter()
+                    .filter(|(site, database_id)| site == site_id && pending.contains(database_id))
+                    .cloned(),
+            );
+        }
+        if unfetched.is_empty() {
+            crate::app_state::set_toast_kind(cx, ToastKind::Info, "表示中の本のタグは取得済みです");
+            return;
+        }
+        let (fanza_ids, dlsite_ids, remaining) = split_tag_targets(&unfetched);
+        let fanza_session = state.fanza_session.lock().clone();
+        let dlsite_session = state.dlsite_session.lock().clone();
+        log::info!(
+            "表示中のタグ取得: 開始（FANZA {} 件 / DLsite {} 件 / 残り {} 件）",
+            fanza_ids.len(),
+            dlsite_ids.len(),
+            remaining
+        );
+        self.tag_fetch_busy = true;
+        cx.notify();
+        let handle = cx.entity();
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, usize, bool)>();
+        // 直列 + 間隔を空けるので、GPUI のワーカーを占有しないよう専用スレッドで実行する
+        std::thread::spawn(move || {
+            let mut fetched = 0usize;
+            let mut skipped = 0usize;
+            let mut stopped = false;
+            if !fanza_ids.is_empty() {
+                match fanza_session {
+                    Some(session) => {
+                        let mut client =
+                            FanzaClient::with_transport(Box::new(UreqTransport::new()), session);
+                        match thundoku_core::fanza::sync::fetch_tags_for(
+                            &db,
+                            &mut client,
+                            &fanza_ids,
+                            thundoku_core::fanza::sync::TAG_FETCH_INTERVAL,
+                        ) {
+                            Ok(outcome) => {
+                                fetched += outcome.fetched;
+                                skipped += outcome.skipped;
+                                stopped |= outcome.stopped;
+                            }
+                            Err(error) => {
+                                log::warn!("表示中のタグ取得を中断しました（FANZA）: {error}");
+                                skipped += fanza_ids.len();
+                            }
+                        }
+                    }
+                    // ログインしていないと取れない（未ログインは失敗として数える）
+                    None => skipped += fanza_ids.len(),
+                }
+            }
+            if !dlsite_ids.is_empty() {
+                match dlsite_session {
+                    Some(session) => {
+                        let mut client =
+                            DlsiteClient::with_transport(Box::new(UreqTransport::new()), session);
+                        match thundoku_core::dlsite::sync::fetch_tags_for(
+                            &db,
+                            &mut client,
+                            &dlsite_ids,
+                        ) {
+                            Ok(outcome) => {
+                                fetched += outcome.fetched;
+                                skipped += outcome.skipped;
+                                stopped |= outcome.stopped;
+                            }
+                            Err(error) => {
+                                log::warn!("表示中のタグ取得を中断しました（DLsite）: {error}");
+                                skipped += dlsite_ids.len();
+                            }
+                        }
+                    }
+                    None => skipped += dlsite_ids.len(),
+                }
+            }
+            let _ = tx.send((fetched, skipped, stopped));
+        });
+        cx.spawn(async move |_window, cx| {
+            let outcome = loop {
+                match rx.try_recv() {
+                    Ok(outcome) => break Some(outcome),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(150))
+                            .await;
+                    }
+                    // 送信前にスレッドが終わった（理由は向こうでログ済み）
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                }
+            };
+            handle.update(cx, |this, cx| {
+                // 中断しても実行中フラグは必ず下ろす（ボタンが押せないままにならない）
+                this.tag_fetch_busy = false;
+                if let Some((fetched, skipped, stopped)) = outcome {
+                    log::info!(
+                        "表示中のタグ取得: {fetched} 件（失敗 {skipped} 件 / 打切 {stopped} / 残り {remaining} 件）"
+                    );
+                    // 取れたタグをチップ・絞り込みに反映する
+                    this.reload(cx);
+                    if let Some(notice) = visible_tag_fetch_notice(fetched, skipped, remaining) {
+                        crate::app_state::set_protected_notice(cx, ToastKind::Success, notice);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// DLsite から本棚を同期する（購入済み一覧 → 画像系のみ bookshelf_items へ保存）。
     pub fn sync_dlsite(&mut self, cx: &mut Context<Self>) {
         let logged_in = *AppState::global(cx).dlsite_logged_in.lock();
@@ -4294,6 +4539,17 @@ impl BookshelfView {
                     // ダウンロード直後からページ数を表示できるように進捗行を作る
                     // （既にあるときは触らない = 再取得で読書位置を消さない）
                     seed_progress_if_absent(&db, &imported.book.id, imported.document.total_pages);
+                    // サイト側のタグ（ジャンル）を反映する。**PDF 経路にも必要**
+                    // （以前は非 PDF の分岐にしか無く、FANZA / DLsite の PDF は
+                    //  ジャンルが空のまま本棚に出ていた）。
+                    apply_site_tags(
+                        &db,
+                        &site_id,
+                        &product_id,
+                        &imported.book.id,
+                        &item,
+                        &genre_tags,
+                    );
                     // タグ取得が OFF なら自動生成タグを取り除く（Web 版の
                     // disableTagGeneration 相当）。
                     if !tag_fetch_enabled {
@@ -4388,20 +4644,18 @@ impl BookshelfView {
                             &item,
                             site_author.as_deref(),
                         );
-                        // FANZA: サイトから取得したジャンルタグを book_tags に保存する
-                        if site_id == "fanza" && !genre_tags.is_empty() {
-                            let pairs: Vec<(&str, &str)> = genre_tags
-                                .iter()
-                                .map(|t| (t.as_str(), "fanza_genre"))
-                                .collect();
-                            let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
-                            // 本棚アイテムの tags_json にも書く（owned フィルタで
-                            // local が外れてもカードに表示できるように）
-                            let _ = bookshelf::update_tags(&db, "fanza", &product_id, &genre_tags);
-                        }
+                        // サイト側のタグ（ジャンル）を反映する（FANZA / DLsite）
+                        apply_site_tags(
+                            &db,
+                            &site_id,
+                            &product_id,
+                            &imported.book.id,
+                            &item,
+                            &genre_tags,
+                        );
                         // DLsite: インポート後に共有メタ列（media_category / ai_type / is_drm /
-                        // release_date / maker_id / age_rating / series_name）とカスタムジャンル
-                        // （tags_json）を books / book_tags へ反映する。
+                        // release_date / maker_id / age_rating / series_name）を反映する
+                        // （タグは `apply_site_tags` が反映済み）。
                         if site_id == "dlsite" {
                             let _ = books::set_source_metadata(
                                 &db,
@@ -4417,14 +4671,6 @@ impl BookshelfView {
                                 item.age_rating.as_deref(),
                                 item.series_name.as_deref(),
                             );
-                            if let Some(tags_json) = &item.tags_json
-                                && let Ok(tags) = serde_json::from_str::<Vec<String>>(tags_json)
-                                && !tags.is_empty()
-                            {
-                                let pairs: Vec<(&str, &str)> =
-                                    tags.iter().map(|t| (t.as_str(), "dlsite_genre")).collect();
-                                let _ = db::tags::set_for_book(&db, &imported.book.id, &pairs);
-                            }
                         }
                         // 進捗行は既にあるときは触らない（再取得で読書位置を消さない）
                         seed_progress_if_absent(
@@ -7615,6 +7861,7 @@ impl Render for BookshelfView {
         let visible_count = self.filtered.len();
         let view_mode = self.view_mode;
         let tag_fetch_enabled = self.tag_fetch_enabled;
+        let tag_fetch_busy = self.tag_fetch_busy;
         let available_events = self.available_events.clone();
         let selected_events = self.selected_events.clone();
         // タグチップ / お気に入りタグ一覧の並び替えキー（お気に入り + 集計数）。
@@ -8251,6 +8498,35 @@ impl Render for BookshelfView {
                                                 });
                                             }
                                         }),
+                                )
+                            })
+                            // 表示中の本のタグ取得（手動）。同期は購入一覧を取り直す操作なので、
+                            // 「見えている本のタグだけ」を埋めたいときはこちらを使う。
+                            // 本棚側の操作なので、BOOTH とお気に入り画面では出さない
+                            .when(!is_booth && !self.favorites_only, |this| {
+                                this.child(
+                                    div()
+                                        .debug_selector(|| "bookshelf-visible-tags".into())
+                                        .child(
+                                            Button::new("bookshelf-visible-tags")
+                                                .cursor_pointer()
+                                                .icon(Icon::new(AppIcon::Tag).size(px(14.0)))
+                                                .label(if tag_fetch_busy {
+                                                    "取得中"
+                                                } else {
+                                                    "表示中のタグ取得"
+                                                })
+                                                .loading(tag_fetch_busy)
+                                                .cursor_pointer()
+                                                .on_click({
+                                                    let handle = handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.fetch_visible_tags(cx)
+                                                        });
+                                                    }
+                                                }),
+                                        ),
                                 )
                             })
                             // 同期（本棚側の操作なので、お気に入り画面では出さない）
@@ -9103,6 +9379,43 @@ fn apply_site_metadata(
     // カードの「作者:」絞り込み用に本棚アイテムへも書く
     if let Some(author) = site_author {
         let _ = bookshelf::update_author(db, site_id, product_id, author);
+    }
+}
+
+/// インポート直後に**サイト側のタグ**（ジャンル）を反映する。
+///
+/// PDF とそれ以外の**両方の取り込み経路**から呼ぶ。PDF 経路にこの処理が無く、
+/// FANZA / DLsite の PDF はタグが空のまま本棚に出ていた（表示は FANZA / DLsite に
+/// ついては `bookshelf_items.tags_json` を正とするため、そちらにも書く）。
+/// 取得元が無いサイト（BOOTH / 技術書典）は何もしない。
+fn apply_site_tags(
+    db: &db::SqlitePool,
+    site_id: &str,
+    product_id: &str,
+    book_id: &str,
+    item: &bookshelf::BookshelfItem,
+    genre_tags: &[String],
+) {
+    if site_id == "fanza" && !genre_tags.is_empty() {
+        let pairs: Vec<(&str, &str)> = genre_tags
+            .iter()
+            .map(|tag| (tag.as_str(), "fanza_genre"))
+            .collect();
+        let _ = db::tags::set_for_book(db, book_id, &pairs);
+        let _ = bookshelf::update_tags(db, "fanza", product_id, genre_tags);
+    }
+    if site_id == "dlsite"
+        && let Some(tags_json) = &item.tags_json
+        && let Ok(tags) = serde_json::from_str::<Vec<String>>(tags_json)
+        && !tags.is_empty()
+    {
+        let pairs: Vec<(&str, &str)> = tags
+            .iter()
+            .map(|tag| (tag.as_str(), "dlsite_genre"))
+            .collect();
+        let _ = db::tags::set_for_book(db, book_id, &pairs);
+        // 「取得済み」の印も立てる（表示中のタグ取得が同じ作品を叩き直さないように）
+        let _ = bookshelf::update_tags(db, "dlsite", product_id, &tags);
     }
 }
 
@@ -10182,6 +10495,67 @@ mod tests {
                 books::get(db, "book-1").unwrap().unwrap().author,
                 "YORIMIYA"
             );
+        });
+    }
+
+    /// サイト側タグの反映は PDF / それ以外の両経路で同じ関数を通る。
+    /// 以前は非 PDF 分岐にしか無く、FANZA / DLsite の PDF がタグ空で表示されていた。
+    #[gpui_kit::test]
+    async fn apply_site_tags_writes_store_tags_for_both_paths(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item_for_site(cx, "fanza", "d_1", "本1", "サークル");
+        seed_shelf_item_for_site(cx, "dlsite", "RJ1", "本2", "サークル");
+        seed_book(cx, "book-1", "本1", "サークル");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            let item = bookshelf::list(db, "fanza").unwrap().remove(0);
+
+            // FANZA: 作品ページのジャンルが book_tags と本棚アイテムの両方に入る
+            apply_site_tags(
+                db,
+                "fanza",
+                "d_1",
+                "book-1",
+                &item,
+                &["拘束".to_string(), "触手".to_string()],
+            );
+            assert_eq!(
+                db::tags::list_for_book(db, "book-1").unwrap().len(),
+                2,
+                "book_tags にジャンルが入ること"
+            );
+            let shelf = bookshelf::list(db, "fanza").unwrap().remove(0);
+            assert_eq!(
+                bookshelf::tags_of(&shelf),
+                vec!["拘束".to_string(), "触手".to_string()],
+                "表示は tags_json を正とするので本棚アイテムにも入ること（PDF の不具合の回帰）"
+            );
+            // 取得済みの印が立つ（「表示中のタグ取得」が同じ作品を叩き直さない）
+            assert!(
+                bookshelf::unfetched_among(db, "fanza", &["d_1".to_string()])
+                    .unwrap()
+                    .is_empty()
+            );
+
+            // タグが取れなかったときは何もしない（既存を消さない）
+            apply_site_tags(db, "fanza", "d_1", "book-1", &item, &[]);
+            assert_eq!(db::tags::list_for_book(db, "book-1").unwrap().len(), 2);
+
+            // 取得元が無いサイト（BOOTH）は何もしない
+            apply_site_tags(db, "booth", "b_1", "book-1", &item, &["タグ".to_string()]);
+            assert_eq!(db::tags::list_for_book(db, "book-1").unwrap().len(), 2);
+
+            // DLsite: 同期で保存したカスタムジャンルが book_tags に入る
+            let mut dlsite_item = bookshelf::list(db, "dlsite").unwrap().remove(0);
+            dlsite_item.tags_json = Some(r#"["タグA"]"#.to_string());
+            apply_site_tags(db, "dlsite", "RJ1", "book-1", &dlsite_item, &[]);
+            let tags: Vec<String> = db::tags::list_for_book(db, "book-1")
+                .unwrap()
+                .into_iter()
+                .map(|tag| tag.tag_name)
+                .collect();
+            assert_eq!(tags, vec!["タグA".to_string()]);
         });
     }
 
@@ -16878,5 +17252,100 @@ mod tests {
             view.read_with(cx, |this, _| this.pending_cancel_download.is_none()),
             "対象を決められないのに中止の確認が出ている"
         );
+    }
+
+    /// 表示範囲のうち、タグを取りに行けるサイト（FANZA / DLsite）の本だけを対象にする。
+    /// 技術書典 / BOOTH は取得元が無いので入れない。
+    #[gpui_kit::test]
+    async fn tag_fetch_targets_cover_the_displayed_range_of_fetchable_sites(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // タイトル昇順で並ぶ（caused_at が無いので同値 → タイトルで決定的）
+        seed_shelf_item_for_site(cx, "fanza", "d_1", "A", "サークル");
+        seed_shelf_item_for_site(cx, "dlsite", "RJ1", "B", "サークル");
+        seed_shelf_item_for_site(cx, "booth", "b_1", "C", "サークル");
+        seed_shelf_item_for_site(cx, "techbookfest", "t_1", "D", "サークル");
+        let view = cx.new(BookshelfView::new);
+
+        // 取得元があるサイトだけを、表示順で返す
+        let targets = cx.update(|cx| view.update(cx, |this, cx| this.tag_fetch_targets(cx, (0, 3))));
+        assert_eq!(
+            targets,
+            vec![
+                ("fanza".to_string(), "d_1".to_string()),
+                ("dlsite".to_string(), "RJ1".to_string()),
+            ]
+        );
+
+        // 表示範囲の外は対象にしない
+        let first = cx.update(|cx| view.update(cx, |this, cx| this.tag_fetch_targets(cx, (0, 0))));
+        assert_eq!(first, vec![("fanza".to_string(), "d_1".to_string())]);
+        // 対象が無い範囲は空
+        assert!(
+            cx.update(|cx| view.update(cx, |this, cx| this.tag_fetch_targets(cx, (5, 9))))
+                .is_empty()
+        );
+    }
+
+    /// 本が 1 冊も無いときに範囲を渡しても落ちない（描画前に押された場合など）。
+    #[gpui_kit::test]
+    async fn tag_fetch_targets_are_empty_without_books(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+
+        assert!(
+            cx.update(|cx| view.update(cx, |this, cx| this.tag_fetch_targets(cx, (0, 0))))
+                .is_empty()
+        );
+    }
+
+    /// 表示中のタグ取得は、サイトごとの上限までに切って残り件数を返す。
+    #[test]
+    fn split_tag_targets_caps_each_site_and_reports_the_rest() {
+        let targets = |site: &str, count: usize| -> Vec<(String, String)> {
+            (1..=count)
+                .map(|i| (site.to_string(), format!("{site}_{i}")))
+                .collect()
+        };
+
+        // FANZA は 1 件 = 1 リクエストなので 20 件まで。超えたぶんは次回に回す
+        let (fanza, dlsite, remaining) =
+            split_tag_targets(&targets("fanza", FANZA_TAG_FETCH_PER_RUN + 5));
+        assert_eq!(fanza.len(), FANZA_TAG_FETCH_PER_RUN);
+        assert!(dlsite.is_empty());
+        assert_eq!(remaining, 5);
+
+        // DLsite は 20 件一括なので上限が違う（同じ定数を使い回していない）
+        let (fanza, dlsite, remaining) =
+            split_tag_targets(&targets("dlsite", DLSITE_TAG_FETCH_PER_RUN + 2));
+        assert!(fanza.is_empty());
+        assert_eq!(dlsite.len(), DLSITE_TAG_FETCH_PER_RUN);
+        assert_eq!(remaining, 2);
+
+        // 混ざっていてもサイトごとに独立して数える（表示順は保つ）
+        let mut mixed = targets("fanza", 3);
+        mixed.extend(targets("dlsite", 2));
+        let (fanza, dlsite, remaining) = split_tag_targets(&mixed);
+        assert_eq!(fanza, vec!["fanza_1", "fanza_2", "fanza_3"]);
+        assert_eq!(dlsite, vec!["dlsite_1", "dlsite_2"]);
+        assert_eq!(remaining, 0);
+    }
+
+    /// 表示中のタグ取得は、取得できた件数を通知する（0 件なら出さない）。
+    #[test]
+    fn visible_tag_fetch_notice_reports_only_when_books_were_fetched() {
+        assert_eq!(
+            visible_tag_fetch_notice(5, 0, 0).as_deref(),
+            Some("表示中の本のタグを 5 件取得しました")
+        );
+        assert_eq!(
+            visible_tag_fetch_notice(5, 2, 3).as_deref(),
+            Some("表示中の本のタグを 5 件取得しました（失敗 2 件 / 残り 3 件）")
+        );
+        // 1 件も取れなければ出さない（失敗の通知はここでは出さない）
+        assert_eq!(visible_tag_fetch_notice(0, 3, 3), None);
     }
 }

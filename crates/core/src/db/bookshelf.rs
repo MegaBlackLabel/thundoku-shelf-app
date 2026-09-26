@@ -284,6 +284,43 @@ pub fn pending_tag_fetch(
     })
 }
 
+/// 渡された本のうち、タグ未取得（`tags_fetched = 0`）の `database_id` を返す。
+///
+/// 対象は**呼び出し側が選ぶ**（表示中の本だけを取る手動操作のため、全件は走査しない）。
+/// `pending_tag_fetch` と違い **ダウンロード済みの本も含む**（取り込み時にタグを取れなかった
+/// 本を後から埋めるため）。タグが 0 件でも `update_tags` が印を立てるので、同じ本を
+/// 毎回叩き続けることはない。
+pub fn unfetched_among(
+    pool: &SqlitePool,
+    site_id: &str,
+    database_ids: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    if database_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::db::block_on(async {
+        let mut out = Vec::new();
+        // SQLite のプレースホルダ上限に余裕を持たせて分割する（表示分は数十件だが、
+        // 全件表示で 1 画面に収まる以上の範囲を渡された場合に備える）。
+        for chunk in database_ids.chunks(500) {
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT database_id FROM bookshelf_items \
+                 WHERE site_id = ?1 AND tags_fetched = 0 AND database_id IN ({placeholders})"
+            );
+            let mut query = sqlx::query_scalar::<_, String>(&sql).bind(site_id);
+            for database_id in chunk {
+                query = query.bind(database_id);
+            }
+            out.extend(query.fetch_all(pool).await?);
+        }
+        Ok(out)
+    })
+}
+
 /// Set the author name of a bookshelf item（取得元 = サイトの作品ページ）。
 pub fn update_author(
     pool: &SqlitePool,
@@ -415,4 +452,103 @@ pub fn list_favorites(pool: &SqlitePool) -> Result<Vec<BookshelfItem>, sqlx::Err
         .fetch_all(pool)
         .await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed_item(pool: &SqlitePool, site_id: &str, database_id: &str) {
+        crate::db::block_on(async {
+            sqlx::query(
+                "INSERT INTO bookshelf_items (site_id, database_id, title) VALUES (?1, ?2, ?3)",
+            )
+            .bind(site_id)
+            .bind(database_id)
+            .bind("タイトル")
+            .execute(pool)
+            .await
+            .unwrap();
+        });
+    }
+
+    /// ダウンロード済みの本（`books` に紐づく）を作る。
+    fn seed_downloaded_book(pool: &SqlitePool, site_id: &str, database_id: &str) {
+        crate::db::block_on(async {
+            sqlx::query(
+                "INSERT INTO books (id, title, file_name, file_size, opfs_path, \
+                 tbf_product_id, site_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(format!("b_{database_id}"))
+            .bind("タイトル")
+            .bind("t.pdf")
+            .bind(1_i64)
+            .bind(format!("b_{database_id}.opfspack"))
+            .bind(database_id)
+            .bind(site_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        });
+    }
+
+    /// 渡した本のうち未取得だけを返す（取得済みの印が立っていれば返さない）。
+    #[test]
+    fn unfetched_among_returns_only_items_without_the_fetched_flag() {
+        let pool = crate::db::test_pool();
+        seed_item(&pool, "fanza", "d_1");
+        seed_item(&pool, "fanza", "d_2");
+        seed_item(&pool, "fanza", "d_3");
+        // タグ 0 件でも印は立つ（毎回同じ作品を叩かない）
+        update_tags(&pool, "fanza", "d_2", &[]).unwrap();
+
+        assert_eq!(
+            unfetched_among(&pool, "fanza", &["d_1".to_string(), "d_2".to_string()]).unwrap(),
+            vec!["d_1".to_string()]
+        );
+        // 渡していない本は返さない（全件走査しない）
+        assert!(unfetched_among(&pool, "fanza", &[]).unwrap().is_empty());
+        // 渡しても取得済みなら返さない / 未取得なら返す
+        assert!(
+            unfetched_among(&pool, "fanza", &["d_2".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            unfetched_among(&pool, "fanza", &["d_3".to_string()]).unwrap(),
+            vec!["d_3".to_string()]
+        );
+    }
+
+    /// ダウンロード済みの本も対象にする（既存の `pending_tag_fetch` は未ダウンロード本だけ）。
+    #[test]
+    fn unfetched_among_includes_downloaded_books() {
+        let pool = crate::db::test_pool();
+        seed_item(&pool, "fanza", "d_1");
+        seed_downloaded_book(&pool, "fanza", "d_1");
+
+        let ids = vec!["d_1".to_string()];
+        assert_eq!(unfetched_among(&pool, "fanza", &ids).unwrap(), ids);
+        assert!(
+            pending_tag_fetch(&pool, "fanza", 10).unwrap().is_empty(),
+            "既存の抽出は未ダウンロード本だけを対象にする"
+        );
+    }
+
+    /// サイトが違えば同じ `database_id` でも拾わない（主キーは (site_id, database_id)）。
+    #[test]
+    fn unfetched_among_matches_the_site() {
+        let pool = crate::db::test_pool();
+        seed_item(&pool, "dlsite", "RJ1");
+
+        assert!(
+            unfetched_among(&pool, "fanza", &["RJ1".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            unfetched_among(&pool, "dlsite", &["RJ1".to_string()]).unwrap(),
+            vec!["RJ1".to_string()]
+        );
+    }
 }
