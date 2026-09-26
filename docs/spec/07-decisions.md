@@ -77,6 +77,10 @@
 | 未読フィルタ | **修正済み**: `ReadFilter::Unread` は未ダウンロード本も未読として通す（カードのバッジ・サイドバーの未読バッジと同じ `ReadingState::Unread` を既定にする） |
 | 履歴一覧 | **修正済み**: 本棚と同じ `gpui_kit::list` + `ListState` で行単位に仮想化（日付バー + カード/リストの行。可視行のみ構築。列数の変化で組み直し） |
 | パスフレーズの位置づけ | **仕様として明記**（セキュリティ評価 F01）: パスフレーズは「Google に依存しない**復元手段**」で、Drive アカウント侵害への追加防御にはならない（`thundoku-keys.json` に `sub` ラップが併存するため、bundle + `sub` が漏れればパスフレーズ無しで解ける）。`sub` ラップを消す「パスフレーズ必須モード」は未実装（`docs/spec/10-pack-keys.md` §1.2 / §9） |
+| ローカル DB の暗号化範囲 | **DB 全体は暗号化しないが、機密列だけは暗号化する**（2026-09-26 / セキュリティ評価 F02）。`document_text.text_content` / `token_analysis` の `token`・`pos`・`base_form`・`reading` / `page_notes.memo` は、keyring の DB 鍵（`books.owner_sub` と同じ鍵）で AES-256-GCM にした `enc:v1:...` として保存する（`crates/core/src/db/column_crypto.rs`。保存形式は `docs/spec/02-data-model.md` §1.11）。SQLCipher 等での DB 全体の暗号化はしない（重い・読み書き経路の総取り替えになる）。**書誌・進捗・履歴などの他の列は平文のまま**で、ディスク暗号化（BitLocker / FileVault 等）と OS アカウント分離を前提にする |
+| 未ログインの取り込み | **修正済み（fail-closed）**（2026-09-26 / セキュリティ評価 F03）: 未ログインでは取り込まず `ImportError::LoginRequired` で失敗させる。`pack_root_key_for_import` / `import_root_key` は `Result<PackRootKey, _>` を返し、**平文 pack を作る経路が型として無い**（`crates/core/src/import/mod.rs:248`）。UI はダウンロードを**始める前**に案内して Google の認証モーダルを開き（`require_import_login`）、お気に入りの自動ダウンロードは利用者が要求した操作ではないので案内だけ出して見送る。**取り込み済みの本の閲覧にログインは要らない**（暗号化 pack は鍵が要る = 従来どおり） |
+| 機密列の鍵を失ったとき | **既知の制約**: 上記の列は**端末の keyring の鍵**で暗号化するので、鍵を消した / 別の端末で復元した場合は復号できない（付箋メモは空として表示。付箋の ON / OFF・ページ・見開き側は残る）。`books.owner_sub` やストアのセッションと同じ性質で、**別端末への復元でメモの中身が戻らない**ことは許容する（Drive のバックアップは暗号文のまま運ばれる） |
+| 平文で残る旧列 | **既知の制約**: `document_images.extracted_text` は 2026-09-22 に書き込みをやめた列だが、それ以前の行には**平文のページ本文が残り得る**（アプリは読まず、バックアップ対象からも除外している）。起動時の移行では触らない（削除するなら別作業） |
 
 ### 6.1 依存の警告（脆弱性ではないもの）
 

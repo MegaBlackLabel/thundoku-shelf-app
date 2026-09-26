@@ -4,7 +4,78 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **終了時のバックアップ アップロード（と「今すぐ同期」）が終わらない問題**:
+  `KeyContext::unlock` / `retry_pending_upload` は内部で `drive()`（Google クライアントの
+  `Mutex` を取る）を呼ぶが、呼び出し側が**同じロックを保持したまま**呼んでいたため、
+  `parking_lot::Mutex`（再入不可）の自己デッドロックで永久に戻らなかった。実際の症状は
+  連鎖する — 1 回目の同期は本体が終わってから鍵の再アップロードで固まり、その間ロックを
+  持ち続けるので 2 回目の同期と終了処理が全部ロック待ちになり、アプリが終了しない。
+  修正: ①呼び出し側は**トークン取得だけロックの内側**にして、鍵の解決・再アップロードは
+  ロックの外で行う（`crates/app/src/workspace.rs` の終了処理、`views/settings.rs` の
+  「今すぐ同期」）②`KeyContext::drive()` は**待ち時間つき**（5 秒）で取得し、取れなければ
+  エラーにする（同じ取り違えが将来入っても固まらない）。終了処理には段階ログも入れた。
+
+### Changed
+
+- **ZIP エントリの上限を 512 MiB → 2 GiB にする（正当な本が弾かれていた）**:
+  FANZA の 142 MB の ZIP（`d_631517.zip`）に含まれる `benrionna_pdf_re.pdf` が
+  「エントリがサイズ上限（512 MiB）を超えています」で取り込めなかった。
+  `MAX_ZIP_ENTRY_BYTES` は**展開後**のサイズで判定しており（宣言サイズは信用しない =
+  解凍爆弾対策）、スキャン画像を多く含む PDF は deflate がよく効くため、142 MB の ZIP でも
+  展開後 512 MiB を超える。上限を取り込み元ファイルの上限（`MAX_IMPORT_SOURCE_BYTES`）と
+  同じ 2 GiB に揃えた。pack に入るのは**レンダリング後**の小さな webp なので、元 PDF の
+  大きさは pack の上限（`MAX_TOTAL_SIZE`）には効かない。あわせて上限超過のエラーに
+  **内訳（宣言サイズ / 実際に読めた長さ）**を出して、上限かデータ破損かを切り分けられる
+  ようにした。`crates/core/src/import/mod.rs`
+
+### Added
+
+- **アップロードの進捗を出す**: `Transport::send_stream_with_progress`（送信バイト数を
+  通知、`false` で中止）を足し、**resumable upload は 1 チャンクごと**、multipart
+  （DB バックアップ）も送信バイト数を報告する。同期は `SyncProgress { phase: Upload,
+  bytes, total_bytes }` として流すので、「今すぐ同期」のバーと終了時の通知が
+  「pack-1.opfspack をアップロード中（3.0 MB / 9.0 MB・33%）」を出す（総数が
+  分からないときは割合を出さない）。終了時の通知は幅が狭いので**ファイル名は出さず
+  進捗だけ**（`3.0 MB / 9.0 MB（45%）`。数字が無い段階は段階名のみ）。進捗は**単調増加**
+  （サーバーが一部しか受理しなくても巻き戻らない）。終了時の進捗は**通知の中の子ビュー**
+  （`ExitUploadProgress`）に出す:
+  gpui-kit の `Notification` は作成時に文言が固定され、差し替えるには作り直しが要る。
+  作り直すと出入りのアニメーションが毎回走って**点滅して見える**ため、通知は 1 回だけ積み、
+  進捗は子ビューを `notify` して文言だけを変える（更新は値が変わったとき + 250ms 間隔）。`crates/core/src/tbf/transport.rs`、`crates/core/src/drive/{mod,sync}.rs`、
+  `crates/app/src/{workspace.rs,views/settings.rs}`
+
 ### Security
+
+- **技術書典のセッションも共通の期限（7 日）と削除ポリシーに揃える**:
+  技術書典のセッションは保存時刻を持たず OS keyring に無期限で置かれていたため、README と
+  `docs/features.md` が案内する「保存期間は 7 日」が技術書典だけ適用されていなかった。また
+  ログアウト時の keyring 削除は戻り値を無視した非同期処理で、非 incognito のログイン WebView が
+  残したブラウザー保存データも消していなかった（セキュリティ評価 F05）。BOOTH / FANZA / DLsite と
+  同じ vault（AES-256-GCM + 保存時刻つきの暗号文・7 日）へ移し、**vault が空なら旧 keyring 値を
+  一度だけ移行**して keyring を消す（消せなければ印（`session-purge.pending`）を残し、次の起動では
+  復元しない＝再ログイン）。ログアウトは①メモリ②端末の保存情報（vault / keyring）③サイト側
+  ④ログイン WebView の保存データ（`clear_all_browsing_data`）を区別し、**成功した範囲だけ**を
+  通知する（④は消去を「呼べたか」までしか分からない。wry が完了を知らせないため）。
+  `crates/core/src/session_store.rs`、`crates/core/src/tbf/mod.rs`、
+  `crates/app/src/{app_state.rs,views/mod.rs,views/settings.rs}`、
+  `docs/logout.md`、`docs/features.md`、`README.md`
+
+- **DB の機密列（ページ本文・形態素解析・付箋メモ）を暗号化する**:
+  ローカルの SQLite は平文で、`.opfspack` を暗号化しても**抽出したページ本文・形態素解析・
+  付箋メモ**は平文のまま残っていた（データディレクトリや WAL のコピーから読書内容が漏れる。
+  セキュリティ評価 F02）。`books.owner_sub` と同じ keyring の DB 鍵で AES-256-GCM にし、
+  `enc:v1:BASE64(IV(12)||暗号文||タグ)` として保存する。AAD は
+  `用途 + テーブル名 + 行キー + 列名` で、**列・行の入れ替え**を検知する（復号できない値は
+  表示しない）。**鍵が取れないときは平文で書かず**エラーにする（fail-closed）。
+  既存の平文行は起動時に一度だけ暗号化し（`db::migrate_column_crypto_once`）、失敗したら
+  フラグを立てず次回起動で再試行する。移行したときは `PRAGMA wal_checkpoint(TRUNCATE)` で
+  **WAL も切り詰める**（書き換える前の平文が WAL に残らないようにする）。付箋は復号できない
+  値を空のメモとして扱い、行と ON / OFF・見開き側は残す。
+  `crates/core/src/db/column_crypto.rs`（新規）、`crates/core/src/db/{mod,documents,notes}.rs`、
+  `crates/app/src/app_state.rs`、`docs/spec/{02-data-model,07-decisions,10-pack-keys}.md`、
+  `docs/database.md`
 
 - **パスフレーズの説明文を実装に合わせる（追加防御ではない）**:
   README・説明画面・仕様書が「パスフレーズを設定すれば Google アカウントを乗っ取られても本の中身は
@@ -14,6 +85,31 @@
   明記する（`docs/spec/10-pack-keys.md` §1.2 の強度表も実装に合わせ、§9 に「パスフレーズ必須
   モード」の代償を書いた）。説明画面のテストで限界の記述を固定する。
   `README.md`、`crates/app/src/views/about.rs`、`docs/spec/{10-pack-keys,07-decisions,README}.md`
+
+- **未ログインの取り込みを fail-closed にする（平文 pack を作らない）**:
+  Google 未ログインでの取り込みは平文 `.opfspack` を作り、`owner_sub` を持たない本として
+  保存していた（セキュリティ評価 F03。Drive 同期の対象にならず、別端末から復元できず、暗号化
+  された本と平文の本が混在する）。pack の鍵（v3 の PRK）は Google アカウントごとに作るため、
+  **未ログインでは取り込まず** `ImportError::LoginRequired` で失敗させる
+  （`pack_root_key_for_import` を `Result<PackRootKey, _>` にして平文の経路自体を消した）。
+  UI は本棚のカード / 行 / 関連サムネイルのクリック・ダウンロード確認の「はい」・
+  コンテキストメニューの「再取得」で、**ダウンロードを始める前に**案内を出して Google の
+  認証モーダルを開く（`require_import_login`）。お気に入りの自動ダウンロードは利用者が
+  要求した操作ではないので、通知だけ出して見送る（待ち行列にも積まない）。**取り込み済みの
+  本の閲覧にログインは要らない**。
+  `crates/core/src/import/mod.rs`、`crates/app/src/pack_keys.rs`、
+  `crates/app/src/views/{bookshelf,about}.rs`、`README.md`、`docs/features.md`、
+  `docs/account-switch.md`、
+  `docs/spec/{README,03-import-and-pack,06-sync-auth-drive,07-decisions,08-notifications-and-nonfunctional,09-stores,10-pack-keys}.md`
+
+- **2 GiB を超える本は、ダウンロードを始める前に確認する**:
+  2 GiB を超える pack は Google Drive のバックアップ（2 GiB 上限）に入らず、取り込みにも時間と
+  メモリを使う。ストアが申告するファイルサイズ（FANZA 詳細 API の `fileSize`・DLsite 作品ページの
+  「ファイル容量」）を取得し、超えるときだけ「取得する / やめる」の確認ダイアログを出す
+  （**サイズが分からないときは確認を出さない**＝誤って止めない）。お気に入りの自動ダウンロードは
+  モーダルを出さず通知のみ。確認済みの本は同じセッションで二度聞かない。
+  `crates/core/src/store_size.rs`、`crates/core/src/dlsite/client.rs`（`work_page_meta`）、
+  `crates/app/src/views/bookshelf.rs`
 
 ### Fixed
 
@@ -27,6 +123,59 @@
   `crates/app/src/app_state.rs`、`crates/core/src/google.rs`、`docs/logout.md`
 
 ### Changed
+
+- **大きい pack を「丸ごと RAM に載せない」ようにする**:
+  これまで閲覧・取得・取り込み・アップロードのすべてが pack 全体（またはその複製）をメモリに
+  載せる前提だった（2 GiB の pack を開くには 2 GiB、取り込み中は 2 倍）。次の 7 点を変えた:
+  ① ビューアーのページ読み出しを**ファイル裏打ち**（`PackFileReader`・1 エントリだけ読む）に
+  ② `PackRead` trait でメモリ読み/ファイル読みを同一経路にし、取り込み・再構築・**pack 全体の
+  SHA-256** も reader 経由に（大きい pack ではファイルを順に読む）
+  ③ Drive の pack 取得を `DriveApi::download_to_file`（`Transport::send_download_to` で
+  **一時ファイルへストリーム**・進捗/キャンセル/上限つき。失敗・中止・2xx 以外では部分ファイルを
+  消す）に
+  ④ pack の組み立てを `PackBuilder::build_to_file`（一時ファイルへ直接組み立て→rename。書き出し
+  バイト数は既存のメモリ組み立てと**同一**であることをテストで固定）に
+  ⑤ pack のハッシュ計算もファイルを順に読む（アップロード時の md5 も同じ）
+  ⑥ 取り込み中のページデータを `PackEntryStore` に移し、**合計 64 MiB を超えたら
+  一時ファイルへ逃がす**（pack の組み立ては `PackBuilder::build_to_file_streaming` で
+  1 件ずつ供給。ピークメモリは「64 MiB + 1 ページ」に収まる。F06 の「変換は一時ファイルへ
+  逐次出力」）。エントリを**まとめて要求しない**ことと、失敗時に書きかけを残さないことを
+  テストで固定。一時ファイルは `Drop` で必ず消す
+  ⑦ Drive へのアップロードを `DriveApi::upload_multipart_from_file`
+  （`Transport::send_stream` で前後の境界 + `File` を流す。`Content-Length` は前後 + ファイル長。
+  送った本文がメモリ組み立てと**バイト一致**することをテストで固定）に。
+  256MiB のファイルで stream 70ms / memory 55ms（差は読み取りループ。常駐は約 320KiB 対 約 512MiB）。
+  `crates/opfspack/src/{reader,builder}.rs`、`crates/core/src/{import/mod,drive/sync,drive/mod,tbf/transport}.rs`、
+  `crates/app/src/components/image_viewer/mod.rs`
+
+- **2 GiB を超える pack を Drive へ上げられるようにする（resumable upload）**:
+  これまでアップロードは `uploadType=multipart`（1 リクエストで全体）だけで、実質 2 GiB が
+  天井だった。`uploadType=resumable` に変え、① セッション開始（メタデータ + `X-Upload-Content-Length`）
+  で `Location` を得る ② `Content-Range: bytes <start>-<end>/<total>` つきの `PUT` を
+  **8 MiB ずつ**（Google の要求どおり 256 KiB の倍数。最後だけ端数）繰り返す
+  ③ 途中は `308 Resume Incomplete` の `Range` を読んで**その位置から続ける**
+  （進まない `308` は無限ループにせずエラー）④ 最後の応答の JSON から `id` を取る。
+  送信中に RAM へ載るのは 1 チャンク分だけ。同期のアップロードはこの経路を使う。
+  あわせて pack の上限を 2 GiB → **10 GiB**（`MAX_TOTAL_SIZE` / `MAX_DOWNLOAD_BODY_BYTES`）へ。
+  個別上限（1 エントリ 512 MiB・件数 10000）と**取り込み元 2 GiB** はそのまま。
+  `crates/core/src/drive/mod.rs`、`crates/core/src/drive/sync.rs`、`crates/core/src/tbf/transport.rs`、
+  `crates/opfspack/src/lib.rs`
+
+- **入力の総量・計算量に上限を入れる**:
+  個別サイズの上限（1 エントリ 512 MiB）だけでは、上限内の入力が多数ある場合に
+  メモリ・CPU を圧迫できた（セキュリティ評価 F06）。① 取り込み元ファイルは
+  **読む前に** 2 GiB で弾く（`MAX_IMPORT_SOURCE_BYTES`。読んでから気付くとその時点で
+  RAM を食う）② 外側 ZIP は**展開の前**にエントリ数（`MAX_ENTRY_COUNT` = 10000）と
+  宣言サイズの合計（2 GiB）で弾く ③ PDF は**描画の前**に総ページ数（9000 =
+  `MAX_PDF_PAGES`）で弾き、エンコード済みの累積出力量も 2 GiB で打ち切る
+  ④ パスフレーズラップの `iterations` は 1 億…ではなく **1000 万**（`MAX_PASSPHRASE_ITERATIONS`）
+  を上限にし、**PBKDF2 を走らせる前**に弾く（鍵ファイルは同期先からも来るため、
+  書き換えられた値で復元中の端末の CPU を焼かせない）⑤ **書き出し側でも読み出し側と同じ
+  上限**（`MAX_ENTRY_SIZE` / `MAX_STORED_ENTRY_SIZE` / `MAX_TOTAL_SIZE` / `MAX_ENTRY_COUNT`）
+  を検査する（これが無いと「書けたのに開けない pack」ができる）。
+  `crates/opfspack/src/{builder,keys}.rs`、`crates/core/src/import/{mod,pdf}.rs`、
+  `crates/app/src/views/bookshelf.rs`、
+  `docs/spec/03-import-and-pack.md`、`docs/spec/10-pack-keys.md`
 
 - **リリースの公開をテストと監査の合格に依存させる**:
   `release.yml` の公開ジョブは `needs: build` だけで、同じタグの CI（テスト・`cargo audit`）が

@@ -10,8 +10,13 @@
   DB / keyring とは別の障害領域（データディレクトリのファイル）に書くので、片方が壊れていても記録できる。
 - 「メモリ上で使用停止」「端末の保存情報の削除」「サイト側の許可取り消し」は**別操作**として扱い、
   **成功した範囲だけ**を表示する。
-- BOOTH / FANZA / DLsite のセッションは keyring の鍵で暗号化して DB に置く（`crates/core/src/session_store.rs`）。
+- BOOTH / FANZA / DLsite / 技術書典 のセッションは keyring の鍵で暗号化して DB に置く（`crates/core/src/session_store.rs`）。
   鍵が無い環境では保存しない（平文へは戻さない）。
+- 技術書典のログアウトは、上に加えて**ログインに使った内蔵ブラウザー（WebView）の保存データ**も
+  消す（`clear_all_browsing_data`。セキュリティ評価 2026-09-25 の F05）。消せなかった場合は
+  「ブラウザーに保存したログイン情報を削除できませんでした」を付けて知らせる（消えていないのに
+  「消した」と見せない）。**消去を「呼べたか」しか分からない**（下の「WebView（ログインモーダル）の
+  Cookie」を参照）。
 
 ## 起動時（印をどう消費するか・2026-09-26 修正）
 
@@ -25,6 +30,19 @@
 - `SecretStore::delete` は**エントリが無い場合も成功**として返す（`keyring::Error::NoEntry`）ので、
   消し忘れが無い通常の状態では印は外れる。印が残り続けるのは実際の削除失敗（ロック・権限拒否）
   だけ。
+
+### 技術書典（2026-09-26 追記）
+
+- 技術書典のセッションは BOOTH / FANZA / DLsite と同じ vault（保存時刻つきの暗号文・**7 日**）から
+  起動時に復元する。7 日を過ぎた値は破棄して未ログインで起動する（＝再ログイン案内。
+  ログイン必須のチェックリスト・試し読みは `tbf_logged_in` が false なので導線ごと閉じる）。
+- 旧版は keyring（`thundoku_core::secrets::USER_TECHBOOKFEST`）に**期限なし**で置いていた。
+  起動時に **vault が空なら一度だけ vault へ移行**し、keyring の値を消す
+  （`SessionVault::adopt_legacy`）。
+  - keyring の削除に失敗したら印を残す。印がある起動では**移行し直さない**（期限の管理外の値を
+    再利用しない）うえで削除を再試行し、成功したときだけ印を外す。
+  - vault に既に値があるときは移行しない（vault のほうが新しい）。keyring の旧値は消すだけ。
+- ログアウトで消す対象は ①メモリ ②vault（DB）+ 旧 keyring ③サイト側 ④WebView の保存データ。
 
 アプリのログアウトは「**サーバー側セッションの破棄** + ローカルクリア」の 2 段階。
 サイト側のセッションが残っていると「ログアウトしても再ログインできる」ように見えるため、
@@ -63,6 +81,15 @@
   ログアウト後にログイン WebView を開くと pixiv の SSO で自動再ログインされ「ログアウトが効かない」ように見える
 - incognito 化により: ログイン WebView を閉じると Cookie も破棄 → 次のログインはクリーンな状態から
 - ログイン完了時の Cookie 収集は `booth.pm` + `accounts.booth.pm` の両方から（`_plaza_session_*` はログアウトに必要）
+- **技術書典は非 incognito（永続）のまま**にする（SSO の自動再ログインが無いため）。その代わり、
+  ログアウト時に `WebView::clear_all_browsing_data()` で保存データを消す（`views/mod.rs` の
+  `clear_login_webview_data` → `tbf_login` 側のログイン WebView と同じ既定プロファイル）。
+  - 消去は **WebView のインスタンスからしか呼べない**ため、ログアウト時は一時的な WebView を
+    作って消去し、消去が走る猶予（3 秒）をおいてから破棄する。
+  - wry は消去の**完了を知らせない**（完了ハンドラーを公開していない）ので、結果として扱えるのは
+    「消去を呼べたか」だけ。生成に失敗した場合も「消去できていない」として利用者に伝える。
+  - 消去対象は既定プロファイル（非 incognito の WebView が共有する exe ごとの保存領域）なので、
+    incognito を使う BOOTH / FANZA / DLsite のログインには影響しない。
 
 ## UI 側の挙動（settings.rs）
 
@@ -71,8 +98,14 @@
   - 成功: 「〜からログアウトしました（サイト側のセッションも破棄しました）」
   - 失敗: 「〜からログアウトしました（サイト側のセッションは残っています）」
 - サーバー側失敗時も**ローカルクリアは実行**（アプリとしてはログアウト状態にする）
+- 技術書典は上の 2 つに加えて、**端末の保存情報の削除に失敗した**場合（成功として見せない）と、
+  **WebView の保存データを消せなかった**場合を文言に含める（`tbf_logout_message`）。
+  WebView の生成は非同期（Windows）なので、結果が揃ってから 1 回だけ通知する。
 
 ## デバッグログ
 
-- `logout_tbf: server logout ok/failed`
+- `logout_tbf: server logout ok/failed` / `logout_tbf: local cleared (経過時間)`
+- `logout_tbf: WebView の保存データを消去できません: ...`（失敗時のみ）
+- `webview: 保存データの消去を要求 ok/failed`
+- `tbf session: keyring の旧保存値を vault へ移行しました`（移行時のみ）
 - `booth logout(plaza): status=... location=...` / `booth logout(booth): status=...`

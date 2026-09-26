@@ -47,7 +47,8 @@
 | Error | `表紙を取得できませんでした（{fail} 件）` | `crates/app/src/views/bookshelf.rs:1887` |
 | Error | 同期失敗メッセージ（BOOTH/FANZA/DLsite/技術書典、`not logged in` / `session expired` 等） | `crates/app/src/views/bookshelf.rs:2462`, `:2539`, `:2617`, `:2694` |
 | Error | 取り込み失敗（`download_messages` のエラー側） | `crates/app/src/views/bookshelf.rs:3207-3209` |
-| Error | `いまはダウンロードを開始できません（同期中など）。少し待ってからもう一度` | `crates/app/src/views/bookshelf.rs:3844` |
+| Error | `いまはダウンロードを開始できません（同期中など）。少し待ってからもう一度` | `crates/app/src/views/bookshelf.rs:5347` |
+| Error | `本を取り込むには Google にログインしてください（本はアカウントごとの鍵で暗号化されます）`（未ログイン。`LOGIN_REQUIRED_FOR_IMPORT`。明示操作では Google の認証モーダルも開き、自動ダウンロードでは通知だけ） | `crates/app/src/views/bookshelf.rs:1356`, `:3822`（`require_import_login`） |
 | Info（種別未指定 = 直前の種別を継承） | `Drive バックアップを復元しました` / `バックアップの復元に失敗しました` | `crates/app/src/workspace.rs:613`, `:615` |
 | Info（種別未指定） | `Google Drive と同期しました` | `crates/app/src/workspace.rs:1449` |
 | Info（種別未指定） | `技術書典からログアウトしました（サイト側のセッションも破棄しました / は残っています）` | `crates/app/src/views/settings.rs:632-642` |
@@ -195,7 +196,8 @@
 | セッション復元（BOOTH） | `booth session: 起動時復元 = ログイン済み（cookies={n}）` / `未ログイン` / `{store} session: 保存値を復号できないため破棄します（再ログインが必要）`（warn） | `crates/app/src/app_state.rs`, `crates/core/src/session_store.rs` |
 | セッション保存（BOOTH） | `booth session: DB 保存成功（暗号化）` / `{store} session: DB 保存失敗: {e}`（error） / `{store} session: 暗号鍵が無いため保存しません（次回起動では再ログインが必要）`（warn） | `crates/app/src/app_state.rs` |
 | セッション保存（技術書典） | `tbf session saved -> tbf_logged_in = true` | `crates/app/src/app_state.rs:383` |
-| ログアウト | `logout_tbf: server logout ok\|failed` / `logout_tbf: session cleared` / `logout_tbf: done ({elapsed})` / `logout_google: client logout ({elapsed})` / `logout_booth: server logout …` / `logout_dlsite: cleared ({elapsed})` | `crates/app/src/views/settings.rs:611-616`, `:640`, `:648`, `:658`, `:687-694`, `:750`; `docs/logout.md:41` |
+| セッション復元（技術書典） | `tbf session: 起動時復元 = ログイン済み` / `未ログイン` / `{store} session: keyring の旧保存値を vault へ移行しました` / `{store} session: 旧 keyring 値を削除できません（次回起動で再試行）`（warn） / `{store} session: 印の記録にも失敗しました`（error） | `crates/app/src/app_state.rs`, `crates/core/src/session_store.rs` |
+| ログアウト | `logout_tbf: server logout ok\|failed` / `logout_tbf: local cleared ({elapsed})` / `logout_tbf: WebView の保存データを消去できません: {e}`（error） / `webview: 保存データの消去を要求 ok\|failed` / `logout_google: client logout ({elapsed})` / `logout_booth: server logout …` / `logout_dlsite: cleared ({elapsed})` | `crates/app/src/views/settings.rs`, `crates/app/src/views/mod.rs`; `docs/logout.md` |
 | ダウンロード/取り込み | `download_item: スレッド完了、UI 反映開始` / `download_item: 失敗しました: {msg}`(warn) / `download_item: UI 反映完了（reload 含む）（{elapsed}）` | `crates/app/src/views/bookshelf.rs:3218-3234` |
 | 本棚リロード/同期開始 | `reload: 完了（{elapsed}）` / `sync_booth: 開始` / `sync_fanza: 開始` / `sync_dlsite: 開始` / `sync_tbf: 開始` | `crates/app/src/views/bookshelf.rs:1653`, `:2269`, `:2495`, `:2573`, `:2647` |
 | チェックリストポーリング失敗 | `checklist poll failed for {slug}: {message}`（error） | `crates/app/src/workspace.rs:280` |

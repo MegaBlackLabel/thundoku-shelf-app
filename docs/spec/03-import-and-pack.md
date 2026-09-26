@@ -59,7 +59,10 @@
 | 合流エントリ数上限 | `MAX_NESTED_ENTRIES = 2000` | `import/mod.rs:197`, `:357-363` |
 | 合流規則 | 入れ子 ZIP のパス（拡張子除去）+ `/` + 内側エントリ名。外側の分類・グルーピングがそのまま効く | `import/mod.rs:336`, `:351-355` |
 | 上限超過時 | 半分だけ取り込まず**その入れ子全体をスキップ**し、`warnings` に 1 行積む（取り込み全体は失敗させない） | `import/mod.rs:357-364` |
-| 通常エントリの上限 | `MAX_ZIP_ENTRY_BYTES = 512 MiB`（非圧縮。**宣言サイズではなく実際に読めたバイト数**で判定）。超過は `ImportError::Zip`（部分的なデータで先へ進めない） | `import/mod.rs`（`read_zip_entry_capped`） |
+| 通常エントリの上限 | `MAX_ZIP_ENTRY_BYTES = 2 GiB`（**展開後**。宣言サイズではなく実際に読めたバイト数で判定）。超過は `ImportError::Zip`（部分的なデータで先へ進めない）。取り込み元ファイルの上限と同値にしてある: 512 MiB にしていたときは「142 MB の ZIP に含まれる PDF が展開後 512 MiB を超える」正当な本を弾いていた（2026-09-26） | `import/mod.rs`（`read_zip_entry_capped`） |
+| 外側 ZIP 全体の上限 | **展開の前**にエントリ数（`opfspack::MAX_ENTRY_COUNT` = 10000）と、中央ディレクトリが宣言する展開後サイズの合計（`opfspack::MAX_TOTAL_SIZE` = 10 GiB）を検査する。超過は `ImportError::ZipTooLarge { detail }`。宣言サイズは信用せず（実際の長さは個別上限で別途見る）、事前に弾ける分だけをここで弾く | `import/mod.rs`（`analyze_zip` / `EntryMeta::declared_size`） |
+| 取り込み元ファイルの上限 | `MAX_IMPORT_SOURCE_BYTES = 2 GiB`。`import_file` は変換のために全体をメモリへ読むため、**`std::fs::read` の前に**メタデータで検査する。超過は `ImportError::SourceTooLarge { size, limit }`（アプリ側もダウンロード直後に同じ値で検査する） | `import/mod.rs`（`import_file`）、`crates/app/src/views/bookshelf.rs` |
+| PDF の上限 | **描画の前**に総ページ数（`MAX_PDF_PAGES` = 9000。`MAX_ENTRY_COUNT` から metadata / サムネイル分を引いた値）を検査。描画中は 1 ページ 16MPix の検査に加えて**エンコード済みの累積出力**（`opfspack::MAX_TOTAL_SIZE` = 10 GiB）で打ち切る。ピークは 8 ページ窓分 | `import/pdf.rs`（`render_pdf_pages`） |
 | 壊れた入れ子 | `warnings` に `"{name}: {error}"` を積んでスキップ | `import/mod.rs:326-333` |
 | 警告文言（実装値） | `"{name}: nested zip is larger than the size limit (536870912 bytes)"` / `"{name}: nested zip inside a nested zip is not expanded (depth limit 1)"` / `"{name}: nested zip exceeds the entry/size limit and was skipped"` | `import/mod.rs:314-317`, `:347-349`, `:358-361` |
 
@@ -93,7 +96,19 @@
 | 表紙 | `cover.webp`（**既定コンテンツが PDF のときだけ**。ZIP 経路では `primary_cover` が立つ場合のみ） | `false` | `import/mod.rs:1744-1751`, `:1679-1684` |
 | サムネイル | `thumbnail.webp`（既定コンテンツ第 1 ページの 200px 版） | `false` | `import/mod.rs:1753-1758` |
 | 音声・動画 | エントリを作らない（構造だけ DB に記録） | — | `import/mod.rs:1712-1713` |
-| pack レベル | `builder.build(pack_key.as_ref(), true)` = pack フラグ `COMPRESSED` を常に立てる（**エントリ個別の compress はすべて false**。鍵を渡したときは `ENCRYPTED` も立つ） | — | `import/mod.rs:1009`, `crates/opfspack/src/builder.rs:110-115` |
+| pack レベル | `PackBuilder::build_to_file_streaming(..., true)` = pack フラグ `COMPRESSED` を常に立てる（**エントリ個別の compress はすべて false**。鍵を渡したときは `ENCRYPTED` も立つ）。エントリは `PackEntryStore` から**1 件ずつ**供給する（全ページを同時にメモリへ載せない）。**一時ファイルへ直接組み立ててから rename** し、pack 全体の SHA-256 はファイルを順に読んで計算する（`PackFileReader::source_sha256`） | — | `crates/opfspack/src/builder.rs`（`write_pack`）, `reader.rs:350`（`PackRead`） |
+
+### 3.5.1 取り込み中のメモリ（`PackEntryStore`）
+
+ページデータは `PackEntryStore` が保持し、**受け取った合計が 64 MiB を超えたら以降は一時ファイル**
+（`std::env::temp_dir()/thundoku-import-spill-<pid>-<時刻>/`）へ書く。pack の組み立ては
+`build_to_file_streaming` で 1 件ずつ供給し、必要なときだけ読み出す（メモリに残るのは
+64 MiB + 1 ページ分 + 組み立て中の 1 エントリ）。一時ファイルは `Drop` で必ず消す。
+
+**残る制約**: PDF は全ページを描画して `pages` に集めてから store へ渡すため、この経路だけは
+全ページ分をメモリに持つ（`import/pdf.rs`）。画像 1 枚・EPUB・ZIP（ページを 1 件ずつ読む経路）は
+store へ直接入る。metadata の書き戻し（`rename_content_in_pack`）も pack 全体を引数で受け取る
+（呼び出し側が既に全体を持っている経路）。
 
 ### 3.6 ページ画像生成（数値・アルゴリズム）
 
@@ -295,6 +310,7 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 
 | 定数 | 値 | 対象 | 正常な本を通す根拠 |
 |---|---|---|---|
+| 書き出し側の検査 | `PackBuilder` も同じ上限（`MAX_ENTRY_COUNT` / `MAX_ENTRY_SIZE` / `MAX_STORED_ENTRY_SIZE` / `MAX_TOTAL_SIZE`）を検査する。これが無いと「書けたのに開けない pack」ができる | - | `crates/opfspack/src/builder.rs`（`write_pack` / `check_entry_limits`） |
 | `MAX_ENTRY_SIZE` | `512 * 1024 * 1024`（512 MiB） | 1 エントリの展開後 `size` | 1 エントリ = 1 ページで、既知の実データ（外側 ZIP の展開後 1.33 GB。`import/mod.rs:265`, `:1585`）でも 1 ページは数 MB 級 |
 | `MAX_TOTAL_SIZE` | `2 * 1024 * 1024 * 1024`（2 GiB） | 1 pack の展開後合計（`checked_add` で積算） | 上記 1.33 GB を上回り、かつ上限として意味のある範囲 |
 | `MAX_STORED_ENTRY_SIZE` | `2 * 1024 * 1024 * 1024`（2 GiB） | 1 エントリの保存サイズ `compressed_size` | 展開上限 512 MiB に AES-GCM タグ 16 バイトと DEFLATE の膨張余地を足しても収まる |
@@ -302,7 +318,7 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 
 `raw_inflate` が宣言サイズ + 1 バイトで打ち切る（§4.6 の読み出し時）ことと併せて、小さな DEFLATE 入力から数 GB を展開させる細工への防波堤になる。回帰テストは `crates/opfspack/tests/limits.rs`（展開爆弾 / 宣言サイズの不一致（大・小）/ 切断 DEFLATE / 未知フラグ / 暗号化の不整合 / 件数・サイズ上限の境界と上限ちょうど / 正常な多ページ pack）。
 
-> **取り込み側の上限とは別物**: §3.3 の `MAX_ZIP_ENTRY_BYTES = 512 MiB` / `MAX_NESTED_BYTES = 512 MiB` / `MAX_NESTED_ENTRIES = 2000`（`crates/core/src/import/mod.rs`）は **ZIP 取り込み時**の上限で、こちらは **pack 読み出し時**の検証。判定対象（ZIP エントリ / 入れ子の合流 vs pack の index）も失敗の扱い（警告を積んでスキップ vs `Corrupted` を返す）も異なる。値を揃えたのは 1 エントリあたり 512 MiB だけで、件数上限は **`MAX_NESTED_ENTRIES = 2000` に合わせられない**（`MAX_NESTED_ENTRIES` は入れ子 ZIP の合流件数であって pack のエントリ数ではなく、3,321 ページの pack は 3,000 件超のエントリを持つため、2000 で切ると正常本が読めなくなる）。
+> **取り込み側の上限とは別物**: §3.3 の `MAX_ZIP_ENTRY_BYTES = 2 GiB` / `MAX_NESTED_BYTES = 512 MiB` / `MAX_NESTED_ENTRIES = 2000`（`crates/core/src/import/mod.rs`）は **ZIP 取り込み時**の上限で、こちらは **pack 読み出し時**の検証。判定対象（ZIP エントリ / 入れ子の合流 vs pack の index）も失敗の扱い（警告を積んでスキップ vs `Corrupted` を返す）も異なる。値を揃えたのは 1 エントリあたり 512 MiB だけで、件数上限は **`MAX_NESTED_ENTRIES = 2000` に合わせられない**（`MAX_NESTED_ENTRIES` は入れ子 ZIP の合流件数であって pack のエントリ数ではなく、3,321 ページの pack は 3,000 件超のエントリを持つため、2000 で切ると正常本が読めなくなる）。
 
 ### 4.7 公開 API
 
@@ -310,6 +326,7 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 |---|---|---|
 | `PackBuilder::new(created_at: u64)` | pack 構築開始（`created_at` は UNIX ミリ秒） | `builder.rs:37-43` |
 | `PackBuilder::add_entry(path, data, mime_type, compress)` | エントリ追加（重複パスの検査はしない）。追加順は保持され、build 時にパスでソート | `builder.rs:44-53` |
+| `PackBuilder::build_to_file(path, key, compress) -> Result<u64, PackError>` | [`PackBuilder::build`] と同じレイアウトを**ファイルへ直接**書く（組み立て中のバイト列を RAM に持たない）。一時ファイルへ書いてから rename するため、途中で失敗しても壊れた pack を残さない。書き出したバイト数を返す | `builder.rs:68-99`, `tests/build_to_file.rs` |
 | `PackBuilder::build(key: Option<&PackKey>, compress: bool) -> Result<Vec<u8>, PackError>` | ① パスを **UTF-16 コード単位順**にソート ② エントリ単位で deflate（`compress`）→ 暗号化（`key` があるとき**全エントリ**） ③ オフセット確定（64 から 8 バイト整列で連結） ④ ヘッダ → 本体 → index → index CRC。pack フラグは `compress` → `COMPRESSED`、`key.is_some()` → `ENCRYPTED`。空 pack も生成可能（`entry_count = 0`） | `builder.rs:55-159`, `:110-115`, `tests/interop.rs:352-359` |
 | `PackReader::open(bytes) -> Result<Self, PackError>` | 全検証を実行（§4.6。件数・サイズの上限は §4.6.1）。`version != 3` は `Version` | `reader.rs:18-54` |
 | `PackReader::header() / entries() / entry(path)` | ヘッダ参照・エントリ一覧・パス検索 | `reader.rs:57-67` |
@@ -332,10 +349,10 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 
 | API | シグネチャ要点 | アンカー |
 |---|---|---|
-| `import::pack_root_key_for_import(profile, resolve_root)` | 取り込みで使う PRK を決める（**fail-closed**）。未ログイン → `Ok(None)`（平文 pack）、ログイン済み + 鍵なし → `ImportError::IdentityKeyUnavailable`、`sub` 空 → `ImportError::IdentitySubMissing` | `crates/core/src/import/mod.rs:237-259` |
+| `import::pack_root_key_for_import(profile, resolve_root)` | 取り込みで使う PRK を決める（**fail-closed**）。未ログイン（`profile` = `None`）→ `ImportError::LoginRequired`（**平文 pack を作らない** — セキュリティ評価 F03）、ログイン済み + 鍵なし → `ImportError::IdentityKeyUnavailable`、`sub` 空 → `ImportError::IdentitySubMissing` | `crates/core/src/import/mod.rs:248-261` |
 | `PackKeyStore`（`resolve` / `ensure` / `set_passphrase` / `remove_passphrase` / `has_passphrase` / `pending_owner` / `retry_pending_upload`） | PRK の解決（keyring → パスフレーズラップ → `sub` ラップ）と bundle の Drive 反映（仕様 §4〜§5）。**パスフレーズはコールバックで受け取る**（core は UI を知らない） | `crates/core/src/pack_keys.rs:61-345` |
 | `pack_keys::{KEY_BUNDLE_NAME, PENDING_UPLOAD_KEY}` | `"thundoku-keys.json"` / `"drive.pack_keys.pending"` | `crates/core/src/pack_keys.rs:23`, `:29` |
-| `PackKeysError` | `Unavailable` / `PassphraseFailed` / `OwnerMismatch` / `Secret` / `Drive` / `Pack` / `Db`。`ImportError` への変換は `IdentityKeyUnavailable` / `PassphraseFailed` / `KeyStore` | `crates/core/src/pack_keys.rs:37-58`, `crates/core/src/import/mod.rs:87-101` |
+| `PackKeysError` | `Unavailable` / `PassphraseFailed` / `OwnerMismatch` / `Secret` / `Drive` / `Pack` / `Db`。`ImportError` への変換は `IdentityKeyUnavailable` / `PassphraseFailed` / `KeyStore` | `crates/core/src/pack_keys.rs:37-58`, `crates/core/src/import/mod.rs:98-109` |
 
 ### 4.8 アプリが書き出すエントリ構成（実データ）
 
@@ -474,7 +491,7 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 
 ### 6.1 `ImportError`（全 variant・定義と発生条件）
 
-定義: `crates/core/src/import/mod.rs:34-78`。
+定義: `crates/core/src/import/mod.rs:34-92`。
 
 | variant | `Display` 文字列（実装値） | 発生条件 | アンカー |
 |---|---|---|---|
@@ -487,10 +504,11 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 | `Zip(String)` | `zip error: {0}` | `zip` crate のオープン/エントリ取得/伸長失敗、および内部不整合 `"entry index out of range"`（`plan` の ordinal が `metas` の範囲外） | `import/mod.rs:48-49`, `:296`, `:346`, `:1512`, `:1576` |
 | `EmptyArchive` | `empty archive` | ZIP のエントリが 0 件（`collect_metas_with_nested` の結果が空） | `import/mod.rs:50-51`, `:1518` |
 | `NotAReadableWork` | `not a readable work` | ① `commit_zip` で既定コンテンツが画像/PDF/EPUB 以外（音声・動画のみ） ② `plan.contents` が空（`get(plan.primary)` が `None`） | `import/mod.rs:54-55`, `:1569-1572`（UI 文言は `docs/import-patterns.md:687-691` §11.2 R3） |
-| `IdentityKeyUnavailable` | `Google にログイン済みですが、本を復号する鍵を取得できません。…`（長文。§10 §4.1 の fail-closed） | ログイン中なのに v3 のルート鍵（PRK）を用意できない（bundle が無い / どのラップも解けない / keyring 障害）。**平文 pack へは落とさない** | `import/mod.rs:56-64`, `:91` |
-| `PassphraseFailed` | `パスフレーズが違います。もう一度入力してください` | 入力されたパスフレーズでラップが解けない（**`sub` ラップへ黙って落ちない**） | `import/mod.rs:65-67`, `:92` |
-| `KeyStore(String)` | `本の鍵を取得できませんでした: {0}` | 鍵 bundle / keyring の入出力失敗（Drive の通信・壊れた bundle など）。`PackKeysError` のうち上 2 つ以外をここへ畳む | `import/mod.rs:68-70`, `:93-95` |
-| `IdentitySubMissing` | `Google アカウントの識別子（sub）を取得できません。設定画面からログインし直してください` | `sub` が空（userinfo の欠落・保存値の破損）。v3 では `owner_id` と `sub` ラップの鍵材料なので空文字は通さない | `import/mod.rs:76-77`, `:247` |
+| `LoginRequired` | `本を取り込むには Google にログインしてください（本はアカウントごとの鍵で暗号化されます）` | 未ログイン（Google のプロフィールが無い）で取り込みを要求された。**平文 pack を作らない**（fail-closed。セキュリティ評価 F03）。UI はダウンロードを始める前にこれを出し、ログイン導線（Google の認証モーダル）を開く | `import/mod.rs:55-65`, `:252-255`, `crates/app/src/views/bookshelf.rs:3822`（`require_import_login`） |
+| `IdentityKeyUnavailable` | `Google にログイン済みですが、本を復号する鍵を取得できません。…`（長文。§10 §4.1 の fail-closed） | ログイン中なのに v3 のルート鍵（PRK）を用意できない（bundle が無い / どのラップも解けない / keyring 障害）。**平文 pack へは落とさない** | `import/mod.rs:66-76`, `:102` |
+| `PassphraseFailed` | `パスフレーズが違います。もう一度入力してください` | 入力されたパスフレーズでラップが解けない（**`sub` ラップへ黙って落ちない**） | `import/mod.rs:77-79`, `:103` |
+| `KeyStore(String)` | `本の鍵を取得できませんでした: {0}` | 鍵 bundle / keyring の入出力失敗（Drive の通信・壊れた bundle など）。`PackKeysError` のうち上 2 つ以外をここへ畳む | `import/mod.rs:80-82`, `:104-106` |
+| `IdentitySubMissing` | `Google アカウントの識別子（sub）を取得できません。設定画面からログインし直してください` | `sub` が空（userinfo の欠落・保存値の破損）。v3 では `owner_id` と `sub` ラップの鍵材料なので空文字は通さない | `import/mod.rs:83-91`, `:256-258` |
 
 非致命の扱い（エラーにしない）: `warnings: Vec<String>` に積む。形式は主に `"{エントリ名}: {理由}"`（例: 壊れた画像・入れ子上限・入れ子破損）。`ImportedBook.warnings` として呼び出し側へ返す（`import/mod.rs:26-29`, `:409-468`, `:1534`, `:1631`）。
 

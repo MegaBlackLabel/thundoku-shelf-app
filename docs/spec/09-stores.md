@@ -975,7 +975,7 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 | 保存タイミング | ログイン成立時（`check_login` 内）のみ。同期では保存しない | `crates/app/src/views/booth_login.rs:148` |
 | `secrets.rs` の `USER_BOOTH` | `pub const USER_BOOTH: &str = "booth";`（keyring 用キーとして定義）— **リポジトリ内で参照箇所ゼロ**（未使用） | `crates/core/src/secrets.rs:12` |
 | keyring の共通定数 | `SERVICE = "com.megablacklabel.thundoku-shelf"`、`USER_DB_KEY = "thundoku-shelf.db-key"`、`USER_SESSION_KEY = "thundoku-shelf.session-key"`（セッション Cookie 暗号化用・別鍵） | `crates/core/src/secrets.rs` |
-| `owner_sub`（別物） | BOOTH の ID からは作られない。ダウンロード時に Google ログイン中の `sub` を AES-256-GCM で暗号化して `books.owner_sub` に入れる（未ログイン時は `NULL`） | `crates/app/src/views/bookshelf.rs:2742-2745`,`:3007-3013`,`:3126-3132`、`crates/core/src/db/books.rs:250-265`、`crates/core/src/owner.rs:14-27` |
+| `owner_sub`（別物） | BOOTH の ID からは作られない。ダウンロード時に Google ログイン中の `sub` を AES-256-GCM で暗号化して `books.owner_sub` に入れる（**取り込みに Google ログインが必須になった**ので新規の `NULL` は付かない。旧版で取り込んだ本の `NULL` 行は残る — セキュリティ評価 F03） | `crates/app/src/views/bookshelf.rs:3844`（`start_download`）、`:3822`（`require_import_login`）、`crates/core/src/db/books.rs:250-265`、`crates/core/src/owner.rs:14-27` |
 | `owner_sub` 列 | `books.owner_sub TEXT`（NULL 可）。実行時 DDL で冪等に追加（`pragma_table_info` 確認後 `ALTER TABLE books ADD COLUMN owner_sub TEXT`） | `crates/core/src/db/schema.sql:50`、`crates/core/src/db/mod.rs:236-244` |
 
 #### 4. レート制限・待機・タイムアウト
@@ -1415,7 +1415,7 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 | 最終同期時刻 | `api.last_sync_at`（`refresh_checklist` が毎回更新、本棚同期 `save_bookshelf` では**更新しない**） | `crates/core/src/tbf/sync.rs:258-262` |
 | 本棚側のロック/状態 | `BookshelfView::sync_busy`（実行中の同期タスク数カウンタ。`> 0` で再同期・ダウンロード・お気に入り・非表示を拒否） | `crates/app/src/views/bookshelf.rs:782-783`, `:2230-2232`, `:2648`, `:2681` |
 | 専用 `sync_state` テーブル | **TBF 用は存在しない**。`drive_sync_state` は Google Drive 用（pack 単位） | `crates/core/src/db/sync_state.rs:1-2`, `docs/database.md:280-283` |
-| アプリ起動時の復元 | keyring から TBF セッションを読み、`tbf.is_authenticated()` で `tbf_logged_in` を決める（読み込み失敗時は false） | `crates/app/src/app_state.rs:151-161`, `:240` |
+| アプリ起動時の復元 | 共通 Vault（DB の `tbf.session`。保存時刻つきの暗号文・7 日）を `SessionVault::adopt_legacy` で読み、vault が空なら旧 keyring 値（`user=techbookfest`）を一度だけ移行して keyring を消す。`TbfSession::is_logged_in()` を満たすものだけを `tbf_logged_in` にする（セキュリティ評価 F05） | `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |
 | 手動同期の多重起動防止 | ボタンから `sync_tbf` を呼ぶ前に `sync_busy > 0` で return。失敗時は `Error` トースト + `"session expired"` を含めば `OpenAuth` | `crates/app/src/views/bookshelf.rs:2229-2232`, `:2692-2703` |
 
 #### 9. ログイン方式
@@ -1425,14 +1425,15 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 | 段階 | 内容 | アンカー |
 |---|---|---|
 | ビュー生成 | `TbfLoginView::new(window, cx)` が WebView を作り、`https://techbookfest.org/user/signin` をロード、非表示にする | `crates/app/src/views/tbf_login.rs:29-42`, `:33` |
-| WebView 実装 | `lb_wry::WebViewBuilder`（`#[cfg(debug_assertions)]` では `with_devtools(true)`）。`window.window_handle()` 失敗時は `webview = None` を返す | `crates/app/src/views/tbf_login.rs:46-67`, `:48-49`, `:50-58` |
+| WebView 実装 | `lb_wry::WebViewBuilder`（`#[cfg(debug_assertions)]` では `with_devtools(true)`）。**`incognito=false`（永続プロファイル。技術書典には SSO の自動再ログインが無く、Cookie 収集だけに使うため）。window.window_handle()` 失敗時は `webview = None` を返す | `crates/app/src/views/tbf_login.rs:46-67`, `:48-49`, `:50-58` |
+| 保存データの消去 | ログアウト時に非 incognito の既定プロファイルを `clear_all_browsing_data()` で消す（`views::clear_login_webview_data`）。ログイン WebView はモーダルを閉じると破棄済みなので、同じ既定プロファイルの**一時 WebView** を作って消し、消去が走る猶予（3 秒）をおいて破棄する。**wry は消去の完了を知らせない**ため、結果は「呼べたか」だけ（生成失敗も `Err` として通知する） | `crates/app/src/views/mod.rs`、`crates/app/src/views/settings.rs`、`docs/logout.md` |
 | 表示/非表示 | `show()` で `WebView::show()` + `check_generation += 1` + 監視再開。`close()` で `check_generation += 1`（監視停止）+ 非表示 + Entity を `take()` | `crates/app/src/views/tbf_login.rs:70-84` |
 | モーダル起動 | `AuthDialog::ensure_states` が `cx.defer_in` で `TbfLoginView` を生成（render 後の defer で RefCell 再入を回避）。`AuthDialog::login_tbf` / `open_with_provider(TechBookFest)` が `show_tbf_login = true` にする | `crates/app/src/views/auth.rs:283-311`, `:320-323`, `:92-105` |
 | WebView 未生成時 | テスト環境等では WebView が無く、`check_login` は常に false | `crates/app/src/views/tbf_login.rs:118-122`, テスト `:272-289` |
 | URL 監視 | 1 秒間隔のループ（`Duration::from_secs(1)`）。`WeakEntity` を使い、ビュー drop で `update` が Err → ループ終了（リーク防止） | `crates/app/src/views/tbf_login.rs:88-116`, `:96-98`, `:93`, `:106-110` |
 | 完了判定 1 | 現在 URL が `techbookfest.org` をホスト末尾に持ち、かつ URL に `/user/signin` を含まない | `crates/app/src/views/tbf_login.rs:124-137`, `:134` |
 | 完了判定 2 | `cookies_for_url("https://techbookfest.org")` から Cookie を取得し、`TbfSession::from_cookies` の `is_logged_in()` が true であること（= `XSRF-TOKEN` 以外の Cookie が 1 つ以上） | `crates/app/src/views/tbf_login.rs:138-151`, `crates/core/src/tbf/mod.rs:40-61` |
-| 保存 | `crate::app_state::save_tbf_session(cx, &session)` → keyring 保存 + `AppState::tbf` へ `restore_session` + `tbf_logged_in = true` | `crates/app/src/views/tbf_login.rs:153-154`, `crates/app/src/app_state.rs:373-383` |
+| 保存 | `crate::app_state::save_tbf_session(cx, &session)` → 共通 Vault（`tbf.session` に暗号化 + 保存時刻。鍵が無ければ保存しない）→ `AppState::tbf` へ `restore_session` + `tbf_logged_in = true` | `crates/app/src/views/tbf_login.rs:153-154`, `crates/app/src/app_state.rs`、`crates/core/src/session_store.rs` |
 | 完了通知 | WebView を `hide()` して `cx.emit(TbfLoginDone)`、`check_login` は true を返しループ終了 | `crates/app/src/views/tbf_login.rs:155-160` |
 | 完了時の UI 処理 | `AuthDialog` が `tbf_logged_in = true`、`show_tbf_login = false`、ビュー購読を破棄し `CloseAuth` を defer dispatch | `crates/app/src/views/auth.rs:283-299` |
 | キャンセル時 | `TbfLoginCancelled` で `show_tbf_login = false` + ビュー/購読を破棄（次回は新規フロー）。閉じるボタンは WebView の右外側 36 px 角（収まらなければ左外側） | `crates/app/src/views/auth.rs:300-308`, `crates/app/src/views/tbf_login.rs:203-234` |
@@ -1457,25 +1458,25 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 | CSRF ヘッダ | `X-XSRF-TOKEN: <percent_decode 済み XSRF-TOKEN 値>` を **全リクエスト**（`request()` 経由）に付与 | `crates/core/src/tbf/mod.rs:655-658`, `:674-677` |
 | `Cookie:` ヘッダ | `name=value` を `"; "` 連結。空なら付与しない | `crates/core/src/tbf/mod.rs:664-670` |
 | percent-decode | `%XX` のみ自前デコード（`hex_val`、大文字小文字対応）。不正シーケンスはそのまま | `crates/core/src/tbf/mod.rs:898-926` |
-| セッション有効期限 | **アプリ側に有効期限の実装なし**。期限切れはサーバー応答（401/403 または auth 系 GraphQL エラー）で検出して `SessionExpired` を返す方式 | `crates/core/src/tbf/mod.rs:224-230`, `:614-627`, `:870-896`（該当実装なし） |
+| セッション有効期限 | **保存から 7 日**（`SESSION_MAX_AGE_SECONDS`。共通 Vault の保存時刻で判定し、期限切れは起動時に行ごと破棄＝再ログイン）。アプリ実行中の期限切れはサーバー応答（401/403 または auth 系 GraphQL エラー）で検出して `SessionExpired` を返す方式 | `crates/core/src/session_store.rs`, `crates/core/src/tbf/mod.rs:224-230`, `:614-627`, `:870-896` |
 | auth 系エラー判定 | `is_auth_related`: `errors[].message` または `errors[].extensions.code` を小文字化し、`unauthorized` / `unauthenticated` / `forbidden` / `login` / `session` のいずれかを含めば真 | `crates/core/src/tbf/mod.rs:870-896` |
 | ログアウト | **POST** `{TBF_GRAPHQL}?operationName=LogoutUserMutation`、body `{operationName:"LogoutUserMutation", variables:{input:{}}, extensions:…, query:"mutation LogoutUserMutation($input: LogoutUserInput!) { logoutUser(input: $input) { clientMutationId user { id email __typename } } }"}`、`redirects = 5`。401/403 → `InvalidCredentials`、`errors` → `InvalidResponse(errors[0].message)`, 成功時は cookies/xsrf をクリア | `crates/core/src/tbf/mod.rs:250-284`, `:263`, `:265-274` |
 | ログアウトで使ってはいけない API | `POST https://techbookfest.org/user/signout` は 200 を返すがログアウトしない（疑似成功） | `docs/logout.md:14` |
-| ログアウト UI | `SettingsView::logout_tbf`: サーバーログアウト → ローカルセッションを空で `restore_session` → `tbf_logged_in = false` → `secrets.delete(USER_TECHBOOKFEST)` をバックグラウンド実行。トーストは成功/失敗で出し分け | `crates/app/src/views/settings.rs:607-649`, `docs/logout.md:43-48` |
+| ログアウト UI | `SettingsView::logout_tbf`: サーバーログアウト → `clear_tbf_session`（メモリは `TbfClient::clear_session` で即時、vault（DB）と旧 keyring の削除は**結果を待つ**。失敗したら `session-purge.pending` に印を残す）→ ログイン WebView の保存データを `clear_all_browsing_data` で消去（生成は非同期なので結果が揃ってから通知）。トーストは①ローカル②サイト側③ブラウザーの**成功した範囲だけ**を出す（`tbf_logout_message`） | `crates/app/src/views/settings.rs`、`crates/app/src/app_state.rs`、`docs/logout.md` |
 
 #### 10. 認証情報の保存先と保護
 
 | 項目 | 内容 | アンカー |
 |---|---|---|
 | keyring サービス名 | `com.megablacklabel.thundoku-shelf` | `crates/core/src/secrets.rs:7` |
-| ユーザキー | `USER_TECHBOOKFEST = "techbookfest"` | `crates/core/src/secrets.rs:9` |
-| ライブラリ | `keyring` crate v3（features: `apple-native`, `windows-native`）/ `crates/core/Cargo.toml:21` | `crates/core/Cargo.toml:21`, `crates/core/src/secrets.rs:40-46` |
-| 保存形式 | `TbfSession` の **JSON 文字列**（`{"cookies":[["name","value"],…],"xsrf_raw":"…","xsrf_token":"…"}`）。`TbfSession` は `Serialize/Deserialize` derive | `crates/app/src/app_state.rs:373-379`, `crates/core/src/tbf/mod.rs:27-34` |
-| 暗号化 | **アプリ独自の暗号化なし**（OS の資格情報ストアに平文相当で格納。`docs/features.md:432-433` は「セッションは keyring に保存」と記載） | `crates/core/src/secrets.rs:40-46`, `docs/features.md:430-433` |
-| 読み込み | 起動時に `secrets.load(USER_TECHBOOKFEST)` → `serde_json::from_str` → `tbf.restore_session()` → `tbf.is_authenticated()` を `tbf_logged_in` に反映。パース失敗時は false（エラーはログ無し） | `crates/app/src/app_state.rs:151-162`, `:240` |
-| 保存タイミング | WebView ログイン完了時（`save_tbf_session`）のみ | `crates/app/src/views/tbf_login.rs:154`, `crates/app/src/app_state.rs:373-383` |
-| 削除タイミング | ログアウト時（`SettingsView::logout_tbf`、バックグラウンド `SecretStore::delete`）。サーバーログアウト失敗でもローカル削除は実行 | `crates/app/src/views/settings.rs:630-635` |
-| サイズ制約 | TBF セッションは keyring 保存のため、Windows Credential Manager の上限（2560 UTF-16 文字）に関する考慮・ガードは**実装に無い**（BOOTH/FANZA/DLsite は上限を理由に `app_settings` の DB 保存へ切り替えている） | `crates/app/src/app_state.rs:190-192`, `:220-227`, `crates/app/src/app_state.rs:392`, `:418`, `:438` |
+| ユーザキー（**旧版の移行元**） | `USER_TECHBOOKFEST = "techbookfest"`。現在は保存先ではなく、起動時に vault へ移行して消す（消せなければ印を残して復元しない） | `crates/core/src/secrets.rs:9`, `crates/core/src/session_store.rs`（`adopt_legacy`） |
+| 保存先 | SQLite の `app_settings` テーブル、キー `"tbf.session"`（BOOTH / FANZA / DLsite と同じ共通 Vault） | `crates/core/src/session_store.rs`（`StoreSession::Techbookfest`） |
+| 保存形式 | `TbfSession` を `serde_json` 化し、`Envelope { saved_at, session }` として暗号化した文字列（`enc:v2:` + base64）を `value` 列へ。**平文 JSON では保存しない** | `crates/core/src/session_store.rs` |
+| 暗号化 | **keyring の鍵（`thundoku-shelf.session-key`）で AES-256-GCM**（AAD に用途名・形式版）。**保存から 7 日**を過ぎた値は行ごと破棄（保存時刻は暗号文の中）。鍵が取れない環境では保存しない | `crates/core/src/session_store.rs`、`crates/core/src/secrets.rs` |
+| 読み込み | 起動時に `SessionVault::adopt_legacy::<TbfSession>(..)`（旧 keyring 値の移行 → 復号 → 7 日判定）→ `TbfSession::is_logged_in()` を満たすものだけ `tbf.restore_session()` して `tbf_logged_in` に反映 | `crates/app/src/app_state.rs`, `crates/core/src/session_store.rs` |
+| 保存タイミング | WebView ログイン完了時（`save_tbf_session`）のみ | `crates/app/src/views/tbf_login.rs:154`, `crates/app/src/app_state.rs` |
+| 削除タイミング | ログアウト時（`SettingsView::logout_tbf` → `clear_tbf_session`）。vault（DB）と旧 keyring を消し、**成否を待って**通知する。削除に失敗したら `session-purge.pending` に印を残す（次回起動で復元しない）。サーバーログアウト失敗でもローカル削除は実行 | `crates/app/src/app_state.rs`, `crates/app/src/views/settings.rs`, `crates/core/src/session_store.rs` |
+| サイズ制約 | 共通 Vault（DB）へ移したため、Windows Credential Manager の上限（2560 UTF-16 文字）は**もう関係ない**（BOOTH/FANZA/DLsite と同じ理由で DB 保存） | `crates/app/src/app_state.rs`, `crates/core/src/session_store.rs` |
 | 他キー | `USER_GOOGLE="google"` / `USER_BOOTH="booth"` / `USER_DB_KEY="thundoku-shelf.db-key"`（`owner_sub` 暗号鍵 32 byte を BASE64 で保存） | `crates/core/src/secrets.rs:10-14`, `:71-84` |
 
 #### 11. レート制限 / 待機 / リトライ / 並列度 / タイムアウト
@@ -1535,7 +1536,7 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 | サークル ID | `exhibit.databaseID`、無ければ `exhibit.id`（`checked_items.tbf_circle_id`。DB 上 `tbf_circle_id`） | `crates/core/src/tbf/mod.rs:801-804` |
 | ローカル本との対応 | ダウンロード時に `books.site_id = "techbookfest"` / `books.tbf_product_id = {作品 ID}` を記録し、`bookshelf_items.database_id` と突合（UI の「ダウンロード済み」判定） | `crates/app/src/views/bookshelf.rs:2983-2988`, `crates/core/src/db/books.rs:192-204` |
 | 後方互換の補完 | 既存本で `tbf_product_id` が NULL の場合は `bookshelf_items.file_name == books.file_name` または `title` 一致で紐付けて `set_tbf_product_id` | `crates/app/src/views/bookshelf.rs:1431-1446` |
-| `owner_sub` との関係 | `owner_sub` は技術書典ではなく **Google アカウントの sub** に由来。TBF 同期は `owner_sub` を書き換えない。`books.owner_sub = encrypt(db_key, google_sub)` はダウンロード／インポート完了時にのみ設定（Google 未ログイン時は NULL＝未所属） | `crates/app/src/views/bookshelf.rs:2742-2745`, `:3008-3013`, `:3127-3132`, `crates/core/src/db/books.rs:250-260`, `crates/core/src/owner.rs:1-4` |
+| `owner_sub` との関係 | `owner_sub` は技術書典ではなく **Google アカウントの sub** に由来。TBF 同期は `owner_sub` を書き換えない。`books.owner_sub = encrypt(db_key, google_sub)` はダウンロード／インポート完了時にのみ設定（**取り込みに Google ログインが必須**なので新規の `NULL` は付かない — セキュリティ評価 F03） | `crates/app/src/views/bookshelf.rs:3844`（`start_download`）、`:3822`（`require_import_login`）、`crates/core/src/db/books.rs:250-260`, `crates/core/src/owner.rs:1-4` |
 | `(source, owner)` 重複抑止 | `books::find_by_source` / `resolve_reuse_id` は `site_id + tbf_product_id` で既存行を探し、`owner_sub` を復号比較して同一 owner の行のみ再利用 | `crates/core/src/db/books.rs:314-352`, `docs/account-switch.md:55-66`, `:155-158` |
 
 - canonical の slug は**ゼロ埋めなし**（`tbf6`）だが、`resolve_event_slug` はサーバーの database id 由来（`tbf06` 等）もそのまま返しうる。`event_window` は完全一致検索のため、`tbf06` は canonical にヒットせず期間フィルタが無効化される — `crates/core/src/tbf/mod.rs:929-938`, `:1090`, `:1210-1216`

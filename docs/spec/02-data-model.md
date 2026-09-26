@@ -682,6 +682,7 @@ ON DELETE の注記（事実）: `books` の子のうち `imported_documents` / 
 | 同期ラッパー | `run_progress_content_migration(pool) -> Result<u64>`（移行件数） | `crates/core/src/db/mod.rs:183-189` |
 | 旧ラベルの書き換え | `content_formats.label` が旧値（`pdf`/`epub` で `PDF`/`EPUB` 以外、`image` で `画像`）の行だけ更新。画像は本のファイル名の拡張子 → `JPEG`/`PNG`/… へ、無ければ `JPEG` | `crates/core/src/db/contents.rs:214-282` |
 | 初回クリア | `app_settings['owner_sub_model.initialized']` が無い初回起動時のみ、FK 安全順（子→親）で 16 テーブルを `DELETE` し、`packs` / `thumbnails` ディレクトリを作り直し、`drive.last_sync_at` / `drive.sync.enabled` / `drive.sync.folder_id` を削除してからフラグを立てる。2 回目以降は `false` を返して何もしない | `crates/core/src/db/mod.rs:403-458` |
+| 機密列の暗号化 | `document_text.text_content` / `token_analysis` の 4 列 / `page_notes.memo` の**平文を一度だけ暗号化**する（`app_settings['column_crypto.v1_migrated']` で 2 回目以降は何もしない）。平文の行が無ければ**鍵（keyring）に触れずに**フラグだけ立てる。鍵が取れない・書き込みに失敗したときはフラグを立てず、**次回起動で再試行**する（§1.11） | `crates/core/src/db/mod.rs`（`migrate_column_crypto_once`）、`crates/core/src/db/column_crypto.rs` |
 | クリア対象テーブル（順序そのまま） | `product_sample_pages` → `token_analysis` → `document_text` → `document_images` → `content_formats` → `book_contents` → `imported_documents` → `book_tags` → `reading_progress` → `view_history` → `page_views` → `book_first_events` → `checked_items` → `bookshelf_items` → `books` → `drive_sync_state`（`sites` / `tbf_events` は残す） | `crates/core/src/db/mod.rs:419-441` |
 | バックアップ対象テーブル（順序 = FK 参照元が先） | `books`, `bookshelf_items`, `checked_items`, `tbf_events`, `book_contents`, `content_formats`, `reading_progress`, `page_views`, `book_tags`, `favorite_tags`, `favorite_entities`, `imported_documents`, `document_images`, `book_first_events`, `zenn_tag_metadata`, `view_history`（16 件） | `crates/core/src/db/backup.rs:15-32` |
 | バックアップから除外する列 | `thumbnail_data`, `image_data`（画像 base64 を含めない）, `extracted_text`（`document_images` のページ本文。暗号化 pack の本文を平文で載せない） | `crates/core/src/db/backup.rs` |
@@ -689,6 +690,32 @@ ON DELETE の注記（事実）: `books` の子のうち `imported_documents` / 
 | バックアップの形式版 | 先頭に `format_version` を持つ（現行 2）。表ではない値なので**内容の比較（md5）には含めない**（`canonicalize_json` は配列以外のキーを無視する）。版が無いバックアップは 1 とみなし、`is_drm = 0` を「不明（2）」に寄せて復元する（旧仕様の `0` は「未確認」の意味だった） | `crates/core/src/db/backup.rs` |
 | 書き出しの行順 | `table_rows` が `pk_columns()` の PK 順に `ORDER BY` する（挿入順・索引の選択で md5 が変わらないように） | `crates/core/src/db/backup.rs:278-284` |
 | バックアップ PK 対応表 | `pk_columns()` が上記 16 テーブルの PK 列を返す（`book_contents→content_id`, `content_formats→format_id`, `reading_progress→[book_id, content_id]`, `page_views→[book_id, content_id, page_number]`, `view_history→id` 等）。書き出しの `ORDER BY` と比較の行ソート（`row_sort_key`）もこの定義を使う | `crates/core/src/db/backup.rs:204-226`, `:100-111` |
+
+### 1.11 機密列の暗号化（保存形式）
+
+ページ本文・形態素解析・付箋メモは**平文で保存しない**（2026-09-26 / セキュリティ評価 F02）。
+DB ファイル全体（SQLCipher 等）は暗号化しない（`docs/spec/10-pack-keys.md` §11.1 の線引き）が、
+この 6 列だけを keyring の DB 鍵（`books.owner_sub` と同じ `thundoku-shelf.db-key`）で
+AES-256-GCM にして保存する。
+
+| 列 | 保存値 | アンカー |
+|---|---|---|
+| `document_text.text_content` | `enc:v1:` + `BASE64(IV(12) ‖ 暗号文 ‖ タグ)` | `crates/core/src/db/column_crypto.rs` / `db/documents.rs` |
+| `token_analysis.token` / `pos` / `base_form` / `reading` | 同上（`base_form` / `reading` の NULL は NULL のまま） | `crates/core/src/db/column_crypto.rs` / `db/documents.rs` |
+| `page_notes.memo` | 同上 | `crates/core/src/db/column_crypto.rs` / `db/notes.rs` |
+
+- AAD は `thundoku-shelf/column/v1/{テーブル名}/{行キー}/{列名}`。**行キー**は
+  `document_text` / `token_analysis` が主キー `id`、`page_notes` が `book_id` + `content_id` +
+  `page`（`ON CONFLICT(book_id, content_id, page)` の自然キー。`id` は別端末の復元で変わり得る）。
+  **列の入れ替え・行の入れ替え・別テーブルへのコピー**はタグ検証で落ちる。
+- 復号できない値（鍵違い・改ざん・壊れた base64）は `None`。読み出し側は**暗号文を返さない**
+  （付箋はメモを空として扱い、行と ON / OFF・見開き側は残す）。
+- 接頭辞の無い値は**移行前の平文**として読める（読み取りでデータを失わない）。起動時に
+  `migrate_column_crypto_once` が一度だけ暗号化し（§1.10）、移行後に書く値は常に暗号化する。
+- 書き込み側は**鍵が取れないときは平文で書かない**（`Err` = fail-closed）。
+- 移行で書き換えた行があるときは `PRAGMA wal_checkpoint(TRUNCATE)` で **WAL を切り詰める**
+  （書き換える前の平文は WAL に残り、データディレクトリのコピーに含まれてしまうため）。
+  失敗しても移行自体は成立するのでログに残して続行する。
 
 ---
 

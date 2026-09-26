@@ -23,25 +23,26 @@
 
 | プロバイダ | 保存先 | キー | 保存される値 | 保護 |
 |---|---|---|---|---|
-| 技術書典 | OS keyring | service=`com.megablacklabel.thundoku-shelf`, user=`techbookfest` | `TbfSession` の JSON（cookies / xsrf_raw / xsrf_token） | OS 資格情報ストア（macOS キーチェーン / Windows Credential Manager）に平文相当で預ける。独自暗号化なし |
+| 技術書典 | アプリ DB（`app_settings`） | `tbf.session` | `TbfSession` の JSON（cookies / xsrf_raw / xsrf_token） | **keyring の鍵で暗号化（AES-256-GCM）+ 保存時刻つき・7 日**（旧版は OS keyring の `user=techbookfest` に平文相当で置いていた。起動時に空なら一度だけ移行して消す） |
 | Google | OS keyring | user=`google` | `OAuthTokens` の JSON（access_token / refresh_token / expires_at） | 同上 |
 | Google Drive 用 DB 鍵 | OS keyring | user=`thundoku-shelf.db-key` | 32 byte 乱数の BASE64 文字列 | 同上 |
 | pack のルート鍵（v3 / PRK） | OS keyring | user=`thundoku-shelf.pack-root-key:<owner_id>`（`owner_id` = `SHA-256("opfspack:v1:" + sub)` の hex） | 32 byte 乱数（PRK そのもの）の BASE64 文字列。Drive 側の `thundoku-keys.json` は `sub` / パスフレーズでラップした PRK | 同上。**PRK は `sub` から導出できない**（乱数）ので、これが漏れれば pack が解ける。`sub` / パスフレーズはここに置かない（§10 章） |
-| BOOTH | アプリ DB（`app_settings`） | `booth.session` | `BoothSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）** |
-| FANZA同人 | アプリ DB（`app_settings`） | `fanza.session` | `FanzaSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）** |
-| DLsite | アプリ DB（`app_settings`） | `dlsite.session` | `DlsiteSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）** |
+| BOOTH | アプリ DB（`app_settings`） | `booth.session` | `BoothSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）+ 保存時刻つき・7 日** |
+| FANZA同人 | アプリ DB（`app_settings`） | `fanza.session` | `FanzaSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）+ 保存時刻つき・7 日** |
+| DLsite | アプリ DB（`app_settings`） | `dlsite.session` | `DlsiteSession` の JSON | **keyring の鍵で暗号化（AES-256-GCM）+ 保存時刻つき・7 日** |
 
 - keyring の service 名と user 名の定数: `crates/core/src/secrets.rs`（`SERVICE` / `USER_TECHBOOKFEST` / `USER_GOOGLE` / `USER_BOOTH` / `USER_DB_KEY` / `USER_SESSION_KEY`）。
 - **pack のルート鍵（v3）はアカウントごとのスロットに入る**: user 名は `PACK_ROOT_KEY_PREFIX = "thundoku-shelf.pack-root-key:"` + `owner_id`（`pack_root_key_user(owner_id)`）、読み書きは `load_pack_root_key` / `save_pack_root_key` / `delete_pack_root_key`（`crates/core/src/secrets.rs:76-80`, `:205-218`）。鍵の解決順序と Drive 側のラップは `crates/core/src/pack_keys.rs`（§3.1 / §10 章）。
-- **DB 保存の 3 ストアは keyring の鍵で暗号化する**: 鍵は `thundoku-shelf.session-key`（`USER_DB_KEY` とは別スロット＝別鍵）、値は AES-256-GCM（AAD に用途名と形式版）で `enc:v2:` + base64 として `app_settings` に入る。**復号できない値は未ログインとして破棄**し、平文へはフォールバックしない `crates/core/src/session_store.rs`。
+- **DB 保存の 4 ストア（技術書典を含む）は keyring の鍵で暗号化する**: 鍵は `thundoku-shelf.session-key`（`USER_DB_KEY` とは別スロット＝別鍵）、値は AES-256-GCM（AAD に用途名と形式版）で `enc:v2:` + base64 として `app_settings` に入る。**復号できない値は未ログインとして破棄**し、平文へはフォールバックしない `crates/core/src/session_store.rs`。
 - **保存期限は 7 日（`SESSION_MAX_AGE_SECONDS`）**: 保存時刻を**暗号文の中**（`Envelope { saved_at, session }`）に入れて復元時に判定し、期限切れ・未来の時刻（改ざん/時計ずれ）は行ごと破棄して再ログインを求める（DB を書き換えても期限は延ばせない）。形式版は v2 で、**v1 の値は接頭辞が違うため復号できず破棄**される `crates/core/src/session_store.rs`。
+- **旧 keyring 値の移行**: 技術書典だけは旧版が keyring（`user=techbookfest`・期限なし）に置いていたため、起動時に `SessionVault::adopt_legacy` で **vault が空なら一度だけ移行**して keyring を消す。vault に値があれば移行しない（vault のほうが新しい）。削除に失敗したら印（`session-purge.pending`）を残し、次の起動では移行し直さず削除を再試行する（消えるまで復元しない＝再ログイン）`crates/core/src/session_store.rs`。
 - keyring の鍵が取得できない環境では**セッションを保存しない**（平文で保存しない）。その場合、次回起動では再ログインが必要。
 - モジュール冒頭の宣言: 「OS keyring-backed secret storage (sessions, OAuth tokens). Passwords are never stored — only session cookies / tokens.」`crates/core/src/secrets.rs:1-2`。
 - keyring 操作は `keyring::Entry::new(service, user)` の `set_password` / `get_password` / `delete_credential`。`NoEntry` は `None`（load）／成功扱い（delete）`crates/core/src/secrets.rs:37-66`。
-- BOOTH / FANZA / DLsite を DB に置く理由（コード内コメント）: 「セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を超えることがあるため、keyring ではなく DB に保存する」`crates/app/src/app_state.rs:187-190`, `:389-391`, `:415-417`, `:435-437`。
-- DB 保存は `db::settings::set(&pool, "<name>.session", &json)` をそのまま呼ぶだけ（暗号化・難読化なし）`crates/app/src/app_state.rs:394-396`, `:419-421`, `:439-441`。
-- 起動時の復元: keyring（技術書典・Google）と DB（BOOTH/FANZA/DLsite）から読み、`session.logged_in()` を満たすものだけを有効とする `crates/app/src/app_state.rs:151-215`。
-- ログアウト時は keyring 削除／DB キー削除をバックグラウンドで実行 `crates/app/src/views/settings.rs:620-630`（技術書典）, `:655-666`（Google）, `:687-700`（BOOTH）, `:722-733`（FANZA）, `:739-750`（DLsite）。
+- BOOTH / FANZA / DLsite / 技術書典 を DB に置く理由（コード内コメント）: 「セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を超えることがあるため、keyring ではなく DB に保存する」`crates/app/src/app_state.rs`。
+- DB 保存は `SessionVault::save`（`db::settings::set` に暗号文を渡す）。**平文 JSON をそのまま `set` しない** `crates/core/src/session_store.rs`。
+- 起動時の復元: keyring（Google）と共通 Vault（技術書典・BOOTH / FANZA / DLsite）から読み、`logged_in()` / `is_logged_in()` を満たすものだけを有効とする `crates/app/src/app_state.rs`。
+- ログアウト時は **vault（DB）の削除結果を待って**通知し、失敗したら印を残す（Google は keyring の削除結果を待つ）。技術書典はさらにログイン WebView の保存データ（`clear_all_browsing_data`）も消し、その成否も通知に含める `crates/app/src/views/settings.rs`, `crates/app/src/app_state.rs`, `docs/logout.md`。
 
 ### 1.2 `owner_sub` 暗号化用ローカル鍵（DB 鍵）
 
@@ -137,7 +138,7 @@
   - UI 側ラッパ `bookshelf::owned_book_ids(state)`: ログイン中は `(sub, key)` で復号比較、**ログイン中で鍵が無い場合は空集合（＝何も表示しない）**、未ログインは NULL 判定 `crates/app/src/views/bookshelf.rs:599-613`。
   - 使用箇所: 本棚 `crates/app/src/views/bookshelf.rs:1338`、履歴 `crates/app/src/views/history.rs:219`、付箋 `crates/app/src/views/notes.rs:131`、Drive アップロード/バックアップ `crates/core/src/drive/sync.rs:231-238`、起動時の復元差分判定 `crates/app/src/workspace.rs:509-516`。
 - owner の付与:
-  - ダウンロード取り込み時、**ログイン中のみ** `books::set_owner_sub(db, book_id, encrypt(key, sub))` を記録（未ログイン時は付けない = NULL）`crates/app/src/views/bookshelf.rs:2742-2745`, `:3007-3015`, `:3126-3134`。
+  - ダウンロード取り込み時、**ログイン中のみ** `books::set_owner_sub(db, book_id, encrypt(key, sub))` を記録。**未ログインでは取り込めない**（鍵はアカウントごと。`ImportError::LoginRequired` — セキュリティ評価 F03）ため、新規の取り込みで `owner_sub` が NULL になる経路は無い（NULL の既存行＝旧版で取り込んだ本は、ログアウト中の表示にだけ残る）`crates/app/src/views/bookshelf.rs:3844`, `:3822`（`require_import_login`）。
   - Drive からダウンロードした pack も現在 sub の所有として記録する（フォルダ分離前提で帰属を信頼）`crates/core/src/drive/sync.rs:310-312`。
 - 重複抑止 `(source, owner)`（`source = site_id + tbf_product_id`）:
   - `books::find_by_source(pool, site_id, tbf_product_id)` が `(id, owner_sub)` を返し `crates/core/src/db/books.rs:315-329`。
@@ -180,8 +181,20 @@
 |---|---|---|
 | 一覧 `list_files(folder_id)` | `GET https://www.googleapis.com/drive/v3/files?q='{folder_id}' in parents and trashed=false&fields=nextPageToken,files(id,name,size,md5Checksum,modifiedTime)&pageSize=100&spaces=drive`（`pageToken` で全ページ走査、`nextPageToken` が無くなったら終了） | `crates/core/src/drive/mod.rs:11-13`, `:133-195` |
 | ダウンロード `download(file_id)` | `GET .../files/{file_id}?alt=media`、`redirects = 5`。実体は `download_with_progress`（進捗コールバックは `\|_,_\| true`） | `crates/core/src/drive/mod.rs:197-199` |
-| 進捗つき取得 `download_with_progress(file_id, on_progress)` | `GET .../files/{file_id}?alt=media` を **`Transport::send_download`** で取得（上限 2 GiB + 進捗 + キャンセル）。トレイトの既定実装は `download` に委譲して完了時に 1 回通知するだけ（テストのモック用）で、`DriveClient` が上書きする | `crates/core/src/drive/mod.rs:63-74`（既定実装）, `:201-234`（本番） |
-| アップロード `upload_multipart(name, folder_id, bytes)` | `POST https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`（`DRIVE_UPLOAD_URL`）、`Content-Type: multipart/related; boundary=thundoku_shelf_boundary`（`MULTIPART_BOUNDARY`）。metadata は `{"name","parents":[folder_id],"mimeType":"application/octet-stream","appProperties":{"app":"thundoku-shelf","packId":<拡張子を除いた name>}}`。応答 JSON の `id` を返す | `crates/core/src/drive/mod.rs:12`, `:14`, `:236-285` |
+| **ファイルへ直接取得** `download_to_file(file_id, path, on_progress)` | `GET .../files/{file_id}?alt=media` を **`Transport::send_download_to`** で取得し、本文を `BufWriter` で**ファイルへ書きながら**進捗を通知（上限 10 GiB + キャンセル）。中止・2xx 以外・書き込み失敗では**部分ファイルを削除**。既定実装はメモリ経由（テストのモック用） | `crates/core/src/drive/mod.rs`（既定実装／`DriveClient` の実装） |
+| 進捗つき取得 `download_with_progress(file_id, on_progress)` | `GET .../files/{file_id}?alt=media` を **`Transport::send_download`** で取得（上限 10 GiB + 進捗 + キャンセル）。トレイトの既定実装は `download` に委譲して完了時に 1 回通知するだけ（テストのモック用）で、`DriveClient` が上書きする | `crates/core/src/drive/mod.rs:63-74`（既定実装）, `:201-234`（本番） |
+**大きい pack（2 GiB 超）の方針**: `uploadType=multipart` は 1 リクエストで全体を送るため、
+10 GiB 級の pack には向かない。Google の案内どおり **resumable upload**
+（`uploadType=resumable` で開始 → `Content-Range` つき `PUT` を繰り返す）を使う。
+当初は「2 GB ごとに分割して part を並べる」設計を検討したが、**分割は採らない**:
+① 読む側に結合の責任が増え、欠損・世代混在の扱いが難しくなる ② Drive 側は 1 ファイルで
+扱える ③ 途中再開は resumable の仕組みが既に持っている。
+
+| アップロードの進捗 | `Transport::send_stream_with_progress(spec, body, content_length, on_progress)` が**送れたバイト数**を通知する（`false` で中止 = `TbfError::Cancelled`）。resumable は 1 チャンクごと、multipart も送信バイト数を報告し、`DriveApi::*_with_progress` 経由で `SyncProgress { phase: Upload, bytes, total_bytes }` として同期の進捗へ流れる（**単調増加**。サーバーが一部しか受理しなかった場合も最大値を報告）。総数が不明なら割合は出さない | `crates/core/src/tbf/transport.rs`、`crates/core/src/drive/{mod,sync}.rs` |
+| resumable upload `upload_resumable_from_file(name, folder_id, path)` | `POST .../files?uploadType=resumable`（メタデータ + `X-Upload-Content-Length`）で `Location`（セッション URI）を得て、`PUT` を `Content-Range: bytes <start>-<end>/<total>` つきで **`RESUMABLE_CHUNK_BYTES`（8 MiB = 256 KiB の倍数）ずつ**送る。途中は `308 Resume Incomplete` + `Range` を読み、**受理済みの位置から続ける**（進まない `308` はエラー = 無限ループにしない）。最後の応答 JSON の `id` を返す。0 バイトは multipart に委譲 | `crates/core/src/drive/mod.rs`（`DriveClient`。既定実装は multipart へ委譲 = テストのモック用） |
+
+| アップロード（ファイル直結） `upload_multipart_from_file(name, folder_id, path)` | 上と同じ multipart を、前後の境界だけメモリに持って**本体は `File` からストリーム**して送る（`Transport::send_stream` に `Content-Length` = 前後 + ファイル長を渡す）。pack 全体を RAM に載せない | `crates/core/src/drive/mod.rs`（`DriveClient` の実装。既定実装はメモリ経由 = テストのモック用） |
+| アップロード（メモリ） `upload_multipart(name, folder_id, bytes)` | `POST https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`（`DRIVE_UPLOAD_URL`）、`Content-Type: multipart/related; boundary=thundoku_shelf_boundary`（`MULTIPART_BOUNDARY`）。metadata は `{"name","parents":[folder_id],"mimeType":"application/octet-stream","appProperties":{"app":"thundoku-shelf","packId":<拡張子を除いた name>}}`。応答 JSON の `id` を返す | `crates/core/src/drive/mod.rs:12`, `:14`, `:236-285` |
 | フォルダ作成 `create_folder(name)` | `POST .../files`、`{"name","mimeType":"application/vnd.google-apps.folder"}`。応答 `id` を返す | `crates/core/src/drive/mod.rs:287-309` |
 | 更新日時更新 `touch(file_id)` | `PATCH .../files/{file_id}`、`{"modifiedTime": <現在 UTC の RFC3339>}` | `crates/core/src/drive/mod.rs:311-328` |
 | 削除 `delete(file_id)` | `DELETE .../files/{file_id}` | `crates/core/src/drive/mod.rs:330-341` |
@@ -189,7 +202,17 @@
 
 - `size` は Drive API が number / string のどちらでも返し得るため両対応 `crates/core/src/drive/mod.rs:16-22`。
 - `DriveApi` trait（テストでモック差し替え可能）: `list_files` / `download` / `download_with_progress` / `upload_multipart` / `create_folder` / `delete` / `touch` `crates/core/src/drive/mod.rs:54-88`。
-- **取得は「保存できたのに戻せない」状態を解消した**: 以前は通常 API（`Transport::send`）を通っていたため応答本文が `MAX_API_BODY_BYTES`（**16 MiB**）で打ち切られ、16 MiB 超の pack / DB JSON を取得できなかった。現在は `DriveClient::download_with_progress` が `Transport::send_download` を使うので、上限は `MAX_DOWNLOAD_BODY_BYTES`（**2 GiB**）になり、進捗コールバックとキャンセルも効く `crates/core/src/drive/mod.rs:201-234`, `crates/core/src/tbf/transport.rs:129-133`。
+- **Google クライアントの `Mutex` は「取得 → すぐ手放す」を守る**: `parking_lot::Mutex` は
+  **再入不可**で、同じスレッドが保持したまま `lock()` すると永久に待つ（デッドロック）。
+  実害が出た経路: 終了時のアップロードと「今すぐ同期」が `google.lock()` を保持したまま
+  `KeyContext::unlock` / `retry_pending_upload` を呼び、その内部の `drive()` が同じ `Mutex` を
+  再取得していた（`retry_pending_upload` は **pending の有無に関係なく** `drive()` を作る）。
+  症状は連鎖する: 1 回目の同期が本体終了後に固まり → ロックを握り続けるので 2 回目の同期と
+  終了処理が全部待ちになり → **アプリが終了しない**（UI のタイマーは動き続ける）。
+  対策は ①呼び出し側は**トークン取得だけロックの内側**にする ②`KeyContext::drive()` は
+  **待ち時間つき**（`try_lock_for`。既定 5 秒）で取れなければエラーにする。
+  `crates/app/src/{workspace.rs,pack_keys.rs,views/settings.rs}`
+- **取得は「保存できたのに戻せない」状態を解消した**: 以前は通常 API（`Transport::send`）を通っていたため応答本文が `MAX_API_BODY_BYTES`（**16 MiB**）で打ち切られ、16 MiB 超の pack / DB JSON を取得できなかった。現在は `DriveClient::download_with_progress` が `Transport::send_download` を使うので、上限は `MAX_DOWNLOAD_BODY_BYTES`（**10 GiB**）になり、進捗コールバックとキャンセルも効く `crates/core/src/drive/mod.rs:201-234`, `crates/core/src/tbf/transport.rs:129-133`。
 - `DriveError::Cancelled` を追加（進捗コールバックが `false` を返したとき。**部分的な本文は返さない**）。`From<TbfError>` は `TbfError::Cancelled` だけ `DriveError::Cancelled` に写し、他は `Network` にする `crates/core/src/drive/mod.rs:41-42`, `:45-51`。
 - **Content-Length が無い応答でも進捗・キャンセルは効く**: `read_body_with_progress` が `total = 0` のとき **1 MiB 刻み**で通知し（`UNKNOWN_TOTAL_STEP`）、読み切ったら最後のサイズを一度通知する `crates/core/src/tbf/transport.rs:175-227`（`:182`, `:207`, `:224-226`）。
 - 同期エンジン（`drive/sync.rs`）は pack の取得に `drive.download_with_progress(...)` を通す（進捗 = `sync_with_progress` の報告、キャンセル = コールバックが `false`）。DB バックアップの復元（`:545`）と差分検査（`:649`）は `drive.download(...)`（＝`download_with_progress` に委譲）で、こちらは 2 GiB 経路だけを使い進捗は報告しない（1 ファイルの小さな JSON のため）`crates/core/src/drive/sync.rs:312-331`, `crates/core/src/drive/mod.rs:414-432`。
@@ -214,7 +237,9 @@
    1. `sync_state::get(pool, pack_id)` を読む。
    2. `drive_md5` が空でなく `state.md5` と一致 → スキップ（`outcome.skipped`）`crates/core/src/drive/sync.rs:255-264`。
    3. `local_changed = state があり、ローカル pack の mtime(秒) > state.last_synced_at("%Y-%m-%d %H:%M:%S")`（厳密に大。ファイル無し・metadata 取得失敗・mtime 取得失敗・日時パース失敗はすべて false = 未変更扱い）`crates/core/src/drive/sync.rs:87-107`。
-   4. `drive.download_with_progress(file.id, on_progress)` で全バイト取得（実体は `Transport::send_download` の 2 GiB + 進捗/キャンセル経路。§3.1）。進捗は `SyncProgress { name, index, count, bytes, total_bytes }` として `sync_with_progress` のコールバックへ渡す（`total_bytes` は `Content-Length` が無ければ `None`）。コールバックが `false` を返すと `SyncError::Cancelled` で同期全体を中断する（**その pack は書かない・取り込まない。取り込み済みの分は残る**）`crates/core/src/drive/sync.rs:284-331`。
+   4. `drive.download_to_file(file.id, temp, on_progress)` で**一時ファイルへ直接ストリーム**する（実体は `Transport::send_download_to` の 10 GiB + 進捗/キャンセル経路。§3.1）。pack 全体を RAM に載せないので、pack サイズがメモリ使用量に効かない。進捗は `SyncProgress { name, index, count, bytes, total_bytes }` として `sync_with_progress` のコールバックへ渡す（`total_bytes` は `Content-Length` が無ければ `None`）。コールバックが `false` を返す、2xx 以外、書き込み失敗のいずれでも**一時ファイルを削除**し、`SyncError::Cancelled` なら同期全体を中断する（**その pack は置き場に残さない・取り込まない。取り込み済みの分は残る**）。
+   4b. 検証も**ファイル裏打ち**（`opfspack::PackFileReader::open`）で行う（`ENCRYPTED` と鍵の有無だけ見る）。失敗したら一時ファイルを消して中断する。検証後は**開いているハンドルを落としてから** rename する（Windows は開いているファイルを rename できない）。
+   4c. 取り込み（`import_book` → `rebuild_from_pack`）は**最終パスから開き直した reader**（`&dyn PackRead`）で行う `crates/core/src/drive/sync.rs:320-400`。
    5. `PackReader::open(&bytes)` が失敗 → **`PackError::Version` は `SyncError::UnsupportedPackVersion`**（v2 以前の pack。ストアからの**再取り込み**を案内）、それ以外は `SyncError::InvalidPack` `crates/core/src/drive/sync.rs:269-277`。
    6. ヘッダの `ENCRYPTED` が立ち、`pack_root_key` が無い → `SyncError::PackKeyRequired`（同期全体を中断）。**平文として読む・平文で上書きする経路は無い**（fail-closed）`crates/core/src/drive/sync.rs:279-281`。
    7. 競合（`local_changed` かつローカル pack が存在）→ ローカルを `packs/{pack_id}.conflict-local.opfspack` にコピーし `outcome.conflicts` に追加。**Drive 側が勝つ**。
@@ -229,7 +254,7 @@
    3. `packs_dir/{pack_id}.opfspack` が無ければスキップ。
    4. `sync_state` が無ければアップロード。あれば「Drive 側に同じ `drive_file_id` がまだ存在」**かつ**「ローカル mtime > last_synced_at」のときだけアップロード（削除は伝播させない）。
    5. 上げる直前に `SyncPhase::Upload` の進捗（`count = 0` = 総数不明。ファイル名のみ）を報告し、`false` なら**そのファイルを上げずに** `SyncError::Cancelled` で中断する（転送そのものは止められないので、ここが区切り）。
-   6. `upload_multipart` 実行後、`sync_state::upsert(md5 = md5(local bytes), modified_time = None, last_synced_at = now)`。
+   6. `drive.upload_multipart_from_file(file名, folder_id, local_path)` で上げた後、`sync_state::upsert(md5 = md5(ファイルを順に読んで計算), modified_time = None, last_synced_at = now)`。
 7. **DB バックアップ**（`db_path.is_some()` のとき）`crates/core/src/drive/sync.rs:379-485`:
    1. `db::backup::export_json(pool, Some(&upload_ids), owner_filter)` でテキストテーブルの JSON を生成（所有者フィルタは必須。無ければバックアップしない）。
    2. **PRK があれば `thundoku-backup.json` を v3 の暗号化された封筒にする**（後述。仕様は `docs/spec/10-pack-keys.md` §11）。**鍵が無ければ平文（v2）で書き、警告をログに残す**（鍵が用意できないだけで利用者の唯一の控えを失う方が危険、という判断）`crates/core/src/drive/sync.rs:406-419`。

@@ -143,7 +143,7 @@ PRK の保管 = ラップ（Wrapping）= 以下で AES-256-GCM した 32B
 | `wraps[]` | array | 1 個以上。`kind` の重複は禁止（同じ `kind` は置換する） |
 | `wraps[].kind` | string | `"sub"` または `"passphrase"` |
 | `wraps[].kdf` | string | `"pbkdf2-sha256"` のみ（将来 `argon2id` を許す余地） |
-| `wraps[].iterations` | number | `kdf` の反復回数。**復号側はこの値を使う**（実装定数を使わない） |
+| `wraps[].iterations` | number | `kdf` の反復回数。**復号側はこの値を使う**（実装定数を使わない）。0 と `MAX_PASSPHRASE_ITERATIONS`（1000 万）超は**PBKDF2 を走らせる前**に拒否する（鍵ファイルは同期先からも来るため、書き換えられた値で復元中の端末の CPU を焼かせない。セキュリティ評価 F06） |
 | `wraps[].salt` | string (base64) | `kdf` の salt。`kind=sub` は `APP_SALT` のバイト列（固定） |
 | `wraps[].nonce` | string (base64) | AES-GCM の 12B IV |
 | `wraps[].ciphertext` | string (base64) | `AES-256-GCM(KEK)(PRK)` = 32B + 16B tag = **48B 固定** |
@@ -158,6 +158,10 @@ PRK の保管 = ラップ（Wrapping）= 以下で AES-256-GCM した 32B
 
 ### 4.1 デスクトップ
 
+0. **未ログイン（Google のプロフィールが無い）は鍵を用意できないので、取り込みを失敗させる**
+   （`ImportError::LoginRequired`。平文 pack を作らない — セキュリティ評価 F03）。UI は
+   ダウンロードを始める前にログインを促す（`crates/app/src/views/bookshelf.rs` の
+   `require_import_login`）。
 1. keyring に `thundoku-shelf.pack-root-key:<owner_id>` があれば**それを使う**（何も尋ねない）。
 2. 無ければ Drive から `thundoku-keys.json` を取得し、`owner_id` 一致の bundle を選ぶ。
 3. `kind=passphrase` がある場合はパスフレーズを尋ねる。入力があればそれで復号し、
@@ -300,7 +304,7 @@ keyring が無いので 2 → 3 の順。`sub` は既存の認証セッション
 | | 内容 |
 |---|---|
 | 守る | Drive に上げる**メタデータバックアップ**（本棚・進捗・履歴・付箋メモ。`crates/core/src/db/backup.rs` の `TABLES` のテキスト列） |
-| **守らない** | **ローカルの SQLite（`thundoku-shelf.db`）**。SQLCipher 等は入れない（重い・既存の読み書き経路を総取り替えになる）。**ディスク暗号化（BitLocker / FileVault 等）と OS アカウント分離**を前提にする（`README.md`） |
+| **守らない（DB 全体）** | **ローカルの SQLite（`thundoku-shelf.db`）全体**。SQLCipher 等は入れない（重い・既存の読み書き経路を総取り替えになる）。**ただし機密列（`document_text.text_content` / `token_analysis` の `token`・`pos`・`base_form`・`reading` / `page_notes.memo`）だけは keyring の DB 鍵で暗号化する**（2026-09-26 / セキュリティ評価 F02。`crates/core/src/db/column_crypto.rs`、保存形式は `docs/spec/02-data-model.md` §1.11）。書誌・進捗・履歴などの他の列は平文のまま。**ディスク暗号化（BitLocker / FileVault 等）と OS アカウント分離**を前提にする（`README.md`） |
 | 守らない | 端末の OS アカウントを奪われて keyring を読まれる場合（PRK そのものが取られる。§1.2 と同じ） |
 | 対象外 | 画像（`thumbnail_data` / `image_data`）とページ本文（`extracted_text`）は**そもそもバックアップに含めない**（`docs/spec/06-sync-auth-drive.md` §3.4） |
 

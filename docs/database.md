@@ -163,6 +163,10 @@ Drive 同期設定など）。
 | is_active | INTEGER | 付箋の ON / OFF。**OFF でもメモは残す**（付け直すと復元される） |
 | created_at / updated_at | TEXT | UTC（`CURRENT_TIMESTAMP`） |
 
+`memo` は**平文で保存しない**（keyring の DB 鍵で AES-256-GCM。`enc:v1:...`。
+`crates/core/src/db/column_crypto.rs`）。読み出しは復号され、復号できない値（鍵違い・改ざん）は
+メモを空として扱う（行と ON / OFF・見開き側は残る）。保存形式は `docs/spec/02-data-model.md` §1.11。
+
 ### checked_items
 
 チェックリスト項目（サークルごと。`tbf_events` に関連）。
@@ -251,6 +255,9 @@ Drive 同期設定など）。
 
 - `document_text`: 抽出したページテキスト（タグ生成の入力）
 - `token_analysis`: 形態素解析結果（名詞の頻度など）
+- `document_text.text_content` と `token_analysis` の `token` / `pos` / `base_form` / `reading` は
+  **平文で保存しない**（keyring の DB 鍵で AES-256-GCM。`enc:v1:...`。
+  `crates/core/src/db/column_crypto.rs`）。保存形式は `docs/spec/02-data-model.md` §1.11
 
 ### book_tags
 
