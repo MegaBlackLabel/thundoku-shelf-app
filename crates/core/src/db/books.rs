@@ -449,6 +449,49 @@ pub fn set_hidden(pool: &SqlitePool, id: &str, hidden: bool) -> Result<(), sqlx:
     })
 }
 
+/// Drive のバックアップ（pack のアップロード）の対象から外す / 戻す。
+///
+/// 大きい pack は Drive の容量と転送時間を食うので、対象外にできる（同期の
+/// アップロード方向がこの印を見て skip する）。取り込み時に一定サイズを超えたら
+/// 自動で立てる（`import::MAX_BACKUP_PACK_BYTES`）。
+pub fn set_backup_excluded(pool: &SqlitePool, id: &str, excluded: bool) -> Result<(), sqlx::Error> {
+    crate::db::block_on(async {
+        sqlx::query(
+            "UPDATE books SET backup_excluded = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(excluded as i64)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+}
+
+/// Drive バックアップ対象外になっている本の id（同期のアップロード判定で使う）。
+pub fn backup_excluded_ids(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    crate::db::block_on(async {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM books WHERE backup_excluded = 1")
+                .fetch_all(pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    })
+}
+
+/// 1 冊が Drive バックアップ対象外か。
+pub fn is_backup_excluded(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    crate::db::block_on(async {
+        let excluded: Option<i64> =
+            sqlx::query_scalar("SELECT backup_excluded FROM books WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(excluded.unwrap_or(0) != 0)
+    })
+}
+
 /// ダウンロード元のサイト（techbookfest / booth）を books に記録する。
 /// ビューアー設定のサイト別キー（viewer.mode.{site} 等）の解決に使う。
 pub fn set_site_id(pool: &SqlitePool, id: &str, site_id: &str) -> Result<(), sqlx::Error> {

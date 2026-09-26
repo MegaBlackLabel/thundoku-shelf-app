@@ -54,6 +54,12 @@ pub enum PackKeysError {
     /// **平文へは落とさない**（既存の pack を読めなくするため、新規作成もしない）。
     #[error("鍵を復元できません。別端末で設定したパスフレーズを入力してください")]
     Unavailable,
+    /// パスフレーズ必須モード（`sub` ラップが無い bundle）で、パスフレーズを入力せずに
+    /// 復元しようとした（仕様 §5.3）。**`sub` へ戻らない**（セキュリティ評価 F01）。
+    #[error(
+        "このアカウントはパスフレーズが必須です。パスフレーズを入力してください（忘れている場合は、この端末では復元できません）"
+    )]
+    PassphraseRequired,
     /// 入力されたパスフレーズが違う。`sub` ラップへ**黙って落ちない**（仕様 §4.1 手順 3）。
     #[error("パスフレーズが違います")]
     PassphraseFailed,
@@ -215,6 +221,87 @@ impl<'a> PackKeyStore<'a> {
         let owner_id = derive_owner_id(sub);
         Ok(load_bundle(drive, self.folder_id, &owner_id)?
             .is_some_and(|bundle| bundle.has_wrap(WrapKind::Passphrase)))
+    }
+
+    /// パスフレーズ必須モードにする（`sub` ラップを削除。仕様 §5.3）。
+    ///
+    /// これで **Google ログイン（`sub`）だけでは PRK に戻せなく**なり、Drive の
+    /// `thundoku-keys.json` と `sub` を奪われても本は復号できない（パスフレーズが要る）。
+    /// セキュリティ評価 F01 の本丸。
+    ///
+    /// **1 回の bundle 書き込み**で「（必要なら）パスフレーズラップを upsert」＋
+    /// 「`sub` ラップを削除」してから上げる（Drive に中途半端な状態を残さない）。
+    ///
+    /// `passphrase`:
+    /// - `Some(値)`: その値でパスフレーズラップを作り直す（設定 / 変更）。短ければ拒否する
+    ///   （bundle を変えない）
+    /// - `None`: **既存のパスフレーズラップをそのまま使う**（値は尋ねない）。必要なのは
+    ///   `sub` ラップを消すことだけなので、これで足りる。既存のラップが無ければ
+    ///   解錠手段が無くなるので [`PackKeysError::PassphraseRequired`] を返す
+    pub fn enable_passphrase_only(
+        &self,
+        drive: &mut dyn DriveApi,
+        sub: &str,
+        root: &PackRootKey,
+        passphrase: Option<&str>,
+    ) -> Result<(), PackKeysError> {
+        let owner_id = derive_owner_id(sub);
+        let now_ms = now_ms();
+        let mut bundle = load_or_new_bundle(drive, self.folder_id, &owner_id, now_ms)?;
+        match passphrase {
+            Some(passphrase) => {
+                if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+                    return Err(PackKeysError::PassphraseTooShort {
+                        min: MIN_PASSPHRASE_CHARS,
+                    });
+                }
+                bundle.upsert_wrap(PackRootKeyWrap::wrap_with_passphrase(
+                    root,
+                    passphrase,
+                    &owner_id,
+                    PASSPHRASE_ITERATIONS,
+                    now_ms,
+                ));
+            }
+            None => {
+                // 値も既存のラップも無い＝必須にした瞬間に誰も解けなくなる。ここで断る。
+                if !bundle.has_wrap(WrapKind::Passphrase) {
+                    return Err(PackKeysError::PassphraseRequired);
+                }
+            }
+        }
+        // ここが要（`sub` を消す）。解錠手段を確保してから消す。
+        bundle.remove_wrap(WrapKind::Sub);
+        bundle.touch(now_ms);
+        upload_bundle(drive, self.folder_id, &bundle)
+    }
+
+    /// パスフレーズ必須モードを解除する（`sub` ラップを戻す。仕様 §5.3）。
+    ///
+    /// 呼ぶ側は**PRK を解決できている**ことを前提にする（＝パスフレーズか keyring で
+    /// 本人確認できた）。パスフレーズラップはそのまま残すので、解除後もパスフレーズで解錠できる。
+    pub fn disable_passphrase_only(
+        &self,
+        drive: &mut dyn DriveApi,
+        sub: &str,
+        root: &PackRootKey,
+    ) -> Result<(), PackKeysError> {
+        let owner_id = derive_owner_id(sub);
+        let now_ms = now_ms();
+        let mut bundle = load_or_new_bundle(drive, self.folder_id, &owner_id, now_ms)?;
+        bundle.upsert_wrap(PackRootKeyWrap::wrap_with_sub(root, sub, &owner_id, now_ms));
+        bundle.touch(now_ms);
+        upload_bundle(drive, self.folder_id, &bundle)
+    }
+
+    /// パスフレーズ必須モードか（`sub` ラップが無いか。設定画面の表示用）。
+    ///
+    /// bundle がまだ無い（鍵を作っていない）ときは `true` を返す（既定は必須ではない）。
+    pub fn has_sub_wrap(&self, drive: &mut dyn DriveApi, sub: &str) -> Result<bool, PackKeysError> {
+        let owner_id = derive_owner_id(sub);
+        Ok(load_bundle(drive, self.folder_id, &owner_id)?
+            .map(|bundle| bundle.has_wrap(WrapKind::Sub))
+            .unwrap_or(true))
     }
 
     /// 未アップロードの鍵 bundle の `owner_id`（設定画面とログの警告に使う）。
@@ -770,6 +857,122 @@ mod tests {
             !keys.has_passphrase(&mut drive, sub).unwrap(),
             "拒否したのに passphrase ラップができている"
         );
+    }
+
+    /// パスフレーズ必須モード: `sub` ラップを消す（Google ログインだけでは解けなくする。§5.3）。
+    ///
+    /// 監査 F01 の合格条件は「`sub` だけで復元できないこと」。必須モードでは bundle から
+    /// `sub` ラップを消すので、`sub` を知っていても PRK に戻せない。
+    #[test]
+    fn enable_passphrase_only_removes_the_sub_wrap() {
+        let sub = "sub-pack-keys-passphrase-only";
+        let secrets = secrets();
+        let pool = pool();
+        let mut drive = FakeDrive::new();
+        let folder = "folder-1";
+        let keys = PackKeyStore::new(&secrets, &pool, folder);
+        let owner_id = derive_owner_id(sub);
+        let mut prompt = no_prompt();
+        let root = keys.ensure(&mut drive, sub, &mut prompt).unwrap();
+        assert!(keys.has_sub_wrap(&mut drive, sub).unwrap(), "既定は sub で解ける");
+
+        keys.enable_passphrase_only(&mut drive, sub, &root, Some("pw-1-is-long-enough"))
+            .expect("必須モードにできる");
+        assert!(!keys.has_sub_wrap(&mut drive, sub).unwrap(), "sub ラップが残っている");
+        let bundle = load_bundle(&mut drive, folder, &owner_id).unwrap().unwrap();
+        assert!(
+            bundle.unwrap_with_sub(sub).is_none(),
+            "sub で解けてしまう（必須モードが効いていない）"
+        );
+        assert_eq!(
+            bundle
+                .unwrap_with_passphrase("pw-1-is-long-enough")
+                .map(|key| key.to_base64()),
+            Some(root.to_base64()),
+            "パスフレーズでは解ける"
+        );
+
+        // 解除すると sub ラップが戻る（元の回復経路に戻す）。
+        keys.disable_passphrase_only(&mut drive, sub, &root)
+            .expect("解除できる");
+        assert!(keys.has_sub_wrap(&mut drive, sub).unwrap(), "sub ラップが戻っていない");
+        let bundle = load_bundle(&mut drive, folder, &owner_id).unwrap().unwrap();
+        assert!(
+            bundle.unwrap_with_sub(sub).is_some(),
+            "解除後は sub で解ける"
+        );
+    }
+
+    /// **既にパスフレーズを設定している**なら、値を尋ねずに必須モードにできる
+    /// （既存のラップをそのまま使う。必要なのは `sub` ラップを消すことだけ）。
+    #[test]
+    fn enable_passphrase_only_without_a_new_value_uses_the_existing_wrap() {
+        let sub = "sub-pack-keys-passphrase-only-existing";
+        let secrets = secrets();
+        let pool = pool();
+        let mut drive = FakeDrive::new();
+        let keys = PackKeyStore::new(&secrets, &pool, "folder-1");
+        let mut prompt = no_prompt();
+        let root = keys.ensure(&mut drive, sub, &mut prompt).unwrap();
+        keys.set_passphrase(&mut drive, sub, &root, "pw-existing-is-long-enough")
+            .unwrap();
+
+        // 値なし（None）＝既存のラップを使う
+        keys.enable_passphrase_only(&mut drive, sub, &root, None)
+            .expect("既存のパスフレーズで必須にできる");
+        assert!(!keys.has_sub_wrap(&mut drive, sub).unwrap(), "sub ラップが残っている");
+        let owner_id = derive_owner_id(sub);
+        let bundle = load_bundle(&mut drive, "folder-1", &owner_id).unwrap().unwrap();
+        assert_eq!(
+            bundle
+                .unwrap_with_passphrase("pw-existing-is-long-enough")
+                .map(|key| key.to_base64()),
+            Some(root.to_base64()),
+            "既存のパスフレーズで解ける"
+        );
+    }
+
+    /// 値も既存のラップも無ければ、必須モードにはできない（解錠手段が無くなるため）。
+    #[test]
+    fn enable_passphrase_only_without_any_passphrase_is_an_error() {
+        let sub = "sub-pack-keys-passphrase-only-none";
+        let secrets = secrets();
+        let pool = pool();
+        let mut drive = FakeDrive::new();
+        let keys = PackKeyStore::new(&secrets, &pool, "folder-1");
+        let mut prompt = no_prompt();
+        let root = keys.ensure(&mut drive, sub, &mut prompt).unwrap();
+
+        let error = keys
+            .enable_passphrase_only(&mut drive, sub, &root, None)
+            .expect_err("解錠手段が無いのに必須にはできない");
+        assert!(
+            matches!(error, PackKeysError::PassphraseRequired),
+            "{error:?}"
+        );
+        assert!(keys.has_sub_wrap(&mut drive, sub).unwrap(), "bundle を壊している");
+    }
+
+    /// 必須モードへの切り替えも短いパスフレーズを拒否し、bundle を変えない。
+    #[test]
+    fn enable_passphrase_only_rejects_short_passphrases() {
+        let sub = "sub-pack-keys-passphrase-only-short";
+        let secrets = secrets();
+        let pool = pool();
+        let mut drive = FakeDrive::new();
+        let keys = PackKeyStore::new(&secrets, &pool, "folder-1");
+        let mut prompt = no_prompt();
+        let root = keys.ensure(&mut drive, sub, &mut prompt).unwrap();
+
+        let error = keys
+            .enable_passphrase_only(&mut drive, sub, &root, Some("short"))
+            .expect_err("短いパスフレーズを受け付けている");
+        assert!(
+            matches!(error, PackKeysError::PassphraseTooShort { min } if min == MIN_PASSPHRASE_CHARS),
+            "{error:?}"
+        );
+        // 中途半端な状態にしない（sub ラップは残ったまま = 従来どおり解ける）
+        assert!(keys.has_sub_wrap(&mut drive, sub).unwrap(), "bundle を壊している");
     }
 
     /// 10. パスフレーズの設定 / 変更 / 削除は bundle に反映される（§5.2）。

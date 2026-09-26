@@ -38,6 +38,9 @@ const DRIVE_FOLDER_KEY: &str = "drive.sync.folder_id";
 /// 「スキップ」の意味も一緒に書く（スキップだけが `sub` ラップへ落ちる経路）。
 pub const WRONG_PASSPHRASE: &str = "パスフレーズが違います。もう一度入力してください（「スキップ」すると Google ログインの鍵で復元できる場合だけ解錠します）";
 
+/// パスフレーズ必須モードで誤入力したときの案内（**取消では復元できない**ことを伝える）。
+pub const WRONG_PASSPHRASE_REQUIRED: &str = "パスフレーズが違います。もう一度入力してください（このアカウントはパスフレーズが必須です。「スキップ」すると復元できません）";
+
 /// 解錠ダイアログの答えを待つ上限。
 ///
 /// 答える相手（UI）が消えた場合に背景スレッドが永久に止まらないための天井。
@@ -172,6 +175,8 @@ pub fn decide_root_key(
                 .ok_or(PackKeysError::Unavailable)?,
         ));
     }
+    // `sub` ラップが無い＝パスフレーズ必須モード。誤入力時の案内も「取消では戻れない」に変える。
+    let required = !bundle.has_wrap(WrapKind::Sub);
     let mut error: Option<String> = None;
     loop {
         match ask(error.as_deref()) {
@@ -179,10 +184,22 @@ pub fn decide_root_key(
                 match bundle.unwrap_with_passphrase(&value) {
                     Some(root) => return Ok(Some(root)),
                     // 違うパスフレーズは sub ラップへ落とさず、もう一度尋ねる
-                    None => error = Some(WRONG_PASSPHRASE.to_string()),
+                    None => {
+                        error = Some(if required {
+                            WRONG_PASSPHRASE_REQUIRED.to_string()
+                        } else {
+                            WRONG_PASSPHRASE.to_string()
+                        })
+                    }
                 }
             }
             PassphraseAnswer::Skipped => {
+                // パスフレーズ必須モード（`sub` ラップが無い）では**取消＝復元しない**。
+                // ここで `sub` へ落ちると、監査 F01 が禁じた「スキップして sub へ戻る経路」が
+                // 復活してしまう（`sub` を奪われても本が開ける状態に戻る）。
+                if !bundle.has_wrap(WrapKind::Sub) {
+                    return Err(PackKeysError::PassphraseRequired);
+                }
                 return Ok(Some(
                     bundle
                         .unwrap_with_sub(sub)
@@ -478,6 +495,68 @@ impl KeyContext {
         let store = PackKeyStore::new(&self.secrets, &self.pool, &folder_id);
         store
             .remove_passphrase(&mut drive, &sub)
+            .map_err(|error| pack_keys_error_message(&error))
+    }
+
+    /// パスフレーズ必須モードにする（`sub` ラップを消す。仕様 §5.3。**背景スレッド専用**）。
+    ///
+    /// 本の鍵が無ければ作る（`ensure`）。必要なら**別端末で設定したパスフレーズ**を
+    /// 解錠ダイアログで尋ねる（入力欄の値は「新しく設定する値」）。
+    ///
+    /// `passphrase` が `None` なら**既存のパスフレーズラップをそのまま使う**
+    /// （既に設定済みのときに値を尋ね直さない）。ラップも無ければエラー。
+    pub fn enable_passphrase_only(
+        &self,
+        passphrase: Option<&str>,
+        purpose: &str,
+    ) -> Result<(), String> {
+        let sub = self
+            .sub()
+            .ok_or_else(|| "Google にログインしてください".to_string())?;
+        let root = self
+            .import_root_key(self.google_profile().as_ref(), purpose)
+            .map_err(|error| import_error_message(&error))?;
+        let mut drive = self.drive()?;
+        let folder_id = self.drive_folder(&mut drive)?;
+        let store = PackKeyStore::new(&self.secrets, &self.pool, &folder_id);
+        store
+            .enable_passphrase_only(&mut drive, &sub, &root, passphrase)
+            .map_err(|error| pack_keys_error_message(&error))
+    }
+
+    /// パスフレーズ必須モードを解除する（`sub` ラップを戻す。**背景スレッド専用**）。
+    ///
+    /// PRK を解決できていることを前提にする（keyring か、パスフレーズ入力＝本人確認）。
+    pub fn disable_passphrase_only(&self, purpose: &str) -> Result<(), String> {
+        let sub = self
+            .sub()
+            .ok_or_else(|| "Google にログインしてください".to_string())?;
+        let root = self
+            .unlock(purpose)?
+            .ok_or_else(|| "本の鍵を解決できません".to_string())?;
+        let mut drive = self.drive()?;
+        let folder_id = self.drive_folder(&mut drive)?;
+        let store = PackKeyStore::new(&self.secrets, &self.pool, &folder_id);
+        store
+            .disable_passphrase_only(&mut drive, &sub, &root)
+            .map_err(|error| pack_keys_error_message(&error))
+    }
+
+    /// パスフレーズ必須モードか（設定画面の表示用）。**背景スレッド専用**（Drive を引く）。
+    pub fn has_sub_wrap(&self) -> Result<bool, String> {
+        let Some(sub) = self.sub() else {
+            return Ok(true);
+        };
+        let Some(folder_id) = db::settings::get(&self.pool, DRIVE_FOLDER_KEY)
+            .ok()
+            .flatten()
+        else {
+            return Ok(true);
+        };
+        let mut drive = self.drive()?;
+        let store = PackKeyStore::new(&self.secrets, &self.pool, &folder_id);
+        store
+            .has_sub_wrap(&mut drive, &sub)
             .map_err(|error| pack_keys_error_message(&error))
     }
 
@@ -909,6 +988,56 @@ mod tests {
         assert_eq!(resolved.as_bytes(), root.as_bytes());
     }
 
+    /// パスフレーズ必須モード（`sub` ラップが無い bundle）では、**取消・誤入力で `sub` へ戻らない**。
+    ///
+    /// 監査 F01 の合格条件: 「スキップして `sub` へ戻る経路を禁止」。
+    #[test]
+    fn passphrase_only_bundle_never_falls_back_to_sub() {
+        let root = PackRootKey::generate();
+        let bundle = bundle_with_passphrase(&root, "pw-only-is-long-enough");
+        assert!(!bundle.has_wrap(WrapKind::Sub), "前提: sub ラップが無い bundle");
+
+        // 正しいパスフレーズでだけ解ける
+        let resolved = decide_root_key(None, Some(&bundle), SUB, |_| {
+            PassphraseAnswer::Passphrase("pw-only-is-long-enough".into())
+        })
+        .unwrap()
+        .expect("パスフレーズで解ける");
+        assert_eq!(resolved.as_bytes(), root.as_bytes());
+
+        // 取消（スキップ）は復元しない（`sub` が無いので落ちる先が無い）
+        let error = decide_root_key(None, Some(&bundle), SUB, |_| PassphraseAnswer::Skipped)
+            .expect_err("取消で解けてしまう");
+        assert!(
+            matches!(error, PackKeysError::PassphraseRequired),
+            "{error:?}"
+        );
+
+        // 誤入力のあと取消でも解けない（誤入力は尋ね直し、取消で required エラー）
+        let mut asked = 0;
+        let error = decide_root_key(None, Some(&bundle), SUB, |error| {
+            asked += 1;
+            if asked == 1 {
+                // 案内文がモードに合っている（取消では戻れないと伝える）
+                assert_eq!(error, None, "最初は案内なし");
+                PassphraseAnswer::Passphrase("wrong-passphrase".into())
+            } else {
+                assert_eq!(
+                    error,
+                    Some(super::WRONG_PASSPHRASE_REQUIRED),
+                    "必須モードの案内になっていない"
+                );
+                PassphraseAnswer::Skipped
+            }
+        })
+        .expect_err("誤入力→取消で解けてしまう");
+        assert!(
+            matches!(error, PackKeysError::PassphraseRequired),
+            "{error:?}"
+        );
+        assert_eq!(asked, 2, "誤入力のあと尋ね直す");
+    }
+
     /// パスフレーズラップがあれば尋ね、入力が正しければそれで解く。
     #[test]
     fn passphrase_unlocks_the_bundle() {
@@ -968,14 +1097,23 @@ mod tests {
         assert_eq!(resolved.as_bytes(), root.as_bytes());
     }
 
-    /// スキップしたが `sub` ラップも無ければ「鍵が無い」（平文へは落ちない）。
+    /// スキップしたが `sub` ラップも無ければ「パスフレーズ必須」（平文へは落ちない）。
+    ///
+    /// この形の bundle は**パスフレーズ必須モード**（仕様 §5.3）で、取消では復元できない。
+    /// 文言が「鍵を復元できません」ではなく**モードの説明**になる（利用者が取れる行動が違う）。
     #[test]
     fn skipped_passphrase_without_sub_wrap_is_unavailable() {
         let root = PackRootKey::generate();
         let bundle = bundle_with_passphrase(&root, "correct horse");
         let error = decide_root_key(None, Some(&bundle), SUB, |_| PassphraseAnswer::Skipped)
             .expect_err("解ける材料が無い");
-        assert!(matches!(error, PackKeysError::Unavailable));
+        assert!(
+            matches!(error, PackKeysError::PassphraseRequired),
+            "{error:?}"
+        );
+        // 文言に「必須」が入る（「鍵が無い」と混同させない）
+        let message = pack_keys_error_message(&error);
+        assert!(message.contains("必須"), "{message}");
     }
 
     /// 背景スレッドの `ask` は UI の答えで解け、UI が消えたら（sender が落ちたら）

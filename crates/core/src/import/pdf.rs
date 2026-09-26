@@ -110,6 +110,56 @@ pub fn render_pdf_pages(
     bytes: &[u8],
     progress: &mut (dyn FnMut(f32) + Send),
 ) -> Result<Vec<PageImage>, ImportError> {
+    let mut pages = Vec::new();
+    render_pdf_pages_into(bytes, progress, &mut |page| {
+        pages.push(page);
+        Ok(())
+    })?;
+    Ok(pages)
+}
+
+/// ページを**1 件ずつ** `on_page` へ渡しながら描画する（全ページを溜めない）。
+///
+/// 戻り値は描画したページ数（＝ `on_page` を呼んだ回数）。エンコードに失敗したページが
+/// あればそこでエラーを返す（呼び出し側が数えたページ番号と実際のページがずれないよう、
+/// **失敗したページは飛ばさずエラーにする**）。進捗の規則は [`render_pdf_pages`] と同じ。
+///
+/// 大きい本（数百ページ）で `Vec<PageImage>` を作ると、レンダリング結果（webp）を
+/// 全部同時に持つことになるため、取り込みはこちらを使う。
+pub fn render_pdf_pages_into(
+    bytes: &[u8],
+    progress: &mut (dyn FnMut(f32) + Send),
+    on_page: &mut dyn FnMut(PageImage) -> Result<(), ImportError>,
+) -> Result<usize, ImportError> {
+    render_pdf_source_into(PdfSource::Bytes(bytes), progress, on_page)
+}
+
+/// ファイルから読んでページを 1 件ずつ渡す（**ソース全体をメモリへ読まない**）。
+///
+/// 4 GiB 級の PDF を取り込む経路。`load_pdf_from_file` は PDFium にファイルを渡すので、
+/// ここで `std::fs::read` する必要がない（読み込みは PDFium が面倒を見る）。
+pub fn render_pdf_file_into(
+    path: &std::path::Path,
+    progress: &mut (dyn FnMut(f32) + Send),
+    on_page: &mut dyn FnMut(PageImage) -> Result<(), ImportError>,
+) -> Result<usize, ImportError> {
+    render_pdf_source_into(PdfSource::File(path), progress, on_page)
+}
+
+/// 描画対象（バイト列かファイルか）。ライフタイムを素直に扱うため enum で分ける
+/// （クロージャにすると、ドキュメントのライフタイムが「PDFium の借用」と「ソースの借用」の
+/// 短い方になり、高階ライフタイムの境界と噛み合わない）。
+enum PdfSource<'a> {
+    Bytes(&'a [u8]),
+    File(&'a std::path::Path),
+}
+
+/// 読み込み方（バイト列 / ファイル）だけが違う共通部分。
+fn render_pdf_source_into(
+    source: PdfSource<'_>,
+    progress: &mut (dyn FnMut(f32) + Send),
+    on_page: &mut dyn FnMut(PageImage) -> Result<(), ImportError>,
+) -> Result<usize, ImportError> {
     log::info!("render_pdf_pages: 開始");
     let render_start = std::time::Instant::now();
 
@@ -118,12 +168,14 @@ pub fn render_pdf_pages(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let pdfium = pdfium_instance()?;
-    let document = pdfium
-        .load_pdf_from_byte_slice(bytes, None)
-        .map_err(|e| ImportError::Pdf(e.to_string()))?;
+    let document = match source {
+        PdfSource::Bytes(bytes) => pdfium.load_pdf_from_byte_slice(bytes, None),
+        PdfSource::File(path) => pdfium.load_pdf_from_file(path, None),
+    }
+    .map_err(|e| ImportError::Pdf(e.to_string()))?;
     let total = document.pages().len().max(0) as usize;
     if total == 0 {
-        return Ok(Vec::new());
+        return Ok(0);
     }
     // **描画の前**にページ数を見る（上限内のページが数万ある PDF で、レンダリングと
     // WebP エンコードを長時間走らせてから pack の上限で落ちるのを避ける。F06）。
@@ -145,7 +197,8 @@ pub fn render_pdf_pages(
     const WINDOW: usize = 8;
     let done = std::sync::atomic::AtomicUsize::new(0);
     let progress = std::sync::Mutex::new(progress);
-    let mut rendered = Vec::with_capacity(total);
+    // 渡したページ数（`on_page` を呼んだ回数）。総ページ数と一致するのが正常。
+    let mut emitted = 0usize;
     // エンコード済みページの累積バイト数（上限を超えたら打ち切る）。
     let mut output_bytes = 0u64;
     let mut first_error: Option<ImportError> = None;
@@ -227,7 +280,9 @@ pub fn render_pdf_pages(
             match result.and_then(|r| r.ok()) {
                 Some(page) => {
                     output_bytes = output_bytes.saturating_add(page.data.len() as u64);
-                    rendered.push(page);
+                    // 1 ページずつ渡す（呼び出し側は store へ入れて手放す）。
+                    on_page(page)?;
+                    emitted += 1;
                 }
                 None => {
                     let index = window_start + offset;
@@ -259,10 +314,10 @@ pub fn render_pdf_pages(
     }
 
     log::info!(
-        "render_pdf_pages: 完了（{total} ページ / {:?}）",
+        "render_pdf_pages: 完了（{emitted}/{total} ページ / {:?}）",
         render_start.elapsed()
     );
-    Ok(rendered)
+    Ok(emitted)
 }
 
 #[cfg(test)]

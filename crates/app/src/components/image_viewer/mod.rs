@@ -2429,6 +2429,16 @@ impl Render for ImageViewer {
             (window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT).max(1.0),
         );
         self.update_display_target(viewport, window.scale_factor(), cx);
+        // トップパネルの中身の高さ上限（窓の高さ基準）。パネルは absolute で
+        // 上端 12px + ヘッダー 60px なので、残りを上限にして**中身をスクロール**させる。
+        // コンテンツ（フォルダ）が多い本で下の方が見切れて選べなくなるのを防ぐ
+        // （2026-09-26 の実機報告）。
+        let panel_content_max_h = (window.bounds().size.height.as_f32()
+            - WIN_TITLE_BAR_HEIGHT
+            - 12.0
+            - 60.0
+            - 16.0)
+            .max(200.0);
         if !input_focused && !self.note_dialog_open && !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
@@ -3116,6 +3126,13 @@ impl Render for ImageViewer {
                         // パネル内のクリックは下の画像（戻る・ズーム等）に伝達しない
                         .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
+                        })
+                        // **ホイールもパネル内で消費する**: カーソルがメニューの上にあるときは
+                        // ページ送りをしない（2026-09-26 の実機報告）。パネル自身のスクロールは
+                        // 内側のスクロール領域（`overflow_y_scroll`）が受け取るので、
+                        // ここで伝播を止めても中身はスクロールできる。
+                        .on_scroll_wheel(|_, _, cx| {
+                            cx.stop_propagation();
                         }),
 
                 )
@@ -3164,9 +3181,24 @@ impl Render for ImageViewer {
                     ),
                 )
                 .child(if let Some(view) = active_panel {
+                    // メニュー（フォルダ/コンテンツ一覧）は**高さ上限つきでスクロール**する。
+                    // コンテンツが多い本で下の方が見切れて選べなくなるため（2026-09-26 の
+                    // 実機報告）。ページ一覧は専用の仮想リスト（`gpui_kit::list`）なので
+                    // 触らない（二重スクロールを作らない）。
+                    let scrollable = view == PanelView::Menu;
                     div()
+                        .id("viewer-panel-content")
+                        .debug_selector(|| "viewer-panel-content".into())
                         .border_t_1()
                         .border_color(cx.theme().muted)
+                        .when(scrollable, |this| {
+                            this.max_h(px(panel_content_max_h))
+                                .overflow_y_scroll()
+                                // スクロールバーを出す（「ここはスクロールできる」と分かるように。
+                                // ホイールがページ送りと衝突するので、操作の当たり判定を見せる）
+                                .scrollbar_width(px(8.0))
+                                .pb_2()
+                        })
                         .child(match view {
                             PanelView::Menu => {
                                 let switch_rows = self.menu_switch_elements(&handle, cx);

@@ -127,6 +127,17 @@ pub struct HideBook {
     pub site_id: SharedString,
 }
 
+/// Drive のバックアップ（pack のアップロード）の対象から外す / 戻す（右クリックメニュー）。
+///
+/// ON の本は同期のアップロード方向で skip される。**終了時のアップロードも同じ経路**
+/// なので、ON にすると終了時にも上がらない。取得済み（ローカルにある）本だけが対象。
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, gpui_kit::Action)]
+#[action(namespace = thundoku, no_json)]
+pub struct ToggleBackupExcluded {
+    pub database_id: SharedString,
+    pub site_id: SharedString,
+}
+
 /// Open the login overlay with a specific provider (payload = provider).
 /// 設定画面などから「技術書典のログイン」を押したとき、プロバイダ選択画面
 /// （Popover に見える画面）を経由せず、そのプロバイダのログイン画面を直接開く。

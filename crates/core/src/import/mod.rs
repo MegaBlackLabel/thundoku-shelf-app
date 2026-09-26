@@ -134,15 +134,28 @@ fn upscale_if_small(img: &image::DynamicImage, min_width: u32) -> image::Dynamic
     img.resize_exact(new_width, new_height, image::imageops::FilterType::Lanczos3)
 }
 
+/// 取り込みで使う libwebp の effort（0=最速 .. 6=最高圧縮。libwebp の既定は 4）。
+///
+/// 取り込みは**1 冊につき 1 回**の変換だがページ数が多いので、既定より軽い 2 にする。
+/// 2026-09-26 の実測（1433×2024 の実ページ、q88）:
+/// method 4 = 220ms / 453KiB、**method 2 = 103ms / 462KiB**（2.1 倍速・+2%）、
+/// method 1 = 84ms / 501KiB（+11%）、method 0 = 76ms / 515KiB（+14%）。
+const WEBP_METHOD: i32 = 2;
+
 /// Encode any dynamic image as lossy webp with the given quality (0-100).
 /// `image` 0.25's own webp encoder is lossless-only, so lossy encoding goes
-/// through the `webp` crate (bundled libwebp).
+/// through the `webp` crate (bundled libwebp). effort は [`WEBP_METHOD`]。
 pub fn encode_webp(image: &image::DynamicImage, quality: u8) -> Result<Vec<u8>, ImportError> {
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
-    let memory =
-        webp::Encoder::from_rgba(&rgba, width, height).encode(quality.clamp(0, 100) as f32);
-    Ok(memory.to_vec())
+    let mut config = webp::WebPConfig::new()
+        .map_err(|_| ImportError::Image("webp: config を作れません".to_string()))?;
+    config.quality = quality.clamp(0, 100) as f32;
+    config.method = WEBP_METHOD;
+    webp::Encoder::from_rgba(&rgba, width, height)
+        .encode_advanced(&config)
+        .map(|memory| memory.to_vec())
+        .map_err(|error| ImportError::Image(format!("webp encode: {error:?}")))
 }
 
 /// Thumbnail: first page scaled to 200px width.
@@ -176,14 +189,17 @@ fn render_page_image(data: &[u8]) -> Result<(Vec<u8>, u32, u32), ImportError> {
 const PAGE_RENDER_CHUNK: usize = 64;
 
 /// ページ変換（デコード + webp 再圧縮）に使うワーカー数。
-/// 1 ページあたり実測 0.8 秒（release）で、重いのはほぼ webp 再圧縮。
-/// 逐次だと 3,000 ページ級で 40 分を超えるため並列化する。デコード済み画像は
-/// 1 枚 数十 MB あるため、ワーカー数は 8 で頭打ちにする（メモリ保護）。
+/// 1 ページあたり実測 0.13 秒（release、1433×2024。重いのはほぼ webp 再圧縮で、
+/// effort を [`WEBP_METHOD`] に下げる前は 0.24 秒だった）。逐次だと 3,000 ページ級で
+/// 数十分かかるため並列化する。デコード済み画像は 1 枚 数十 MB あるため、
+/// ワーカー数は 12 で頭打ちにする（メモリ保護）。
 fn page_render_workers(page_count: usize) -> usize {
     let cores = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4);
-    cores.min(8).min(page_count.max(1))
+    // 1 ワーカーあたり 30〜40MB（デコード済み RGB + RGBA + libwebp の作業領域）なので、
+    // 12 で頭打ちにする（実測機は 12 コア / 16 論理）。
+    cores.min(12).min(page_count.max(1))
 }
 
 /// 1 ページ分の変換結果（WebP バイト列・幅・高さ）。失敗時は理由を持つ。
@@ -268,6 +284,18 @@ fn entry_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// これを超える pack は Drive バックアップ（アップロード）の対象から**自動で**外す（1 GiB）。
+///
+/// 大きい pack は Drive の容量と転送時間（終了時のアップロード）を食うため。
+/// 右クリックメニューから**手動でも**切り替えられる（`db::books::set_backup_excluded`）。
+/// 除外された本は同期のアップロード方向で skip される（終了時のアップロードも同じ経路）。
+pub const AUTO_EXCLUDE_BACKUP_PACK_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// 取り込んだ pack を自動でバックアップ対象外にするか（純関数）。
+pub fn should_auto_exclude_backup(pack_bytes: u64) -> bool {
+    pack_bytes > AUTO_EXCLUDE_BACKUP_PACK_BYTES
+}
+
 /// 1 冊の PDF のページ数上限（9000）。
 ///
 /// `opfspack::MAX_ENTRY_COUNT`（10000）から metadata / サムネイル分を引いた値。
@@ -275,12 +303,14 @@ fn entry_file_name(path: &str) -> &str {
 /// WebP エンコードに長時間かけてから pack の上限で落ちる（セキュリティ評価 F06）。
 pub const MAX_PDF_PAGES: usize = 9000;
 
-/// 取り込み元ファイルの上限（2 GiB）。**読む前に**検査する。
+/// 取り込み元ファイルの上限（10 GiB）。**読む前に**検査する。
 ///
-/// `import_file` は変換のために全体をメモリへ読む（`import_*_bytes` 系の API）。
-/// 読んでから大きさに気付くとその時点で RAM を食い潰すため、メタデータだけで先に弾く
-/// （セキュリティ評価 F06）。これを超える本は、変換をストリーム化してから対応する。
-pub const MAX_IMPORT_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// pack の上限（`opfspack::MAX_TOTAL_SIZE`）と揃えてある。PDF と ZIP は**ファイルから**
+/// 読む（PDF は PDFium にファイルを渡し、ZIP は `ZipArchive<File>`）ので、取り込み元の
+/// 大きさがそのまま RAM 使用量になるわけではない。EPUB（ビューアー非対応で 1 エントリ
+/// として入れるだけ）と単体画像は全体を読むが、実データでは小さい。
+/// 読んでから大きさに気付くとその時点で RAM を食うため、メタデータだけで先に弾く（F06）。
+pub const MAX_IMPORT_SOURCE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// 入れ子 ZIP の再帰展開の上限（決定 D5 / `docs/import-patterns.md` §11.2 R1）。
 ///
@@ -1276,12 +1306,21 @@ fn finish_import(
             },
         );
     drop(store);
-    built?;
+    let pack_bytes = built?;
     if let Err(error) = std::fs::rename(&temp_file, &pack_file) {
         let _ = std::fs::remove_file(&temp_file);
         return Err(ImportError::Io(error));
     }
     log::info!("finish_import: パック作成（{:?}）", save_start.elapsed());
+    // 大きい pack は Drive バックアップの対象から自動で外す（容量と転送時間のため）。
+    if should_auto_exclude_backup(pack_bytes) {
+        match books::set_backup_excluded(pool, &book_id, true) {
+            Ok(()) => log::info!(
+                "finish_import: pack が {pack_bytes} バイトなので Drive バックアップ対象外にする"
+            ),
+            Err(error) => log::warn!("finish_import: バックアップ対象外にできない: {error}"),
+        }
+    }
     // pack 全体のハッシュは**ファイルを順に読んで**計算する（大きい pack を RAM に載せない）。
     let pack_hash = {
         let reader = opfspack::PackFileReader::open(&pack_file)?;
@@ -1538,20 +1577,30 @@ pub fn import_file(
             limit: MAX_IMPORT_SOURCE_BYTES,
         });
     }
-    let bytes = std::fs::read(source_path)?;
     match extension.as_str() {
-        "pdf" => import_pdf_bytes(
-            pool, &file_name, &bytes, packs_dir, root_key, progress, None,
+        // PDF は**ファイルから**読む（4 GiB 級をメモリに載せない）
+        "pdf" => import_pdf_path(
+            pool, &file_name, source_path, packs_dir, root_key, progress, None,
         ),
-        "epub" => import_epub_bytes(pool, &file_name, &bytes, packs_dir, root_key, None),
-        "zip" => import_zip_bytes(
-            pool, &file_name, &bytes, packs_dir, root_key, progress, None,
+        // EPUB は pack に 1 エントリとして入れるだけ（ビューアー非対応）なので全体を読む
+        "epub" => {
+            let bytes = std::fs::read(source_path)?;
+            import_epub_bytes(pool, &file_name, &bytes, packs_dir, root_key, None)
+        }
+        // ZIP はファイルから読む（同じく大きい本があるため）
+        "zip" => import_zip_path(
+            pool, &file_name, source_path, packs_dir, root_key, progress, None,
         ),
         _ => Err(ImportError::UnsupportedType(extension)),
     }
 }
 
-/// Import a PDF from memory.
+/// PDF をメモリから取り込む（レンダリング → pack → DB）。
+///
+/// **1 ページずつ** `PackEntryStore` へ入れる（全ページを同時に持たない。以前は
+/// `Vec<PageImage>` に全ページを集めてから `clone` して entries を作っていたので、
+/// 200 ページ級の本で数百 MB を余分に持っていた）。レンダリングは DB を触る前に
+/// 終わるので、UI スレッドの DB 操作をブロックしない点は変わらない。
 pub fn import_pdf_bytes(
     pool: &SqlitePool,
     file_name: &str,
@@ -1561,73 +1610,115 @@ pub fn import_pdf_bytes(
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
 ) -> Result<ImportedBook, ImportError> {
-    let pages = pdf::render_pdf_pages(bytes, progress)?;
-    import_rendered_pdf_pages(
+    let file_size = bytes.len() as i64;
+    import_pdf_rendered(
         pool,
         file_name,
-        bytes.len() as i64,
-        pages,
+        file_size,
         packs_dir,
         root_key,
         reuse_book_id,
+        progress,
+        |progress, on_page| pdf::render_pdf_pages_into(bytes, progress, on_page),
     )
 }
 
-/// Import already-rendered PDF pages. Rendering is expensive and must happen
-/// **outside** the DB lock, so callers run `pdf::render_pdf_pages` first and
-/// only take the connection for this final write step.
-pub fn import_rendered_pdf_pages(
+/// ファイルから PDF を取り込む（**ソース全体をメモリへ読まない**。4 GiB 級の本用）。
+pub fn import_pdf_path(
+    pool: &SqlitePool,
+    file_name: &str,
+    path: &Path,
+    packs_dir: &Path,
+    root_key: Option<&PackRootKey>,
+    progress: &mut (dyn FnMut(f32) + Send),
+    reuse_book_id: Option<&str>,
+) -> Result<ImportedBook, ImportError> {
+    let file_size = std::fs::metadata(path)?.len() as i64;
+    import_pdf_rendered(
+        pool,
+        file_name,
+        file_size,
+        packs_dir,
+        root_key,
+        reuse_book_id,
+        progress,
+        |progress, on_page| pdf::render_pdf_file_into(path, progress, on_page),
+    )
+}
+
+/// レンダリングの仕方（バイト列 / ファイル）だけが違う共通部分。
+#[allow(clippy::too_many_arguments)]
+fn import_pdf_rendered(
     pool: &SqlitePool,
     file_name: &str,
     file_size: i64,
-    pages: Vec<pdf::PageImage>,
     packs_dir: &Path,
     root_key: Option<&PackRootKey>,
     reuse_book_id: Option<&str>,
+    progress: &mut (dyn FnMut(f32) + Send),
+    render: impl FnOnce(
+        &mut (dyn FnMut(f32) + Send),
+        &mut dyn FnMut(pdf::PageImage) -> Result<(), ImportError>,
+    ) -> Result<usize, ImportError>,
 ) -> Result<ImportedBook, ImportError> {
-    if pages.is_empty() {
+    // ページのメタデータ（小さい）だけを集める。バイト列は store が持つ（閾値超で一時ファイル）。
+    let mut store = PackEntryStore::new();
+    let mut rows: Vec<(i64, i64, i64, String, i64)> = Vec::new(); // 番号, 幅, 高さ, パス, サイズ
+    let mut texts: Vec<(i64, String)> = Vec::new();
+    // cover はページ 1 と同じバイト列のもう 1 エントリ、thumbnail はそこから作る（どちらも小さい）。
+    let mut cover: Option<Vec<u8>> = None;
+    let mut thumbnail: Option<Vec<u8>> = None;
+
+    let total_pages = render(progress, &mut |page| {
+        let page_number = rows.len() as i64 + 1;
+        let entry_path = format!("pages/page_{page_number:04}.webp");
+        if page_number == 1 {
+            cover = Some(page.data.clone());
+            let (thumb, _, _) = thumbnail_of(&page.data)?;
+            thumbnail = Some(thumb);
+        }
+        rows.push((
+            page_number,
+            page.width as i64,
+            page.height as i64,
+            entry_path.clone(),
+            page.data.len() as i64,
+        ));
+        texts.push((page_number, page.text));
+        // ここで store へ渡す（閾値を超えていれば一時ファイルへ逃げる）。
+        store.push(entry_path, page.data, "image/webp".to_string(), false)
+    })?;
+    if total_pages == 0 {
         return Err(ImportError::Pdf("no pages rendered".into()));
     }
-    let total_pages = pages.len() as i64;
+    let total_pages = total_pages as i64;
     let content = single_content(MediaKind::Pdf, "PDF", total_pages, Some("pages"));
     let content_id = content.content_id.clone();
     let format_id = content.formats[0].format_id.clone();
-    let mut entries = Vec::new();
-    let mut page_rows = Vec::new();
-    let mut texts = Vec::new();
-    for (index, page) in pages.iter().enumerate() {
-        let entry_path = format!("pages/page_{:04}.webp", index + 1);
-        entries.push((
-            entry_path.clone(),
-            page.data.clone(),
-            "image/webp".to_string(),
-            false,
-        ));
-        page_rows.push(PageRow {
+    let page_rows: Vec<PageRow> = rows
+        .into_iter()
+        .map(|(page_number, width, height, entry_path, file_size)| PageRow {
             content_id: Some(content_id.clone()),
             format_id: Some(format_id.clone()),
-            page_number: index as i64 + 1,
-            width: page.width as i64,
-            height: page.height as i64,
+            page_number,
+            width,
+            height,
             entry_path,
-            file_size: page.data.len() as i64,
-        });
-        texts.push((index as i64 + 1, page.text.clone()));
+            file_size,
+        })
+        .collect();
+    // cover = page 1; thumbnail = page 1 scaled to 200px width（レンダリング中に作ってある）。
+    if let Some(cover) = cover {
+        store.push("cover.webp".to_string(), cover, "image/webp".to_string(), false)?;
     }
-    // cover = page 1; thumbnail = page 1 scaled to 200px width.
-    entries.push((
-        "cover.webp".to_string(),
-        pages[0].data.clone(),
-        "image/webp".to_string(),
-        false,
-    ));
-    let (thumb, _, _) = thumbnail_of(&pages[0].data)?;
-    entries.push((
-        "thumbnail.webp".to_string(),
-        thumb,
-        "image/webp".to_string(),
-        false,
-    ));
+    if let Some(thumbnail) = thumbnail {
+        store.push(
+            "thumbnail.webp".to_string(),
+            thumbnail,
+            "image/webp".to_string(),
+            false,
+        )?;
+    }
 
     finish_import(
         pool,
@@ -1636,7 +1727,7 @@ pub fn import_rendered_pdf_pages(
         file_name,
         file_size,
         PackSpec {
-            entries: PackEntryStore::from_entries(entries),
+            entries: store,
             page_rows,
             texts,
             warnings: Vec::new(),
@@ -1783,10 +1874,17 @@ fn is_body_name(name: &str) -> bool {
 pub fn analyze_zip(bytes: &[u8]) -> Result<ImportPlan, ImportError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| ImportError::Zip(e.to_string()))?;
+    analyze_zip_with(&mut archive)
+}
+
+/// すでに開いた ZIP を解析する（バイト列でもファイルでも同じ処理）。
+pub fn analyze_zip_with<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<ImportPlan, ImportError> {
     // 1 周目: 名前だけを集める（ページ画像は伸長しない）。
     // 入れ子 ZIP はここで 1 階層だけ展開して名前一覧に合流させる（決定 D5）。
     let mut warnings = Vec::new();
-    let metas = collect_metas_with_nested(&mut archive, &mut warnings)?;
+    let metas = collect_metas_with_nested(archive, &mut warnings)?;
     if metas.is_empty() {
         return Err(ImportError::EmptyArchive);
     }
@@ -1823,7 +1921,7 @@ pub fn analyze_zip(bytes: &[u8]) -> Result<ImportPlan, ImportError> {
         .iter()
         .filter(|meta| classify_entry(&meta.name) == EntryKind::ExportText)
     {
-        match read_entry(&mut archive, meta) {
+        match read_entry(archive, meta) {
             Ok(data) => {
                 let decoded = zip_names::decode_text_bytes(&data);
                 export_texts.extend(export_text::parse_export_text(&decoded));
@@ -1860,6 +1958,34 @@ pub fn commit_zip(
     reuse_book_id: Option<&str>,
     plan: &ImportPlan,
 ) -> Result<ImportedBook, ImportError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| ImportError::Zip(e.to_string()))?;
+    commit_zip_with(
+        pool,
+        file_name,
+        &mut archive,
+        bytes.len() as i64,
+        packs_dir,
+        root_key,
+        progress,
+        reuse_book_id,
+        plan,
+    )
+}
+
+/// すでに開いた ZIP を取り込む（バイト列でもファイルでも同じ処理）。
+#[allow(clippy::too_many_arguments)]
+pub fn commit_zip_with<R: std::io::Read + std::io::Seek>(
+    pool: &SqlitePool,
+    file_name: &str,
+    archive: &mut zip::ZipArchive<R>,
+    source_bytes_len: i64,
+    packs_dir: &Path,
+    root_key: Option<&PackRootKey>,
+    progress: &mut (dyn FnMut(f32) + Send),
+    reuse_book_id: Option<&str>,
+    plan: &ImportPlan,
+) -> Result<ImportedBook, ImportError> {
     let primary = plan
         .contents
         .get(plan.primary)
@@ -1871,11 +1997,9 @@ pub fn commit_zip(
     // 内部不整合（ordinal が範囲外）用。呼び出し側の入力に由来する
     // 「読めるものが無い」は `NotAReadableWork` で返す。
     let missing_entry = || ImportError::Zip("entry index out of range".into());
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| ImportError::Zip(e.to_string()))?;
     // 入れ子 ZIP の展開警告は `plan.warnings` に既に入っている
     // （`analyze_zip` が同じ規則で解析する）ため、ここでは捨てる。
-    let metas = collect_metas_with_nested(&mut archive, &mut Vec::new())?;
+    let metas = collect_metas_with_nested(archive, &mut Vec::new())?;
 
     // 2 周目: 選んだエントリだけを 1 件ずつ読む。
     // 旧実装は全エントリを `Vec<(String, Vec<u8>)>` に読み込んでいたため、
@@ -1916,7 +2040,7 @@ pub fn commit_zip(
                         let mut pages = Vec::with_capacity(chunk.len());
                         for ordinal in chunk {
                             let meta = metas.get(*ordinal).ok_or_else(missing_entry)?;
-                            pages.push((meta.name.clone(), read_entry(&mut archive, meta)?));
+                            pages.push((meta.name.clone(), read_entry(archive, meta)?));
                         }
                         // 2) デコード + webp 再圧縮を並列に
                         let rendered = render_page_images(&pages);
@@ -1956,7 +2080,7 @@ pub fn commit_zip(
                 MediaKind::Pdf => {
                     let ordinal = rendition.entries.first().ok_or_else(missing_entry)?;
                     let meta = metas.get(*ordinal).ok_or_else(missing_entry)?;
-                    let data = read_entry(&mut archive, meta)?;
+                    let data = read_entry(archive, meta)?;
                     // 進捗は既定表示コンテンツの PDF だけに流す（他は描画の副作用を避ける）
                     let pages = if legacy {
                         render_pdf_with(&data, Some(&mut *progress))?
@@ -1992,7 +2116,7 @@ pub fn commit_zip(
                 MediaKind::Epub => {
                     let ordinal = rendition.entries.first().ok_or_else(missing_entry)?;
                     let meta = metas.get(*ordinal).ok_or_else(missing_entry)?;
-                    let data = read_entry(&mut archive, meta)?;
+                    let data = read_entry(archive, meta)?;
                     let entry_path = if legacy {
                         book_file_name = entry_file_name(&meta.name).to_string();
                         entry_file_name(&meta.name).to_string()
@@ -2067,7 +2191,7 @@ pub fn commit_zip(
         packs_dir,
         root_key,
         &book_file_name,
-        bytes.len() as i64,
+        source_bytes_len,
         PackSpec {
             entries: pack_entries,
             page_rows,
@@ -2101,6 +2225,65 @@ pub fn import_zip_bytes(
         progress,
         reuse_book_id,
         &plan,
+    )
+}
+
+/// ファイルから ZIP を取り込む（**ソース全体をメモリへ読まない**。4 GiB 級の本用）。
+///
+/// 解析と取り込みでアーカイブを 2 回開くが、どちらも `File` から読む。
+pub fn import_zip_path(
+    pool: &SqlitePool,
+    file_name: &str,
+    path: &Path,
+    packs_dir: &Path,
+    root_key: Option<&PackRootKey>,
+    progress: &mut (dyn FnMut(f32) + Send),
+    reuse_book_id: Option<&str>,
+) -> Result<ImportedBook, ImportError> {
+    let plan = analyze_zip_path(path)?;
+    commit_zip_path(
+        pool,
+        file_name,
+        path,
+        packs_dir,
+        root_key,
+        progress,
+        reuse_book_id,
+        &plan,
+    )
+}
+
+/// ファイルから ZIP を解析する（取り込み前の確認・計画づくり）。
+pub fn analyze_zip_path(path: &Path) -> Result<ImportPlan, ImportError> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| ImportError::Zip(e.to_string()))?;
+    analyze_zip_with(&mut archive)
+}
+
+/// ファイルから ZIP を取り込む（計画は [`analyze_zip_path`] の結果）。
+#[allow(clippy::too_many_arguments)]
+pub fn commit_zip_path(
+    pool: &SqlitePool,
+    file_name: &str,
+    path: &Path,
+    packs_dir: &Path,
+    root_key: Option<&PackRootKey>,
+    progress: &mut (dyn FnMut(f32) + Send),
+    reuse_book_id: Option<&str>,
+    plan: &ImportPlan,
+) -> Result<ImportedBook, ImportError> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| ImportError::Zip(e.to_string()))?;
+    commit_zip_with(
+        pool,
+        file_name,
+        &mut archive,
+        std::fs::metadata(path)?.len() as i64,
+        packs_dir,
+        root_key,
+        progress,
+        reuse_book_id,
+        plan,
     )
 }
 
@@ -2747,5 +2930,97 @@ mod zip_entry_limit_tests {
         );
         assert!(message.contains("宣言 1000 バイト"), "{message}");
         assert!(message.contains("実際に読めた 700000000 バイト"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod page_render_bench {
+    use super::*;
+
+    /// 手元で 1 ページの変換コストと libwebp の effort ごとの差を測る（CI では走らせない）。
+    ///
+    /// 実行: `PAGE_BENCH=<画像パス> cargo test --release -p thundoku-core --lib \
+    ///        bench_page_render -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_page_render() {
+        let path = std::env::var("PAGE_BENCH").expect("PAGE_BENCH=<画像パス> を指定する");
+        let data = std::fs::read(path).expect("読める");
+        let runs = 5;
+        // ウォームアップ
+        for _ in 0..2 {
+            let _ = render_page_image(&data).unwrap();
+        }
+        let mut sizes = Vec::new();
+        let started = std::time::Instant::now();
+        for _ in 0..runs {
+            let (out, w, h) = render_page_image(&data).unwrap();
+            sizes.push((w, h, out.len()));
+        }
+        let per_page = started.elapsed() / runs;
+        println!("render_page_image: {per_page:?}/ページ  {sizes:?}");
+
+        // 内訳
+        let t = std::time::Instant::now();
+        let decoded = image::load_from_memory(&data).unwrap();
+        let decode = t.elapsed();
+        let t = std::time::Instant::now();
+        let rgba = decoded.to_rgba8();
+        let to_rgba = t.elapsed();
+        let t = std::time::Instant::now();
+        let encoded = webp::Encoder::from_rgba(&rgba, rgba.width(), rgba.height()).encode(88.0);
+        let encode = t.elapsed();
+        println!(
+            "内訳: decode={decode:?} to_rgba8={to_rgba:?} webp_encode(q88)={encode:?} → {} KiB",
+            encoded.len() / 1024
+        );
+
+        // method ごとの比較（libwebp の effort。既定 4）
+        for method in [4i32, 3, 2, 1, 0] {
+            let mut config = webp::WebPConfig::new().expect("config");
+            config.quality = 88.0;
+            config.method = method;
+            let encoder = webp::Encoder::from_rgba(&rgba, rgba.width(), rgba.height());
+            let t = std::time::Instant::now();
+            let out = encoder.encode_advanced(&config).expect("encode");
+            println!(
+                "method={method}: {:?} → {} KiB",
+                t.elapsed(),
+                out.len() / 1024
+            );
+        }
+
+        // 幅 1600 に収めた場合（表示は最大でも 1000px 幅相当。縮小するとどうなるか）
+        if decoded.width() > 1600 {
+            let t = std::time::Instant::now();
+            let small = decoded.resize_exact(1600, 1600 * decoded.height() / decoded.width(), image::imageops::FilterType::Triangle);
+            let resize = t.elapsed();
+            let rgba = small.to_rgba8();
+            let t = std::time::Instant::now();
+            let encoded = webp::Encoder::from_rgba(&rgba, rgba.width(), rgba.height()).encode(88.0);
+            println!(
+                "幅1600に縮小: resize={resize:?} encode={:?} → {} KiB",
+                t.elapsed(),
+                encoded.len() / 1024
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod backup_exclude_tests {
+    use super::{AUTO_EXCLUDE_BACKUP_PACK_BYTES, should_auto_exclude_backup};
+
+    /// 自動でバックアップ対象外にする境界（これを超えたら外す）。
+    #[test]
+    fn auto_exclude_threshold_is_boundary_exclusive() {
+        assert!(!should_auto_exclude_backup(0));
+        assert!(
+            !should_auto_exclude_backup(AUTO_EXCLUDE_BACKUP_PACK_BYTES),
+            "上限ちょうどは対象内（境界）"
+        );
+        assert!(should_auto_exclude_backup(AUTO_EXCLUDE_BACKUP_PACK_BYTES + 1));
+        // 実データの想定: 1.03GB の pack は対象外になる
+        assert!(should_auto_exclude_backup(1_080_044_140));
     }
 }

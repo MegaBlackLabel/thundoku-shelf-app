@@ -442,6 +442,9 @@ pub fn sync_with_progress(
     log::info!("drive sync: download direction done, upload direction start");
     // -- upload direction ---------------------------------------------------
     let drive_ids: Vec<&str> = files.iter().map(|file| file.id.as_str()).collect();
+    // バックアップ対象外の本（`books.backup_excluded = 1`）を 1 回だけ読む。
+    // 終了時のアップロードもこの経路を通るので、ここで skip すれば終了時も上がらない。
+    let backup_excluded = books::backup_excluded_ids(pool).unwrap_or_default();
     for book in books::list(pool)? {
         let pack_id = book
             .pack_id
@@ -453,6 +456,12 @@ pub fn sync_with_progress(
         }
         // 所有者フィルタ：現在 sub の本だけアップロード（未所属・他アカウントは上げない）。
         if !upload_ids.contains(&book.id) {
+            continue;
+        }
+        // バックアップ対象外（大きい pack / 右クリックメニューで外した本）は上げない。
+        if backup_excluded.contains(&book.id) {
+            log::info!("drive sync: skip upload（バックアップ対象外）: {pack_id}");
+            outcome.skipped.push(pack_id.clone());
             continue;
         }
         let local_path: PathBuf = crate::pack_path::pack_path(packs_dir, &pack_id)

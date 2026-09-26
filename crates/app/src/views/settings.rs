@@ -108,6 +108,8 @@ pub struct SettingsView {
     key_pending_owner: Option<String>,
     /// 鍵の操作（設定 / 解除 / アップロード）の実行中フラグ。
     key_busy: bool,
+    /// パスフレーズ必須モードか（`sub` ラップが無い。Drive の bundle が正）。
+    key_passphrase_only: bool,
     /// パスフレーズ解除の確認ダイアログの表示フラグ。
     confirm_remove_passphrase: bool,
     /// Drive 同期の進捗（pack のダウンロード中だけ `Some`。`render` は DB を読まない）。
@@ -327,6 +329,7 @@ impl SettingsView {
             key_has_passphrase: false,
             key_pending_owner: None,
             key_busy: false,
+            key_passphrase_only: false,
             confirm_remove_passphrase: false,
             sync_progress: None,
             sync_cancel: None,
@@ -493,13 +496,22 @@ impl SettingsView {
             return;
         }
         let handle = cx.entity();
+        // パスフレーズの有無と、必須モード（`sub` ラップの有無）を読む。
+        // どちらも Drive の bundle なので、まとめて背景で引く。
+        let keys_for_mode = crate::pack_keys::KeyContext::from_state(AppState::global(cx));
         let task = cx
             .background_executor()
             .spawn(async move { keys.has_passphrase() });
+        let mode_task = cx
+            .background_executor()
+            .spawn(async move { keys_for_mode.has_sub_wrap() });
         cx.spawn(async move |_window, cx| {
             let has_passphrase = task.await.unwrap_or(false);
+            // 取得できなければ「必須ではない」に倒す（表示だけの問題。判定は bundle が正）
+            let has_sub_wrap = mode_task.await.unwrap_or(true);
             handle.update(cx, |this, cx| {
                 this.key_has_passphrase = has_passphrase;
+                this.key_passphrase_only = !has_sub_wrap;
                 cx.notify();
             });
         })
@@ -607,6 +619,102 @@ impl SettingsView {
                     }
                     Err(error) => {
                         log::warn!("passphrase remove failed: {error}");
+                        this.error = Some(error);
+                    }
+                }
+                this.refresh_key_state(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// パスフレーズ必須モードにする（`sub` ラップを消す。仕様 §5.3）。
+    ///
+    /// - 入力欄に値がある → その値でパスフレーズを設定（変更）して必須にする
+    /// - 入力欄が空で**既にパスフレーズ設定済み** → 値を尋ねず、既存のラップのまま必須にする
+    ///   （必要なのは `sub` ラップを消すことだけ）
+    /// - どちらも無い → 入力を促す（必須にすると解錠手段が無くなるため）
+    ///
+    /// **忘れると復元できない**ので、UI で代償を明記している。
+    pub fn enable_passphrase_only(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.passphrase_input.clone() else {
+            return;
+        };
+        let value = input.read(cx).value().trim().to_string();
+        let passphrase = if value.is_empty() {
+            if !self.key_has_passphrase {
+                self.show_toast(
+                    "パスフレーズを入力してください（まだ設定されていないので、必須にすると解錠できなくなります）",
+                    cx,
+                );
+                return;
+            }
+            None
+        } else {
+            Some(value)
+        };
+        let used_existing = passphrase.is_none();
+        self.key_busy = true;
+        cx.notify();
+        let handle = cx.entity();
+        let keys = crate::pack_keys::KeyContext::from_state(AppState::global(cx));
+        let task = cx.background_executor().spawn(async move {
+            keys.enable_passphrase_only(passphrase.as_deref(), "パスフレーズ必須にする")
+        });
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle.update(cx, |this, cx| {
+                this.key_busy = false;
+                match result {
+                    Ok(()) => {
+                        // 入力欄は作り直す（打った値を残さない）
+                        this.passphrase_input = None;
+                        this.passphrase_clear_input = true;
+                        this.show_toast(
+                            if used_existing {
+                                "パスフレーズを必須にしました（設定済みのパスフレーズを使って、Google ログインだけでは復元できなくしました）"
+                            } else {
+                                "パスフレーズを必須にしました（Google ログインだけでは本の鍵を復元できません）"
+                            },
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!("passphrase-only enable failed: {error}");
+                        this.error = Some(error);
+                    }
+                }
+                this.refresh_key_state(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// パスフレーズ必須モードを解除する（`sub` ラップを戻す。仕様 §5.3）。
+    ///
+    /// 解除には PRK が要るので、keyring に無ければ**解錠ダイアログでパスフレーズを尋ねる**
+    /// （＝本人確認を兼ねる）。
+    pub fn disable_passphrase_only(&mut self, cx: &mut Context<Self>) {
+        self.key_busy = true;
+        cx.notify();
+        let handle = cx.entity();
+        let keys = crate::pack_keys::KeyContext::from_state(AppState::global(cx));
+        let task = cx
+            .background_executor()
+            .spawn(async move { keys.disable_passphrase_only("パスフレーズ必須を解除") });
+        cx.spawn(async move |_window, cx| {
+            let result = task.await;
+            handle.update(cx, |this, cx| {
+                this.key_busy = false;
+                match result {
+                    Ok(()) => this.show_toast(
+                        "パスフレーズ必須を解除しました（Google ログインで復元できるようになります）",
+                        cx,
+                    ),
+                    Err(error) => {
+                        log::warn!("passphrase-only disable failed: {error}");
                         this.error = Some(error);
                     }
                 }
@@ -2950,6 +3058,65 @@ impl Render for SettingsView {
                                                 }
                                             })
                                     })),
+                            ),
+                    );
+                    // パスフレーズ必須モード（`sub` ラップを消す。仕様 §5.3 / セキュリティ評価 F01）。
+                    // オンにすると Google ログイン（`sub`）だけでは PRK に戻せなくなる。
+                    let mode = self.key_passphrase_only;
+                    card = card.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(if mode {
+                                        "パスフレーズ必須: オン"
+                                    } else {
+                                        "パスフレーズ必須: オフ"
+                                    }),
+                            )
+                            .child(div().text_xs().text_color(muted_fg).child(if mode {
+                                "Google ログイン（sub）だけでは本の鍵を復元できません。Drive の \
+                                 thundoku-keys.json と sub を奪われても本は復号できません。\
+                                 パスフレーズを忘れると復元できません。"
+                            } else {
+                                "オンにすると、Google ログインだけでは本の鍵を復元できなくなります\
+                                 （Drive の鍵ファイルと sub を奪われても本は復号できません）。\
+                                 パスフレーズを忘れると復元できません。"
+                            }))
+                            .child(
+                                div().flex().flex_row().gap_2().child(if mode {
+                                    dialog_button("passphrase-only-disable", "必須を解除する")
+                                        .disabled(key_busy)
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.disable_passphrase_only(cx)
+                                                });
+                                            }
+                                        })
+                                } else {
+                                    Button::new("passphrase-only-enable")
+                                        .cursor_pointer()
+                                        .label(if key_has_passphrase {
+                                            "必須にする（設定済みのパスフレーズを使う）"
+                                        } else {
+                                            "必須にする（上のパスフレーズを設定）"
+                                        })
+                                        .disabled(key_busy)
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.enable_passphrase_only(cx)
+                                                });
+                                            }
+                                        })
+                                }),
                             ),
                     );
                 }

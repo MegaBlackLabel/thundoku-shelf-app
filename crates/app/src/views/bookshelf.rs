@@ -36,6 +36,7 @@ use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE, UreqTransport};
 
 use crate::actions::{
     CancelDownload, DeleteBook, EditBookTags, HideBook, OpenAuth, OpenAuthProvider, OpenReader,
+    ToggleBackupExcluded,
     SyncDrive,
 };
 use crate::app_state::{AppState, ToastKind};
@@ -1443,6 +1444,27 @@ enum ImportFailure {
     Message(String),
 }
 
+/// **転送の前に**「取り込み元の上限を超える」ことを断る（無駄なダウンロードをしない）。
+///
+/// 取り込みは `import_*_bytes` がソース全体をメモリへ読む設計で、上限は
+/// [`thundoku_core::import::MAX_IMPORT_SOURCE_BYTES`]。超える本は落としても取り込めないので、
+/// ストアが申告するサイズが分かるときは**ここで止める**（以前は 4.7 GB を全部落としてから
+/// 「取り込めません」と出ていた）。申告サイズが不明なら従来どおり進む（転送後に同じ判定をする）。
+fn reject_declared_too_large(declared_size: Option<u64>) -> Result<(), ImportFailure> {
+    let Some(size) = declared_size else {
+        return Ok(());
+    };
+    let limit = thundoku_core::import::MAX_IMPORT_SOURCE_BYTES;
+    if size > limit {
+        return Err(ImportFailure::Message(format!(
+            "この本は大きすぎて取り込めません（約 {}。上限は {}）",
+            thundoku_core::store_size::format_size_gb(size),
+            thundoku_core::store_size::format_size_gb(limit),
+        )));
+    }
+    Ok(())
+}
+
 /// ダウンロードの失敗を UI の失敗種別にする。
 ///
 /// 転送は中止要求で `Err`（各クライアントの `Cancelled`）になるが、中止かどうかは
@@ -1618,6 +1640,9 @@ impl BookshelfView {
                 })
                 .ok();
         });
+        // シャドウイングで元の `handle` に触れなくなるので、先に別名で確保しておく
+        // （バックアップ対象外 ON/OFF のハンドラ用）。
+        let backup_handle = handle.clone();
         let handle = handle.clone();
         App::on_action(cx, move |action: &HideBook, cx: &mut App| {
             let database_id = action.database_id.to_string();
@@ -1633,6 +1658,23 @@ impl BookshelfView {
                         return;
                     };
                     this.toggle_hidden(cx, &card);
+                })
+                .ok();
+        });
+        App::on_action(cx, move |action: &ToggleBackupExcluded, cx: &mut App| {
+            let database_id = action.database_id.to_string();
+            let site_id = action.site_id.to_string();
+            backup_handle
+                .update(cx, |this, cx| {
+                    let Some(card) = this
+                        .shelf_cards
+                        .iter()
+                        .find(|c| c.shelf.database_id == database_id && c.shelf.site_id == site_id)
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    this.toggle_backup_excluded(cx, &card);
                 })
                 .ok();
         });
@@ -3999,6 +4041,8 @@ impl BookshelfView {
                         .file_size
                         .as_deref()
                         .and_then(thundoku_core::store_size::parse_store_size);
+                    // 上限を超える本は**転送の前に**断る（落としても取り込めない）
+                    reject_declared_too_large(declared_size)?;
                     if !large_confirmed
                         && thundoku_core::store_size::needs_large_download_confirmation(declared_size)
                     {
@@ -4060,6 +4104,8 @@ impl BookshelfView {
                     let page_meta = client.work_page_meta(&product_id).unwrap_or_default();
                     site_author = page_meta.author;
                     // 2 GiB 超は転送の前に確認する
+                    // 上限を超える本は**転送の前に**断る（落としても取り込めない）
+                    reject_declared_too_large(page_meta.file_size)?;
                     if !large_confirmed
                         && thundoku_core::store_size::needs_large_download_confirmation(
                             page_meta.file_size,
@@ -4192,19 +4238,17 @@ impl BookshelfView {
                     }
                 };
                 let imported = if extension == "pdf" {
-                    // PDF レンダリング（重い）は DB ロック外で行い、UI スレッドの
-                    // DB 操作をブロックしないようにする。
-                    let pages =
-                        thundoku_core::import::pdf::render_pdf_pages(&bytes, &mut on_import)
-                            .map_err(|e| e.to_string())?;
-
-                    let imported = thundoku_core::import::import_rendered_pdf_pages(
+                    // PDF のレンダリング（重い）は DB を触る前に終わる（`import_pdf_bytes` の
+                    // 中で レンダリング → pack → DB の順に進む）。**1 ページずつ** pack へ
+                    // 入れるので、全ページをメモリに持たない（以前は全ページを集めてから
+                    // clone していた）。
+                    let imported = thundoku_core::import::import_pdf_bytes(
                         &db,
                         &file_name,
-                        bytes.len() as i64,
-                        pages,
+                        &bytes,
                         &packs_dir,
                         Some(&root_key),
+                        &mut on_import,
                         reuse_book_id.as_deref(),
                     )
                     .map_err(import_failure)?;
@@ -4619,6 +4663,40 @@ impl BookshelfView {
         }
         // 非表示にした本を本棚から即時除外する
         self.filtered_dirty = true;
+        cx.notify();
+    }
+
+    /// 右クリックメニュー「バックアップ対象外 ON/OFF」。
+    ///
+    /// Drive へ上げない本にする / 戻す（`books.backup_excluded`）。同期のアップロード方向が
+    /// この印を見て skip するので、**終了時のアップロードでも上がらない**。
+    /// 取得済み（ローカルにある）本だけが対象（未取得は落とす必要があるので対象外にできない）。
+    fn toggle_backup_excluded(&mut self, cx: &mut Context<Self>, card: &ShelfCard) {
+        let Some(local) = &card.local else {
+            return;
+        };
+        let book_id = local.book.id.clone();
+        let current = {
+            let state = Self::app_state(cx);
+            db::books::is_backup_excluded(&state.db_pool, &book_id).unwrap_or(false)
+        };
+        let next = !current;
+        {
+            let state = Self::app_state(cx);
+            if let Err(error) = db::books::set_backup_excluded(&state.db_pool, &book_id, next) {
+                log::warn!("backup excluded toggle failed: {error}");
+                return;
+            }
+        }
+        crate::app_state::set_toast_kind(
+            cx,
+            crate::app_state::ToastKind::Info,
+            if next {
+                "この本を Drive のバックアップ対象外にしました（同期・終了時のアップロードで上げません）"
+            } else {
+                "この本を Drive のバックアップ対象に戻しました"
+            },
+        );
         cx.notify();
     }
 
@@ -6021,6 +6099,25 @@ impl BookshelfView {
                         site_id: site_id_for_menu.clone().into(),
                     }),
                 );
+                // Drive バックアップ対象外 ON/OFF: ON にすると同期のアップロードから外れる
+                // （**終了時のアップロードも同じ経路**なので、終了時にも上がらない）。
+                // 未取得（クラウドにしか無い）本は落とす必要があるので対象外にできない。
+                let backup_excluded_now = delete_id_for_menu.as_deref().is_some_and(|book_id| {
+                    db::books::is_backup_excluded(&AppState::global(cx).db_pool, book_id)
+                        .unwrap_or(false)
+                });
+                menu = menu.menu_with_disabled(
+                    if backup_excluded_now {
+                        "バックアップ対象外を解除"
+                    } else {
+                        "バックアップ対象外にする"
+                    },
+                    Box::new(ToggleBackupExcluded {
+                        database_id: edit_id_for_menu.clone().into(),
+                        site_id: site_id_for_menu.clone().into(),
+                    }),
+                    delete_id_for_menu.is_none(),
+                );
                 menu
             }
         })
@@ -7303,6 +7400,25 @@ impl BookshelfView {
                         database_id: edit_id_for_menu.clone().into(),
                         site_id: site_id_for_menu.clone().into(),
                     }),
+                );
+                // Drive バックアップ対象外 ON/OFF: ON にすると同期のアップロードから外れる
+                // （**終了時のアップロードも同じ経路**なので、終了時にも上がらない）。
+                // 未取得（クラウドにしか無い）本は落とす必要があるので対象外にできない。
+                let backup_excluded_now = delete_id_for_menu.as_deref().is_some_and(|book_id| {
+                    db::books::is_backup_excluded(&AppState::global(cx).db_pool, book_id)
+                        .unwrap_or(false)
+                });
+                menu = menu.menu_with_disabled(
+                    if backup_excluded_now {
+                        "バックアップ対象外を解除"
+                    } else {
+                        "バックアップ対象外にする"
+                    },
+                    Box::new(ToggleBackupExcluded {
+                        database_id: edit_id_for_menu.clone().into(),
+                        site_id: site_id_for_menu.clone().into(),
+                    }),
+                    delete_id_for_menu.is_none(),
                 );
                 menu
             }
@@ -13085,6 +13201,27 @@ mod tests {
                 "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main.jpg".to_string()
             ]
         );
+    }
+
+    /// 取り込み元の上限を超える本は、**転送の前に**断る（無駄なダウンロードをしない）。
+    ///
+    /// 以前は 4.7 GB を全部落としてから「この本は大きすぎて取り込めません」と出ていた
+    /// （2026-09-26 の実機報告）。申告サイズが分かるストアではここで止める。
+    #[test]
+    fn declared_size_over_the_import_limit_is_rejected_before_downloading() {
+        let limit = thundoku_core::import::MAX_IMPORT_SOURCE_BYTES;
+        // 申告サイズが不明なら進む（転送後に同じ判定をする）
+        assert!(super::reject_declared_too_large(None).is_ok());
+        // 上限ちょうどは進む（境界）
+        assert!(super::reject_declared_too_large(Some(limit)).is_ok());
+        // 1 バイトでも超えたら断る（大きさと上限が文言に入る）
+        match super::reject_declared_too_large(Some(limit + 1)) {
+            Err(super::ImportFailure::Message(message)) => {
+                assert!(message.contains("大きすぎて取り込めません"), "{message}");
+                assert!(message.contains("上限"), "{message}");
+            }
+            _ => panic!("上限超は Message で断る"),
+        }
     }
 
     /// 2 GiB 超は失敗ではなく「確認待ち」として扱う（通知で終わらせない）。

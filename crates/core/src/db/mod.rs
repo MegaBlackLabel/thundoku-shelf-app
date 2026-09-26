@@ -230,6 +230,23 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 .await?;
             }
         }
+        // Drive バックアップ対象外（大きな pack を上げない。α版なので
+        // PRAGMA で存在確認してから ALTER TABLE する。migration ファイルは
+        // checksum 管理なので触らない）。
+        {
+            let has_backup_excluded: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('books') WHERE name = 'backup_excluded'",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if !has_backup_excluded {
+                sqlx::query(
+                    "ALTER TABLE books ADD COLUMN backup_excluded INTEGER NOT NULL DEFAULT 0",
+                )
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
         // 所有者 sub（暗号化済み / NULL = 未所属）。アカウント切替・複数アカウント対応
         // （改訂版）。既存の migration ファイルは checksum 管理されるため変更せず、
         // PRAGMA で存在確認してから ALTER TABLE する。

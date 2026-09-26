@@ -1800,3 +1800,72 @@ fn import_pdf_rejects_more_pages_than_the_limit() {
         started.elapsed()
     );
 }
+
+/// 逐次版レンダラは、ページを**順番どおり 1 件ずつ**渡し、件数を返す。
+///
+/// 取り込みはこの順序に依存して `pages/page_NNNN.webp` を決めるので、飛ばしたり
+/// 前後したりすると pack の中身と DB のページ番号がずれる。
+#[test]
+fn render_pdf_pages_into_emits_pages_in_order() {
+    if !pdfium_ready() {
+        return;
+    }
+    // 3 ページの最小 PDF を組む（順序と件数を見るため、高さを変えて区別する）。
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Count 3 /Kids [3 0 R 4 0 R 5 0 R] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 300] >>".to_vec(),
+    ];
+    let multi = build_pdf(&objects);
+
+    let mut heights: Vec<u32> = Vec::new();
+    let mut seen: Vec<usize> = Vec::new();
+    let total = thundoku_core::import::pdf::render_pdf_pages_into(
+        &multi,
+        &mut no_progress,
+        &mut |page| {
+            seen.push(seen.len() + 1);
+            heights.push(page.height);
+            Ok(())
+        },
+    )
+    .expect("レンダリングできる");
+    assert_eq!(total, 3, "総ページ数を返す");
+    assert_eq!(seen, vec![1, 2, 3], "順番どおりに渡す");
+    assert_eq!(heights.len(), 3, "全ページを渡す");
+    // MediaBox の高さが違うので、画像の高さも単調に増える（順序が入れ替わっていない）
+    assert!(
+        heights[0] < heights[1] && heights[1] < heights[2],
+        "ページの順序が入れ替わっている: {heights:?}"
+    );
+}
+
+/// `on_page` がエラーを返したら、そこで止めて同じエラーを返す
+/// （取り込み側は「ページ番号と実際のページがずれない」ため、失敗ページを飛ばさない）。
+#[test]
+fn render_pdf_pages_into_stops_on_error() {
+    if !pdfium_ready() {
+        return;
+    }
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 200] >>".to_vec(),
+    ];
+    let pdf = build_pdf(&objects);
+    let mut calls = 0;
+    let error = thundoku_core::import::pdf::render_pdf_pages_into(
+        &pdf,
+        &mut no_progress,
+        &mut |_| {
+            calls += 1;
+            Err(ImportError::Pdf("テスト用の失敗".into()))
+        },
+    )
+    .expect_err("エラーを返す");
+    assert!(matches!(error, ImportError::Pdf(_)), "{error}");
+    assert_eq!(calls, 1, "1 ページ目で止める（2 ページ目を渡さない）");
+}

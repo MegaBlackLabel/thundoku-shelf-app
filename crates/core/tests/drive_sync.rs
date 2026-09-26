@@ -1640,3 +1640,95 @@ fn upload_progress_reports_sent_bytes() {
         "途中経過が無い: {uploads:?}"
     );
 }
+
+/// バックアップ対象外の本は**アップロードしない**（大きい pack / 右クリックで外した本）。
+///
+/// 終了時のアップロードも同じ経路を通るので、ここが効けば終了時も上がらない。
+#[test]
+fn excluded_book_is_not_uploaded() {
+    let env = TestEnv::new("upload-excluded");
+    let mut drive = FakeDrive::new();
+    let bytes = plain_pack("pages/page_0001.webp", b"EXCLUDED");
+    std::fs::write(env.packs().join("pack-8.opfspack"), &bytes).unwrap();
+    db::books::insert(
+        &env.pool,
+        &db::books::Book {
+            id: "pack-8".into(),
+            title: "pack-8".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "pack-8.opfspack".into(),
+            file_size: bytes.len() as i64,
+            opfs_path: "pack-8.opfspack".into(),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some("pack-8".into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: "2026-08-21 00:00:00".into(),
+            updated_at: "2026-08-21 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+    let key = [11u8; 32];
+    db::books::set_owner_sub(
+        &env.pool,
+        "pack-8",
+        Some(thundoku_core::owner::encrypt(&key, "test-sub")),
+    )
+    .unwrap();
+    // バックアップ対象外にする（右クリックメニューの「バックアップ対象外」と同じ）
+    db::books::set_backup_excluded(&env.pool, "pack-8", true).unwrap();
+    assert!(db::books::is_backup_excluded(&env.pool, "pack-8").unwrap());
+    assert!(
+        db::books::backup_excluded_ids(&env.pool)
+            .unwrap()
+            .contains("pack-8")
+    );
+
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("test-sub"),
+        pack_root_key: None,
+        owner_key: Some(&key),
+        folder_id: "folder-1",
+        db_path: None,
+    })
+    .unwrap();
+    assert_eq!(drive.upload_count(), 0, "対象外なのに上げている");
+    assert!(outcome.uploaded.is_empty(), "{:?}", outcome.uploaded);
+    assert!(outcome.skipped.contains(&"pack-8".to_string()), "{:?}", outcome.skipped);
+    assert!(!drive.files.contains_key("id-pack-8.opfspack"));
+
+    // 戻せば上げられる（ON/OFF が効く）
+    db::books::set_backup_excluded(&env.pool, "pack-8", false).unwrap();
+    sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("test-sub"),
+        pack_root_key: None,
+        owner_key: Some(&key),
+        folder_id: "folder-1",
+        db_path: None,
+    })
+    .unwrap();
+    assert_eq!(drive.upload_count(), 1, "戻したのに上げていない");
+}
