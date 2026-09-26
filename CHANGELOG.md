@@ -19,6 +19,19 @@
 
 ### Changed
 
+- **アプリのダウンロードを一時ファイル経由にする（4 GiB 級の本で RAM を数 GB 使う問題）**:
+  これまでダウンロードはメモリ（`Vec<u8>`）に載せたまま取込みへ渡しており、4.7 GB の本で
+  ピーク 4.8 GB を消費していた（メモリの少ない端末では落ちる）。4 ストア
+  （FANZA / DLsite / 技術書典 / BOOTH）に `download_to_file_with_progress` を足し、
+  アプリは**一時ファイルへ落としてパス経由で取り込む**（`import_pdf_path` /
+  `analyze_zip_path` + `commit_zip_path`。EPUB と単体画像は小さいのでファイルから読む）。
+  一時ファイルは `TempDownload`（`Drop`）が**成功・失敗・中止のどの経路でも消す**。
+  検証（宛先・リダイレクト・署名 Cookie）と進捗・キャンセルの規則はメモリ経路と同じで、
+  2xx の本文だけをファイルへ書く（リダイレクトの本文は書かない）。ピークは
+  「1 ページ＋64 MiB」程度になる。`crates/core/src/tbf/{mod,redirect}.rs`、
+  `crates/core/src/{fanza,dlsite,booth}*.rs`、`crates/app/src/views/bookshelf.rs`
+
+
 - **ZIP エントリの上限を 512 MiB → 2 GiB にする（正当な本が弾かれていた）**:
   FANZA の 142 MB の ZIP（`d_631517.zip`）に含まれる `benrionna_pdf_re.pdf` が
   「エントリがサイズ上限（512 MiB）を超えています」で取り込めなかった。
@@ -62,6 +75,18 @@
   `crates/core/src/import/{pdf,mod}.rs`、`crates/app/src/views/bookshelf.rs`
 
 ### Added
+
+- **Drive から削除（右クリックメニュー）と、既存の大きい本への自動適用**:
+  ① 右クリック →「Drive から削除（この端末には残る）」で Drive のコピーを消して容量を空ける
+  （消すだけだと次の同期で上げ直すので**同時にバックアップ対象外にする**。ローカルの pack は
+  残り、同期の状態行も消すので、対象外を解除すれば次の同期で上げ直せる）。Drive にコピーが
+  無い本では無効表示。② 起動時に**一度だけ**、pack が 1 GiB を超える本へ自動で印を立てる
+  （設定のマーカー `backup.auto_excluded_once` で二度目以降は何もしない＝ユーザーが手動で
+  解除した本をひっくり返さない。未取得の本は対象外）。
+  `crates/core/src/drive/sync.rs`（`delete_pack_from_drive`）、`crates/core/src/db/books.rs`
+  （`apply_auto_backup_exclusion_once`）、`crates/app/src/{actions.rs,views/bookshelf.rs,workspace.rs}`、
+  `docs/spec/06-sync-auth-drive.md`
+
 
 - **本ごとに「Drive バックアップ対象外」を切り替えられる（右クリックメニュー）**:
   大きい pack は Drive の容量と、終了時のアップロードの時間を食う。右クリックメニュー →

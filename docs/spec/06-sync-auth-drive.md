@@ -249,6 +249,7 @@
    11. `sync_state::upsert(pack_id, drive_file_id, md5, modified_time, last_synced_at=now)`。`now` は UTC の `%Y-%m-%d %H:%M:%S` `crates/core/src/drive/sync.rs:81-83`。
 
 6. **アップロード方向**（`books::list(pool)` の全行について）:
+   - **Drive から削除**（`delete_pack_from_drive`）: Drive 上の pack を消して同期の状態行も消す（ローカルは残す）。右クリックメニューから実行でき、同時にバックアップ対象外にする（消した直後に上げ直さないため）。状態行を消すので、対象外を解除すれば次に上げ直せる `crates/core/src/drive/sync.rs`
    - **Drive バックアップ対象外の本（`books.backup_excluded = 1`）は skip する**（大きい pack を上げない。右クリックメニューで切り替え、取り込み時に pack が 1 GiB を超えたら自動で立てる）。**終了時のアップロードも同じ経路**なので終了時にも上がらない `crates/core/src/drive/sync.rs`
    1. `pack_id = book.pack_id`（無ければ `book.id`）。空ならスキップ。
    2. `upload_ids` に含まれない本（未所属・他アカウント）はスキップ。
