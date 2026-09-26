@@ -4,7 +4,58 @@
 
 ## [Unreleased]
 
+### Added
+
+- **「表示中のタグ取得」でタグ未取得の本を後から埋められるようにした**: タグ（ジャンル）は
+  作品ページ / 作品メタにしか無く、取り込み時に取れなかった本（FANZA の PDF など）は
+  タグが空のまま**取り直す手段が無かった**（同期の後追い取得は未ダウンロード本に限定され、
+  ダウンロード済みの本は対象外だった）。ヘッダーの「表示中のタグ取得」
+  （セレクタ `bookshelf-visible-tags`）で、**いま見えている本**のうち未取得
+  （`bookshelf_items.tags_fetched = 0`）のものだけを取って反映する。ダウンロード済みの本も
+  対象で、サイトは FANZA（作品ページ、1 件 = 1 リクエスト、20 件/回・300 ms 間隔）と
+  DLsite（`product/info/ajax`、20 件一括、100 件/回）。タグが 0 件の作品も「取得済み」に
+  するので同じ作品を叩き続けない。完了は「表示中の本のタグを N 件取得しました（失敗 K 件 /
+  残り M 件）」と保護つき通知で知らせる。`crates/core/src/db/bookshelf.rs`
+  （`unfetched_among`）、`crates/core/src/{fanza,dlsite}/sync.rs`（`fetch_tags_for`）、
+  `crates/app/src/views/bookshelf.rs`（`fetch_visible_tags` / `tag_fetch_targets` /
+  `split_tag_targets`）
+
 ### Fixed
+
+- **ビューアーでページ送り/戻しの帯にカーソルを合わせるとトップ/ボトムのメニューが出る問題**:
+  左右 10% のクリック帯（前へ / 次へ）は `viewer-root` の**全画面レイヤー**
+  （マウス移動でオーバーレイを表示する）より下にあるため、移動イベントがそのまま
+  下の層へ届き、**帯へ向かって動かすだけでメニューが開いていた**（帯はページ送りの入口
+  なので毎回出るのは邪魔）。帯の `on_mouse_move` / `on_mouse_down` で
+  `stop_propagation()` して、帯の上ではオーバーレイを出さない・帯のダブルクリックで
+  オーバーレイをトグルしないようにした（ページの上でのマウス移動で表示する動作は
+  そのまま）。`crates/app/src/components/image_viewer/mod.rs`
+
+- **ビューアーで高解像度のページほど荒れて見える問題（前縮小が効いていなかった）**:
+  表示用の前縮小（`downscale_for_display`）は「表示に必要な幅」が決まってから走るが、
+  `ImageViewer::new` / `set_loader` の先読みは**描画前**（`display_target_width == 0`）に走る
+  ため、開いた直後のページは**フル解像度のまま**キャッシュされていた。作り直しの条件が
+  「小さすぎるとき」だけだったので、そのまま GPU に渡って実質 1 タップで縮小され、
+  網点（スクリーントーン）が潰れていた。**解像度が高いページほど縮小率が大きく目立つ**ため、
+  同じ本・同じビューアー設定でも「4441px の JPEG 版だけが荒れて、1000px の PDF 版は綺麗」に
+  見えていた（取り込みは両方とも正常で、データも欠けていない）。**目標の 2 倍を超える
+  大きさのページも読み直す**ようにした。`crates/app/src/components/image_viewer/mod.rs`
+
+- **ビューアーの左右クリック帯が綴じ方向を見ていなかった（右綴じで「左を押すと戻る」）**:
+  画像の左右 10% のクリック帯は、左が常に `prev_page` / 右が常に `next_page` に固定されて
+  いた。見開きのページ配置（`spread_pages` の反転）・キーボードの左右（`handle_key`）・
+  ボトムドックの前へ/次へ（`mirror_nav`）は綴じ方向で入れ替えていたため、**右綴じの本で
+  左を押すと戻る**（次へ進むべきところで逆）になっていた。左右の判断を
+  `edge_left_nav` / `edge_right_nav` に集約し、`page_turn_right_to_left` で反転する
+  （単一・見開きの両方、Shift の 1 ページ移動も同じ）。
+  `crates/app/src/components/image_viewer/mod.rs`
+
+- **PDF で取り込んだ本にサイトのタグ（ジャンル）が入らない問題**: ストアタグの反映
+  （`fanza_genre` / `dlsite_genre` を `book_tags` と `bookshelf_items.tags_json` に書く）が
+  **非 PDF の分岐にしか無く**、FANZA / DLsite の PDF はタグが空のまま本棚に出ていた。
+  FANZA のタグは作品ページにしか無く、同期は `tags_json: None` で行を作り、既存の後追い取得は
+  ダウンロード済みの本を対象外にしていたため、**埋める経路が無かった**。`apply_site_tags` に
+  切り出して**両方の取り込み経路**から呼ぶ。`crates/app/src/views/bookshelf.rs`
 
 - **終了時のバックアップ アップロード（と「今すぐ同期」）が終わらない問題**:
   `KeyContext::unlock` / `retry_pending_upload` は内部で `drive()`（Google クライアントの

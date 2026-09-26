@@ -93,7 +93,7 @@ Drive 同期設定など）。
 | is_downloadable / is_checked / is_purchased / is_new / is_active | INTEGER | フラグ群 |
 | is_favorite / is_hidden | INTEGER | お気に入り・非表示 |
 | tags_json | TEXT | タグの JSON スナップショット |
-| tags_fetched | INTEGER | タグ取得済みフラグ（0 = 未取得）。FANZA の**未ダウンロード本**のタグを同期のたびに少しずつ取るための印（`fanza::sync::fetch_pending_tags`）。タグが 0 件でも 1 を立てて再取得しない |
+| tags_fetched | INTEGER | タグ取得済みフラグ（0 = 未取得）。①FANZA の**未ダウンロード本**のタグを同期のたびに少しずつ取るための印（`fanza::sync::fetch_pending_tags`）②ヘッダーの「表示中のタグ取得」が**表示中の本**を絞るための印（`db::bookshelf::unfetched_among`）。タグが 0 件でも 1 を立てて再取得しない |
 | synced_at / created_at / updated_at | TEXT | |
 
 ### reading_progress

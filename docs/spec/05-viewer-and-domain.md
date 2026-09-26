@@ -104,6 +104,7 @@
 - キーボードの左右は綴じ方向で反転: `rtl == true` のとき `right`/`l` = 前へ、`left`/`h` = 次へ（Shift 付きは 1 ページ版）（`crates/app/src/components/image_viewer/mod.rs:1953-1993`）。
 - ボトムドックの「前へ / 次へ」ボタンも `mirror_nav = mode == Spread && page_turn_right_to_left` のとき入れ替える（`crates/app/src/components/image_viewer/mod.rs:2254`、`crates/app/src/components/image_viewer/mod.rs:2930-2950`）。
 - ナビ帯: 単一表示は画像矩形上に左右 `edge_w = max(img_w * 0.1, 40.0)` px（`crates/app/src/components/image_viewer/mod.rs:2575`）。見開きはウィンドウ左右端の幅 10%（`DefiniteLength::Fraction(0.1)`）で、`mode == Spread && !zoomed` のときだけ出す（`crates/app/src/components/image_viewer/mod.rs:2789-2849`）。スクロールでは非表示。
+- ナビ帯の左右は**綴じ方向で反転する**（`edge_left_nav` / `edge_right_nav` → `navigate`）。左綴じは 左 = 前へ / 右 = 次へ、右綴じは 左 = 次へ / 右 = 前へ。キーボード（前掲）とボトムドック（`mirror_nav`）と同じ規則で、**右綴じで「左を押すと戻る」**になっていた不具合の修正（`crates/app/src/components/image_viewer/mod.rs:1408-1423`、テスト `edge_click_navigation_follows_the_binding_direction`）。
 
 ### 1.5 ズームとパン
 
@@ -174,7 +175,7 @@
 | パネル / ドックの背景 | ライト = 白 80%（`white().alpha(0.8)`。パネル・ドック共通）/ ダーク = 黒 70%（パネル）/ 黒 60%（ドック） | `crates/app/src/components/image_viewer/mod.rs:2272-2281` |
 | 自動非表示 | `OVERLAY_HIDE_MS`(5000 ms) 後、`hide_generation` が一致するときだけ `overlay_visible = false`。`active_panel.is_some() || hovering_ui` 中はタイマーを張らない | `crates/app/src/components/image_viewer/mod.rs:1626-1644` |
 | 連続ページ送りでの自動非表示 | `page_turn_count += 1` が **2 回以上**かつ表示中なら `overlay_visible = false` + `hide_generation += 1`。`show_overlay()` で `page_turn_count = 0`。オーバーレイ表示操作でカウントはリセット | `crates/app/src/components/image_viewer/mod.rs:1267-1276`、`crates/app/src/components/image_viewer/mod.rs:1603-1608` |
-| ホバー挙動 | 画像面ホバーで非表示なら表示 / 表示中ならタイマー再起動。ドック / パネル内は `hovering_ui` を立てて自動非表示を止め、外れたら再起動 | `crates/app/src/components/image_viewer/mod.rs:2688-2706`、`crates/app/src/components/image_viewer/mod.rs:2925-2943` |
+| ホバー挙動 | 画像面ホバーで非表示なら表示 / 表示中ならタイマー再起動。ドック / パネル内は `hovering_ui` を立てて自動非表示を止め、外れたら再起動。**ページ送り / 戻しのクリック帯の上では表示しない**（帯が `stop_propagation` でイベントを下の全画面レイヤーへ流さない。帯へのダブルクリックもオーバーレイをトグルしない） | `crates/app/src/components/image_viewer/mod.rs:2688-2706`、`crates/app/src/components/image_viewer/mod.rs:2925-2943` |
 | 中央ダブルクリック | `event.click_count == 2` で `toggle_overlay()` | `crates/app/src/components/image_viewer/mod.rs:2695-2698` |
 | 自動再生開始条件 | `mode == Scroll` なら `start_autoplay` は何もしない。ループは `interval_ms` ごとに `next_page()`。最終ページで `autoplay = false` にして停止 | `crates/app/src/components/image_viewer/mod.rs:1657-1692` |
 | スライダー（自動再生） | `SliderState::new().max(30000).min(3000).step(1000).default_value(5000)`（**max を先に設定**。min を先にすると min > max で panic する） | `crates/app/src/components/image_viewer/mod.rs:1908-1918` |
@@ -384,8 +385,8 @@ ON CONFLICT(book_id, content_id, page_number) DO UPDATE SET
 |---|---|---|---|
 | `"generated"` | 取り込み時の形態素解析（lindera ipadic）→ 名詞抽出 → Zenn タグ照合 | `import::finish_import` が `tags_repo::set_for_book(pool, &book_id, &tag_pairs)`（全件置換） | `crates/core/src/import/mod.rs:1138-1146` |
 | `"manual"` | 手動編集（本棚のインラインエディタ / タグ編集画面） | `set_for_book(local_id, tags.iter().map(|t| (t, "manual")))` | `crates/app/src/views/bookshelf.rs:3700-3702`、`crates/app/src/views/tag_edit.rs:139-141` |
-| `"fanza_genre"` | FANZA のジャンルタグ（取り込み時） | `set_for_book(imported.book.id, genre_tags.map(|t| (t, "fanza_genre")))` + `bookshelf::update_tags` で `tags_json` にも書く | `crates/app/src/views/bookshelf.rs:3081-3088` |
-| `"dlsite_genre"` | DLsite のカスタムジャンル（`item.tags_json`） | `set_for_book(imported.book.id, tags.map(|t| (t, "dlsite_genre")))` | `crates/app/src/views/bookshelf.rs:3108-3114` |
+| `"fanza_genre"` | FANZA のジャンルタグ（作品ページ。取り込み時の PDF / それ以外の**両経路**） | `apply_site_tags` が `set_for_book(book_id, genre_tags.map(|t| (t, "fanza_genre")))` + `bookshelf::update_tags` で `tags_json` にも書く | `crates/app/src/views/bookshelf.rs:9390-9419` |
+| `"dlsite_genre"` | DLsite のカスタムジャンル（`item.tags_json`。取り込み時の**両経路**） | `apply_site_tags` が `set_for_book(book_id, tags.map(|t| (t, "dlsite_genre")))` + `bookshelf::update_tags` | `crates/app/src/views/bookshelf.rs:9390-9419` |
 
 - タグ行 ID は `uuid::Uuid::new_v4().to_string()`（UUID v4 の文字列）。`set_for_book` は **DELETE + INSERT の全置換**を 1 トランザクションで行う（`crates/core/src/db/tags.rs:18-42`）。
 - 編集 UI が読み込むのは `source` が `"manual"` / `"fanza_genre"` / `"dlsite_genre"` の行のみ（`"generated"` は編集対象に出さない）（`crates/app/src/views/bookshelf.rs:3552-3562`）。
