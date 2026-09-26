@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS books (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   owner_sub TEXT,
+  backup_excluded INTEGER NOT NULL DEFAULT 0,  -- Drive バックアップ（アップロード）対象外
   page_turn TEXT
 );
 
@@ -601,6 +602,7 @@ CREATE TABLE IF NOT EXISTS drive_sync_state (
 | 対象 | `0001_init.sql` | `schema.sql`（= 最終形） | 差分を作る runtime DDL |
 |---|---|---|---|
 | `books` | `owner_sub` なし | `owner_sub TEXT` あり | `db/mod.rs:242` |
+| `books` | `backup_excluded` なし | `backup_excluded INTEGER NOT NULL DEFAULT 0` あり（Drive バックアップ対象外。α版のため migration ファイルを増やさず `migrate` の PRAGMA 付き `ALTER TABLE` で足す） | `db/mod.rs`（`migrate`） |
 | `books` | `page_turn` なし | `page_turn TEXT` あり（`NULL` = サイト別設定 `viewer.page_turn.{site}` に従う） | `db/mod.rs:274`（`ensure_column`） |
 | `books` の UNIQUE | `books_site_tbf_product_id_unique`（部分 UNIQUE インデックス）あり | なし | `db/mod.rs:250` の `DROP INDEX IF EXISTS` |
 | `bookshelf_items` | `author` / `hidden_at` / `poll_sync_enabled`(誤記注: `poll_sync_enabled` は `tbf_events`) なし、共有ソースメタ 10 列なし | あり | `db/mod.rs:209`（`hidden_at`）, `:226`（`author`）, `:355-380`（10 列） |

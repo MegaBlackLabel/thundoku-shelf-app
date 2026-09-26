@@ -30,6 +30,51 @@
   **内訳（宣言サイズ / 実際に読めた長さ）**を出して、上限かデータ破損かを切り分けられる
   ようにした。`crates/core/src/import/mod.rs`
 
+### Fixed
+
+- **大きい本（4 GiB 級）を取り込めなかった**: `MAX_IMPORT_SOURCE_BYTES` が 2 GiB のまま
+  （pack は 10 GiB まで対応）だったため、ストアが 4.7 GiB と申告する本は
+  **全部ダウンロードしてから**「この本は大きすぎて取り込めません」と出ていた
+  （2026-09-26 の実機報告）。① 上限を pack と同じ **10 GiB** に揃え、② ストアが申告する
+  サイズが分かるときは**転送の前**に断る（無駄な転送をしない）、③ PDF と ZIP は
+  **ファイルから読む**経路（`import_pdf_path` / `import_zip_path` / `analyze_zip_path` /
+  `commit_zip_path`、`pdf::render_pdf_file_into`）を追加した。
+  `crates/core/src/import/{mod,pdf}.rs`、`crates/app/src/views/bookshelf.rs`、
+  `docs/spec/{03-import-and-pack,README}.md`
+
+### Changed
+
+- **取り込みの画像変換を約 1.85 倍速くする**: 変換時間の内訳を実測したところ
+  **libwebp のエンコードが 91%**（1433×2024 の実ページ、q88 で 220ms/453KiB）だった。
+  libwebp の effort（`method`）を既定の 4 から **2** に下げて **103ms/462KiB**（2.1 倍速・
+  +2%）にし、並列ワーカーの上限も 8 → 12（実測機は 12 コア / 16 論理。1 ワーカー
+  30〜40MB なのでメモリ保護の上限は維持）にした。ページ全体では 239ms → **129ms**
+  （1.85 倍）。3,321 枚のコレクション本で 4 分 43 秒 → 1 分 50 秒前後になる見込み。
+  `crates/core/src/import/mod.rs`（`encode_webp` / `WEBP_METHOD` / `page_render_workers`）
+
+- **PDF の取り込みも 1 ページずつにする（全ページをメモリに持たない）**:
+  以前はレンダリング結果（webp）を `Vec<PageImage>` に全部集めてから `clone` して pack の
+  エントリを作っていたため、200 ページ級の本で数百 MB を余分に保持していた。
+  `pdf::render_pdf_pages_into`（1 ページずつ `on_page` へ渡す）に変え、取り込み
+  （`import_pdf_bytes`）は各ページをその場で `PackEntryStore` へ入れる（合計 64 MiB を
+  超えたら一時ファイルへ逃がす既存の仕組みに乗る）。`render_pdf_pages` は逐次版を集める
+  薄いラッパとして残す（テストと小さい呼び出し用）。
+  `crates/core/src/import/{pdf,mod}.rs`、`crates/app/src/views/bookshelf.rs`
+
+### Added
+
+- **本ごとに「Drive バックアップ対象外」を切り替えられる（右クリックメニュー）**:
+  大きい pack は Drive の容量と、終了時のアップロードの時間を食う。右クリックメニュー →
+  「バックアップ対象外にする / 解除」で `books.backup_excluded` を切り替え、ON の本は
+  同期のアップロード方向で **skip** する（**終了時のアップロードも同じ経路**なので終了時にも
+  上がらない）。取り込み時に pack が **1 GiB** を超えた本は**自動で**対象外にする
+  （`import::AUTO_EXCLUDE_BACKUP_PACK_BYTES`。手動で戻せる）。未取得（クラウドにしか無い）本は
+  落とす必要があるので対象外にできない（メニューは無効）。α版のため migration ファイルは
+  増やさず、`migrate` の PRAGMA 付き `ALTER TABLE` で列を足す。
+  `crates/core/src/db/{mod,books}.rs`、`crates/core/src/drive/sync.rs`、
+  `crates/core/src/import/mod.rs`、`crates/app/src/{actions.rs,views/bookshelf.rs}`、
+  `docs/spec/{02-data-model,06-sync-auth-drive}.md`、`docs/features.md`
+
 ### Added
 
 - **アップロードの進捗を出す**: `Transport::send_stream_with_progress`（送信バイト数を
@@ -176,6 +221,28 @@
   `crates/opfspack/src/{builder,keys}.rs`、`crates/core/src/import/{mod,pdf}.rs`、
   `crates/app/src/views/bookshelf.rs`、
   `docs/spec/03-import-and-pack.md`、`docs/spec/10-pack-keys.md`
+
+- **「パスフレーズ必須モード」を実装する（セキュリティ評価 F01 の本丸）**:
+  これまでパスフレーズを設定しても `sub` ラップが残るため、Drive の `thundoku-keys.json` と
+  `sub` を奪われた相手はパスフレーズ無しで本を復号できた（追加防御になっていなかった）。
+  設定 →「本の鍵」→「必須にする」で **bundle から `sub` ラップを削除**し、以後はパスフレーズが
+  唯一の経路になる。解錠で「スキップ」しても `sub` へは戻らず**復元しない**
+  （`PackKeysError::PassphraseRequired`）。既定はオフで、明示的に選んだときだけ有効。
+  **忘れると復元できない**ため、UI に代償（他端末・Web 版でパスフレーズが必要）を明記した。
+  解除も同じ場所から（解錠ダイアログで本人確認してから `sub` ラップを戻す）。
+  **既にパスフレーズを設定している場合は、値を尋ね直さない**（`enable_passphrase_only(..., None)`。
+  必要なのは `sub` ラップを消すことだけで、既存のラップがそのまま解錠手段になる）。
+  値も既存のラップも無いときだけ `PassphraseRequired` で断る。
+  `crates/core/src/pack_keys.rs`（`enable_passphrase_only` / `disable_passphrase_only` /
+  `has_sub_wrap`）、`crates/app/src/pack_keys.rs`（`decide_root_key` の fail-closed）、
+  `crates/app/src/views/settings.rs`、`docs/spec/10-pack-keys.md` §5.2.1、README、`docs/features.md`
+
+- **依存の監査を定期実行する**: 依存の勧告はコードを変えなくても増えるため、CI に
+  **週次の定期実行**（`schedule: 毎週月曜 00:00 UTC`）を足し、`test` と `audit` を
+  自動で回す（セキュリティ評価 F07 の「定期監査」の推奨）。`.cargo/audit.toml` の例外は
+  「理由」と「見直し時期」を持っているので、定期実行があって初めて機能する。
+  注意点として、GitHub は 60 日間リポジトリに動きが無いと定期実行を止める（workflow に
+  その旨のコメントを残した）。`.github/workflows/ci.yml`
 
 - **リリースの公開をテストと監査の合格に依存させる**:
   `release.yml` の公開ジョブは `needs: build` だけで、同じタグの CI（テスト・`cargo audit`）が

@@ -61,7 +61,8 @@
 | 上限超過時 | 半分だけ取り込まず**その入れ子全体をスキップ**し、`warnings` に 1 行積む（取り込み全体は失敗させない） | `import/mod.rs:357-364` |
 | 通常エントリの上限 | `MAX_ZIP_ENTRY_BYTES = 2 GiB`（**展開後**。宣言サイズではなく実際に読めたバイト数で判定）。超過は `ImportError::Zip`（部分的なデータで先へ進めない）。取り込み元ファイルの上限と同値にしてある: 512 MiB にしていたときは「142 MB の ZIP に含まれる PDF が展開後 512 MiB を超える」正当な本を弾いていた（2026-09-26） | `import/mod.rs`（`read_zip_entry_capped`） |
 | 外側 ZIP 全体の上限 | **展開の前**にエントリ数（`opfspack::MAX_ENTRY_COUNT` = 10000）と、中央ディレクトリが宣言する展開後サイズの合計（`opfspack::MAX_TOTAL_SIZE` = 10 GiB）を検査する。超過は `ImportError::ZipTooLarge { detail }`。宣言サイズは信用せず（実際の長さは個別上限で別途見る）、事前に弾ける分だけをここで弾く | `import/mod.rs`（`analyze_zip` / `EntryMeta::declared_size`） |
-| 取り込み元ファイルの上限 | `MAX_IMPORT_SOURCE_BYTES = 2 GiB`。`import_file` は変換のために全体をメモリへ読むため、**`std::fs::read` の前に**メタデータで検査する。超過は `ImportError::SourceTooLarge { size, limit }`（アプリ側もダウンロード直後に同じ値で検査する） | `import/mod.rs`（`import_file`）、`crates/app/src/views/bookshelf.rs` |
+| 取り込み元ファイルの上限 | `MAX_IMPORT_SOURCE_BYTES = 10 GiB`（pack の上限と同値）。**読む前に**メタデータで検査する。超過は `ImportError::SourceTooLarge { size, limit }`。アプリ側は①ストアが申告するサイズが分かるときは**転送の前**に断り（無駄なダウンロードをしない）②ダウンロード直後にも同じ値で検査する | `import/mod.rs`（`import_file`）、`crates/app/src/views/bookshelf.rs` |
+| 取り込み元の読み方 | **PDF と ZIP はファイルから読む**（`import_pdf_path` / `import_zip_path`。PDF は PDFium の `load_pdf_from_file`、ZIP は `ZipArchive<File>`）ので、取り込み元の大きさがそのまま RAM 使用量にはならない。EPUB（ビューアー非対応で 1 エントリとして入れるだけ）と単体画像は全体を読む（実データでは小さい）。**アプリのダウンロードはまだメモリ経由**（`download_with_progress`）なので、4 GiB 級の本は一時的に大きめの RAM を使う（一時ファイル経由への切り替えが残件） | `crates/core/src/import/{mod,pdf}.rs` |
 | PDF の上限 | **描画の前**に総ページ数（`MAX_PDF_PAGES` = 9000。`MAX_ENTRY_COUNT` から metadata / サムネイル分を引いた値）を検査。描画中は 1 ページ 16MPix の検査に加えて**エンコード済みの累積出力**（`opfspack::MAX_TOTAL_SIZE` = 10 GiB）で打ち切る。ピークは 8 ページ窓分 | `import/pdf.rs`（`render_pdf_pages`） |
 | 壊れた入れ子 | `warnings` に `"{name}: {error}"` を積んでスキップ | `import/mod.rs:326-333` |
 | 警告文言（実装値） | `"{name}: nested zip is larger than the size limit (536870912 bytes)"` / `"{name}: nested zip inside a nested zip is not expanded (depth limit 1)"` / `"{name}: nested zip exceeds the entry/size limit and was skipped"` | `import/mod.rs:314-317`, `:347-349`, `:358-361` |
@@ -105,9 +106,12 @@
 `build_to_file_streaming` で 1 件ずつ供給し、必要なときだけ読み出す（メモリに残るのは
 64 MiB + 1 ページ分 + 組み立て中の 1 エントリ）。一時ファイルは `Drop` で必ず消す。
 
-**残る制約**: PDF は全ページを描画して `pages` に集めてから store へ渡すため、この経路だけは
-全ページ分をメモリに持つ（`import/pdf.rs`）。画像 1 枚・EPUB・ZIP（ページを 1 件ずつ読む経路）は
-store へ直接入る。metadata の書き戻し（`rename_content_in_pack`）も pack 全体を引数で受け取る
+PDF も `pdf::render_pdf_pages_into` で**1 ページずつ** store へ入れる（`import_pdf_bytes`。
+以前は全ページを `Vec<PageImage>` に集めてから clone していた）。画像 1 枚・EPUB・ZIP も
+store へ直接入る。
+
+**残る制約**: 取り込み元ファイルは `import_*_bytes` が全体をメモリへ読む（2 GiB 超は
+`MAX_IMPORT_SOURCE_BYTES` で先に断る）。metadata の書き戻し（`rename_content_in_pack`）も pack 全体を引数で受け取る
 （呼び出し側が既に全体を持っている経路）。
 
 ### 3.6 ページ画像生成（数値・アルゴリズム）
@@ -116,7 +120,8 @@ store へ直接入る。metadata の書き戻し（`rename_content_in_pack`）�
 |---|---|---|
 | 元画像デコード | `image::load_from_memory`（`image` 0.25、features: webp/png/jpeg/bmp/tiff） | `import/mod.rs:109` |
 | 小さい画像の拡大 | 幅が 1000 px 未満なら `Lanczos3` で**幅 1000 px** まで拡大（`scale = 1000/width`、四捨五入、最小 1 px） | `import/mod.rs:67-78`, `:110` |
-| ページ WebP | `encode_webp(&decoded, 88)`（品質 **88**、lossy、`webp` crate = libwebp / `libwebp-sys`） | `import/mod.rs:111`, `:81-87` |
+| ページ WebP | `encode_webp(&decoded, 88)`（品質 **88**、lossy、`webp` crate = libwebp）。**libwebp の effort は 2**（既定 4。実測 1433×2024 q88 で 220ms → 103ms、+2% のサイズ。変換時間の 91% がここだった） | `import/mod.rs`（`encode_webp` / `WEBP_METHOD`） |
+| 変換の並列度 | ページ変換は `page_render_workers`（`min(コア数, 12)`）で並列。1 ワーカー 30〜40MB なので 12 で頭打ち。実測 1 ページ 129ms（release、effort 2） | `import/mod.rs`（`render_page_images` / `page_render_workers`） |
 | 品質の丸め | `quality.clamp(0, 100)` | `import/mod.rs:84` |
 | サムネイル | 最初のページを**幅 200 px**（高さはアスペクト比から四捨五入、最小 1）に `Triangle` で縮小し、**品質 80** の WebP | `import/mod.rs:90-105` |
 | 並列度 | `page_render_workers(n) = min(available_parallelism, 8, max(n,1))`（未取得時は 4 コア扱い。ワーカー数を 8 で頭打ちにするのはデコード済み画像のメモリ保護） | `import/mod.rs:123-129` |
@@ -416,7 +421,7 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 | `PAGE_RENDER_CHUNK` | `64` | ページ | ZIP から一度に読み出して並列変換する単位（1 ページ約 0.5 MiB 想定で 1 チャンク約 30 MiB） | `import/mod.rs:162` |
 | ページ変換ワーカー数 | `min(available_parallelism, 8, max(page_count,1))`、取得失敗時は 4 扱い | スレッド | 上限 8 はデコード済み画像（1 枚 数十 MB）のメモリ保護 | `import/mod.rs:168-178` |
 | 小画像の拡大しきい値 | 幅 `1000` 未満を拡大（`scale = 1000/width`、`Lanczos3`、最小 1 px） | px | ページ画像・単体画像の両方 | `import/mod.rs:112-124`, `:155`, `:2164-2165` |
-| ページ WebP 品質 | `88`（`clamp(0,100)`） | 0-100 | lossy（`webp` crate = libwebp） | `import/mod.rs:157`, `:129-130` |
+| ページ WebP 品質 | `88`（`clamp(0,100)`）と effort `2` | 品質 0-100 / effort 0-6 | lossy（`webp` crate = libwebp。effort は 2026-09-26 に 4 → 2。2.1 倍速・+2%） | `import/mod.rs`（`encode_webp` / `WEBP_METHOD`） |
 | サムネイル幅 | `200` | px | 高さはアスペクト比で四捨五入・最小 1 | `import/mod.rs:135-142` |
 | サムネイル WebP 品質 | `80` | 0-100 | 縮小フィルタは `Triangle` | `import/mod.rs:143-147` |
 | `MAX_NESTED_DEPTH` | `1` | 階層 | 入れ子 ZIP の展開深さ | `import/mod.rs:261` |
