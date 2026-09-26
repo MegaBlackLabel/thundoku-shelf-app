@@ -4,10 +4,7 @@
 //! （仕様 §3.2）なのでここで固定する。KDF とラップの期待値そのものは
 //! `tests/keys_v3.rs`（仕様 §8 のベクタ）が見る。
 
-use opfspack::{
-    APP_SALT, KEY_BUNDLE_FORMAT_VERSION, PackError, PackKeyBundle, PackRootKey, PackRootKeyWrap,
-    WrapKind, derive_owner_id,
-};
+use opfspack::{APP_SALT, KEY_BUNDLE_FORMAT_VERSION, MAX_PASSPHRASE_ITERATIONS, PackError, PackKeyBundle, PackRootKey, PackRootKeyWrap, WrapKind, derive_owner_id};
 
 /// 仕様 §8 のベクタ PRK（`00 01 … 1f`）。
 fn vector_root() -> PackRootKey {
@@ -181,4 +178,51 @@ fn bundle_json_rejects_malformed_wraps() {
             "{label} が受理された"
         );
     }
+}
+
+/// 指定の `iterations` を持つ最小の bundle JSON（wrap は 1 つ、形式としては妥当）。
+fn bundle_with_iterations(iterations: u32) -> String {
+    format!(
+        "{{\"format_version\":1,\"owner_id\":\"{owner}\",\"created_at\":1,\"updated_at\":1,\
+         \"wraps\":[{{\"kind\":\"sub\",\"kdf\":\"pbkdf2-sha256\",\
+         \"iterations\":{iterations},\"salt\":\"AA==\",\
+         \"nonce\":\"AAECAwQFBgcICQoL\",\"ciphertext\":\"{ciphertext}\"}}]}}",
+        owner = owner_id(),
+        ciphertext = "A".repeat(64),
+    )
+}
+
+/// 過大な `iterations` は**復号（PBKDF2）の前**に弾く。
+///
+/// 鍵ファイルは同期先からも来る（相手に書き換えられ得る）ので、`u32::MAX` のような値を
+/// そのまま PBKDF2 へ渡すと、復元しようとした利用者の CPU を何時間も焼く。
+#[test]
+fn bundle_json_rejects_absurd_iterations_before_running_the_kdf() {
+    assert!(matches!(
+        PackKeyBundle::from_json(bundle_with_iterations(0).as_bytes()),
+        Err(PackError::Corrupted(_))
+    ));
+    // 上限ちょうどは受け付け、上限 + 1 は弾く。
+    assert!(
+        PackKeyBundle::from_json(bundle_with_iterations(MAX_PASSPHRASE_ITERATIONS).as_bytes())
+            .is_ok(),
+        "上限ちょうどは受理する"
+    );
+    assert!(
+        matches!(
+            PackKeyBundle::from_json(bundle_with_iterations(MAX_PASSPHRASE_ITERATIONS + 1).as_bytes()),
+            Err(PackError::Corrupted(_))
+        ),
+        "上限 + 1 は弾く"
+    );
+
+    // 桁違いの値でも**待たされない**（PBKDF2 を走らせていない）。
+    let started = std::time::Instant::now();
+    let result = PackKeyBundle::from_json(bundle_with_iterations(u32::MAX).as_bytes());
+    assert!(matches!(result, Err(PackError::Corrupted(_))));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "復号を始めていない（{:?}）",
+        started.elapsed()
+    );
 }

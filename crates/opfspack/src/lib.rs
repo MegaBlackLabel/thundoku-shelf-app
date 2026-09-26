@@ -28,12 +28,20 @@ mod format;
 mod keys;
 mod reader;
 
-pub use builder::PackBuilder;
+pub use builder::{EntrySpec, PackBuilder};
 pub use keys::{
-    BACKUP_FORMAT_VERSION, BackupEnvelope, KEY_BUNDLE_FORMAT_VERSION, PackKey, PackKeyBundle,
-    PackRootKey, PackRootKeyWrap, WrapKind, sub_wrap_kek,
+    BACKUP_FORMAT_VERSION,
+    BackupEnvelope,
+    KEY_BUNDLE_FORMAT_VERSION,
+    MAX_PASSPHRASE_ITERATIONS,
+    PackKey,
+    PackKeyBundle,
+    PackRootKey,
+    PackRootKeyWrap,
+    WrapKind,
+    sub_wrap_kek,
 };
-pub use reader::{PackFileReader, PackReader};
+pub use reader::{PackFileReader, PackRead, PackReader};
 
 /// Magic bytes at offset 0 of every pack.
 pub const MAGIC: [u8; 4] = [0x4f, 0x50, 0x46, 0x53];
@@ -59,7 +67,7 @@ pub const MAX_ENTRY_SIZE: u64 = 512 * 1024 * 1024;
 
 /// 展開後サイズの合計上限 — 1 pack あたり（既知の最大は 1.33 GB）。
 /// 合計は `checked_add` で積み上げ、overflow と上限超過の両方を拒否する。
-pub const MAX_TOTAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_TOTAL_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
 /// 保存サイズ（圧縮・暗号化後）の上限 — 1 エントリあたり。
 /// 展開上限 512 MiB に暗号タグ 16 バイトと DEFLATE の膨張余地を加えても

@@ -5,7 +5,8 @@ use crate::{
     FORMAT_VERSION, PackEntry, PackError, PackHeader, PackKey, entry_flags,
     format::{deserialize_header, deserialize_index_entry, index_entry_size},
 };
-use std::io::{Read, Seek, SeekFrom};
+use sha2::{Digest as _, Sha256};
+use std::io::Read as _;
 
 pub struct PackReader<'a> {
     bytes: &'a [u8],
@@ -309,9 +310,153 @@ fn io_error(error: std::io::Error) -> PackError {
     PackError::Io(error.to_string())
 }
 
-fn read_at(file: &mut std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), PackError> {
-    file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-    file.read_exact(buf).map_err(io_error)
+/// `offset` から `buf` を読む（**ファイル位置を動かさない**ので `&File` で読める）。
+///
+/// 位置読みにすることで `PackFileReader` の読み出しが `&self` になり、
+/// `&dyn PackRead` でメモリ読みと同じように扱える（Mutex での直列化も不要）。
+fn read_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), PackError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt as _;
+        return file.read_exact_at(buf, offset).map_err(io_error);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt as _;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let read = file
+                .seek_read(&mut buf[filled..], offset + filled as u64)
+                .map_err(io_error)?;
+            if read == 0 {
+                // 途中で EOF（他プロセスが切り詰めた等）
+                return Err(io_error(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected end of pack",
+                )));
+            }
+            filled += read;
+        }
+        Ok(())
+    }
+}
+
+/// pack を読む側の共通 API。
+///
+/// メモリ上の [`PackReader`]（`&[u8]` を借りる）と、ファイル裏打ちの
+/// [`PackFileReader`]（必要な範囲だけ読む）を**同じ経路で扱う**ための trait。
+/// 取り込み・再構築・表紙・ビューアーはこれを使うことで、pack 全体を RAM に
+/// 載せるかどうかを呼び出し側で選べる（大きい pack ではファイル裏打ちを選ぶ）。
+pub trait PackRead {
+    fn header(&self) -> &PackHeader;
+    fn entries(&self) -> &[PackEntry];
+    fn entry(&self, path: &str) -> Option<&PackEntry>;
+    fn read_entry(&self, path: &str, key: Option<&PackKey>) -> Result<Vec<u8>, PackError>;
+    fn read_entry_with_key(
+        &self,
+        path: &str,
+        key: Option<&PackKey>,
+    ) -> Result<Vec<u8>, PackError>;
+    fn read_entry_range(
+        &self,
+        path: &str,
+        start: u64,
+        end: u64,
+        key: Option<&PackKey>,
+    ) -> Result<Vec<u8>, PackError>;
+
+    /// **pack ファイル全体**の SHA-256（小文字 hex）。
+    ///
+    /// `document_images` の親（`imported_documents.file_hash`）に記録する値で、
+    /// メモリ読みなら借りているバイト列、ファイル裏打ちなら**ファイルを順に読んで**
+    /// 計算する（大きい pack でも全体を RAM に載せない）。
+    fn source_sha256(&self) -> Result<String, PackError>;
+}
+
+impl PackRead for PackReader<'_> {
+    fn header(&self) -> &PackHeader {
+        PackReader::header(self)
+    }
+    fn entries(&self) -> &[PackEntry] {
+        PackReader::entries(self)
+    }
+    fn entry(&self, path: &str) -> Option<&PackEntry> {
+        PackReader::entry(self, path)
+    }
+    fn read_entry(&self, path: &str, key: Option<&PackKey>) -> Result<Vec<u8>, PackError> {
+        PackReader::read_entry(self, path, key)
+    }
+    fn read_entry_with_key(
+        &self,
+        path: &str,
+        key: Option<&PackKey>,
+    ) -> Result<Vec<u8>, PackError> {
+        PackReader::read_entry_with_key(self, path, key)
+    }
+    fn read_entry_range(
+        &self,
+        path: &str,
+        start: u64,
+        end: u64,
+        key: Option<&PackKey>,
+    ) -> Result<Vec<u8>, PackError> {
+        PackReader::read_entry_range(self, path, start, end, key)
+    }
+
+    fn source_sha256(&self) -> Result<String, PackError> {
+        Ok(hex_sha256(&Sha256::digest(self.bytes)))
+    }
+}
+
+impl PackRead for PackFileReader {
+    fn header(&self) -> &PackHeader {
+        PackFileReader::header(self)
+    }
+    fn entries(&self) -> &[PackEntry] {
+        PackFileReader::entries(self)
+    }
+    fn entry(&self, path: &str) -> Option<&PackEntry> {
+        PackFileReader::entry(self, path)
+    }
+    fn read_entry(&self, path: &str, key: Option<&PackKey>) -> Result<Vec<u8>, PackError> {
+        PackFileReader::read_entry(self, path, key)
+    }
+    fn read_entry_with_key(
+        &self,
+        path: &str,
+        key: Option<&PackKey>,
+    ) -> Result<Vec<u8>, PackError> {
+        PackFileReader::read_entry_with_key(self, path, key)
+    }
+    fn read_entry_range(
+        &self,
+        path: &str,
+        start: u64,
+        end: u64,
+        key: Option<&PackKey>,
+    ) -> Result<Vec<u8>, PackError> {
+        PackFileReader::read_entry_range(self, path, start, end, key)
+    }
+
+    /// ファイルを 1 MiB ずつ順に読んでハッシュする（全体を RAM に載せない）。
+    fn source_sha256(&self) -> Result<String, PackError> {
+        let len = self.file.metadata().map_err(io_error)?.len();
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut offset = 0u64;
+        while offset < len {
+            let chunk = ((len - offset) as usize).min(buf.len());
+            read_at(&self.file, offset, &mut buf[..chunk])?;
+            hasher.update(&buf[..chunk]);
+            offset += chunk as u64;
+        }
+        Ok(hex_sha256(&hasher.finalize()))
+    }
+}
+
+/// SHA-256 の結果を小文字 hex にする（`core` の `sha256_hex` と同じ表現）。
+fn hex_sha256(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// ファイル裏打ちの pack リーダー。
@@ -329,14 +474,14 @@ pub struct PackFileReader {
 
 impl PackFileReader {
     pub fn open(path: &std::path::Path) -> Result<Self, PackError> {
-        let mut file = std::fs::File::open(path).map_err(io_error)?;
+        let file = std::fs::File::open(path).map_err(io_error)?;
         let len = file.metadata().map_err(io_error)?.len();
         if len < crate::HEADER_SIZE as u64 {
             return Err(PackError::Corrupted(format!("pack too small: {len} bytes")));
         }
 
         let mut header_bytes = [0u8; crate::HEADER_SIZE];
-        read_at(&mut file, 0, &mut header_bytes)?;
+        read_at(&file, 0, &mut header_bytes)?;
         let header = deserialize_header(&header_bytes)?;
         if header.version != FORMAT_VERSION {
             return Err(PackError::Version(header.version));
@@ -354,7 +499,7 @@ impl PackFileReader {
         }
 
         let mut index = vec![0u8; header.index_size as usize];
-        read_at(&mut file, index_offset, &mut index)?;
+        read_at(&file, index_offset, &mut index)?;
         let stored_crc =
             u32::from_le_bytes(index[index.len() - 4..].try_into().expect("4-byte slice"));
         let computed_crc = crate::crypto::crc32(&index[..index.len() - 4]);
@@ -390,8 +535,13 @@ impl PackFileReader {
     }
 
     /// エントリの格納バイト列だけを読んで復号する（本体全体は読まない）。
+    pub fn read_entry(&self, path: &str, key: Option<&PackKey>) -> Result<Vec<u8>, PackError> {
+        self.read_entry_with_key(path, key)
+    }
+
+    /// エントリの格納バイト列だけを読んで復号する（本体全体は読まない）。
     pub fn read_entry_with_key(
-        &mut self,
+        &self,
         path: &str,
         key: Option<&PackKey>,
     ) -> Result<Vec<u8>, PackError> {
@@ -404,7 +554,35 @@ impl PackFileReader {
         }
         // 境界は `open` の時点で検証済み（本体領域内に収まっている）。
         let mut data = vec![0u8; entry.compressed_size as usize];
-        read_at(&mut self.file, entry.offset, &mut data)?;
+        read_at(&self.file, entry.offset, &mut data)?;
         decode_entry_payload(&entry, data, key)
+    }
+
+    /// エントリの一部だけを復号して返す（`PackReader` と同じ意味）。
+    pub fn read_entry_range(
+        &self,
+        path: &str,
+        start: u64,
+        end: u64,
+        key: Option<&PackKey>,
+    ) -> Result<Vec<u8>, PackError> {
+        let entry = self
+            .entry(path)
+            .ok_or_else(|| PackError::NotFound(path.to_owned()))?;
+        if start >= end || end > entry.size {
+            return Err(PackError::InvalidRange(format!(
+                "range {start}..{end} exceeds {} bytes",
+                entry.size
+            )));
+        }
+        let full = self.read_entry_with_key(path, key)?;
+        // 宣言 `size` ではなく**実際に展開できた長さ**で最終確認する（細工した index 対策）。
+        if end > full.len() as u64 {
+            return Err(PackError::Corrupted(format!(
+                "range {start}..{end} exceeds decoded {} bytes: {path}",
+                full.len()
+            )));
+        }
+        Ok(full[start as usize..end as usize].to_vec())
     }
 }

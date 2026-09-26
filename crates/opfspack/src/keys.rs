@@ -42,6 +42,13 @@ const WRAP_AAD_PREFIX: &str = "thundoku-pack-root:1:";
 const KDF_PBKDF2_SHA256: &str = "pbkdf2-sha256";
 
 /// パスフレーズラップの salt 長（仕様 §3.2 の「base64 16B 乱数」）。
+/// パスフレーズラップの `iterations` に許容する上限（1000 万回）。
+///
+/// 鍵ファイルは同期先（Drive）からも来るため、相手が `iterations` を書き換えられる。
+/// 上限が無いと、復元しようとした利用者の CPU を何時間も焼かせられる（セキュリティ評価
+/// F06）。アプリが書く値は 10 万回なので、将来の引き上げ余地を 100 倍残してこれを天井にする。
+pub const MAX_PASSPHRASE_ITERATIONS: u32 = 10_000_000;
+
 const PASSPHRASE_SALT_LEN: usize = 16;
 
 /// AES-GCM nonce 長。
@@ -541,6 +548,13 @@ impl WireWrap {
         }
         if self.iterations == 0 {
             return Err(invalid("iterations must not be zero"));
+        }
+        // **復号の前**に弾く（改変された鍵ファイルで PBKDF2 を走らせない）。
+        if self.iterations > MAX_PASSPHRASE_ITERATIONS {
+            return Err(invalid(&format!(
+                "iterations too large: {} > {MAX_PASSPHRASE_ITERATIONS}",
+                self.iterations
+            )));
         }
         let salt = BASE64
             .decode(&self.salt)

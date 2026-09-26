@@ -192,7 +192,7 @@ fn file_reader_enforces_the_decompression_cap() {
     set_size(&mut bytes, 0, 512);
     let temp = TempPack::write("bomb", &bytes);
 
-    let mut reader = PackFileReader::open(temp.path()).expect("構造としては開ける");
+    let reader = PackFileReader::open(temp.path()).expect("構造としては開ける");
     let error = reader.read_entry_with_key("a.bin", None).unwrap_err();
     assert!(matches!(error, PackError::Corrupted(_)), "{error}");
 }
@@ -260,8 +260,13 @@ fn entry_size_over_the_limit_is_rejected() {
 /// 1 冊合計の展開上限を超える宣言は落ちる（各エントリは上限内でも合計で見る）。
 #[test]
 fn total_size_over_the_limit_is_rejected() {
+    // 単体上限（512 MiB）ちょうどのエントリを、合計上限を超えるまで並べる。
+    const COUNT: usize = (MAX_TOTAL_SIZE / MAX_ENTRY_SIZE) as usize + 1;
+    const {
+        assert!(MAX_ENTRY_SIZE * COUNT as u64 > MAX_TOTAL_SIZE);
+    }
     let mut builder = PackBuilder::new(0);
-    for i in 0..5 {
+    for i in 0..COUNT {
         builder.add_entry(
             &format!("{i}.bin"),
             vec![0u8; 8],
@@ -270,11 +275,7 @@ fn total_size_over_the_limit_is_rejected() {
         );
     }
     let mut bytes = builder.build(None, true).unwrap();
-    // 前提: 各エントリは単体上限（512 MiB）内でも、5 件で合計上限（2 GiB）を超える。
-    const {
-        assert!(MAX_ENTRY_SIZE * 5 > MAX_TOTAL_SIZE);
-    }
-    for i in 0..5 {
+    for i in 0..COUNT {
         set_size(&mut bytes, i, MAX_ENTRY_SIZE);
     }
 
@@ -370,7 +371,11 @@ fn plaintext_entry_in_an_encrypted_pack_is_rejected() {
 /// 件数上限ちょうどは読める（境界）。上限は `entry_count` の検査で先に落ちる。
 #[test]
 fn entry_count_at_the_limit_is_accepted() {
-    let bytes = many_entries(MAX_ENTRY_COUNT);
+    let mut builder = PackBuilder::new(0);
+    for i in 0..MAX_ENTRY_COUNT {
+        builder.add_entry(&format!("p{i:05}.txt"), b"x".to_vec(), "text/plain", false);
+    }
+    let bytes = builder.build(None, true).expect("上限ちょうどの pack は作れる");
     let reader = PackReader::open(&bytes).expect("上限ちょうどは開ける");
     assert_eq!(reader.entries().len(), MAX_ENTRY_COUNT as usize);
 }
@@ -378,7 +383,7 @@ fn entry_count_at_the_limit_is_accepted() {
 /// 件数上限を超える pack は拒否する（index 長では説明できてしまう件数でも）。
 #[test]
 fn entry_count_over_the_limit_is_rejected() {
-    let bytes = many_entries(MAX_ENTRY_COUNT + 1);
+    let bytes = pack_with_one_entry_too_many();
     let error = open_error(&bytes);
     assert!(matches!(error, PackError::Corrupted(_)), "{error}");
     assert!(error.to_string().contains("exceeds limit"), "{error}");
@@ -515,10 +520,53 @@ fn page(n: usize) -> Vec<u8> {
 }
 
 /// `count` 件のエントリを持つ pack（上限検査の境界を作るためだけに使う）。
-fn many_entries(count: u32) -> Vec<u8> {
+/// 件数が上限ちょうどの pack を作り、**ヘッダーの `entry_count` だけ**を +1 に細工する。
+///
+/// 書き出し側も同じ上限で弾くようになったので、読み出し側の検査を通すには
+/// （他所で作られた pack を読む想定で）ヘッダーを直接いじる必要がある。
+/// ヘッダーは 60 バイト目までの CRC を持つため、書き換えたら CRC も計算し直す。
+fn pack_with_one_entry_too_many() -> Vec<u8> {
     let mut builder = PackBuilder::new(0);
-    for i in 0..count {
+    for i in 0..MAX_ENTRY_COUNT {
         builder.add_entry(&format!("p{i:05}.txt"), b"x".to_vec(), "text/plain", false);
     }
-    builder.build(None, true).expect("pack を作れる")
+    let mut bytes = builder.build(None, true).expect("上限ちょうどの pack は作れる");
+    let count = MAX_ENTRY_COUNT + 1;
+    bytes[32..36].copy_from_slice(&count.to_le_bytes());
+    let crc = crc32(&bytes[..60]);
+    bytes[60..64].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+/// 書き出し側も**読み出し側と同じ上限**で弾く（書けたのに開けない pack を作らない）。
+///
+/// 件数は `MAX_ENTRY_COUNT` を超えると、ファイルへ書く前に失敗し、書きかけも残さない。
+#[test]
+fn builder_rejects_more_entries_than_the_reader_accepts() {
+    let dir = std::env::temp_dir().join("opfspack-limits-builder");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("too-many.opfspack");
+
+    let specs: Vec<opfspack::EntrySpec> = (0..=MAX_ENTRY_COUNT)
+        .map(|index| opfspack::EntrySpec {
+            path: format!("pages/{index:05}.webp"),
+            mime_type: "image/webp".to_string(),
+            compress: false,
+        })
+        .collect();
+    let result = PackBuilder::new(1_728_000_000_000).build_to_file_streaming(
+        &path,
+        specs,
+        None,
+        false,
+        |_| Ok(vec![1u8; 16]),
+    );
+    match result {
+        Err(PackError::Corrupted(message)) => {
+            assert!(message.contains("entry count"), "{message}");
+        }
+        other => panic!("Corrupted を期待した: {other:?}"),
+    }
+    assert!(!path.exists(), "書きかけを残さない");
+    let _ = std::fs::remove_dir_all(&dir);
 }
