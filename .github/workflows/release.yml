@@ -440,6 +440,30 @@ jobs:
     permissions:
       contents: write
     steps:
+      # リリース本文: **注釈タグのメッセージ**を使う（互換性の注意などを書く場所。0.2.9 と同じ流儀）。
+      # 自動生成ノート（Full Changelog と変更一覧）は action が後ろに足す。
+      #
+      # **artifact のダウンロードより前**に置くこと: `actions/checkout` は作業ツリーを clean する
+      # ので、後ろに置くとダウンロード済みの `artifacts/` を消してしまい、zip が 1 つも
+      # 添付されない（v0.2.10 で実際に起きた）。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Extract release notes from the tag message
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # checkout（fetch-depth: 1）はタグ ref を**コミット直指し**で作ることがあり、その場合
+          # `%(contents:body)` は注釈タグではなくコミットのメッセージになる（v0.2.10 で実際に
+          # 起きた）。注釈タグのオブジェクトを取り直してから読む。
+          git fetch --force --no-tags origin "refs/tags/$tag:refs/tags/$tag" >/dev/null 2>&1 || true
+          if [ "$(git cat-file -t "refs/tags/$tag" 2>/dev/null || echo missing)" = "tag" ]; then
+            git tag -l --format='%(contents:body)' "$tag" > RELEASE_NOTES.md
+            echo "リリース本文: 注釈タグのメッセージ $(wc -c < RELEASE_NOTES.md) バイト"
+          else
+            echo "::warning::注釈タグのメッセージが取れなかった（自動生成ノートだけになる）"
+            : > RELEASE_NOTES.md
+          fi
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
@@ -454,26 +478,6 @@ jobs:
           set -euo pipefail
           find artifacts -name '*.zip.sha256' -exec cat {} + | sort -k2 > SHA256SUMS.txt
           cat SHA256SUMS.txt
-
-      # リリース本文: **注釈タグのメッセージ**を使う（互換性の注意などを書く場所。0.2.9 と同じ流儀）。
-      # 自動生成ノート（Full Changelog と変更一覧）は action が後ろに足す。
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Extract release notes from the tag message
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          # checkout がタグ ref を取っているのが前提。無ければ明示的に取る（失敗しても続行）
-          git rev-parse -q --verify "refs/tags/$tag" >/dev/null ||
-            git fetch --force --no-tags origin "refs/tags/$tag:refs/tags/$tag" || true
-          # 注釈タグの本文（先頭行の件名は除く）。無い / 軽量タグなら空になる
-          git tag -l --format='%(contents:body)' "$tag" > RELEASE_NOTES.md || true
-          if [ -s RELEASE_NOTES.md ]; then
-            echo "リリース本文: タグのメッセージ $(wc -c < RELEASE_NOTES.md) バイト"
-          else
-            echo "リリース本文: タグのメッセージが無い（自動生成ノートだけにする）"
-            : > RELEASE_NOTES.md
-          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
