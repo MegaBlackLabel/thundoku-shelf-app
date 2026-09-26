@@ -235,10 +235,13 @@ pub struct PackPageLoader {
     /// 冊ごとの pack 鍵は `root.derive_pack_key(book_id)` で導出する（HKDF-SHA256 は
     /// 軽いのでページごとに導出してよい）。
     pub pack_root_key: Option<opfspack::PackRootKey>,
-    /// pack バイト列のキャッシュ（pack_id + バイト列。初回 load 時に 1 回だけ
-    /// ディスクから読み込む。ページをめくるたびに数十 MB の pack を読み直すのを防ぐ）。
-    /// OnceLock なので並列アクセスでも初期化は 1 回だけ。
-    pub pack_bytes: std::sync::OnceLock<Option<(String, Arc<Vec<u8>>)>>,
+    /// pack の**ファイル裏打ちリーダー**のキャッシュ（pack_id + リーダー。初回 load 時に
+    /// 一度だけ開く）。ページをめくるたびに pack 全体を読み直さないだけでなく、
+    /// **pack 全体を RAM に載せない**（読むのは 1 エントリ分だけ）。
+    ///
+    /// 読み出しは `&self`（位置読み）なので、並列ロードでもそのまま共有できる。
+    /// OnceLock なので初期化も 1 回だけ。
+    pub pack_reader: std::sync::OnceLock<Option<(String, Arc<opfspack::PackFileReader>)>>,
 }
 
 impl PageLoader for PackPageLoader {
@@ -256,20 +259,18 @@ impl PageLoader for PackPageLoader {
         let load_start = std::time::Instant::now();
         let image = self.images.get(index).ok_or("page out of range")?;
         let pack_entry = image.pack_entry_path.as_deref().ok_or("no pack entry")?;
-        // pack バイト列は一度だけディスクから読み込む（OnceLock で並列でも 1 回）。
+        // pack は一度だけ開く（OnceLock で並列でも 1 回）。**全体は読まない**。
         // 併せて **book id**（＝ v3 の pack 鍵の導出元）も保持する。
-        let cached = self.pack_bytes.get_or_init(|| {
+        let cached = self.pack_reader.get_or_init(|| {
             let db = &self.db;
             let book = db::books::get(db, &book_id_of(image, db)).ok()??;
             let pack_id = book.pack_id.as_deref().unwrap_or(&book.id).to_string();
             // 保存領域の外を指す id（改変バックアップ由来）では読まない。
             let path = thundoku_core::pack_path::pack_path(&self.packs_dir, &pack_id).ok()?;
-            let bytes = std::fs::read(path).ok()?;
-            Some((book.id.clone(), Arc::new(bytes)))
+            let reader = opfspack::PackFileReader::open(&path).ok()?;
+            Some((book.id.clone(), Arc::new(reader)))
         });
-        let (book_id, bytes) = cached.as_ref().ok_or("pack load failed")?;
-        let reader = opfspack::PackReader::open(bytes)
-            .map_err(|e| crate::pack_keys::pack_read_error_message(&e))?;
+        let (book_id, reader) = cached.as_ref().ok_or("pack load failed")?;
         // v3: 冊ごとの pack 鍵は book id から導出する（取り込み側と同じ規則）
         let key = self
             .pack_root_key
@@ -4589,7 +4590,7 @@ mod tests {
             packs_dir,
             db: db_pool,
             pack_root_key: None,
-            pack_bytes: std::sync::OnceLock::new(),
+            pack_reader: std::sync::OnceLock::new(),
         });
         let view = cx.new(|cx| ImageViewer::new(cx, loader, "画像だけの本", 0, None));
 
@@ -4714,7 +4715,7 @@ mod tests {
             packs_dir: packs_dir.clone(),
             db: db_pool.clone(),
             pack_root_key: Some(root.clone()),
-            pack_bytes: std::sync::OnceLock::new(),
+            pack_reader: std::sync::OnceLock::new(),
         };
         assert!(
             loader.load(0).is_ok(),
@@ -4727,7 +4728,7 @@ mod tests {
             packs_dir,
             db: db_pool,
             pack_root_key: None,
-            pack_bytes: std::sync::OnceLock::new(),
+            pack_reader: std::sync::OnceLock::new(),
         };
         let error = loader.load(0).expect_err("鍵が無ければ復号できない");
         assert!(error.contains("パスフレーズ"), "復元の案内を出す: {error}");
@@ -4766,7 +4767,7 @@ mod tests {
             packs_dir,
             db: db_pool,
             pack_root_key: None,
-            pack_bytes: std::sync::OnceLock::new(),
+            pack_reader: std::sync::OnceLock::new(),
         });
         let view = cx.new(|cx| ImageViewer::new(cx, loader, "欠損本", 0, None));
         cx.run_until_parked();

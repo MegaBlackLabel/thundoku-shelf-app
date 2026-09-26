@@ -145,6 +145,34 @@ fn logout_purge_failed_message(service: &str) -> String {
     )
 }
 
+/// 技術書典ログアウトの通知文（種別つき）。
+///
+/// **成功した範囲だけ**を見せる（[`logout_purge_failed_message`] と同じ方針）。
+/// サイト側・ブラウザー（WebView）の保存データはローカルとは**別の操作**なので、
+/// 失敗した項目を文言に残す（消えていないのに「消した」と見せない）。
+fn tbf_logout_message(
+    purge: &Result<(), String>,
+    server_ok: bool,
+    webview: &Result<(), String>,
+) -> (crate::app_state::ToastKind, String) {
+    let mut message = if purge.is_err() {
+        logout_purge_failed_message("技術書典")
+    } else if server_ok {
+        "技術書典からログアウトしました（サイト側のセッションも破棄しました）".to_string()
+    } else {
+        "技術書典からログアウトしました（サイト側のセッションは残っています）".to_string()
+    };
+    if webview.is_err() {
+        message.push_str("（ブラウザーに保存したログイン情報を削除できませんでした）");
+    }
+    let kind = if purge.is_err() || webview.is_err() {
+        crate::app_state::ToastKind::Error
+    } else {
+        crate::app_state::ToastKind::Info
+    };
+    (kind, message)
+}
+
 /// Google の認証が失効したことを示すメッセージか。
 ///
 /// 同期のエラーは `String` に畳まれて渡ってくるため、core の `GoogleError` の文言で判定する
@@ -165,7 +193,7 @@ fn format_transfer_bytes(bytes: u64) -> String {
 
 /// 同期の進捗ラベル（純関数）。`Content-Length` が無い転送は「受信」とだけ出す
 /// （総数を偽らない）。
-fn sync_progress_label(progress: &sync::SyncProgress) -> String {
+pub(crate) fn sync_progress_label(progress: &sync::SyncProgress) -> String {
     match progress.phase {
         sync::SyncPhase::Download => {
             let size = match progress.total_bytes.filter(|total| *total > 0) {
@@ -181,16 +209,54 @@ fn sync_progress_label(progress: &sync::SyncProgress) -> String {
                 progress.name, progress.index, progress.count
             )
         }
-        // 転送そのものに進捗 API が無いので、どのファイルを上げているかだけ出す
-        sync::SyncPhase::Upload => format!("{} をアップロード中", progress.name),
+        // アップロードも**送れたバイト数**を報告する（resumable は 1 チャンクごと）。
+        // 総数が分からないとき（相手が `Content-Length` を返さない等）は名前だけ出す。
+        sync::SyncPhase::Upload => {
+            let size = match progress.total_bytes.filter(|total| *total > 0) {
+                Some(total) => format!(
+                    "{} / {}",
+                    format_transfer_bytes(progress.bytes),
+                    format_transfer_bytes(total)
+                ),
+                None => format!("{} 送信", format_transfer_bytes(progress.bytes)),
+            };
+            format!("{} をアップロード中（{size}）", progress.name)
+        }
         sync::SyncPhase::Backup => "バックアップを作成中".to_string(),
     }
 }
 
 /// 進捗の割合（0..=100）。総数が分からないとき（アップロード・バックアップ、
 /// `Content-Length` 無しの取得）は `None`（バーを出さず、割合を偽らない）。
-fn sync_progress_percent(progress: &sync::SyncProgress) -> Option<u32> {
-    if progress.phase != sync::SyncPhase::Download {
+/// 進捗だけの短文（通知のように幅が狭く、ファイル名が邪魔になる場所で使う）。
+///
+/// 例: `3.0 MB / 9.0 MB（45%）`。総数が分からないときは `3.0 MB 送信`。
+/// バックアップ作成のように数字が無い段階はそのまま段階名を返す。
+pub(crate) fn sync_progress_compact(progress: &sync::SyncProgress) -> String {
+    match progress.phase {
+        sync::SyncPhase::Upload | sync::SyncPhase::Download => {
+            let transferred = format_transfer_bytes(progress.bytes);
+            match progress.total_bytes.filter(|total| *total > 0) {
+                Some(total) => {
+                    let percent = sync_progress_percent(progress).unwrap_or(0);
+                    format!(
+                        "{transferred} / {}（{percent}%）",
+                        format_transfer_bytes(total)
+                    )
+                }
+                None => format!("{transferred} 送信"),
+            }
+        }
+        sync::SyncPhase::Backup => "バックアップを作成中".to_string(),
+    }
+}
+
+pub(crate) fn sync_progress_percent(progress: &sync::SyncProgress) -> Option<u32> {
+    // 取得とアップロードは総数が分かるときだけ割合を出す（バックアップ作成中は出さない）。
+    if !matches!(
+        progress.phase,
+        sync::SyncPhase::Download | sync::SyncPhase::Upload
+    ) {
         return None;
     }
     let total = progress.total_bytes.filter(|total| *total > 0)?;
@@ -975,7 +1041,16 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub fn logout_tbf(&mut self, cx: &mut Context<Self>) {
+    /// 技術書典のログアウト。**ローカルの資格情報・サイト側・ブラウザー（WebView）の
+    /// 保存データを区別**して、成功した範囲だけを知らせる（セキュリティ評価 F05）。
+    ///
+    /// - メモリ上のセッションは即時に破棄する（`clear_tbf_session`）。
+    /// - 永続値（vault・旧 keyring）の削除は結果を待つ。失敗したら印を残し、成功として
+    ///   見せない（`logout_purge_failed_message`）。
+    /// - 非 incognito のログイン WebView が端末に残した保存データは
+    ///   `clear_all_browsing_data` で消す。WebView の生成は非同期（Windows）なので、
+    ///   結果は揃った時点で 1 回だけ知らせる。
+    pub fn logout_tbf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
         let server_ok = {
             let state = AppState::global(cx);
@@ -986,41 +1061,36 @@ impl SettingsView {
             if server_ok.is_ok() { "ok" } else { "failed" },
             t.elapsed()
         );
-        {
-            let state = AppState::global(cx);
-            state
-                .tbf
-                .lock()
-                .restore_session(thundoku_core::tbf::TbfSession {
-                    cookies: Vec::new(),
-                    xsrf_raw: String::new(),
-                    xsrf_token: String::new(),
-                });
-            log::info!("logout_tbf: session cleared ({:?})", t.elapsed());
-            *state.tbf_logged_in.lock() = false;
-            // keyring の削除は数秒かかることがあるためバックグラウンドで行う
-            let store = state.secrets.clone();
-            cx.background_spawn(async move {
-                let _ = store.delete(secrets::USER_TECHBOOKFEST);
-            })
-            .detach();
-        }
-        if server_ok.is_ok() {
-            self.show_toast(
-                "技術書典からログアウトしました（サイト側のセッションも破棄しました）",
-                cx,
-            );
-        } else {
-            self.show_toast(
-                "技術書典からログアウトしました（サイト側のセッションは残っています）",
-                cx,
-            );
-        }
+        let purge = crate::app_state::clear_tbf_session(cx);
+        log::info!("logout_tbf: local cleared ({:?})", t.elapsed());
+        // WebView の保存データを消す（結果は生成完了後に返る）。
+        crate::views::clear_login_webview_data(self, window, cx, move |this, webview, cx| {
+            this.report_tbf_logout(purge, server_ok.is_ok(), webview, cx);
+        });
         log::info!("logout_tbf: done ({:?})", t.elapsed());
         cx.notify();
     }
 
-    pub fn logout_google(&mut self, cx: &mut Context<Self>) {
+    /// 技術書典ログアウトの結果を知らせる（判定は [`tbf_logout_message`]）。
+    fn report_tbf_logout(
+        &mut self,
+        purge: Result<(), String>,
+        server_ok: bool,
+        webview: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = &purge {
+            log::error!("logout_tbf: {error}");
+        }
+        if let Err(error) = &webview {
+            log::error!("logout_tbf: WebView の保存データを消去できません: {error}");
+        }
+        let (kind, message) = tbf_logout_message(&purge, server_ok, &webview);
+        crate::app_state::set_toast_kind(cx, kind, message);
+        cx.notify();
+    }
+
+    pub fn logout_google(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
         // ローカルの利用状態は即時に落とす（メモリ上のトークンは破棄する）。
         // 永続値（keyring）の削除は結果を待ってから知らせる（SEC-09）。
@@ -1086,7 +1156,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub fn logout_booth(&mut self, cx: &mut Context<Self>) {
+    pub fn logout_booth(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
         let server_ok = {
             let state = AppState::global(cx);
@@ -1122,7 +1192,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub fn logout_fanza(&mut self, cx: &mut Context<Self>) {
+    pub fn logout_fanza(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
         let purge = crate::app_state::clear_fanza_session(cx);
         log::info!("logout_fanza: cleared ({:?})", t.elapsed());
@@ -1130,7 +1200,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub fn logout_dlsite(&mut self, cx: &mut Context<Self>) {
+    pub fn logout_dlsite(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let t = std::time::Instant::now();
         let purge = crate::app_state::clear_dlsite_session(cx);
         log::info!("logout_dlsite: cleared ({:?})", t.elapsed());
@@ -1260,11 +1330,18 @@ impl SettingsView {
                     .flatten()
             };
             log::info!("sync_drive_now: folder_id={folder_id:?}");
-            let mut client = google.lock();
-            let client = client.as_mut().ok_or_else(|| {
-                crate::pack_keys::SyncFailure::message("Google にログインしてください")
-            })?;
-            let token = client.access_token().map_err(|e| e.to_string())?;
+            // トークンだけ取って**ロックはすぐ手放す**。この後の `keys.unlock` /
+            // `keys.retry_pending_upload` は内部で `drive()`（同じ `Mutex` を取る）を
+            // 呼ぶため、ロックを保持したまま呼ぶと自己デッドロックする
+            // （`parking_lot::Mutex` は再入不可。実際に「同期が終わらない →
+            // 以降の同期と終了処理が全部ロック待ちで固まる」不具合になっていた）。
+            let token = {
+                let mut guard = google.lock();
+                let client = guard.as_mut().ok_or_else(|| {
+                    crate::pack_keys::SyncFailure::message("Google にログインしてください")
+                })?;
+                client.access_token().map_err(|e| e.to_string())?
+            };
             let mut drive = DriveClient::new(Box::new(UreqTransport::new()), token);
             log::info!("sync_drive_now: token ok, drive client ready");
             let folder_id = match folder_id {
@@ -1992,8 +2069,10 @@ impl SettingsView {
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_google(cx)).ok();
+                                    move |_, window, cx| {
+                                        handle
+                                            .update(cx, |this, cx| this.logout_google(window, cx))
+                                            .ok();
                                     }
                                 })
                                 .into_any_element()
@@ -2047,8 +2126,10 @@ impl SettingsView {
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_tbf(cx)).ok();
+                                    move |_, window, cx| {
+                                        handle
+                                            .update(cx, |this, cx| this.logout_tbf(window, cx))
+                                            .ok();
                                     }
                                 })
                                 .into_any_element()
@@ -2099,8 +2180,10 @@ impl SettingsView {
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_booth(cx)).ok();
+                                    move |_, window, cx| {
+                                        handle
+                                            .update(cx, |this, cx| this.logout_booth(window, cx))
+                                            .ok();
                                     }
                                 })
                                 .into_any_element()
@@ -2152,8 +2235,10 @@ impl SettingsView {
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_fanza(cx)).ok();
+                                    move |_, window, cx| {
+                                        handle
+                                            .update(cx, |this, cx| this.logout_fanza(window, cx))
+                                            .ok();
                                     }
                                 })
                                 .into_any_element()
@@ -2205,8 +2290,10 @@ impl SettingsView {
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
-                                    move |_, _window, cx| {
-                                        handle.update(cx, |this, cx| this.logout_dlsite(cx)).ok();
+                                    move |_, window, cx| {
+                                        handle
+                                            .update(cx, |this, cx| this.logout_dlsite(window, cx))
+                                            .ok();
                                     }
                                 })
                                 .into_any_element()
@@ -3539,6 +3626,140 @@ mod tests {
         assert_eq!(message.unwrap_or_default(), "FANZA からログアウトしました");
     }
 
+    /// 技術書典のログアウトは**成功した範囲だけ**を知らせる（ローカル / サイト側 /
+    /// ブラウザーの保存データは別操作。セキュリティ評価 F05）。
+    #[test]
+    fn tbf_logout_message_reports_only_what_succeeded() {
+        use crate::app_state::ToastKind;
+
+        // ローカルの削除に失敗 → 成功として見せない（他ストアと同じ扱い）
+        let (kind, message) = tbf_logout_message(&Err("database is locked".into()), true, &Ok(()));
+        assert_eq!(kind, ToastKind::Error);
+        assert!(
+            message.contains("削除できませんでした"),
+            "失敗を伝えていない: {message}"
+        );
+
+        // サイト側のログアウトに失敗 → ローカルは消えたが、サイト側は残っていると伝える
+        let (kind, message) = tbf_logout_message(&Ok(()), false, &Ok(()));
+        assert_eq!(kind, ToastKind::Info);
+        assert!(
+            message.contains("サイト側のセッションは残っています"),
+            "サイト側の失敗を伝えていない: {message}"
+        );
+
+        // WebView の保存データを消せなかった → 消えたことにしない
+        let (kind, message) = tbf_logout_message(&Ok(()), true, &Err("build failed".into()));
+        assert_eq!(kind, ToastKind::Error);
+        assert!(
+            message.contains("ブラウザー") && message.contains("削除できませんでした"),
+            "WebView の失敗を伝えていない: {message}"
+        );
+        assert!(
+            message.contains("サイト側のセッションも破棄しました"),
+            "成功した範囲まで消している: {message}"
+        );
+
+        // すべて成功
+        let (kind, message) = tbf_logout_message(&Ok(()), true, &Ok(()));
+        assert_eq!(kind, ToastKind::Info);
+        assert_eq!(
+            message,
+            "技術書典からログアウトしました（サイト側のセッションも破棄しました）"
+        );
+    }
+
+    /// 技術書典のセッションは vault（暗号化 + 保存時刻つき）に入り、ログアウトで消える。
+    ///
+    /// 旧版は keyring に期限なしで置いていた（セキュリティ評価 F05）。平文で保存しない
+    /// こと・メモリと永続値の両方が落ちることを固定する。
+    #[gpui_kit::test]
+    async fn tbf_session_is_stored_in_the_vault_and_cleared_on_logout(cx: &mut TestAppContext) {
+        use thundoku_core::session_store::StoreSession;
+
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+
+        let session = thundoku_core::tbf::TbfSession::from_cookies(vec![(
+            "session".to_string(),
+            "secret-cookie-value".to_string(),
+        )]);
+        let raw = cx.update(|cx| {
+            crate::app_state::save_tbf_session(cx, &session);
+            let state = AppState::global(cx);
+            assert!(*state.tbf_logged_in.lock(), "ログイン状態になっていない");
+            assert!(
+                state.tbf.lock().session().is_some(),
+                "クライアントへ反映されていない"
+            );
+            db::settings::get(&state.db_pool, StoreSession::Techbookfest.settings_key())
+                .unwrap()
+                .expect("vault に保存されている")
+        });
+        assert!(raw.starts_with("enc:v2:"), "平文で保存している: {raw}");
+        assert!(
+            !raw.contains("secret-cookie-value"),
+            "Cookie が平文で残っている: {raw}"
+        );
+
+        let purge = cx.update(|cx| crate::app_state::clear_tbf_session(cx));
+        assert!(purge.is_ok(), "削除に失敗: {purge:?}");
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            assert!(!*state.tbf_logged_in.lock(), "未ログインに戻っていない");
+            assert!(
+                state.tbf.lock().session().is_none(),
+                "メモリのセッションが残っている"
+            );
+            assert!(
+                db::settings::get(&state.db_pool, StoreSession::Techbookfest.settings_key())
+                    .unwrap()
+                    .is_none(),
+                "永続値が残っている"
+            );
+        });
+    }
+
+    /// 技術書典のログアウトで永続値を消せなかったら、成功として見せず、次回起動で
+    /// 復元しない印を残す（他ストアと同じ流儀。`logout_reports_purge_failure_instead_of_success`
+    /// と対になる）。
+    #[gpui_kit::test]
+    async fn tbf_logout_failure_marks_the_session_for_the_next_start(cx: &mut TestAppContext) {
+        use thundoku_core::session_store::StoreSession;
+
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+
+        let session = thundoku_core::tbf::TbfSession::from_cookies(vec![(
+            "session".to_string(),
+            "secret-cookie-value".to_string(),
+        )]);
+        let (purge, pending) = cx.update(|cx| {
+            crate::app_state::save_tbf_session(cx, &session);
+            let state = AppState::global(cx);
+            // DB を閉じて削除を失敗させる（読取専用・破損の代用）
+            db::block_on(state.db_pool.close());
+            let purge = crate::app_state::clear_tbf_session(cx);
+            let marker = crate::app_state::purge_marker(state);
+            let pending = marker.pending();
+            // 後続のテストへ印を持ち越さない（データディレクトリはテスト間で共有）
+            marker.clear(StoreSession::Techbookfest.label());
+            (purge, pending)
+        });
+
+        assert!(purge.is_err(), "削除失敗を成功として返している");
+        assert!(
+            pending.iter().any(|slot| slot == StoreSession::Techbookfest.label()),
+            "次回起動用の印が残っていない: {pending:?}"
+        );
+        cx.update(|cx| {
+            assert!(
+                !*AppState::global(cx).tbf_logged_in.lock(),
+                "未ログインに戻っていない"
+            );
+        });
+    }
+
     /// Google のトークン失効（`invalid_grant`）を見逃さないこと。
     ///
     /// 同期のエラーは `String` に畳まれて渡ってくるため core の文言で判定している。
@@ -4062,9 +4283,21 @@ mod tests {
         };
         assert_eq!(
             sync_progress_label(&upload),
-            "pack-2.opfspack をアップロード中"
+            "pack-2.opfspack をアップロード中（0 KB 送信）"
         );
         assert_eq!(sync_progress_percent(&upload), None);
+
+        // 総数が分かるアップロードは「送れた / 全体」と割合を出す（resumable の進捗）。
+        let uploading = SyncProgress {
+            bytes: 3 * 1024 * 1024,
+            total_bytes: Some(9 * 1024 * 1024),
+            ..upload.clone()
+        };
+        assert_eq!(
+            sync_progress_label(&uploading),
+            "pack-2.opfspack をアップロード中（3.0 MB / 9.0 MB）"
+        );
+        assert_eq!(sync_progress_percent(&uploading), Some(33));
 
         let backup = SyncProgress {
             phase: SyncPhase::Backup,
@@ -4075,6 +4308,15 @@ mod tests {
             total_bytes: None,
         };
         assert_eq!(sync_progress_label(&backup), "バックアップを作成中");
+
+        // 通知用の短文はファイル名を出さない（進捗だけ）。
+        assert_eq!(
+            sync_progress_compact(&uploading),
+            "3.0 MB / 9.0 MB（33%）",
+            "通知は進捗だけ（ファイル名を出さない）"
+        );
+        assert_eq!(sync_progress_compact(&unknown), "512 KB 送信");
+        assert_eq!(sync_progress_compact(&backup), "バックアップを作成中");
         assert_eq!(sync_progress_percent(&backup), None);
     }
 

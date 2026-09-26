@@ -261,7 +261,16 @@ pub struct KeyContext {
     pub prompt: Arc<PackKeyPrompt>,
     /// 解決済み PRK の置き場（`AppState::pack_root_key` と同じ実体）
     pub slot: Arc<Mutex<Option<PackRootKey>>>,
+    /// Google クライアントのロックを待つ上限。
+    ///
+    /// 呼び出し側が**同じスレッドで既にロックを持っている**と `lock()` は永久に
+    /// 返らない（`parking_lot::Mutex` は再入不可）。終了処理のようにロックを跨いで
+    /// 呼ばれ得る経路があるので、待ち時間つきにして「固まる」ではなくエラーにする。
+    pub lock_wait: std::time::Duration,
 }
+
+/// Google クライアントのロックを待つ既定の上限（5 秒）。
+pub const DEFAULT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl KeyContext {
     pub fn from_state(state: &AppState) -> Self {
@@ -272,6 +281,7 @@ impl KeyContext {
             profile: state.google_profile.clone(),
             prompt: state.pack_key_prompt.clone(),
             slot: state.pack_root_key.clone(),
+            lock_wait: DEFAULT_LOCK_WAIT,
         }
     }
 
@@ -319,7 +329,11 @@ impl KeyContext {
     ///
     /// Google の Mutex はここで解放する（パスフレーズの入力待ちの間に握らない）。
     fn drive(&self) -> Result<DriveClient, String> {
-        let mut google = self.google.lock();
+        // **待ち時間つき**で取る。同じスレッドがロックを持ったままここへ来ると
+        // `lock()` は永久に返らず、終了処理が固まる（実際に起きた）。
+        let mut google = self.google.try_lock_for(self.lock_wait).ok_or_else(|| {
+            "Google クライアントのロックを取得できません（別の処理が使用中です）".to_string()
+        })?;
         let client = google
             .as_mut()
             .ok_or_else(|| "Google にログインしてください".to_string())?;
@@ -334,7 +348,7 @@ impl KeyContext {
 
     /// ログイン中のアカウントの PRK を解決する（**背景スレッド専用**）。
     ///
-    /// 未ログイン（平文 pack の経路）と Drive 未設定は `Ok(None)`。
+    /// 未ログイン（平文 pack を読む経路。**旧版で取り込んだ本**）と Drive 未設定は `Ok(None)`。
     /// パスフレーズが要るときは解錠ダイアログが出る（答えが来るまでここでブロックする）。
     pub fn unlock(&self, purpose: &str) -> Result<Option<PackRootKey>, String> {
         let Some(sub) = self.sub() else {
@@ -375,7 +389,9 @@ impl KeyContext {
 
     /// 取り込みで使う PRK を用意する（仕様 §4.1 手順 5 / §5.1。**背景スレッド専用**）。
     ///
-    /// - 未ログイン（`profile` = `None`）: 平文 pack（`Ok(None)`）
+    /// - 未ログイン（`profile` = `None`）: **失敗**（[`ImportError::LoginRequired`]）。
+    ///   平文 pack の取り込みは行わない（セキュリティ評価 F03。UI 側もダウンロードを
+    ///   始める前にログインを促す）。
     /// - ログイン中: keyring → bundle → パスフレーズ、無ければ**新規作成**して
     ///   keyring に保存し、`sub` ラップを bundle に載せて Drive へ上げる
     ///   （アップロードに失敗しても取り込みは続ける。未アップロードの印が残り、
@@ -384,7 +400,7 @@ impl KeyContext {
         &self,
         profile: Option<&GoogleProfile>,
         purpose: &str,
-    ) -> Result<Option<PackRootKey>, ImportError> {
+    ) -> Result<PackRootKey, ImportError> {
         pack_root_key_for_import(profile, |sub| {
             // このセッションで解決済みなら Drive を触らない
             if self.sub().as_deref() == Some(sub)
@@ -442,8 +458,7 @@ impl KeyContext {
         // 鍵を用意する（無ければ作成。別端末のパスフレーズが要る場合はここで尋ねる）
         let root = self
             .import_root_key(self.google_profile().as_ref(), purpose)
-            .map_err(|error| import_error_message(&error))?
-            .ok_or_else(|| "本の鍵を用意できませんでした".to_string())?;
+            .map_err(|error| import_error_message(&error))?;
         let mut drive = self.drive()?;
         let folder_id = self.drive_folder(&mut drive)?;
         let store = PackKeyStore::new(&self.secrets, &self.pool, &folder_id);
@@ -586,7 +601,9 @@ pub fn pack_read_error_message(error: &opfspack::PackError) -> String {
 
 /// 取り込みの失敗を利用者に伝わる文言にする。
 ///
-/// 鍵が無いときは**復元（パスフレーズ入力）への導線**を文面に含める。
+/// 鍵が無いときは**復元（パスフレーズ入力）への導線**を、未ログインで取り込みを
+/// 要求されたとき（`LoginRequired`）は**Google ログインへの導線**を文面に含める
+/// （前者はこの関数、後者は `ImportError` の文言がそのまま画面に出る）。
 pub fn import_error_message(error: &ImportError) -> String {
     match error {
         ImportError::IdentityKeyUnavailable => {
@@ -1067,6 +1084,22 @@ mod tests {
         );
     }
 
+    /// 未ログインでは取り込みの鍵を用意できない（**平文 pack に落とさない** — F03）。
+    ///
+    /// アプリ側の入口（`KeyContext::import_root_key`）でも `LoginRequired` で失敗し、
+    /// 平文 pack を作る経路が無いことを固定する。
+    #[gpui_kit::test]
+    async fn import_root_key_requires_a_google_login(cx: &mut gpui_kit::TestAppContext) {
+        if cx.update(|cx| cx.try_global::<AppState>().is_none()) {
+            cx.update(AppState::init_test);
+        }
+        let keys = cx.read(|cx| KeyContext::from_state(AppState::global(cx)));
+        let error = keys
+            .import_root_key(None, "取り込み")
+            .expect_err("未ログインでは平文 pack を作らない");
+        assert!(matches!(error, ImportError::LoginRequired), "{error:?}");
+    }
+
     // ---- ここから下は Drive を伴う経路（偽 Drive を使う） ----
 
     /// メモリバックエンドの keyring はプロセス内で共有されるため、同じ `sub` を使う
@@ -1201,5 +1234,44 @@ mod tests {
             created.as_bytes(),
             "bundle から同じ鍵が戻る"
         );
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::{DEFAULT_LOCK_WAIT, KeyContext, PackKeyPrompt, SecretStore};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// ロックが取れないときは**待ち時間で諦めてエラー**にする（固まらない）。
+    ///
+    /// 終了処理は Google のロックを持ったまま鍵解決を呼んでおり、`drive()` が
+    /// 再入待ちで永久に戻らなくなっていた（アプリが終了しない）。
+    #[test]
+    fn drive_gives_up_instead_of_waiting_forever_when_the_lock_is_held() {
+        let state = thundoku_core::db::test_pool();
+        thundoku_core::db::migrate(&state).unwrap();
+        let secrets = SecretStore::new();
+        let context = KeyContext {
+            secrets,
+            pool: state,
+            google: Arc::new(Mutex::new(None)),
+            profile: Arc::new(Mutex::new(None)),
+            prompt: Arc::new(PackKeyPrompt::default()),
+            slot: Arc::new(Mutex::new(None)),
+            lock_wait: Duration::from_millis(50),
+        };
+        // 同じスレッドで持ったまま呼ぶ（= 終了処理と同じ状況）。
+        let _held = context.google.lock();
+        let started = std::time::Instant::now();
+        let error = match context.drive() {
+            Ok(_) => panic!("ロックが取れないのでエラーになるはず"),
+            Err(error) => error,
+        };
+        assert!(error.contains("ロック"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2), "待ち続けない");
+        // 既定の待ち時間は有限
+        assert!(DEFAULT_LOCK_WAIT > Duration::ZERO);
     }
 }

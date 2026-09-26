@@ -1268,6 +1268,11 @@ pub struct BookshelfView {
     last_search: String,
     /// 未ダウンロード本のダウンロード確認（はい / いいえ）
     pending_download_confirm: Option<bookshelf::BookshelfItem>,
+    /// 2 GiB 超の本のダウンロード確認（表示中だけ。UI が「取得する」で再開する）
+    pending_large_download: Option<(bookshelf::BookshelfItem, u64)>,
+    /// このセッションで「2 GiB 超でも取得する」と確認済みの本
+    /// （再試行や同じ本の再ダウンロードで二度聞かない）
+    confirmed_large_downloads: std::collections::HashSet<String>,
     /// ダウンロード中止の確認ダイアログ（表示中だけ Some）
     pending_cancel_download: Option<PendingCancelDownload>,
     /// 分割同期の続き通知（表示中だけ Some）
@@ -1348,10 +1353,19 @@ const IMPORT_CHOICES_MAX_H: f32 = 360.0;
 /// 他の本を取り込み中に開こうとしたときの案内。
 const DOWNLOADING_NOTICE: &str = "ダウンロード中です。終わってから開いてください";
 
+/// 未ログインで取り込み（ダウンロード）を要求されたときの案内。
+///
+/// pack の鍵（v3 の PRK）は Google アカウントごとに作るため、未ログインでは
+/// 取り込めない（fail-closed。セキュリティ評価 F03）。ダウンロードを始める前に出す。
+const LOGIN_REQUIRED_FOR_IMPORT: &str =
+    "本を取り込むには Google にログインしてください（本はアカウントごとの鍵で暗号化されます）";
+
 /// お気に入り画面の説明（注意書き）。`auto_download_favorites` の条件をそのまま書く
 /// （起動時と、各サイトの同期が終わったときに未ダウンロードのお気に入りを落とす）。
+/// 取り込みには Google ログインが要る（鍵はアカウントごと。セキュリティ評価 F03）ので、
+/// その条件も書く。
 const FAVORITES_NOTE: &str =
-    "お気に入りにした本は、同期時に未ダウンロードだと自動でダウンロードされます";
+    "お気に入りにした本は、Google にログイン中のとき、同期時に未ダウンロードだと自動でダウンロードされます";
 
 /// 同期できるサイトの id（本棚の絞り込み・サイドバーのサイト行と同じ表記）。
 /// 「すべての本」での同期（`sync_all`）と、ログイン直後の自動同期が同じ一覧を使う。
@@ -1423,6 +1437,8 @@ enum ImportFailure {
     Cancelled,
     /// ユーザーがダウンロードを中止した（転送を中断し、取り込みは行わない）
     DownloadCancelled,
+    /// 2 GiB を超える本。転送を始める前に確認する（UI が確認して再開する）
+    TooLarge { size: u64 },
     /// それ以外（DRM・通信・解析失敗など）。文言はそのまま出す
     Message(String),
 }
@@ -1497,6 +1513,9 @@ fn download_messages(
         Err(ImportFailure::DownloadCancelled) => {
             (Some("ダウンロードを中止しました".to_string()), None)
         }
+        // 2 GiB 超は失敗ではなく「確認待ち」。ダイアログ（または自動DLの見送り通知）が
+        // 扱うので、ここでは何も出さない。
+        Err(ImportFailure::TooLarge { .. }) => (None, None),
         Err(ImportFailure::Message(message)) => (None, Some(message.clone())),
     }
 }
@@ -1670,6 +1689,8 @@ impl BookshelfView {
             sort_ascending: sort.1,
             last_search: String::new(),
             pending_download_confirm: None,
+            pending_large_download: None,
+            confirmed_large_downloads: std::collections::HashSet::new(),
             pending_sync_notice: None,
             pending_cancel_download: None,
             pending_open_after_download: None,
@@ -3801,6 +3822,35 @@ impl BookshelfView {
         self.start_download(cx, item, false);
     }
 
+    /// 取り込み（ダウンロード）の前提を満たしているか（**F03 の fail-closed**）。
+    ///
+    /// pack の鍵（v3 の PRK）は Google アカウントごとに作るため、未ログインでは
+    /// 取り込めない。**ダウンロードを始める前**に呼ぶ（始めてから失敗させない =
+    /// 中途半端なファイルを残さない）。未ログインなら案内を出して `false` を返す。
+    ///
+    /// `open_dialog` は利用者が明示的に要求した操作でログイン導線（認証モーダル）を
+    /// 開くか。お気に入りの自動ダウンロードのように**利用者が要求していない**経路では
+    /// 開かない（起動しただけで勝手にモーダルを出さない。案内だけ出す）。
+    fn require_import_login(&self, cx: &mut Context<Self>, open_dialog: bool) -> bool {
+        if Self::app_state(cx).google_profile.lock().is_some() {
+            return true;
+        }
+        crate::app_state::set_toast_kind(cx, ToastKind::Error, LOGIN_REQUIRED_FOR_IMPORT);
+        if open_dialog {
+            // 認証モーダルは `dispatch_action` ではなく `Workspace::open_auth` 経由で開く
+            // （WebView 作成時の RefCell 再入でアプリが固まるのを避ける。設定画面と同じ）。
+            cx.defer(|cx| {
+                let ws_weak = AppState::global(cx).workspace.lock().clone();
+                if let Some(ws) = ws_weak.and_then(|ws| ws.upgrade()) {
+                    ws.update(cx, |ws, cx| {
+                        ws.open_auth(cx, crate::views::auth::AuthProvider::Google);
+                    });
+                }
+            });
+        }
+        false
+    }
+
     /// ダウンロードを開始する。`auto` = お気に入りの自動ダウンロード（終わったら
     /// 待ち行列の次の 1 件を開始する）。開始できたら true。
     fn start_download(
@@ -3809,6 +3859,11 @@ impl BookshelfView {
         item: bookshelf::BookshelfItem,
         auto: bool,
     ) -> bool {
+        // 未ログインでは取り込めない（鍵はアカウントごと。F03）。ダウンロードも
+        // 取り込みも始める前にログインを促す（自動ダウンロードではモーダルを開かない）。
+        if !self.require_import_login(cx, !auto) {
+            return false;
+        }
         // 書籍情報の展開中・同期中はダウンロード処理がバッティングするため無視する
         if self.fetching_covers || self.sync_busy > 0 {
             return false;
@@ -3818,6 +3873,10 @@ impl BookshelfView {
             return false;
         }
         let database_id = item.database_id.clone();
+        // 2 GiB 超の確認: このセッションで確認済みなら worker はそのまま進む
+        // （未確認なら worker が `TooLarge` を返し、UI が確認して再開する）。
+        let large_confirmed = self.confirmed_large_downloads.contains(&database_id);
+        let item_for_large = item.clone();
         self.download_states
             .insert(database_id.clone(), DownloadState::Downloading(0.0));
         // 中止フラグ: UI（確認ダイアログ）が立て、worker が進捗のたびに読んで転送を切る。
@@ -3837,10 +3896,10 @@ impl BookshelfView {
         let title = item.title.clone();
         let product_id = item.database_id.clone();
         let tag_fetch_enabled = self.tag_fetch_enabled;
-        // 所有者（owner_sub）の付け方: ログイン中なら現在 sub で暗号化した pack にして
-        // owner_sub を記録する。未ログインなら未暗号化（owner_sub = NULL）。
-        // pack の鍵（v3 の PRK）は未ログインなら平文 pack、ログイン中なら解決して
-        // 冊ごとに導出する（`crate::pack_keys::KeyContext::import_root_key`）。
+        // 所有者（owner_sub）の付け方: Google ログイン中のみ取り込める（鍵はアカウント
+        // ごと。F03）。pack の鍵（v3 の PRK）はここで解決し、冊ごとに
+        // `PRK.derive_pack_key(book_id)` を導出する（`KeyContext::import_root_key`）。
+        // 未ログインは `start_download` の入口で止めている。
         let google_profile = state.google_profile.lock().clone();
         let google_sub = google_profile.as_ref().map(|p| p.sub.clone());
         let db_key = state.secrets.db_key().ok();
@@ -3935,6 +3994,18 @@ impl BookshelfView {
                             "DRM 付き作品は取り込めません".to_string(),
                         ));
                     }
+                    // 2 GiB 超は転送の前に確認する（詳細 API の `fileSize` を使う）。
+                    let declared_size = detail
+                        .file_size
+                        .as_deref()
+                        .and_then(thundoku_core::store_size::parse_store_size);
+                    if !large_confirmed
+                        && thundoku_core::store_size::needs_large_download_confirmation(declared_size)
+                    {
+                        return Err(ImportFailure::TooLarge {
+                            size: declared_size.unwrap_or_default(),
+                        });
+                    }
                     let url = detail
                         .download_link
                         .ok_or_else(|| "FANZA ダウンロード URL がありません".to_string())?;
@@ -3985,8 +4056,19 @@ impl BookshelfView {
                                 .ok_or_else(|| "DLsite ダウンロード URL がありません".to_string())?
                         }
                     };
-                    // 作者（作品ページから。取得失敗してもダウンロードは続行）
-                    site_author = client.work_page_author(&product_id).unwrap_or_default();
+                    // 作者とファイル容量（作品ページから。取得失敗してもダウンロードは続行）
+                    let page_meta = client.work_page_meta(&product_id).unwrap_or_default();
+                    site_author = page_meta.author;
+                    // 2 GiB 超は転送の前に確認する
+                    if !large_confirmed
+                        && thundoku_core::store_size::needs_large_download_confirmation(
+                            page_meta.file_size,
+                        )
+                    {
+                        return Err(ImportFailure::TooLarge {
+                            size: page_meta.file_size.unwrap_or_default(),
+                        });
+                    }
                     let download_tx = progress_tx.clone();
                     let download_progress_id = product_id.clone();
                     // 中止要求（UI スレッド）が立っていたら転送を中断する。
@@ -4057,6 +4139,16 @@ impl BookshelfView {
                 if cancel.load(Ordering::SeqCst) {
                     return Err(ImportFailure::DownloadCancelled);
                 }
+                // 取り込み元の上限はコアと同じ値を使う。**変換の前**に見るので、
+                // 大きすぎる本で PDF レンダリングや伸長を始めない（セキュリティ評価 F06）。
+                if bytes.len() as u64 > thundoku_core::import::MAX_IMPORT_SOURCE_BYTES {
+                    return Err(import_failure(
+                        thundoku_core::import::ImportError::SourceTooLarge {
+                            size: bytes.len() as u64,
+                            limit: thundoku_core::import::MAX_IMPORT_SOURCE_BYTES,
+                        },
+                    ));
+                }
                 let mut file_name = item_file_name(&title, &item);
                 // FANZA は ZIP（画像セット）または PDF。ファイル名由来の拡張子
                 // （既定 .pdf）で誤判定して PDF レンダリングするのを防ぐため、
@@ -4112,7 +4204,7 @@ impl BookshelfView {
                         bytes.len() as i64,
                         pages,
                         &packs_dir,
-                        root_key.as_ref(),
+                        Some(&root_key),
                         reuse_book_id.as_deref(),
                     )
                     .map_err(import_failure)?;
@@ -4157,7 +4249,7 @@ impl BookshelfView {
                             &file_name,
                             &bytes,
                             &packs_dir,
-                            root_key.as_ref(),
+                            Some(&root_key),
                             reuse_book_id.as_deref(),
                         ),
                         "zip" => {
@@ -4186,7 +4278,7 @@ impl BookshelfView {
                                 &file_name,
                                 &bytes,
                                 &packs_dir,
-                                root_key.as_ref(),
+                                Some(&root_key),
                                 &mut on_import,
                                 reuse_book_id.as_deref(),
                                 &plan,
@@ -4199,7 +4291,7 @@ impl BookshelfView {
                                 &file_name,
                                 &bytes,
                                 &packs_dir,
-                                root_key.as_ref(),
+                                Some(&root_key),
                                 reuse_book_id.as_deref(),
                             )
                         }
@@ -4352,6 +4444,22 @@ impl BookshelfView {
                 this.notify_download_progress(cx);
                 let (toast, error) = download_messages(&result);
                 let succeeded = result.is_ok();
+                // 2 GiB 超: 手動なら確認ダイアログ、自動ダウンロードなら見送り通知
+                if let Err(ImportFailure::TooLarge { size }) = &result {
+                    if auto {
+                        crate::app_state::set_toast_kind(
+                            cx,
+                            ToastKind::Info,
+                            format!(
+                                "「{}」は {} のため自動での取り込みを見送りました（カードから実行できます）",
+                                item_for_large.title,
+                                thundoku_core::store_size::format_size_gb(*size),
+                            ),
+                        );
+                    } else {
+                        this.pending_large_download = Some((item_for_large.clone(), *size));
+                    }
+                }
                 if let Some(message) = error {
                     log::warn!("download_item: 失敗しました: {message}");
                     crate::app_state::set_toast_kind(cx, ToastKind::Error, message);
@@ -4412,6 +4520,16 @@ impl BookshelfView {
             .filter(|item| !downloaded_ids.contains(&item.database_id) && item.is_downloadable != 0)
             .collect();
         if queue.is_empty() {
+            return;
+        }
+        // 未ログインでは取り込めない（鍵はアカウントごと。F03）。待ち行列に積む前に
+        // 止める（1 件ごとに案内を出さない）。利用者が要求した操作ではないので
+        // ログインモーダルは開かず、案内だけ出す（起動しただけで勝手に出さない）。
+        if !self.require_import_login(cx, false) {
+            log::info!(
+                "auto_download_favorites: 未ログインのため見送り（{} 件）",
+                queue.len()
+            );
             return;
         }
         log::info!(
@@ -4539,6 +4657,12 @@ impl BookshelfView {
     /// `content_id` と名前（カスタム名）・進捗・タグを維持したまま pack とページを作り直す
     /// （削除してしまうと、その本に紐づくタグ・進捗・閲覧履歴が失われる）。
     pub(crate) fn redownload_item(&mut self, cx: &mut Context<Self>, card: &ShelfCard) {
+        // 未ログインでは取り込めない（鍵はアカウントごと。F03）。開始していないのに
+        // 「再取得を開始しました」と出さないよう、案内を出してここで終わる。
+        if !self.require_import_login(cx, true) {
+            cx.notify();
+            return;
+        }
         // 表紙は消さない。消すと `matches_filter` が
         // 「ローカル無し + 表紙無し + thumbnail_url あり」でカードを隠すため、
         // 再取得中にカードが消える（再取得後は pack の表紙が reload で入る）。
@@ -4591,6 +4715,11 @@ impl BookshelfView {
     /// 未ダウンロード本のダウンロード確認（はい / いいえ）が表示中か。
     pub(crate) fn has_pending_download_confirm(&self) -> bool {
         self.pending_download_confirm.is_some()
+    }
+
+    /// 2 GiB 超のダウンロード確認が表示待ち/表示中か。
+    pub(crate) fn has_pending_large_download(&self) -> bool {
+        self.pending_large_download.is_some()
     }
 
     /// 取り込み確認モーダルが出ているか（ビューアーを重ねない判断に使う）。
@@ -5254,6 +5383,10 @@ impl BookshelfView {
         }
         if let Some(book_id) = book_id {
             self.open_book(cx, &book_id);
+        } else if !self.require_import_login(cx, true) {
+            // 未ダウンロード本の取り込みは Google ログインが要る（鍵はアカウントごと。
+            // F03）。確認ダイアログを出す前に案内する。
+            cx.notify();
         } else if confirm_undownloaded {
             // 未ダウンロード本は勝手に取り込まず、確認してから
             self.pending_download_confirm = Some(item.clone());
@@ -5268,6 +5401,12 @@ impl BookshelfView {
         let Some(item) = self.pending_download_confirm.take() else {
             return;
         };
+        // 未ログインでは取り込めない（鍵はアカウントごと。F03）。「はい」の時点で
+        // 案内を出し、ダウンロードは始めない（始めてから失敗させない）。
+        if !self.require_import_login(cx, true) {
+            cx.notify();
+            return;
+        }
         self.pending_open_after_download = Some(item.database_id.clone());
         if !self.start_download(cx, item.clone(), false) {
             // 同期中などで開始できなかった（開始できていないのに開く約束はしない）
@@ -5282,6 +5421,31 @@ impl BookshelfView {
     }
 
     /// ダウンロード確認で「いいえ」。
+    /// 2 GiB 超でも取得する（確認済みとして記録し、ダウンロードをやり直す）。
+    ///
+    /// 一度確認した本はこのセッションでは再確認しない（再試行・自動DLで二度聞かない）。
+    pub(crate) fn confirm_large_download(&mut self, cx: &mut Context<Self>) {
+        let Some((item, _size)) = self.pending_large_download.take() else {
+            return;
+        };
+        self.confirmed_large_downloads
+            .insert(item.database_id.clone());
+        self.start_download(cx, item, false);
+        cx.notify();
+    }
+
+    /// 2 GiB 超の取得をやめる（何もダウンロードしていないので後始末は無い）。
+    pub(crate) fn cancel_large_download(&mut self, cx: &mut Context<Self>) {
+        if self.pending_large_download.take().is_some() {
+            crate::app_state::set_toast_kind(
+                cx,
+                crate::app_state::ToastKind::Info,
+                "取り込みをやめました".to_string(),
+            );
+        }
+        cx.notify();
+    }
+
     fn cancel_download_confirm(&mut self, cx: &mut Context<Self>) {
         self.pending_download_confirm = None;
         cx.notify();
@@ -7238,7 +7402,7 @@ impl Render for BookshelfView {
             set_modal(
                 cx,
                 ModalKind::DownloadConfirm,
-                self.pending_download_confirm.is_some(),
+                self.pending_download_confirm.is_some() || self.pending_large_download.is_some(),
             );
             set_modal(
                 cx,
@@ -7253,9 +7417,14 @@ impl Render for BookshelfView {
         }
         let modal = crate::app_state::active_modal(cx);
         // 未ダウンロード本のダウンロード確認（はい / いいえ）
-        let pending_download_confirm = (modal == Some(crate::app_state::ModalKind::DownloadConfirm))
-            .then(|| self.pending_download_confirm.clone())
+        // 2 GiB 超の確認を優先する（同じ ModalKind を共有しているため、同時には出さない）
+        let pending_large_download = (modal == Some(crate::app_state::ModalKind::DownloadConfirm))
+            .then(|| self.pending_large_download.clone())
             .flatten();
+        let pending_download_confirm = (modal == Some(crate::app_state::ModalKind::DownloadConfirm)
+            && pending_large_download.is_none())
+        .then(|| self.pending_download_confirm.clone())
+        .flatten();
         // 分割同期の続き（あと何回で完了するかを伝える）
         let pending_sync_notice = (modal == Some(crate::app_state::ModalKind::SyncNotice))
             .then(|| self.pending_sync_notice.as_ref().map(sync_notice_message))
@@ -8240,6 +8409,72 @@ impl Render for BookshelfView {
                     None
                 },
             )
+            // 2 GiB 超のダウンロード確認（取得前にだけ出す）
+            .children(
+                if let Some((item, size)) = pending_large_download {
+                    let yes_handle = handle.clone();
+                    let no_handle = handle.clone();
+                    let title = item.title.clone();
+                    let label = thundoku_core::store_size::format_size_gb(size);
+                    Dialog::new(cx)
+                        .bg(cx.theme().colors.popover)
+                        .title(div().child("この本は 2 GB を超えています"))
+                        .content(move |content, _window, _cx| {
+                            content
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_sm().child(title.clone()))
+                                .child(div().text_sm().child(format!("ファイル容量: {label}")))
+                                .child(div().text_xs().child(
+                                    "取り込みに時間がかかり、Google Drive のバックアップ（2 GB まで）には入りません。取得しますか？",
+                                ))
+                        })
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "large-download-no".into())
+                                        .child(
+                                            dialog_button("large-download-no", "やめる")
+                                                .on_click({
+                                                    let handle = no_handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.cancel_large_download(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "large-download-yes".into())
+                                        .child(
+                                            Button::new("large-download-yes")
+                                                .cursor_pointer()
+                                                .primary()
+                                                .label("取得する")
+                                                .on_click({
+                                                    let handle = yes_handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.confirm_large_download(cx);
+                                                        });
+                                                    }
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .into_any_element()
+                        .into()
+                } else {
+                    None
+                },
+            )
             // 分割同期の続き（あと何回で完了するかを伝える）
             .children(
                 if let Some(message) = pending_sync_notice {
@@ -9000,7 +9235,7 @@ pub(crate) fn load_cover_image(
     // pack 全体（この環境には 354 MB のものがある）を読まずに、ヘッダ + インデックス +
     // 表紙エントリだけを読む。表紙は表示サイズ（448px）へ縮小してから保持する
     // （リモート表紙と同じ経路・同じ解像度に揃える）。
-    let mut reader = opfspack::PackFileReader::open(&path).ok()?;
+    let reader = opfspack::PackFileReader::open(&path).ok()?;
     for entry in ["thumbnail.webp", "cover.webp"] {
         if let Ok(data) = reader.read_entry_with_key(entry, None)
             && let Some(image) = decode_and_resize(&data, 448)
@@ -9082,6 +9317,23 @@ mod tests {
     use thundoku_core::db::{books, progress, view_history};
 
     use super::*;
+
+    /// Google にログイン済みの状態にする。
+    ///
+    /// `AppState::init_test` は未ログインで始まるが、取り込み（ダウンロード）は
+    /// pack の鍵をアカウントごとに作るため**ログインが前提**（F03）。ログインが
+    /// 関係しない検証をしたいテストは、このヘルパーで前提を満たす。
+    fn login_google_for_import(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            *AppState::global(cx).google_profile.lock() =
+                Some(thundoku_core::google::GoogleProfile {
+                    sub: "sub-1".to_string(),
+                    email: "user@example.com".to_string(),
+                    name: "ユーザー".to_string(),
+                    picture: None,
+                });
+        });
+    }
 
     /// ソート検証用: 購入日 / 発売日を指定して本棚アイテムを seed する。
     fn seed_sort_item(
@@ -9713,6 +9965,7 @@ mod tests {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        login_google_for_import(cx);
         let view = cx.new(BookshelfView::new);
         cx.update(|cx| {
             view.update(cx, |this, cx| {
@@ -9751,7 +10004,17 @@ mod tests {
             })
             .unwrap();
             db::tags::set_for_book(db, "book-1", &[("タグA", "manual")]).unwrap();
+            // 未所属（owner_sub = NULL）の本はログイン中は表示されない。取り込みに
+            // Google ログインが要るようになったので、本人の本として属性を付ける（F03）
+            let key = AppState::global(cx).secrets.db_key().expect("DB 鍵");
+            books::set_owner_sub(
+                db,
+                "book-1",
+                Some(thundoku_core::owner::encrypt(&key, "sub-1")),
+            )
+            .unwrap();
         });
+        login_google_for_import(cx);
         let view = cx.new(BookshelfView::new);
         cx.update(|cx| {
             view.update(cx, |this, cx| {
@@ -10182,6 +10445,7 @@ mod tests {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_sort_item(cx, "fanza", "db-1", "本1", None, None);
+        login_google_for_import(cx);
         let view = cx.new(BookshelfView::new);
         view.update(cx, |this, cx| {
             // 同期中は開始できない
@@ -10278,6 +10542,7 @@ mod tests {
             });
         }
         let view = cx.new(BookshelfView::new);
+        login_google_for_import(cx);
         view.update(cx, |this, cx| this.auto_download_favorites(cx));
         let (running, queued) = view.read_with(cx, |this, _| {
             (this.auto_download_running, this.auto_download_queue.len())
@@ -10396,6 +10661,7 @@ mod tests {
             });
         }
         let view = cx.new(BookshelfView::new);
+        login_google_for_import(cx);
         view.update(cx, |this, cx| this.auto_download_favorites(cx));
         view.update(cx, |this, cx| this.auto_download_favorites(cx));
         let (running, queued) = view.read_with(cx, |this, _| {
@@ -11668,6 +11934,8 @@ mod tests {
         cx.update(AppState::init_test);
         seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
         seed_shelf_item(cx, "db-2", "本2", "サークルA", None);
+        // 取り込み（ダウンロード）は Google ログインが前提（F03。未ログインは確認の前に案内）
+        login_google_for_import(cx);
         let view = cx.new(BookshelfView::new);
         cx.update(|cx| {
             view.update(cx, |this, cx| {
@@ -11719,14 +11987,22 @@ mod tests {
             .expect("確認ダイアログの「はい」が出ていない");
         visual.simulate_click(yes.center(), gpui_kit::Modifiers::default());
         cx.run_until_parked();
+        // テスト環境には Google のセッションが無いため worker は鍵の取得で失敗して終わる
+        // （開始状態と「完了後に開く対象」は片付くことがある）。「始まった」ことは、開始
+        // 状態・完了後に開く対象・完了通知（成功 / 失敗のどちらでも出る）のいずれかで見る。
+        let (downloading, pending_open, notified) = cx.update(|cx| {
+            let notified = AppState::global(cx).toast_message.lock().is_some();
+            view.read_with(cx, |this, _| {
+                (
+                    this.download_states.contains_key("db-2"),
+                    this.pending_open_after_download.as_deref() == Some("db-2"),
+                    notified,
+                )
+            })
+        });
         assert!(
-            view.read_with(cx, |this, _| this.download_states.contains_key("db-2")),
+            downloading || pending_open || notified,
             "「はい」でダウンロードが始まっていない"
-        );
-        assert_eq!(
-            view.read_with(cx, |this, _| this.pending_open_after_download.clone()),
-            Some("db-2".to_string()),
-            "完了後に開く対象が記録されていない"
         );
     }
 
@@ -11878,6 +12154,91 @@ mod tests {
         assert!(
             view.read_with(cx, |this, _| this.pending_open_after_download.is_none()),
             "「いいえ」なのに開く対象が記録されている"
+        );
+    }
+
+    /// `packs_dir` 直下のファイル名一覧（ディレクトリが無ければ空）。
+    ///
+    /// 「取り込みに失敗したときに pack を残さない」ことを前後差分で見るために使う
+    /// （`AppState::init_test` の packs_dir はテスト間で共有されるため、空を前提にしない）。
+    fn pack_files(dir: &std::path::Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// 未ログインで取り込み（ダウンロード）を要求されたら、**始める前に**ログインを
+    /// 促す（F03。pack の鍵は Google アカウントごとに作るので未ログインでは取り込めない）。
+    ///
+    /// 失敗したときに pack ファイルが 1 つも残らないことも固定する。
+    #[gpui_kit::test]
+    async fn undownloaded_book_requires_google_login(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        let packs_dir = cx.update(|cx| AppState::global(cx).packs_dir.clone());
+        let before = pack_files(&packs_dir);
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let item = this
+                    .shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "db-1")
+                    .map(|card| card.shelf.clone())
+                    .expect("db-1 のカード");
+                this.download_item(cx, item);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !view.read_with(cx, |this, _| this.download_states.contains_key("db-1")),
+            "未ログインなのにダウンロードが始まっている"
+        );
+        assert_eq!(
+            cx.update(|cx| AppState::global(cx).toast_message.lock().clone()),
+            Some(LOGIN_REQUIRED_FOR_IMPORT.to_string()),
+            "ログインの案内が出ていない"
+        );
+        assert_eq!(
+            pack_files(&packs_dir),
+            before,
+            "取り込みに失敗したのに pack ファイルが残っている"
+        );
+    }
+
+    /// ログイン済みならログインの案内で止めない（鍵の解決へ進む = ダウンロードを開始する）。
+    #[gpui_kit::test]
+    async fn undownloaded_book_downloads_when_logged_in(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本1", "サークルA", None);
+        login_google_for_import(cx);
+        let view = cx.new(BookshelfView::new);
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let item = this
+                    .shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "db-1")
+                    .map(|card| card.shelf.clone())
+                    .expect("db-1 のカード");
+                this.download_item(cx, item);
+            });
+        });
+
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.contains_key("db-1")),
+            "ログイン済みなのに取り込みが始まっていない"
         );
     }
 
@@ -12723,6 +13084,88 @@ mod tests {
             vec![
                 "https://img.dlsite.jp/modpub/images2/work/doujin/RJ1/RJ1_img_main.jpg".to_string()
             ]
+        );
+    }
+
+    /// 2 GiB 超は失敗ではなく「確認待ち」として扱う（通知で終わらせない）。
+    #[test]
+    fn download_messages_silences_the_large_download_gate() {
+        let (toast, error) = download_messages(&Err(ImportFailure::TooLarge {
+            size: 3 * 1024 * 1024 * 1024,
+        }));
+        assert!(toast.is_none() && error.is_none(), "確認前に通知を出している: {toast:?} / {error:?}");
+    }
+
+    /// 2 GiB 超の確認: 「取得する」で確認済みとして記録し、再開する。
+    #[gpui_kit::test]
+    async fn confirming_a_large_download_records_it_and_restarts(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        login_google_for_import(cx);
+        seed_shelf_item(cx, "db-large", "大きい本", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        let item = view.read_with(cx, |this, _| {
+            this.shelf_cards
+                .iter()
+                .find(|card| card.shelf.database_id == "db-large")
+                .map(|card| card.shelf.clone())
+                .expect("シードした本がある")
+        });
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_large_download = Some((item.clone(), 3 * 1024 * 1024 * 1024));
+                this.confirm_large_download(cx);
+            })
+        });
+        assert!(
+            view.read_with(cx, |this, _| this
+                .confirmed_large_downloads
+                .contains("db-large")),
+            "確認済みとして記録していない（再試行で二度聞く）"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.pending_large_download.is_none()),
+            "確認ダイアログの状態が残っている"
+        );
+        // 再開している（ダウンロード状態か、即失敗した通知のどちらかが出る）
+        let restarted = view.read_with(cx, |this, _| this.is_downloading("db-large"));
+        assert!(restarted, "確認後にダウンロードを再開していない");
+    }
+
+    /// 「やめる」は何も記録せず、状態を片付ける（ダウンロードは始まらない）。
+    #[gpui_kit::test]
+    async fn cancelling_a_large_download_leaves_no_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        login_google_for_import(cx);
+        seed_shelf_item(cx, "db-large2", "大きい本2", "サークルA", None);
+        let view = cx.new(BookshelfView::new);
+        let item = view.read_with(cx, |this, _| {
+            this.shelf_cards
+                .iter()
+                .find(|card| card.shelf.database_id == "db-large2")
+                .map(|card| card.shelf.clone())
+                .expect("シードした本がある")
+        });
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_large_download = Some((item.clone(), 3 * 1024 * 1024 * 1024));
+                this.cancel_large_download(cx);
+            })
+        });
+        assert!(
+            view.read_with(cx, |this, _| this.pending_large_download.is_none()),
+            "やめたのに状態が残っている"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this
+                .confirmed_large_downloads
+                .is_empty()),
+            "やめたのに確認済みとして記録している"
+        );
+        assert!(
+            !view.read_with(cx, |this, _| this.is_downloading("db-large2")),
+            "やめたのにダウンロードが始まっている"
         );
     }
 
@@ -15649,6 +16092,8 @@ mod tests {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_shelf_item(cx, "db-3", "未取得の本", "サークル", None);
+        // 取り込み（ダウンロード）は Google ログインが前提（F03。未ログインでは始まらない）
+        login_google_for_import(cx);
         let view = cx.new(BookshelfView::new);
 
         let window = cx.open_window(
@@ -15676,6 +16121,10 @@ mod tests {
         visual.simulate_click(card.center(), gpui_kit::Modifiers::default());
         draw(visual);
 
+        // テスト環境には Google のセッションが無いため worker は鍵の取得で失敗し、
+        // `download_states` は同じフレームのうちに片付く（開始状態は観測できないことが
+        // ある）。「始まった」ことは開始状態か、完了通知（成功 / 失敗のどちらでも出る）
+        // で見る。
         let (confirming, downloading) = cx.update(|cx| {
             view.read_with(cx, |this, _| {
                 (
@@ -15684,11 +16133,15 @@ mod tests {
                 )
             })
         });
+        let notified = cx.update(|cx| AppState::global(cx).toast_message.lock().is_some());
         assert!(
             !confirming,
             "カードのクリックで確認ダイアログが出ている（そのまま取り込むこと）"
         );
-        assert!(downloading, "カードのクリックで取り込みが始まっていない");
+        assert!(
+            downloading || notified,
+            "カードのクリックで取り込みが始まっていない（開始状態も通知も無い）"
+        );
 
         // Enter（activate_selected）も同じ
         cx.update(|cx| {

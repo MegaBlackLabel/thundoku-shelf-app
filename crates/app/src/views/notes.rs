@@ -1072,7 +1072,7 @@ fn load_note_thumb(
         packs_dir,
         db: pool.clone(),
         pack_root_key,
-        pack_bytes: std::sync::OnceLock::new(),
+        pack_reader: std::sync::OnceLock::new(),
     };
     loader.load_thumb((page - 1).max(0) as usize)
 }

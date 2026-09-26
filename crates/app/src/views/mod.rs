@@ -113,6 +113,28 @@ pub(crate) fn create_login_webview<T: 'static>(
     initial_url: &'static str,
     on_ready: impl FnOnce(&mut T, Entity<WebView>, &mut Window, &mut Context<T>) + 'static,
 ) {
+    create_login_webview_reported(this, window, cx, incognito, initial_url, move |this, webview, window, cx| {
+        if let Some(webview) = webview {
+            on_ready(this, webview, window, cx);
+        }
+    });
+}
+
+/// [`create_login_webview`] の「生成できなかった」も呼び出し側へ知らせる版。
+///
+/// `on_result` は**必ず 1 回**呼ばれる（生成できたら `Some(webview)`、できなければ `None`）。
+/// ログアウト時の保存データ消去（[`clear_login_webview_data`]）のように、**できなかった
+/// ことを利用者へ報告する必要がある**経路で使う（ログインでは生成失敗＝ログインできない
+/// と分かるので何も返さない）。
+fn create_login_webview_reported<T: 'static>(
+    // Windows では生成をタスクへ出すため、ここでは使わない（`update_in` 側で受け取る）。
+    #[allow(unused_variables)] this: &mut T,
+    window: &mut Window,
+    cx: &mut Context<T>,
+    incognito: bool,
+    initial_url: &'static str,
+    on_result: impl FnOnce(&mut T, Option<Entity<WebView>>, &mut Window, &mut Context<T>) + 'static,
+) {
     let build = move || {
         let builder = lb_wry::WebViewBuilder::new().with_incognito(incognito);
         #[cfg(debug_assertions)]
@@ -124,6 +146,7 @@ pub(crate) fn create_login_webview<T: 'static>(
     {
         let Some(hwnd) = OwnedHwnd::new(window) else {
             log::error!("webview: ウィンドウハンドルを取得できません");
+            on_result(this, None, window, cx);
             return;
         };
         cx.spawn_in(window, async move |weak, cx| {
@@ -132,12 +155,14 @@ pub(crate) fn create_login_webview<T: 'static>(
                 Ok(webview) => webview,
                 Err(error) => {
                     log::error!("webview: build failed: {error:?} | {error}");
+                    let _ = weak
+                        .update_in(cx, |this, window, cx| on_result(this, None, window, cx));
                     return;
                 }
             };
             let attached = weak.update_in(cx, |this, window, cx| {
                 let entity = attach_webview(webview, initial_url, window, cx);
-                on_ready(this, entity, window, cx);
+                on_result(this, Some(entity), window, cx);
             });
             if attached.is_err() {
                 // ビューが既に破棄されている（モーダルを閉じた等）。ここで WebView は drop される。
@@ -158,11 +183,70 @@ pub(crate) fn create_login_webview<T: 'static>(
         match built {
             Some(webview) => {
                 let entity = attach_webview(webview, initial_url, window, cx);
-                on_ready(this, entity, window, cx);
+                on_result(this, Some(entity), window, cx);
             }
-            None => log::error!("webview: build failed"),
+            None => {
+                log::error!("webview: build failed");
+                on_result(this, None, window, cx);
+            }
         }
     }
+}
+
+/// 非 incognito のログイン WebView（技術書典）が端末に残したブラウザー保存データを消す。
+///
+/// `clear_all_browsing_data` は **WebView のインスタンスからしか呼べない**（消去は
+/// WebView2 / WebKit のプロファイル単位で走る）。ログイン WebView はモーダルを閉じた
+/// 時点で破棄されているため、同じ既定ユーザーデーターフォルダー（非 incognito の
+/// WebView は exe ごとの既定プロファイルを共有する）の**一時 WebView** を作って消し、
+/// 消去が走る猶予をおいてから破棄する。
+///
+/// 返すのは「消去を**呼べた**か」であって「消し終わったか」ではない（wry は消去の完了を
+/// 知らせない）。生成できなかった場合も `Err` を返す（＝消去できていないと報告できる）。
+pub(crate) fn clear_login_webview_data<T: 'static>(
+    this: &mut T,
+    window: &mut Window,
+    cx: &mut Context<T>,
+    on_done: impl FnOnce(&mut T, Result<(), String>, &mut Context<T>) + 'static,
+) {
+    create_login_webview_reported(
+        this,
+        window,
+        cx,
+        false,
+        "about:blank",
+        move |this, webview, _window, cx| {
+            let Some(webview) = webview else {
+                on_done(
+                    this,
+                    Err("WebView を生成できないため保存データを消去できません".to_string()),
+                    cx,
+                );
+                return;
+            };
+            let result = webview
+                .read(cx)
+                .raw()
+                .clear_all_browsing_data()
+                .map_err(|error| error.to_string());
+            log::info!(
+                "webview: 保存データの消去を要求 {}",
+                if result.is_ok() { "ok" } else { "failed" }
+            );
+            // 呼び出し直後に破棄すると消去が途中で止まり得る（消去は非同期で、完了も
+            // 知らせない）。数秒だけ保持してから手放す。
+            let hold = webview.clone();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                drop(hold);
+                drop(webview);
+            })
+            .detach();
+            on_done(this, result, cx);
+        },
+    );
 }
 
 /// 生成済み WebView を gpui の entity にして、初期 URL を開いて隠す。

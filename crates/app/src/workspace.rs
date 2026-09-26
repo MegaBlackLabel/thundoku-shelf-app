@@ -66,6 +66,14 @@ pub enum NavTarget {
 const EXIT_UPLOAD_NOTICE: &str =
     "バックアップをアップロード中です…（完了するとアプリが終了します）";
 
+/// 終了時のアップロードで**通知に出す**進捗の文言。
+///
+/// 通知は幅が狭いので、**ファイル名は出さず進捗だけ**にする（`3.0 MB / 9.0 MB（45%）`）。
+/// 数字が無い段階（バックアップ作成）だけ段階名を出す。
+fn exit_upload_progress_text(progress: &thundoku_core::drive::sync::SyncProgress) -> String {
+    crate::views::settings::sync_progress_compact(progress)
+}
+
 /// パスフレーズ未設定の警告の本文（ログイン直後に 1 回だけ出す）。
 ///
 /// 「いま危ない状態である」ことと、**パスフレーズがあれば端末を失っても復元できる**
@@ -122,6 +130,41 @@ pub fn sync_app_menus(cx: &App) {
 }
 
 /// メインのワークスペースエンティティ。
+/// 終了時のアップロード進捗を**通知の中**に出す小さなビュー。
+///
+/// `Notification` は作成時に文言が固定され、変えるには作り直しが要る（= 出入りの
+/// アニメーションが毎回走って点滅する）。そこで進捗はこの子ビューに持たせ、
+/// **この Entity だけを `notify`** する（通知は作り直さない）。
+pub struct ExitUploadProgress {
+    text: Option<String>,
+}
+
+impl ExitUploadProgress {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
+        Self { text: None }
+    }
+
+    /// 表示する文言を差し替える（`None` で空）。
+    pub fn set_text(&mut self, text: Option<String>, cx: &mut Context<Self>) {
+        if self.text != text {
+            self.text = text;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for ExitUploadProgress {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = self.text.clone().unwrap_or_default();
+        div()
+            .id("exit-upload-progress")
+            .debug_selector(|| "exit-upload-progress".into())
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(text)
+    }
+}
+
 pub struct Workspace {
     pub active: NavTarget,
     pub sidebar_open: bool,
@@ -131,6 +174,8 @@ pub struct Workspace {
     /// 未読バッジ表示用の件数。
     unread_count: usize,
     toast_host_generation: u64,
+    /// 終了時のアップロード進捗（通知の中に子ビューとして出す）。
+    exit_progress: Entity<ExitUploadProgress>,
     /// 設定画面（ログアウト等のアクションを委譲）。
     pub settings: Entity<SettingsView>,
     pub bookshelf: Entity<BookshelfView>,
@@ -295,6 +340,7 @@ impl Workspace {
         let checklist = cx.new(ChecklistView::new);
         let about = cx.new(AboutView::new);
         let report = cx.new(ReportView::new);
+        let exit_progress = cx.new(ExitUploadProgress::new);
 
         // どのサイトにもログインしていなければ、本棚ではなく説明画面を初期表示に
         // する（本が 1 冊も入らない空の本棚より、各ストアのログイン手順が書かれた
@@ -313,6 +359,7 @@ impl Workspace {
             bookshelf_submenu_open: false,
             unread_count: 0,
             toast_host_generation: 0,
+            exit_progress,
             settings,
             bookshelf,
             history,
@@ -1205,7 +1252,8 @@ impl Workspace {
         set_modal(
             cx,
             ModalKind::DownloadConfirm,
-            bookshelf_active && bookshelf.has_pending_download_confirm(),
+            bookshelf_active
+                && (bookshelf.has_pending_download_confirm() || bookshelf.has_pending_large_download()),
         );
         set_modal(
             cx,
@@ -1362,6 +1410,7 @@ impl Workspace {
         // 確認ダイアログは閉じるので、進行中であることを通知で知らせる
         // （見た目が何も変わらないと、終了したのか固まったのか分からない）。
         // 完了（アプリ終了）まで消えない通知にする（長いアップロードでも見失わない）
+        // 通知にスピナーを出す（進捗の文言は子ビューが担当する）。
         crate::app_state::set_sticky_progress_notice(cx, EXIT_UPLOAD_NOTICE);
         AppState::global(cx)
             .exit_uploading
@@ -1383,27 +1432,46 @@ impl Workspace {
         let db_key = state.secrets.db_key().ok();
         // pack の鍵（v3 の PRK）の解決に要るもの（背景スレッドへ move する）
         let keys = crate::pack_keys::KeyContext::from_state(state);
+        // アップロードの進捗を UI（スティッキー通知）へ流す口。
+        // `send` は無限バッファなのでブロックしない（終了処理を止めない）。
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<thundoku_core::drive::sync::SyncProgress>();
         let task: gpui_kit::Task<Result<(), String>> = cx.background_executor().spawn(async move {
+            log::info!("exit upload: start");
             let folder_id = db::settings::get(&db, "drive.sync.folder_id")
                 .ok()
                 .flatten()
                 .ok_or_else(|| "Drive 同期が未設定です".to_string())?;
-            let mut google_guard = google.lock();
-            let client = google_guard
-                .as_mut()
-                .ok_or_else(|| "Google にログインしてください".to_string())?;
-            let token = client.access_token().map_err(|e| e.to_string())?;
-            let mut drive = thundoku_core::drive::DriveClient::new(
-                Box::new(thundoku_core::tbf::UreqTransport::new()),
-                token,
-            );
+            log::info!("exit upload: folder_id={folder_id}");
             // 鍵（v3 の PRK）を用意する。無ければ暗号化 pack は上げられない
             // （必要なら解錠ダイアログが出る。終了処理なので失敗しても終了はする）。
+            //
+            // **Google のロックを取る前に済ませること**: `KeyContext::unlock` は内部で
+            // `drive()`（同じ `Mutex` を取る）を呼ぶため、ロックを保持したまま呼ぶと
+            // 自己デッドロックしてアプリが終了しなくなる（`parking_lot::Mutex` は再入不可）。
             let pack_root_key = keys.unlock("終了時のバックアップ").unwrap_or_else(|error| {
                 log::warn!("exit upload: 鍵を解決できない: {error}");
                 None
             });
-            let _ = thundoku_core::drive::sync::sync(thundoku_core::drive::sync::SyncRequest {
+            log::info!(
+                "exit upload: 鍵 {}",
+                if pack_root_key.is_some() { "ok" } else { "なし（平文 pack のみ同期）" }
+            );
+            // トークンだけ取り、**ロックはすぐ手放す**（この後の `sync` は `drive` を使う）。
+            let token = {
+                let mut google_guard = google.lock();
+                let client = google_guard
+                    .as_mut()
+                    .ok_or_else(|| "Google にログインしてください".to_string())?;
+                client.access_token().map_err(|e| e.to_string())?
+            };
+            let mut drive = thundoku_core::drive::DriveClient::new(
+                Box::new(thundoku_core::tbf::UreqTransport::new()),
+                token,
+            );
+            log::info!("exit upload: sync 開始");
+            let progress_tx = progress_tx;
+            let _ = thundoku_core::drive::sync::sync_with_progress(
+                thundoku_core::drive::sync::SyncRequest {
                 pool: &db,
                 drive: &mut drive,
                 packs_dir: &packs_dir,
@@ -1411,10 +1479,14 @@ impl Workspace {
                 identity_sub: google_sub.as_deref(),
                 pack_root_key: pack_root_key.as_ref(),
                 owner_key: db_key.as_ref(),
-                folder_id: &folder_id,
-                db_path: Some(&db_path),
-            })
+                    folder_id: &folder_id,
+                    db_path: Some(&db_path),
+                },
+                // 進捗は UI の通知に出す（UI が消えていたら false = 中止）。
+                &mut |progress| progress_tx.send(progress.clone()).is_ok(),
+            )
             .map_err(|e| e.to_string())?;
+            log::info!("exit upload: sync 完了");
             // 未アップロードの鍵 bundle があれば上げ直す（仕様 §5.1）
             match keys.retry_pending_upload() {
                 Ok(true) => log::info!("exit upload: 鍵 bundle の再アップロードに成功"),
@@ -1424,12 +1496,58 @@ impl Workspace {
             Ok(())
         });
         cx.spawn(async move |_window, cx| {
+            // 進捗を画面の行に出す（値が変わったときだけ描き直す = 点滅しない）。完了まで出し続ける。
+            let mut last: Option<String> = None;
+            let mut last_at: Option<std::time::Instant> = None;
+            let mut disconnected = false;
+            while !disconnected {
+                let mut latest: Option<thundoku_core::drive::sync::SyncProgress> = None;
+                loop {
+                    match progress_rx.try_recv() {
+                        Ok(progress) => latest = Some(progress),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some(progress) = latest {
+                    let text = exit_upload_progress_text(&progress);
+                    // **値が変わったときだけ**更新する。加えて 250ms の間隔を空けて、
+                    // 文字列が細かく変わっても描き直しが連続しないようにする。
+                    // 通知は作り直さず、子ビュー（`exit_progress`）だけを `notify` する。
+                    let due = last_at.map(|at: std::time::Instant| at.elapsed().as_millis() >= 250)
+                        .unwrap_or(true);
+                    if last.as_ref() != Some(&text) && due {
+                        last = Some(text.clone());
+                        last_at = Some(std::time::Instant::now());
+                        let text = text.clone();
+                        handle.update(cx, |this, cx| {
+                            this.exit_progress.update(cx, |progress, cx| {
+                                progress.set_text(Some(text), cx);
+                            });
+                        });
+                    }
+                }
+                if !disconnected {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                }
+            }
             // アップロードは best-effort（失敗しても終了する）が、無言で捨てない:
             // 「アップロードしたつもり」のまま終了すると、次回起動で毎回復元確認が
             // 出る原因を後から追えない。
             if let Err(error) = task.await {
                 log::error!("exit upload failed: {error}");
             }
+            // 進捗の文言を片付ける（通知はもうすぐ消えるが、残しても意味がない）。
+            handle.update(cx, |this, cx| {
+                this.exit_progress.update(cx, |progress, cx| {
+                    progress.set_text(None, cx);
+                });
+            });
             handle.update(cx, |this, cx| {
                 this.exit_uploading = false;
                 AppState::global(cx)
@@ -1490,6 +1608,7 @@ impl Workspace {
                         logout: Option<
             fn(
                 &mut crate::views::settings::SettingsView,
+                &mut Window,
                 &mut Context<crate::views::settings::SettingsView>,
             ),
         >| {
@@ -1541,11 +1660,13 @@ impl Workspace {
                                 .id(format!("account-logout-{name}"))
                                 .on_click({
                                     let handle = handle.clone();
-                                    move |_, _window, cx| {
+                                    move |_, window, cx| {
                                         if let Some(logout) = logout {
                                             handle.update(cx, |this, cx| {
                                                 let settings = this.settings.clone();
-                                                settings.update(cx, logout);
+                                                settings.update(cx, |settings, cx| {
+                                                    logout(settings, window, cx)
+                                                });
                                                 this.auth_panel_open = false;
                                                 cx.notify();
                                             });
@@ -1824,17 +1945,24 @@ impl Render for Workspace {
                     // 進行中は Spinner を添える。面と文字だけだと「進んでいるのか
                     // 固まっているのか」が分からないため。id を固定して、進捗で
                     // 積み直しても通知が増えない（置き換わる）ようにする。
-                    notification = notification.id::<ProgressNotice>().content(|_, _, cx| {
+                    //
+                    // 進捗の**文言**は子ビュー（`ExitUploadProgress`）が持つ。通知は
+                    // 作り直すと出入りのアニメーションが走って点滅するので、文言だけを
+                    // 差し替えたいときはこの子ビューを `notify` する（通知は据え置き）。
+                    let progress = self.exit_progress.clone();
+                    notification = notification.id::<ProgressNotice>().content(move |_, _, cx| {
                         gpui_kit::div()
                             .flex()
                             .flex_row()
                             .debug_selector(|| "notice-progress".into())
                             .items_center()
+                            .gap_2()
                             .child(
                                 gpui_kit::component::spinner::Spinner::new()
                                     .small()
                                     .color(cx.theme().muted_foreground),
                             )
+                            .child(progress.clone())
                             .into_any_element()
                     });
                 }
@@ -3380,6 +3508,33 @@ fn window_restore(window: &mut Window) {
 
 #[cfg(test)]
 mod tests {
+    use thundoku_core::drive::sync::{SyncPhase, SyncProgress};
+
+    /// 終了時の通知は「何をどこまで送ったか」を出す（進捗が無い段階でも段階名を出す）。
+    #[test]
+    fn exit_upload_notice_shows_progress() {
+        let uploading = SyncProgress {
+            phase: SyncPhase::Upload,
+            name: "pack-1.opfspack".into(),
+            index: 0,
+            count: 0,
+            bytes: 3 * 1024 * 1024,
+            total_bytes: Some(9 * 1024 * 1024),
+        };
+        let text = super::exit_upload_progress_text(&uploading);
+        assert_eq!(text, "3.0 MB / 9.0 MB（33%）");
+        // **ファイル名は出さない**（通知は幅が狭く、どの本かより進捗が要る）。
+        assert!(!text.contains("pack-1"), "{text}");
+
+        // 総数が分からない段階では割合を出さない（数字を偽らない）。
+        let unknown = SyncProgress {
+            total_bytes: None,
+            ..uploading.clone()
+        };
+        let text = super::exit_upload_progress_text(&unknown);
+        assert_eq!(text, "3.0 MB 送信");
+        assert!(!text.contains('%'), "{text}");
+    }
     use super::*;
     use crate::app_state::AppState;
     use crate::app_state::ToastKind;
@@ -5164,6 +5319,51 @@ mod tests {
             ws.read_with(cx, |w, _| w.reader.is_none()),
             "取り込み確認が出たらビューアーは閉じること"
         );
+    }
+
+    /// 進捗の文言を更新しても**通知は作り直さない**（= 出入りのアニメーションが走らない）。
+    ///
+    /// 通知（gpui-kit の `Notification`）は作成時に文言が固定されるため、作り直して
+    /// 差し替えると点滅して見える。文言は子ビュー（`ExitUploadProgress`）が持つので、
+    /// 何度更新しても通知の数は増えない。
+    #[gpui_kit::test]
+    async fn exit_upload_progress_updates_without_recreating_the_notification(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| w.confirm_exit_upload(cx));
+        });
+        draw_frames(visual);
+        assert_eq!(notification_count(visual), 1, "アップロード中の通知が出ていない");
+
+        // 進捗を何度更新しても通知は 1 件のまま（作り直していない）。
+        for percent in [1u32, 17, 42, 73, 100] {
+            let text = format!("pack-1.opfspack をアップロード中（{percent}%）");
+            cx.update(|cx| {
+                ws.update(cx, |w, cx| {
+                    w.exit_progress.update(cx, |progress, cx| {
+                        progress.set_text(Some(text.clone()), cx);
+                    });
+                });
+            });
+            draw_frames(visual);
+            assert_eq!(
+                notification_count(visual),
+                1,
+                "進捗の更新で通知を作り直している（点滅する）"
+            );
+        }
     }
 
     /// 終了時のアップロードを始めたら、通知でアップロード中であることを知らせること。

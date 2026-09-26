@@ -111,7 +111,7 @@ pub struct AppState {
     /// トーストを自動で消すか（終了時のアップロード中など、完了まで出したいときは false）
     pub toast_autohide: Arc<Mutex<bool>>,
     /// 進行中のトーストか（通知に Spinner を添えて「動いている」ことを示す）
-    pub toast_progress: Arc<Mutex<bool>>,
+        pub toast_progress: Arc<Mutex<bool>>,
     /// 保護つき通知（タグ取得の完了など）の保護期限。この時刻まではバックグラウンドの
     /// 通知（進行中・定期同期の完了）で上書きしない（`set_protected_notice` が立てる）
     pub toast_protected_until: Arc<Mutex<Option<std::time::Instant>>>,
@@ -308,21 +308,56 @@ impl AppState {
             Ok(false) => {}
             Err(error) => log::warn!("drm status: 移行に失敗（次回起動で再試行）: {error}"),
         }
+        // 機密列（ページ本文 / 形態素解析 / 付箋メモ）の平文を一度だけ暗号化する（F02）。
+        // 鍵が取れないときは暗号化せず、フラグも立てない（次回起動で再試行）。
+        match db::migrate_column_crypto_once(&db_pool) {
+            Ok(0) => {}
+            Ok(rows) => log::info!("column crypto: 平文の {rows} 行を暗号化しました"),
+            Err(error) => log::warn!("column crypto: 移行に失敗（次回起動で再試行）: {error}"),
+        }
 
         let secrets = SecretStore::new();
+        // BOOTH / FANZA / DLsite / 技術書典のセッションを DB（app_settings）から復元する。
+        // セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を
+        // 超えることがあるため DB に置くが、**keyring の鍵で暗号化して**保存する
+        // （平文の旧値・改ざん・別鍵は復号できず、未ログインとして破棄される）。
+        let session_vault = match SessionVault::new(&secrets, &data_dir) {
+            Ok(vault) => Some(vault),
+            Err(error) => {
+                // 鍵が取れない = セッションを安全に保存できない。平文で保存しない。
+                log::warn!(
+                    "session vault を初期化できないためストアのセッションを復元/保存しません: {error}"
+                );
+                None
+            }
+        };
         let mut tbf = TbfClient::new();
-        let tbf_logged_in =
-            if let Ok(Some(json)) = secrets.load(thundoku_core::secrets::USER_TECHBOOKFEST) {
-                match serde_json::from_str(&json) {
-                    Ok(session) => {
-                        tbf.restore_session(session);
-                        tbf.is_authenticated()
-                    }
-                    Err(_) => false,
-                }
+        // 技術書典は旧版が keyring に**期限なし**で置いていた（共通 Vault は 7 日）。
+        // vault が空なら一度だけ移し、keyring の値を消す。消せなければ印を残し、
+        // 次の起動では復元しない（＝再ログイン。セキュリティ評価 2026-09-25 の F05）。
+        let tbf_session = session_vault
+            .as_ref()
+            .and_then(|vault| {
+                vault.adopt_legacy::<TbfSession>(
+                    &secrets,
+                    &db_pool,
+                    StoreSession::Techbookfest,
+                    thundoku_core::secrets::USER_TECHBOOKFEST,
+                )
+            })
+            .filter(TbfSession::is_logged_in);
+        if let Some(session) = &tbf_session {
+            tbf.restore_session(session.clone());
+        }
+        let tbf_logged_in = tbf_session.is_some();
+        log::info!(
+            "tbf session: 起動時復元 = {}",
+            if tbf_logged_in {
+                "ログイン済み"
             } else {
-                false
-            };
+                "未ログイン"
+            }
+        );
 
         let client_id = default_client_id();
         // 前回のログアウトで keyring から削除できなかった資格情報は復元しない
@@ -372,20 +407,8 @@ impl AppState {
         // プロフィール（email 等）の取得に失敗してもログイン状態は維持する。
         let google_logged_in = google.as_ref().is_some_and(|c| c.has_tokens());
 
-        // BOOTH / FANZA / DLsite のセッションを DB（app_settings）から復元する。
-        // セッション Cookie は Windows Credential Manager の上限（2560 UTF-16 文字）を
-        // 超えることがあるため DB に置くが、**keyring の鍵で暗号化して**保存する
-        // （平文の旧値・改ざん・別鍵は復号できず、未ログインとして破棄される）。
-        let session_vault = match SessionVault::new(&secrets, &data_dir) {
-            Ok(vault) => Some(vault),
-            Err(error) => {
-                // 鍵が取れない = セッションを安全に保存できない。平文で保存しない。
-                log::warn!(
-                    "session vault を初期化できないためストアのセッションを復元/保存しません: {error}"
-                );
-                None
-            }
-        };
+        // BOOTH / FANZA / DLsite のセッションを DB（app_settings）から復元する
+        // （vault の初期化と技術書典の移行はこの上で済ませている）。
         let booth_session = session_vault
             .as_ref()
             .and_then(|vault| vault.load::<BoothSession>(&db_pool, StoreSession::Booth))
@@ -759,18 +782,45 @@ pub fn clear_toast(cx: &App) {
     *state.toast_message.lock() = None;
 }
 
-/// 技術書典のセッションを keyring に永続化し、クライアントと状態を更新する。
-/// WebView ログイン（Cookie 取得）の完了時に呼ぶ。
+
+/// 技術書典のセッションを共通 Vault（暗号化 + 7 日の期限）へ永続化し、クライアントと
+/// 状態を更新する。WebView ログイン（Cookie 取得）の完了時に呼ぶ。
 pub fn save_tbf_session(cx: &App, session: &TbfSession) {
     let state = AppState::global(cx);
-    if let Ok(json) = serde_json::to_string(session) {
-        let _ = state
-            .secrets
-            .save(thundoku_core::secrets::USER_TECHBOOKFEST, &json);
-    }
+    save_store_session(state, StoreSession::Techbookfest, session);
     state.tbf.lock().restore_session(session.clone());
     *state.tbf_logged_in.lock() = true;
     log::info!("tbf session saved -> tbf_logged_in = true");
+}
+
+/// 技術書典のセッションを破棄する（ログアウト）。
+///
+/// メモリ上は即座に未ログインへ落とす。**永続値（vault / 旧 keyring）の削除に失敗したら
+/// `Err`** を返すので、呼び出し側は「消えた」と誤って表示しないこと（次回起動で復元され得る）。
+pub fn clear_tbf_session(cx: &App) -> Result<(), String> {
+    let state = AppState::global(cx);
+    state.tbf.lock().clear_session();
+    *state.tbf_logged_in.lock() = false;
+    // vault（DB）の削除。失敗したら vault 側が印を残す。
+    let purged = clear_store_session(state, StoreSession::Techbookfest);
+    // 旧版が keyring に置いていた値が残っていれば消す（移行時に消せなかった残骸があり得る）。
+    // keyring 側だけ消せなかった場合も印を残し、次回起動では復元しない（＝再ログイン）。
+    let keyring = state
+        .secrets
+        .delete(thundoku_core::secrets::USER_TECHBOOKFEST);
+    if let Err(error) = &keyring {
+        log::warn!("tbf session: keyring の残骸を削除できません: {error}");
+        if purged.is_ok()
+            && let Err(mark_error) = purge_marker(state).mark(StoreSession::Techbookfest.label())
+        {
+            log::error!("tbf session: 印の記録にも失敗しました: {mark_error}");
+        }
+    }
+    match (purged, keyring) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.to_string()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// BOOTH のセッションを DB（app_settings）に暗号化して永続化し、グローバル状態を更新する。
@@ -1011,6 +1061,90 @@ mod tests {
 
         // 印が無い通常起動 → 復元を許す（削除は呼ばない）
         assert!(clear_pending_logout(&marker, GOOGLE_LOGOUT_SLOT, failed(), true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// テスト用のデータディレクトリ（テストごとに作り直す）。
+    fn temp_data_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "thundoku-shelf-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn tbf_session() -> TbfSession {
+        TbfSession::from_cookies(vec![(
+            "session".to_string(),
+            "secret-cookie-value".to_string(),
+        )])
+    }
+
+    /// 保存した技術書典のセッションは vault から復元され、ログイン状態で起動する。
+    ///
+    /// ログイン必須の機能（チェックリスト・試し読み）は `tbf_logged_in` で判定するため、
+    /// 起動時の復元経路（vault → `TbfClient` → `tbf_logged_in`）を固定する。
+    /// 旧版は keyring に期限なしで置いていた（セキュリティ評価 2026-09-25 の F05）。
+    #[gpui_kit::test]
+    async fn tbf_session_is_restored_from_the_vault_on_startup(cx: &mut gpui_kit::TestAppContext) {
+        SecretStore::use_memory_backend();
+        let dir = temp_data_dir("tbf-restore");
+
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| AppState::init_with_data_dir(cx, dir.clone()));
+        cx.update(|cx| save_tbf_session(cx, &tbf_session()));
+
+        // 起動し直す（同じデータディレクトリ）
+        cx.update(|cx| AppState::init_with_data_dir(cx, dir.clone()));
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            assert!(
+                *state.tbf_logged_in.lock(),
+                "vault から技術書典のセッションを復元していない"
+            );
+            assert!(
+                state.tbf.lock().is_authenticated(),
+                "クライアントへ復元していない"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 前回のログアウトで消せなかった（印が残っている）技術書典のセッションは、
+    /// 行が残っていても次回起動で復元しない（＝再ログイン）。
+    #[gpui_kit::test]
+    async fn tbf_session_is_not_restored_when_a_purge_is_pending(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        SecretStore::use_memory_backend();
+        let dir = temp_data_dir("tbf-purge");
+
+        cx.update(gpui_kit::component::init);
+        cx.update(|cx| AppState::init_with_data_dir(cx, dir.clone()));
+        cx.update(|cx| save_tbf_session(cx, &tbf_session()));
+        // 前回のログアウトで削除に失敗した状況（印だけが残っている）を作る
+        PurgeMarker::new(&dir)
+            .mark(StoreSession::Techbookfest.label())
+            .expect("印を付けられる");
+
+        cx.update(|cx| AppState::init_with_data_dir(cx, dir.clone()));
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            assert!(
+                !*state.tbf_logged_in.lock(),
+                "削除に失敗した技術書典のセッションを復元している"
+            );
+            // 印に従って行も破棄する（次の起動で復元されない）
+            assert!(
+                db::settings::get(&state.db_pool, StoreSession::Techbookfest.settings_key())
+                    .unwrap()
+                    .is_none(),
+                "復元しないだけでなく行も消す"
+            );
+        });
 
         let _ = std::fs::remove_dir_all(&dir);
     }

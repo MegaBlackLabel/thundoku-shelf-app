@@ -109,7 +109,7 @@ impl ReaderView {
             packs_dir,
             db: db.clone(),
             pack_root_key,
-            pack_bytes: std::sync::OnceLock::new(),
+            pack_reader: std::sync::OnceLock::new(),
         });
         // レンディション未指定なら、そのコンテンツの先頭を実際の選択として記録する
         let resolved_format = match &format_id {
@@ -210,7 +210,7 @@ impl ReaderView {
             packs_dir,
             db,
             pack_root_key,
-            pack_bytes: std::sync::OnceLock::new(),
+            pack_reader: std::sync::OnceLock::new(),
         });
         let initial_page = progress
             .as_ref()
