@@ -138,10 +138,29 @@ impl<'a> PackKeyStore<'a> {
             return Ok(root);
         }
         let owner_id = derive_owner_id(sub);
-        let root = PackRootKey::generate();
-        // keyring に置けないと「この端末にしか無い鍵」よりもさらに悪い（消える）ので、
-        // ここは fail-closed（取り込みを失敗させる）。
-        save_keyring(self.secrets, &owner_id, &root)?;
+        // 生成〜keyring 保存はプロセス内で**直列化**する。並行に初回作成されると、呼び出しごとに
+        // 別々の PRK を作って後勝ちで保存され、**先に返した PRK で暗号化した pack が復号できなく
+        // なる**（取り込みは同時に走りうる）。ネットワーク（bundle のアップロード）はロックの外。
+        let (root, created) = {
+            static KEY_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = KEY_INIT.lock().unwrap_or_else(|error| error.into_inner());
+            match load_keyring(self.secrets, &owner_id)? {
+                // ロックを待つ間に他の呼び出しが保存した値を拾う（自分の鍵を返さない）
+                Some(root) => (root, false),
+                None => {
+                    let root = PackRootKey::generate();
+                    // keyring に置けないと「この端末にしか無い鍵」よりもさらに悪い（消える）ので、
+                    // ここは fail-closed（取り込みを失敗させる）。
+                    save_keyring(self.secrets, &owner_id, &root)?;
+                    (root, true)
+                }
+            }
+        };
+        if !created {
+            // 他の呼び出しが先に作った（bundle のアップロードも mark_pending もそちらの役目）
+            log::info!("pack keys: 別の呼び出しが先に鍵を作った（owner_id={owner_id}）");
+            return Ok(root);
+        }
         let now_ms = now_ms();
         let mut bundle = PackKeyBundle::new(owner_id.clone(), now_ms);
         bundle.upsert_wrap(PackRootKeyWrap::wrap_with_sub(&root, sub, &owner_id, now_ms));
@@ -832,6 +851,45 @@ mod tests {
         assert!(!keys.retry_pending_upload(&mut drive, "sub-pack-keys-other").unwrap());
         assert_eq!(drive.uploads, 0);
         assert!(keys.pending_owner().unwrap().is_some(), "印は残す");
+    }
+
+    /// 初回作成が並行しても、**同じ PRK** に収束すること。
+    ///
+    /// 生成〜keyring 保存が直列化されていないと、複数の呼び出しが別々の PRK を作って
+    /// 後勝ちで保存し、先に返した PRK で暗号化した pack が復号できなくなる
+    /// （取り込みは同時に走りうる）。
+    #[test]
+    fn concurrent_first_creation_converges_to_one_root_key() {
+        const THREADS: usize = 8;
+        let secrets = secrets();
+        let pool = pool();
+        let keys = PackKeyStore::new(&secrets, &pool, "folder-1");
+        let sub = "sub-pack-keys-concurrent";
+        let barrier = std::sync::Barrier::new(THREADS);
+
+        let roots: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut drive = FakeDrive::new();
+                        let mut prompt = no_prompt();
+                        barrier.wait();
+                        keys.ensure(&mut drive, sub, &mut prompt)
+                            .unwrap()
+                            .to_base64()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        assert!(
+            roots.iter().all(|root| root == &roots[0]),
+            "同じ sub で別々の PRK が返っている"
+        );
     }
 
     /// 短いパスフレーズは拒否する（PRK を守る強度は反復回数より**長さ**に効く）。

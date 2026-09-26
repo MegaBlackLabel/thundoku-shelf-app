@@ -168,18 +168,39 @@ impl SecretStore {
     /// 用途ごとに **別のスロット**（＝別の鍵）を使う。1 つの鍵を複数の用途で
     /// 使い回すと、片方の漏洩が他方へ波及する。
     fn random_key(&self, slot: &str) -> Result<[u8; 32], SecretError> {
-        if let Some(encoded) = self.load(slot)?
-            && let Ok(decoded) = B64.decode(encoded.trim())
-            && decoded.len() == 32
-        {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&decoded);
+        // 速い経路: 既に保存済みなら読み出しだけ（プロセス内キャッシュで完結する）
+        if let Some(key) = self.load_key(slot)? {
+            return Ok(key);
+        }
+        // 生成〜保存はプロセス内で**直列化**する。並行に初回アクセスされると、両方が別々の鍵を
+        // 作って後勝ちで保存され、先に返した鍵で暗号化した列が復号できなくなる
+        // （付箋メモが空として復元される形で CI に出た。`db_key()` は表示経路から並行に呼ばれる）。
+        static KEY_INIT: Mutex<()> = Mutex::new(());
+        let _guard = KEY_INIT.lock().unwrap_or_else(|error| error.into_inner());
+        // ロックを待つ間に他のスレッドが保存した値を拾う（自分の鍵を返さない）
+        if let Some(key) = self.load_key(slot)? {
             return Ok(key);
         }
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
         self.save(slot, &B64.encode(key))?;
         Ok(key)
+    }
+
+    /// スロットの 32 byte 鍵を読む（未保存・壊れた値は `None`）。
+    fn load_key(&self, slot: &str) -> Result<Option<[u8; 32]>, SecretError> {
+        let Some(encoded) = self.load(slot)? else {
+            return Ok(None);
+        };
+        let Ok(decoded) = B64.decode(encoded.trim()) else {
+            return Ok(None);
+        };
+        if decoded.len() != 32 {
+            return Ok(None);
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&decoded);
+        Ok(Some(key))
     }
 
     /// `books.owner_sub` の暗号化用ローカル鍵（32 byte）。無ければ新規生成して保存する。
@@ -239,6 +260,39 @@ mod tests {
         assert_eq!(store.db_key().unwrap(), key, "db_key が安定していること");
         store.delete("test-slot").unwrap();
         assert!(store.load("test-slot").unwrap().is_none());
+    }
+
+    /// 初回アクセスが並行しても、全員が**同じ鍵**を受け取ること。
+    ///
+    /// 生成〜保存を直列化しないと、複数のスレッドが別々の鍵を作って後勝ちで保存し、
+    /// 先に返した鍵で暗号化した列が復号できなくなる（CI の Windows で付箋メモが空として
+    /// 復元される形で出た。`db_key()` は表示経路から並行に呼ばれる）。
+    #[test]
+    fn concurrent_first_access_to_a_slot_yields_one_key() {
+        SecretStore::use_memory_backend();
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 20;
+        for round in 0..ROUNDS {
+            // ラウンドごとに**新しいスロット**を使う（プロセス内キャッシュは共有なので、
+            // 既に値があるスロットだと全員が同じ値を読むだけで競合しない）
+            let slot = format!("concurrent-slot-{round}");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let slot = slot.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SecretStore::new().random_key(&slot).unwrap()
+                    })
+                })
+                .collect();
+            let keys: Vec<[u8; 32]> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(
+                keys.iter().all(|key| key == &keys[0]),
+                "同じスロットで別々の鍵が返っている（round {round}）"
+            );
+        }
     }
 
     /// pack のルート鍵（v3）は `owner_id` ごとの別スロットに保存し、
