@@ -110,3 +110,39 @@
 見直し: CI の `cargo audit` は毎回これを警告として出す（消えれば上流が直った合図）。依存を更新する
 たび、または四半期ごとにこの表を引き直す。**新しい勧告（とくに unsound）が出たら、まず配布物へ
 入るかを確認する。**
+
+### 6.2 依存ライセンスの方針（許可リスト）
+
+アプリ本体は MIT（`LICENSE`）。依存クレートは**許可リスト方式**で CI が強制する
+（`crates/app/src/views/licenses.rs` の `ALLOWED_LICENSES` / `ALLOWED_EXCEPTIONS`）。
+`licenses.json` の全パッケージを SPDX 式として評価し、**許可リストに無いものが 1 件でもあれば
+テストが落ちる**（未知のライセンスも落ちる＝黙って受け入れない）。強制は CI の
+`cargo test --workspace`（macOS ジョブ）で回る `licenses_json_has_no_disallowed_license`。
+
+- 評価規則: `OR` はどれか 1 つ許可されていれば可、`AND` は全部、`WITH <exception>` は基本
+  ライセンスで判定する。旧式の `MIT/Apache-2.0` や**括弧つきの式**（`(MIT OR Apache-2.0) AND
+  NCSA` など）も実データに存在するため解釈する
+- 許可しているもの: MIT / Apache-2.0 / BSD-2-Clause / BSD-3-Clause / ISC / Zlib / Unlicense /
+  CC0-1.0 / 0BSD / MIT-0 / Unicode-3.0 / CDLA-Permissive-2.0 / BSL-1.0（Boost） / NCSA /
+  bzip2-1.0.6 / MPL-2.0（+ `LLVM-exception`）
+- **MPL-2.0 を許可している理由**: gpui 経由（`cssparser` / `selectors` / `resvg` / `usvg` /
+  `dwrote` 等 9 件）が該当する。ファイル単位のコピーレフトで、**未改変の依存として使う限り**
+  MIT で配布するバイナリと両立する。**これらを改変して配布する場合はソース開示義務が生じる**ので、
+  そのときは方針を見直す
+- GPL / AGPL / LGPL / SSPL / BUSL / CC-BY-NC 等は許可リストに無いので落ちる
+  （`self_cell` の `Apache-2.0 OR GPL-2.0-only`、`r-efi` の `MIT OR Apache-2.0 OR
+  LGPL-2.1-or-later` は許容側を選べるので通る）。PDF レンダリングに PDFium（BSD-3-Clause /
+  Apache-2.0）を選んでいるのも同じ判断（`crates/core/Cargo.toml:41-42` で mupdf の AGPL を回避）
+- 追加するときは `ALLOWED_LICENSES` に足し、**なぜ許容できるかをこの節に書く**（テストの失敗
+  メッセージもこの手順を案内する）
+- 配布物（Windows / macOS の zip）には `LICENSE` と同梱アセットの全文（`lucide-LICENSE.txt` =
+  ISC / `pdfium-LICENSE.txt` = BSD-3-Clause + Apache-2.0）を同梱する。Rust 依存の一覧は
+  アプリ内に埋め込む（`licenses.json`）
+- **貢献の受け入れ（inbound=outbound）**: PR を送ると、その貢献は **MIT で提供されたものとして
+  扱う**（CLA・DCO の署名は不要。著作権は貢献者に残る）。手順は `CONTRIBUTING.md`、
+  行動規範は `CODE_OF_CONDUCT.md`。`main` は必須ステータスチェック（`audit` / `test (os)`）が
+  あり、force push と削除は禁止（管理者はバイパスできる）。**必須チェックは CI のジョブ名と matrix を
+  名前で参照している**（`ci.yml` の先頭にも同じ注意書きがある）ので、ジョブ名を変えたら保護側も
+  同時に直す（`gh api repos/{owner}/{repo}/branches/main/protection`）。アクションは
+  **完全なコミット SHA で固定**することがリポジトリ設定でも強制されている
+  （`sha_pinning_required`）

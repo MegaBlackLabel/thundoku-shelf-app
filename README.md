@@ -104,6 +104,11 @@ DRM で保護された作品は**このアプリでは開けない**ため、各
 
 アプリ本体は [MIT](LICENSE)。
 
+貢献（バグ修正・ドキュメントの修正など）を歓迎します。手順は [CONTRIBUTING.md](CONTRIBUTING.md)、
+参加にあたっては [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) に従ってください。**PR を送ると、その
+貢献は MIT ライセンスで提供されたものとして扱います**（CLA・DCO は不要。著作権は貢献者に残ります）。
+脆弱性は公開 Issue に書かず、[SECURITY.md](SECURITY.md) の手順で報告してください。
+
 同梱・依存しているソフトウェア（アプリ本体 / Lucide アイコン・PDFium などの同梱アセット /
 Rust の依存クレート）のライセンス表記と全文は、アプリ内の「説明」画面の一番下の
 **「ライセンスについて」**から確認できます（[`Cargo.lock`](Cargo.lock) から生成した一覧を

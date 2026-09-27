@@ -314,6 +314,13 @@ jobs:
           mkdir -p "$STAGE"
           cp -R "$APP" "$STAGE/ThundokuShelf.app"
           cp packaging/macos/はじめにお読みください.txt "$STAGE/"
+          # ライセンス表記も配布物へ同梱する（MIT の notice と、同梱アセットの全文。
+          # アプリ内の「ライセンスについて」と同じ内容が zip にも入る）。
+          # Rust 依存クレートの一覧はアプリ内に埋め込んである（1,000 件超の全文を
+          # テキストで置くと配布物が肥大するため、規約上必要な同梱アセットだけを置く）。
+          cp LICENSE "$STAGE/"
+          cp crates/app/assets/third-party/lucide-LICENSE.txt "$STAGE/"
+          cp crates/app/assets/third-party/pdfium-LICENSE.txt "$STAGE/"
           # ditto でバンドル構造（権限・リソース）を保ったまま zip 化する
           # --keepParent は付けない = zip 直下に .app と txt が並ぶ
           ditto -c -k "$STAGE" "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
@@ -336,9 +343,16 @@ jobs:
           }
           tar -xzf pdfium.tgz
           Copy-Item bin/pdfium.dll "target/${{ matrix.target }}/release/pdfium.dll"
+          # LICENSE（MIT の notice）と、同梱アセットのライセンス全文も zip に入れる
+          # （配布物を受け取った人がアプリを起動しなくても確認できるように）。
+          # Rust 依存クレートの一覧はアプリ内に埋め込んである（配布物の肥大を避けるため、
+          # 規約上必要な同梱アセットの全文だけをテキストで置く）。
           Compress-Archive -Path @(
             "target/${{ matrix.target }}/release/thundoku-shelf.exe",
-            "target/${{ matrix.target }}/release/pdfium.dll"
+            "target/${{ matrix.target }}/release/pdfium.dll",
+            "LICENSE",
+            "crates/app/assets/third-party/lucide-LICENSE.txt",
+            "crates/app/assets/third-party/pdfium-LICENSE.txt"
           ) -DestinationPath "thundoku-shelf-${{ steps.ver.outputs.v }}-${{ matrix.arch }}-${{ matrix.os_name }}.zip"
 
       # 配布物の部品表（CycloneDX JSON）を作る。`Cargo.lock` と `cargo metadata` の両方から

@@ -36,6 +36,41 @@
   実測（120 ページ・本文約 453 B/ページ）: pack は +1.11%、復元は +0.2 ms/ページ。
   `crates/core/src/import/mod.rs`、`crates/app/src/views/bookshelf.rs`
 
+- **依存ライセンスの許可リストを CI で強制**: `licenses.json` は生成・表示されるだけで
+  **ライセンスの種類は誰も見ていなかった**（陳腐化だけを `licenses_json_matches_cargo_lock` が
+  見張っていた）。依存を 1 本足すだけで GPL/AGPL が混入しうる状態だったので、許可リストと
+  SPDX 式の評価（`OR` は 1 つ許可されていれば可 / `AND` は全部 / `WITH` は基本ライセンス /
+  旧式の `/` 区切り / 括弧）を `crates/app/src/views/licenses.rs` に足し、**実データ
+  1,087 件を評価して拒否 0 件をテストで固定**した（未知のライセンスは失敗させて人間に判断を
+  促す。許可リストの根拠は同ファイルの doc コメント）。現状の拒否対象は GPL/AGPL/LGPL/SSPL/
+  BUSL/CC-BY-NC など（MPL-2.0 の 9 件は gpui 経由で、ファイル単位のコピーレフト＝未改変の
+  依存として使う限り MIT 配布と両立するため許可）
+
+- **配布物にライセンス表記を同梱**: Windows の zip は exe と `pdfium.dll` だけ、macOS の zip も
+  `.app` と「はじめにお読みください.txt」だけで、**配布物を受け取った人がアプリを起動せずに
+  ライセンスを確認できなかった**（MIT の notice と同梱アセットの全文はアプリ内と `LICENSE` /
+  `crates/app/assets/third-party/*-LICENSE.txt` にしか無かった）。配布物へ `LICENSE`・
+  `lucide-LICENSE.txt`（ISC）・`pdfium-LICENSE.txt`（BSD-3-Clause + Apache-2.0）を同梱する。
+  Rust 依存クレートの一覧（1,000 件超）は従来どおりアプリ内に埋め込む（全文をテキストで置くと
+  配布物が肥大するため）。`.github/workflows/release.yml`（Package (macOS) / Package (Windows)）
+
+- **`SECURITY.md` を追加**: 脆弱性の報告先を明示した（GitHub の private vulnerability reporting を
+  既定にし、**リポジトリ設定でも有効化**した。公開 Issue を使わない理由と、開けない場合の
+  代替手段も記載）。サポート対象は最新リリースのみ、報告に含めてほしい情報（秘密情報は
+  貼らないこと）、設計上の守備範囲（端末の OS アカウントを奪われた場合と「Drive のバックアップ
+  + `sub`」の組み合わせは守れないこと、DB は機密列のみ暗号化でディスク暗号化が前提）、対象外、
+  対応の目安（ベストエフォート・報奨金なし）
+
+- **貢献の受け入れ方を明文化**: `CONTRIBUTING.md`（歓迎する変更 / 先に Issue で相談してほしい変更 /
+  開発手順 / TDD / コミットメッセージ / **inbound=outbound（CLA・DCO 不要で提出物は MIT、著作権は
+  貢献者に残る）** / レビューの目安）、`.github/pull_request_template.md`（テスト・clippy・整形・
+  `licenses.json`・`--locked` のチェックリスト）、`CODE_OF_CONDUCT.md`（Contributor Covenant 2.1）を
+  追加。`main` にブランチ保護を設定（`audit` と `test (ubuntu/macos/windows)` を必須チェック、
+  force push と削除を禁止。**管理者はバイパスできるので直接 push は従来どおり可能**）。fork からの
+  PR は初回のみ承認制（既に設定済みであることを確認）。アクションの**完全なコミット SHA 固定**を
+  リポジトリ設定（`sha_pinning_required`）でも強制した（必須チェック名が CI のジョブ名に依存する
+  ことは `ci.yml` の先頭に注意書きとして残した）
+
 ### Fixed
 
 - **同期フォルダを毎回作って My Drive 直下に同名フォルダが増える問題**:

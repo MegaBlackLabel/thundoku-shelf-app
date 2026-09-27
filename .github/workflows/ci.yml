@@ -19,6 +19,10 @@ on:
 permissions:
   contents: read
 
+# 注意: **ジョブ名と matrix は main のブランチ保護が必須ステータスチェックとして名前で参照している**
+# （`audit` / `test (ubuntu-latest)` / `test (macos-latest)` / `test (windows-latest)`）。
+# ここを変えるときは保護側も同時に直さないと PR がマージできなくなる。確認・更新は
+# `gh api repos/{owner}/{repo}/branches/main/protection`。
 jobs:
   test:
     strategy:
