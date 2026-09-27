@@ -70,7 +70,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
-          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       # cargo のビルドキャッシュを保存/復元。2 回目以降は依存のフルビルドを省略。
@@ -391,6 +390,7 @@ jobs:
       # 「どのワークフローが・どのコミットで・この zip を作ったか」を署名つきで証明する。
       # 署名は Sigstore の鍵レス（OIDC の短期証明書）。利用者は次のように検証できる:
       #   gh attestation verify <zip> --repo MegaBlackLabel/thundoku-shelf-app
+      # ※ `gh` 2.6x 以降が必要（古い gh は Sigstore の Ed25519 tlog 鍵を検証できない）
       # SHA256SUMS と違い、zip を差し替えてもハッシュも一緒に差し替えれば通ってしまう、
       # という弱点が無い（証明はリポジトリ側に保存される）。
       - name: Attest build provenance
@@ -401,6 +401,7 @@ jobs:
       # SBOM 自体も同じ配布物に結び付けて署名する。検証:
       #   gh attestation verify <zip> --repo MegaBlackLabel/thundoku-shelf-app \
       #     --predicate-type https://cyclonedx.org/bom
+      # （subject は zip。SBOM は predicate として入る）
       - name: Attest SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
