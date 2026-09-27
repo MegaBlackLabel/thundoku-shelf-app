@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-09-28
+
 ### Added
 
 - **設定の「書籍のバックアップ」ON/OFF**: 本のファイル（`.opfspack`）は `drive.sync.enabled` に
