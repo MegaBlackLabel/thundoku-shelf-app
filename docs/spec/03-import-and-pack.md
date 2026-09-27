@@ -5,7 +5,7 @@
 > 事実にはアンカー付き。断定できない事項は章末の「不明点 / 推測」に分離してある。
 > 情報源: crates/core/src/import/**, crates/opfspack/**, crates/core/src/db/**
 >
-> **注（v3 移行に伴うアンカーのずれ）**: v3 対応（`crates/opfspack` の鍵スキームと `crates/core/src/import/mod.rs` の鍵の受け渡し）で行番号が動いた。§3.1・§3.5・§4・§5.1・§5.4・§5.5・§6 のアンカーは更新済み。**§3.2〜§3.4・§3.6〜§3.10 の `import/mod.rs` アンカーは移行前の値のまま**（目安として +85〜+100 行ずれている）なので、参照時は関数名・定数名で検索すること。
+> **注（アンカーの状態）**: `crates/core/src/import/mod.rs` は v3 対応・本文エントリ対応で行番号が動いた。**§3.1・§3.5・§3.7（ページ 0 件の行）・§3.8・§3.9 と §4.8・§4.9・§6.1 のアンカーは 2026-09-27 時点の実測値に更新済み**。**それ以外（§3.2〜§3.4・§3.6・§3.7 の他行・§3.10・§5・§6.2〜§6.3 など）は古い値のまま**で、実際とは数十〜数百行ずれる（例: §3.6 の `upscale_if_small` は表の `:67-78` → 実際は `:138-159`、§3.10 の進捗コールバック型は `:1163` → 実際は `:1633`）。参照時は関数名・定数名で検索すること。
 
 ## 3. 取り込みパイプライン
 
@@ -13,24 +13,24 @@
 
 | # | 段 | 関数 / 定数 | アンカー | 入力 → 出力 |
 |---|---|---|---|---|
-| 0 | 起動（アプリ層・参考） | ダウンロード済み `bytes` + 拡張子で分岐（`epub` / `zip` / `jpg｜jpeg｜png｜webp｜gif` / `pdf`） | `crates/app/src/views/bookshelf.rs:3017-3057`, `:2976-2980` | ファイル → 取り込み API 呼び出し |
-| 1 | 拡張子ディスパッチ | `import_file` | `import/mod.rs:1251-1279` | パス → `pdf`/`epub`/`zip` のいずれか、他は `ImportError::UnsupportedType` |
-| 2 | ZIP 解析（書き込みなし） | `analyze_zip` | `import/mod.rs:1510-1554` | bytes → `ImportPlan` |
-| 3 | エントリ名列挙 + 入れ子展開 | `collect_metas_with_nested` → `collect_entry_metas` + `expand_nested_archives` | `import/mod.rs:365-382`, `:289-311`, `:383-478` | ZIP → `Vec<EntryMeta>` |
+| 0 | 起動（アプリ層・参考） | ダウンロード済み一時ファイル + 拡張子で分岐（`epub` / `zip` / `jpg｜jpeg｜png｜webp｜gif` / `pdf`） | `crates/app/src/views/bookshelf.rs:4636-4701`（`start_download` の worker） | ファイル → 取り込み API 呼び出し |
+| 1 | 拡張子ディスパッチ | `import_file` | `import/mod.rs:1628-1670` | パス → `pdf`/`epub`/`zip` のいずれか、他は `ImportError::UnsupportedType` |
+| 2 | ZIP 解析（書き込みなし） | `analyze_zip` / `analyze_zip_with` | `import/mod.rs:1962-2037` | bytes → `ImportPlan` |
+| 3 | エントリ名列挙 + 入れ子展開 | `collect_metas_with_nested` → `collect_entry_metas` + `expand_nested_archives` | `import/mod.rs:473-490`, `:372-395`, `:491-587` | ZIP → `Vec<EntryMeta>` |
 | 4 | 種別判定（名前のみ） | `classify_entry` / `is_nested_archive` / `is_readable_kind` | `classify.rs:74-105`, `:63-71`, `:136-141` | パス → `EntryKind` |
-| 5 | コンテンツ組み立て | `build_contents` / `group_push` / `plan_content` / `rendition_label` | `import/mod.rs:606-641`, `:644-660`, `:662-700`, `:702-723` | `Vec<EntryMeta>` → `Vec<PlannedContent>` |
-| 6 | 既定コンテンツ決定 | `choose_primary` / `is_body_name` | `import/mod.rs:1457-1486`, `:1505-1508` | コンテンツ列 → `primary` 添字 |
+| 5 | コンテンツ組み立て | `build_contents` / `group_push` / `plan_content` / `rendition_label` | `import/mod.rs:715-752`, `:753-770`, `:771-810`, `:811-844` | `Vec<EntryMeta>` → `Vec<PlannedContent>` |
+| 6 | 既定コンテンツ決定 | `choose_primary` / `is_body_name` | `import/mod.rs:1909-1939`, `:1957-1959` | コンテンツ列 → `primary` 添字 |
 | 7 | `_export.txt` 読み | `parse_export_text` / `decode_text_bytes` | `export_text.rs:11-31`, `zip_names.rs:21-23` | txt bytes → `Vec<(i64, String)>` |
-| 8 | 実体化 + pack 生成 + DB 登録 | `commit_zip` | `import/mod.rs:1556-1786` | `ImportPlan` + bytes → `ImportedBook` |
-| 8a | （ZIP 経由の PDF） | `render_pdf_with` → `pdf::render_pdf_pages` | `import/mod.rs:1494-1503`, `pdf.rs:71-120`(Win) / `:122-193`(非 Win) | PDF bytes → `Vec<PageImage>` |
-| 8b | ページ画像（画像レンディション） | `render_page_images` → `render_page_image` → `upscale_if_small` + `encode_webp` | `import/mod.rs:180-215`, `:153-159`, `:112-124`, `:126-132` | 元画像 bytes → `(WebP, w, h)` |
-| 8c | サムネイル | `thumbnail_of` | `import/mod.rs:135-150` | ページ bytes → `(WebP, 200, h)` |
-| 9 | 単体 PDF 経路 | `import_pdf_bytes` → `import_rendered_pdf_pages` | `import/mod.rs:1282-1304`, `:1306-1377` | PDF bytes → `finish_import` |
-| 10 | 単体 EPUB 経路 | `import_epub_bytes` | `import/mod.rs:1379-1411` | EPUB bytes → `finish_import`（生 1 エントリ） |
-| 11 | 単体画像経路 | `import_image_bytes` | `import/mod.rs:2155-2210` | 画像 bytes → `finish_import`（1 ページ） |
-| 12 | pack 書き出し + DB 一括登録 | `finish_import` | `import/mod.rs:945-1249` | `PackSpec` → `ImportedBook` |
-| 13 | Drive 復元（pack → DB） | `rebuild_from_pack` / `content_from_metadata` / `infer_contents` | `import/mod.rs:1818-1997`, `:1999-2050`, `:2052-2091` | pack bytes → DB 行（再構築したら `true`） |
-| 14 | pack 内メタ書き換え | `rename_content_in_pack` | `import/mod.rs:819-895` | pack bytes + 新表示名 → 新しい pack bytes（変更なしは `None`） |
+| 8 | 実体化 + pack 生成 + DB 登録 | `commit_zip` / `commit_zip_with` | `import/mod.rs:2039-2064`, `:2068-2298` | `ImportPlan` + bytes → `ImportedBook` |
+| 8a | （ZIP 経由の PDF） | `render_pdf_with` → `pdf::render_pdf_pages`（単体 PDF は `import_pdf_rendered` が `render_pdf_pages_into` / `render_pdf_file_into`） | `import/mod.rs:1946-1954`, `pdf.rs:109-119`, `:129-140`, `:141-147` | PDF bytes → ページ（ZIP 経由は `Vec<PageImage>`、単体は 1 ページずつ） |
+| 8b | ページ画像（画像レンディション） | `render_page_images` → `render_page_image` → `upscale_if_small` + `encode_webp` | `import/mod.rs:233-268`, `:192-218`, `:138-159`, `:160-173` | 元画像 bytes → `(WebP, w, h)` |
+| 8c | サムネイル | `thumbnail_of` | `import/mod.rs:174-191` | ページ bytes → `(WebP, 200, h)` |
+| 9 | 単体 PDF 経路 | `import_pdf_bytes` / `import_pdf_path` → `import_pdf_rendered` | `import/mod.rs:1681-1703`, `:1709-1731`, `:1735-1826` | PDF bytes → `finish_import` |
+| 10 | 単体 EPUB 経路 | `import_epub_bytes` | `import/mod.rs:1829-1862` | EPUB bytes → `finish_import`（生 1 エントリ） |
+| 11 | 単体画像経路 | `import_image_bytes` | `import/mod.rs:2850-2907` | 画像 bytes → `finish_import`（1 ページ） |
+| 12 | pack 書き出し + DB 一括登録 | `finish_import` | `import/mod.rs:1251-1625` | `PackSpec` → `ImportedBook` |
+| 13 | Drive 復元（pack → DB） | `rebuild_from_pack` / `content_from_metadata` / `infer_contents` | `import/mod.rs:2406-2629`, `:2694-2744`, `:2747-2787` | pack bytes → DB 行（再構築したら `true`） |
+| 14 | pack 内メタ書き換え | `rename_content_in_pack` | `import/mod.rs:951-1003` | pack bytes + 新表示名 → 新しい pack bytes（変更なしは `None`） |
 
 ### 3.2 判定（拡張子 / 名前 / ZIP 解析）
 
@@ -89,15 +89,16 @@
 
 | 条件 | エントリパス | compress フラグ | アンカー |
 |---|---|---|---|
-| 常に最初 | `metadata.json`（`application/json`） | `false` | `import/mod.rs:1002`, `:765-808` |
-| 既定表示コンテンツの第 1 レンディション（画像/PDF） | `pages/page_{n:04}.webp`（n は 1 始まり） | `false` | `import/mod.rs:1605-1610`, `:1639-1645`, `:1671-1677`, `:1326` |
-| それ以外のコンテンツ/レンディション（画像/PDF） | `contents/{content_index}/r{rendition_index}/page_{n:04}.webp` | `false` | `import/mod.rs:1605-1610`, `:1639`, `:1671` |
-| EPUB（既定コンテンツの第 1 レンディション） | 元のファイル名そのもの（`dir/book.epub` → `book.epub`） | `false` | `import/mod.rs:1699-1711` |
-| EPUB（それ以外） | `contents/{c}/r{r}/{元ファイル名}` | `false` | `import/mod.rs:1699-1706` |
-| 表紙 | `cover.webp`（**既定コンテンツが PDF のときだけ**。ZIP 経路では `primary_cover` が立つ場合のみ） | `false` | `import/mod.rs:1744-1751`, `:1679-1684` |
-| サムネイル | `thumbnail.webp`（既定コンテンツ第 1 ページの 200px 版） | `false` | `import/mod.rs:1753-1758` |
-| 音声・動画 | エントリを作らない（構造だけ DB に記録） | — | `import/mod.rs:1712-1713` |
-| pack レベル | `PackBuilder::build_to_file_streaming(..., true)` = pack フラグ `COMPRESSED` を常に立てる（**エントリ個別の compress はすべて false**。鍵を渡したときは `ENCRYPTED` も立つ）。エントリは `PackEntryStore` から**1 件ずつ**供給する（全ページを同時にメモリへ載せない）。**一時ファイルへ直接組み立ててから rename** し、pack 全体の SHA-256 はファイルを順に読んで計算する（`PackFileReader::source_sha256`） | — | `crates/opfspack/src/builder.rs`（`write_pack`）, `reader.rs:350`（`PackRead`） |
+| 常に最初 | `metadata.json`（`application/json`） | `false` | `import/mod.rs:1310-1314`, `:874-927` |
+| 既定表示コンテンツの第 1 レンディション（画像/PDF） | `pages/page_{n:04}.webp`（n は 1 始まり） | `false` | `import/mod.rs:2116-2122`（`legacy` = 主コンテンツの第 1 レンディション）, `:2151-2164`, `:2183-2196`, `:1759-1774`（単体 PDF） |
+| それ以外のコンテンツ/レンディション（画像/PDF） | `contents/{content_index}/r{rendition_index}/page_{n:04}.webp` | `false` | `import/mod.rs:2118-2122`, `:2151-2164` |
+| EPUB（既定コンテンツの第 1 レンディション） | 元のファイル名そのもの（`dir/book.epub` → `book.epub`） | `false` | `import/mod.rs:2211-2222`, `:1838-1847`（単体 EPUB） |
+| EPUB（それ以外） | `contents/{c}/r{r}/{元ファイル名}` | `false` | `import/mod.rs:2214-2222` |
+| 表紙 | `cover.webp`（**既定コンテンツが PDF のときだけ**。ZIP 経路では `primary_cover` が立つ場合のみ） | `false` | `import/mod.rs:2258-2265`, `:2203`, `:1797-1798`（単体 PDF） |
+| サムネイル | `thumbnail.webp`（既定コンテンツ第 1 ページの 200px 版） | `false` | `import/mod.rs:2266-2272`, `:1801-1805`（単体 PDF）, `:1335`（DB 行が参照） |
+| ページ本文（PDF の抽出テキスト / `_export.txt`。既定コンテンツ以外のページ本文も含む） | `documents/text.jsonl`（`application/x-ndjson`。1 行 = `{"pageNumber":<int>,"text":"..."}`）。本文が 1 件以上あるときだけ作る | **`true`**（per-entry の deflate。テキストは圧縮が効く） | `import/mod.rs:212`, `:929-941`, `:1316-1333`, `:1365-1369` |
+| 音声・動画 | エントリを作らない（構造だけ DB に記録） | — | `import/mod.rs:2225-2226` |
+| pack レベル | `PackBuilder::build_to_file_streaming(..., true)` = pack フラグ `COMPRESSED` を常に立てる（**エントリ個別の compress は `documents/text.jsonl` だけ `true`**、他はすべて `false`。鍵を渡したときは `ENCRYPTED` も立つ）。エントリは `PackEntryStore` から**1 件ずつ**供給する（全ページを同時にメモリへ載せない）。**一時ファイルへ直接組み立ててから rename** し、pack 全体の SHA-256 はファイルを順に読んで計算する（`PackFileReader::source_sha256`） | — | `crates/opfspack/src/builder.rs`（`write_pack`）, `reader.rs:350`（`PackRead`） |
 
 ### 3.5.1 取り込み中のメモリ（`PackEntryStore`）
 
@@ -137,7 +138,7 @@ store へ直接入る。
 | テキスト抽出 | `page.text()` の文字列。取れない場合は空文字 | — | — | `pdf.rs:118` |
 | 進捗 | `progress(finished / total)`（0.0〜1.0）。**エンコードが終わったページ数**を `AtomicUsize` で数えてページごとに通知 | — | — | `pdf.rs:157-160` |
 | 失敗時 | 1 ページでも失敗したら `ImportError::Pdf`（失敗したページ番号はログに残す） | — | — | `pdf.rs:166-183` |
-| ページ 0 件 | `import_rendered_pdf_pages` が `ImportError::Pdf("no pages rendered")` | — | — | `import/mod.rs:1223` |
+| ページ 0 件 | `import_pdf_rendered` が `ImportError::Pdf("no pages rendered")` | — | — | `import/mod.rs:1775-1778` |
 
 以前は macOS / Linux が mupdf だったが、mupdf は **AGPL-3.0** で MIT 配布の本アプリと両立しないため依存から外し、全プラットフォーム PDFium に統一した（`crates/core/Cargo.toml:38-44`）。
 
@@ -145,31 +146,34 @@ store へ直接入る。
 
 | # | 処理 | アンカー |
 |---|---|---|
-| 1 | `book_id` 決定（`book_id_for`） / `title` = ファイル名から拡張子を除いたもの | `import/mod.rs:870-873`, `:676-681` |
-| 2 | 再取り込み時: 既存 `book_contents` と件数が一致するときだけ `content_id` と `display_name` を引き継ぎ、`page_rows[].content_id` も張り替える | `import/mod.rs:880-910` |
-| 3 | pack 構築（`metadata.json` → 追加エントリ）と `packs_dir/{book_id}.opfspack` への書き出し | `import/mod.rs:916-924` |
-| 4 | `books` 行を組み立て（`file_name` = 取り込みファイル名、`file_size` = **元ファイルのバイト数**、`opfs_path` = `{book_id}.opfspack`、`cover_thumbnail` = `None`、`tbf_product_id`/`site_id` = `None`、`tags_fetched` = 1） | `import/mod.rs:927-956` |
-| 5 | 再取り込み時は `is_favorite` / `is_hidden` / `created_at` を既存行から引き継ぎ、`documents::delete_for_book` + `contents::delete_for_book` の後に `books::upsert`。新規は `books::insert` | `import/mod.rs:958-981` |
-| 6 | `imported_documents` 行（`source_type` = `pdf`/`epub`/`image-set`/`image`、`file_hash` = pack の SHA-256、`status` = `"completed"`、`metadata` = `None`） | `import/mod.rs:979-988`, `:1687-1691` |
-| 7 | `book_contents` + `content_formats` を `contents::insert_batch`（1 トランザクション） | `import/mod.rs:990-1017`, `db/contents.rs:41-83` |
-| 8 | `document_images`: ページ行（`image_type = "page"`、`opfs_path = {book_id}.opfspack`、`mime_type = "image/webp"`） | `import/mod.rs:1019-1056` |
-| 9 | `document_images`: サムネイル行（`image_type = "thumbnail"`、`page_number = 1`、寸法は WebP をデコードして取得） | `import/mod.rs:1058-1085` |
-| 10 | `documents::insert_images_batch`（画像 200 件ずつ / 1 トランザクション） | `import/mod.rs:1086`, `db/documents.rs:260-301` |
-| 11 | `document_text`（PDF のページテキスト + `_export.txt` のパース結果）。200 件ずつ | `import/mod.rs:1094-1107`, `db/documents.rs:303-335` |
-| 12 | `token_analysis`（ページテキストごとに `crate::tags::extract_nouns(text, &[title])` の名詞）。500 件ずつ | `import/mod.rs:1109-1128`, `db/documents.rs:338-371` |
-| 13 | `book_tags`: `fetch_zenn_tags()` → `generate_tags(texts, &[title], zenn_tags)` → `tags::set_for_book(pool, book_id, &[(tag, "generated")])`（既存タグは全削除して入れ直す） | `import/mod.rs:1129-1137`, `db/tags.rs:18-44` |
-| 14 | `ImportedBook { book, document, tags, warnings }` を返す | `import/mod.rs:1139-1145`, `:22-30` |
+| 1 | `book_id` 決定（`book_id_for`） / `title` = ファイル名から拡張子を除いたもの（`base_title`） | `import/mod.rs:1260-1261`, `:269`, `:867-872` |
+| 2 | 再取り込み時: 既存 `book_contents` と件数が一致するときだけ `content_id` と `display_name` を引き継ぎ、`page_rows[].content_id` も張り替える | `import/mod.rs:1270-1301` |
+| 3 | pack 構築（`metadata.json` → 追加エントリ → 本文エントリ）と `packs_dir/{book_id}.opfspack` への書き出し | `import/mod.rs:1304-1387`, `:1310-1314`, `:1316-1333`, `:1355-1380` |
+| 4 | `books` 行を組み立て（`file_name` = 取り込みファイル名、`file_size` = **元ファイルのバイト数**、`opfs_path` = `{book_id}.opfspack`、`cover_thumbnail` = `None`、`tbf_product_id`/`site_id` = `None`、`tags_fetched` = 1）。`site_id`/`tbf_product_id` はアプリ層が取り込み直後に `set_site_id` / `set_tbf_product_id` で入れる | `import/mod.rs:1403-1431`, `crates/app/src/views/bookshelf.rs:4590-4596` |
+| 5 | 再取り込み時は `is_favorite` / `is_hidden` / `created_at` を既存行から引き継ぎ、`documents::delete_for_book` + `contents::delete_for_book` の後に `books::upsert`。新規は `books::insert` | `import/mod.rs:1434-1453` |
+| 6 | `imported_documents` 行（`source_type` = `pdf`/`epub`/`image-set`/`image`、`file_hash` = pack の SHA-256、`status` = `"completed"`、`metadata` = `None`） | `import/mod.rs:1455-1466`, `:2275-2279` |
+| 7 | `book_contents` + `content_formats` を `contents::insert_batch`（1 トランザクション） | `import/mod.rs:1470-1503`, `db/contents.rs:41-84` |
+| 8 | `document_images`: ページ行（`image_type = "page"`、`opfs_path = {book_id}.opfspack`、`mime_type = "image/webp"`） | `import/mod.rs:1513-1544` |
+| 9 | `document_images`: サムネイル行（`image_type = "thumbnail"`、`page_number = 1`、寸法は WebP をデコードして取得） | `import/mod.rs:1545-1568` |
+| 10 | `documents::insert_images_batch`（画像 200 件ずつ / 1 トランザクション） | `import/mod.rs:1569`, `db/documents.rs:281-322` |
+| 11 | `document_text`（PDF のページテキスト + `_export.txt` のパース結果）。200 件ずつ | `import/mod.rs:1572-1582`, `db/documents.rs:324-364` |
+| 12 | `token_analysis`（ページテキストごとに `crate::tags::extract_nouns(text, &[title])` の名詞）。500 件ずつ | `import/mod.rs:1585-1602`, `db/documents.rs:366-419` |
+| 13 | `book_tags`: `fetch_zenn_tags()` → `generate_tags(texts, &[title], zenn_tags)` → `tags::set_for_book(pool, book_id, &[(tag, "generated")])`（既存タグは全削除して入れ直す） | `import/mod.rs:1608-1616`, `db/tags.rs:18-45` |
+| 14 | `ImportedBook { book, document, tags, warnings }` を返す | `import/mod.rs:1619-1624`, `:22-30` |
 
 ### 3.9 再取り込み・復元・改名
 
 | 機能 | 内容 | アンカー |
 |---|---|---|
-| 再取り込み（同一 source） | `reuse_book_id` を渡すと `books.id` を再利用。既存 `documents` / `contents` を削除してから入れ直し、`is_favorite` / `is_hidden` / `created_at` と `content_id` / `display_name` を引き継ぐ | `import/mod.rs:891-981`, `db/books.rs:336-362` |
-| 再利用 id の探索 | `(site_id, tbf_product_id)` 一致行のうち owner（暗号化 `owner_sub` を鍵で復号した sub）が一致するもの。未ログインは `owner_sub IS NULL` の行 | `db/books.rs:315-362` |
-| Drive からの再構築 | `rebuild_from_pack`: 既にドキュメント行があれば `false`（何もしない）。`metadata.json` の `contents` を使い、無ければ `infer_contents` で推定（ページエントリがあれば `image`/`pages`、`.epub` なら `epub`、ルート直下の `.pdf` なら `pdf`）。`cover.webp` は行を作らない。主レンディションのページ数が 0 なら `false` | `import/mod.rs:1728-1800`, `:1960-1998` |
-| 復元時の寸法 | 画素デコードせず `image::ImageReader::into_dimensions()` でヘッダのみ読む | `import/mod.rs:2020-2028` |
-| ページ番号の復元 | パス末尾の `page_NNNN` から数値化（`page_` + 数字） | `import/mod.rs:2013-2017` |
-| コンテンツ名の改名 | DB（`book_contents.display_name`、最大 60 文字、空白畳み込み）と pack の `metadata.json` の両方に書く。pack は全エントリを読み直して再構築（`created_at` と pack フラグ・エントリの compress フラグを維持） | `db/contents.rs:167-213`, `import/mod.rs:737-786` |
+| 再取り込み（同一 source） | `reuse_book_id` を渡すと `books.id` を再利用。既存 `documents` / `contents` を削除してから入れ直し、`is_favorite` / `is_hidden` / `created_at` と `content_id` / `display_name` を引き継ぐ | `import/mod.rs:1270-1301`, `:1434-1453`, `db/books.rs:370-395` |
+| 再利用 id の探索 | `(site_id, tbf_product_id)` 一致行のうち owner（暗号化 `owner_sub` を鍵で復号した sub）が一致するもの。未ログインは `owner_sub IS NULL` の行 | `db/books.rs:349-395`（`find_by_source` / `resolve_reuse_id`） |
+| Drive からの再構築 | `rebuild_from_pack`: 既にドキュメント行があれば `false`（何もしない。ただし source の復元はその前に走る = 次行）。`metadata.json` の `contents` を使い、無ければ `infer_contents` で推定（ページエントリがあれば `image`/`pages`、`.epub` なら `epub`、ルート直下の `.pdf` なら `pdf`）。`cover.webp` は行を作らない。主レンディションのページ数が 0 なら `false`。本文エントリ（`documents/text.jsonl`）はページ行の対象外（`metadata.json` と同様にスキップ） | `import/mod.rs:2406-2447`, `:2461-2464`, `:2530-2532`, `:2747-2787` |
+| 取り込み元の記録 | `ImportSource { site_id, product_id }` を `import_*` / `commit_*` 系の末尾引数（`source: Option<&ImportSource>`）で受け取り、`metadata.json` の `source` に書く（`site_id` が空のときは書かない）。アプリは同期で得た site / 商品 id から作り、PDF / EPUB / ZIP / 画像の各経路へ渡す | `import/mod.rs:39-42`, `:874-927`, `crates/app/src/views/bookshelf.rs:4570-4573`, `:4579-4588`, `:4640-4648`, `:4672-4682`, `:4688-4696` |
+| pack からの source 復元 | `metadata.json` の `source`（`siteId` / `productId`）を `books.site_id` / `books.tbf_product_id` へ戻す（`restore_source`）。**ドキュメント行が既にある早期 return でも実行**する。端末が知らないサイト id のときは site_id を入れず product_id も入れない（片方だけにしない）。失敗しても復元は続ける | `import/mod.rs:2421-2429`, `:2631-2661`, `db/books.rs:531`, `:226` |
+| pack からの本文復元 | `documents/text.jsonl` を `read_texts_entry` で読み、`document_text` へ既存の INSERT 経路（`documents::insert_texts_batch`、暗号化列）で入れる。`token_analysis` は本文から `tags::extract_nouns` で**再生成**する（解析器のバージョン差で取り込み時とずれうる = 仕様として許容）。エントリの無い pack は本文無し（後方互換）、壊れた行はその行だけ飛ばす | `import/mod.rs:2584-2621`, `:2663-2691`, `db/documents.rs:324`, `:366` |
+| 復元時の寸法 | 画素デコードせず `image::ImageReader::into_dimensions()` でヘッダのみ読む | `import/mod.rs:2807-2816` |
+| ページ番号の復元 | パス末尾の `page_NNNN` から数値化（`page_` + 数字） | `import/mod.rs:2800-2805` |
+| コンテンツ名の改名 | DB（`book_contents.display_name`、最大 60 文字、空白畳み込み）と pack の `metadata.json` の両方に書く。pack は全エントリを読み直して再構築（`created_at` と pack フラグ・エントリの compress フラグを維持するので、本文エントリもそのまま残る） | `db/contents.rs:175-213`, `import/mod.rs:951-1003` |
 
 ### 3.10 進捗コールバック
 
@@ -363,41 +367,45 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 
 | pack 種別 | エントリ（ソート後 = UTF-16 順で並ぶ） | 出典 |
 |---|---|---|
-| 画像 ZIP（既定コンテンツ第 1 レンディション） | `metadata.json`, `pages/page_0001.webp` … `pages/page_NNNN.webp`, `thumbnail.webp` | `import/mod.rs:1002`, `:1639-1645`, `:1753-1758` |
-| 複数コンテンツ/レンディション | `metadata.json`, `pages/…`（既定の第 1 のみ）, `contents/{c}/r{r}/page_0001.webp` …, `thumbnail.webp` | `import/mod.rs:1605-1610`, `:1639` |
-| PDF 単体 | `metadata.json`, `pages/page_0001.webp` …, `cover.webp`, `thumbnail.webp` | `import/mod.rs:1324-1356` |
-| ZIP 内の PDF（既定レンディション） | 同上（`pages/…`）+ `cover.webp`（`primary_cover` が立つときだけ） | `import/mod.rs:1671-1684`, `:1744-1751` |
-| EPUB 単体 | `metadata.json`, `<元ファイル名>.epub`（圧縮なしの生エントリ） | `import/mod.rs:1394-1400` |
-| ZIP 内の EPUB | `metadata.json`, `<元ファイル名>.epub`（既定レンディション）または `contents/{c}/r{r}/<元ファイル名>.epub` | `import/mod.rs:1699-1711` |
-| 画像 1 枚 | `metadata.json`, `pages/page_0001.webp`, `thumbnail.webp` | `import/mod.rs:2174-2196` |
-| 音声/動画のみを含む ZIP | 当該コンテンツはエントリを作らない（`page_count = 0`）。主コンテンツなら `NotAReadableWork` | `import/mod.rs:1712-1713`, `:1570-1573` |
-| pack レベルフラグ | 常に `pack_flags::COMPRESSED`（`build(pack_key.as_ref(), true)`）、鍵があるとき（＝ログイン中の取り込み）のみ `ENCRYPTED`（**全エントリ**） | `import/mod.rs:1009`, `builder.rs:111-117` |
-| エントリの compress | **すべて `false`**（metadata.json / ページ / 表紙 / サムネ / EPUB 生データ） | `import/mod.rs:1002`, `:1640-1645`, `:1672-1677`, `:1703-1710`, `:1746-1758`, `:1330-1335` |
-| 暗号化の伝播 | `rename_content_in_pack` は元 pack の `ENCRYPTED` フラグを見て `pack_key` の有無を決め、エントリごとの `COMPRESSED` フラグも維持して再構築する | `import/mod.rs:855-870` |
+| 画像 ZIP（既定コンテンツ第 1 レンディション） | `metadata.json`, `pages/page_0001.webp` … `pages/page_NNNN.webp`, `thumbnail.webp`（+ 本文があるときは `documents/text.jsonl`） | `import/mod.rs:1310-1314`, `:2118-2122`, `:2151-2157`, `:2266-2272`, `:1316-1333` |
+| 複数コンテンツ/レンディション | `metadata.json`, `pages/…`（既定の第 1 のみ）, `contents/{c}/r{r}/page_0001.webp` …, `thumbnail.webp`（+ 本文エントリ） | `import/mod.rs:2116-2122`, `:2151-2157`, `:2183-2189`, `:2266-2272` |
+| PDF 単体 | `metadata.json`, `pages/page_0001.webp` …, `cover.webp`, `thumbnail.webp`（+ 本文エントリ） | `import/mod.rs:1759-1774`, `:1797-1805`, `:1316-1333` |
+| ZIP 内の PDF（既定レンディション） | 同上（`pages/…`）+ `cover.webp`（`primary_cover` が立つときだけ） | `import/mod.rs:2200-2204`, `:2258-2265` |
+| EPUB 単体 | `metadata.json`, `<元ファイル名>.epub`（圧縮なしの生エントリ） | `import/mod.rs:1838-1847` |
+| ZIP 内の EPUB | `metadata.json`, `<元ファイル名>.epub`（既定レンディション）または `contents/{c}/r{r}/<元ファイル名>.epub` | `import/mod.rs:2211-2222` |
+| 画像 1 枚 | `metadata.json`, `pages/page_0001.webp`, `thumbnail.webp` | `import/mod.rs:2875-2888` |
+| 音声/動画のみを含む ZIP | 当該コンテンツはエントリを作らない（`page_count = 0`）。主コンテンツなら `NotAReadableWork` | `import/mod.rs:2225-2226`, `:2251-2255` |
+| ページ本文エントリ | 本文が 1 件以上あるときだけ `documents/text.jsonl`（`application/x-ndjson`、1 行 = `{"pageNumber":<int>,"text":"..."}`）を入れる。`metadata.json` を太らせずに本文を運ぶためのもの | `import/mod.rs:212`, `:929-941`, `:1316-1333` |
+| pack レベルフラグ | 常に `pack_flags::COMPRESSED`（`build_to_file_streaming(..., true, ...)`）、鍵があるとき（＝ログイン中の取り込み）のみ `ENCRYPTED`（**全エントリ**） | `import/mod.rs:1355-1360`, `builder.rs:278-290` |
+| エントリの compress | **`documents/text.jsonl` だけ `true`**（per-entry deflate）。他はすべて `false`（metadata.json / ページ / 表紙 / サムネ / EPUB 生データ） | `import/mod.rs:1327-1333`, `:1313`, `:1774`, `:1797-1805`, `:2217-2222`, `:2258-2272`, `:2875-2888` |
+| 暗号化の伝播 | `rename_content_in_pack` は元 pack の `ENCRYPTED` フラグを見て `pack_key` の有無を決め、エントリごとの `COMPRESSED` フラグも維持して再構築する | `import/mod.rs:986-1002` |
 | 検算例（フィクスチャ） | `plain.opfspack`: 3 件・pack フラグ `COMPRESSED`・index 244 B・`created_at = 1_728_000_000_000`（`metadata.json` 62 B 非圧縮 / `pages/page_0001.webp` 12,019 B → 圧縮 56 B / `pages/page_0002.webp` 6,019 B 非圧縮）。`encrypted.opfspack`: 同じ 3 件・pack フラグ `COMPRESSED \| ENCRYPTED`・各エントリの保存サイズは +16 B（暗号タグ）で `flags = ENCRYPTED`（`IDENTITY_BOUND` は立たない） | `crates/opfspack/tests/interop.rs:61-108`, `:151-186`（実測値は §4.10 の表と同じ） |
+
+**本文エントリの実測**（release ビルド、120 ページ・本文 約 453 B/ページ）: pack は **+3,856 B（+1.11%）**、Drive 復元は **+20〜29 ms**（≒ +0.2 ms/ページ）、取り込み時間の差は誤差。旧 pack（`source` 無し・本文エントリ無し）も今までどおり復元できる（`import/mod.rs:2668-2670`, `:2637-2639`）。
 
 ### 4.9 `metadata.json`（pack 内メタデータ）
 
-`finish_import` が必ず `metadata.json` を 1 件目として書く（`import/mod.rs:1002`）。内容は `metadata_entry()` が生成（`import/mod.rs:765-808`）:
+`finish_import` が必ず `metadata.json` を 1 件目として書く（`import/mod.rs:1310-1314`）。内容は `metadata_entry()` が生成（`import/mod.rs:874-927`）。**本文はここに入れず**、別エントリ `documents/text.jsonl`（§4.8）が運ぶ:
 
 | キー | 型 | 値 / 由来 | アンカー |
 |---|---|---|---|
-| `schemaVersion` | number | `1`（固定） | `import/mod.rs:797` |
-| `title` | string | ファイル名から拡張子を除いたもの（ZIP に PDF/EPUB が 1 つだけの場合は内側エントリ名から採る） | `import/mod.rs:758-763`, `:1680-1684` |
-| `author` | string | `""`（取り込み時は常に空。後から `books::set_metadata` で補完） | `import/mod.rs:799`, `db/books.rs:166-189` |
-| `circleName` | string | `""` | `import/mod.rs:800` |
-| `purchaseDate` | null | `null` | `import/mod.rs:801` |
-| `readingProgress.currentPage` | number | `0` | `import/mod.rs:802` |
-| `readingProgress.totalPages` | number \| null | 主コンテンツのページ数 | `import/mod.rs:802` |
-| `contents[]` | array | 1 コンテンツ 1 要素（下記） | `import/mod.rs:770-795` |
-| `contents[].contentId` | string | `book_contents.content_id`（UUID v4） | `import/mod.rs:774` |
-| `contents[].displayName` | string | 表示名（`本文` / フォルダ名 / ファイル名 / ユーザー設定名） | `import/mod.rs:775`, `:843-844` |
-| `contents[].mediaKind` | string | `image` / `pdf` / `epub` / `audio` / `video` | `import/mod.rs:776`, `:747-756` |
-| `contents[].isPrimary` | bool | 既定表示コンテンツか | `import/mod.rs:777` |
-| `contents[].sortOrder` | number | コンテンツの並び順（0 始まり） | `import/mod.rs:778` |
-| `contents[].formats[]` | array | レンディション。`formatId` / `label` / `formatKind` / `pageCount` / `packEntryPrefix` / `sortOrder` | `import/mod.rs:782-793` |
-| 復元側の対応 | — | `content_from_metadata` が同じキーを読み戻す。`mediaKind`/`formatKind` の未知値は `None`（そのコンテンツ/レンディションを捨てる） | `import/mod.rs:1999-2050`, `:2093-2103` |
-| 旧 pack 互換 | — | `contents` が無い pack は `infer_contents` が 1 コンテンツを推定（`pages/page_*` があれば `image`/接頭辞 `pages`、`.epub` なら `epub`、ルート直下 `.pdf` なら `pdf`。それ以外は空 → 復元しない） | `import/mod.rs:2052-2091` |
+| `schemaVersion` | number | `1`（固定。`source` を足しても上げない） | `import/mod.rs:907` |
+| `title` | string | ファイル名から拡張子を除いたもの（ZIP に PDF/EPUB が 1 つだけの場合は内側エントリ名から採る） | `import/mod.rs:1261`, `:867-872`, `:2200-2202`, `:2284` |
+| `author` | string | `""`（取り込み時は常に空。後から `books::set_metadata` で補完） | `import/mod.rs:909`, `db/books.rs:200-225` |
+| `circleName` | string | `""` | `import/mod.rs:910` |
+| `purchaseDate` | null | `null` | `import/mod.rs:911` |
+| `readingProgress.currentPage` | number | `0` | `import/mod.rs:912` |
+| `readingProgress.totalPages` | number \| null | 主コンテンツのページ数 | `import/mod.rs:912` |
+| `contents[]` | array | 1 コンテンツ 1 要素（下記） | `import/mod.rs:880-905` |
+| `contents[].contentId` | string | `book_contents.content_id`（UUID v4） | `import/mod.rs:884` |
+| `contents[].displayName` | string | 表示名（`本文` / フォルダ名 / ファイル名 / ユーザー設定名） | `import/mod.rs:885`, `:1288-1289` |
+| `contents[].mediaKind` | string | `image` / `pdf` / `epub` / `audio` / `video` | `import/mod.rs:886`, `:856-865` |
+| `contents[].isPrimary` | bool | 既定表示コンテンツか | `import/mod.rs:887` |
+| `contents[].sortOrder` | number | コンテンツの並び順（0 始まり） | `import/mod.rs:888` |
+| `contents[].formats[]` | array | レンディション。`formatId` / `label` / `formatKind` / `pageCount` / `packEntryPrefix` / `sortOrder` | `import/mod.rs:889-902` |
+| `source` | object（**任意**） | `siteId` / `productId`（`books.site_id` / `books.tbf_product_id` の元）。**`site_id` が空のときは書かない**（キー自体が無い）。読む側は無い pack を今までどおり扱う（後方互換） | `import/mod.rs:915-922`, `:2421-2429` |
+| 復元側の対応 | — | `content_from_metadata` が同じキーを読み戻す。`mediaKind`/`formatKind` の未知値は `None`（そのコンテンツ/レンディションを捨てる）。`source` は `restore_source` が `books` 行へ戻す（無い pack では何もしない） | `import/mod.rs:2694-2744`, `:2788-2797`, `:2631-2661` |
+| 旧 pack 互換 | — | `contents` が無い pack は `infer_contents` が 1 コンテンツを推定（`pages/page_*` があれば `image`/接頭辞 `pages`、`.epub` なら `epub`、ルート直下 `.pdf` なら `pdf`。それ以外は空 → 復元しない） | `import/mod.rs:2747-2787` |
 
 ### 4.10 相互運用の担保
 
@@ -449,9 +457,9 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 | foreign keys | `true` | — | `db/mod.rs:53` |
 | tokio ランタイム worker | `2` | スレッド | `db/mod.rs:36` |
 | テストプール最大接続 | `1` | 接続 | `db/mod.rs:467` |
-| `document_images` バッチ | `200` 行 / INSERT 文 | 行 | `db/documents.rs:268` |
-| `document_text` バッチ | `200` 行 / INSERT 文 | 行 | `db/documents.rs:311` |
-| `token_analysis` バッチ | `500` 行 / INSERT 文 | 行 | `db/documents.rs:346` |
+| `document_images` バッチ | `200` 行 / INSERT 文 | 行 | `db/documents.rs:287` |
+| `document_text` バッチ | `200` 行 / INSERT 文 | 行 | `db/documents.rs:331` |
+| `token_analysis` バッチ | `500` 行 / INSERT 文 | 行 | `db/documents.rs:373` |
 | `MAX_DISPLAY_NAME_CHARS` | `60` | 文字（バイトではない） | `db/contents.rs:168` |
 | 改名時の空白処理 | 連続空白（改行・タブ含む）を半角スペース 1 個に畳む → 60 文字で切る → 末尾空白を除去 | — | `db/contents.rs:175-186` |
 | `view_history.id` | `hex(randomblob(16))` = 32 文字 hex | — | `db/view_history.rs:26-28` |
@@ -496,26 +504,28 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 
 ### 6.1 `ImportError`（全 variant・定義と発生条件）
 
-定義: `crates/core/src/import/mod.rs:34-92`。
+定義: `crates/core/src/import/mod.rs:44-112`。
 
 | variant | `Display` 文字列（実装値） | 発生条件 | アンカー |
 |---|---|---|---|
-| `UnsupportedType(String)` | `unsupported file type: {0}` | `import_file` の拡張子が `pdf`/`epub`/`zip` 以外（文字列は小文字化した拡張子。拡張子なしは空文字） | `import/mod.rs:36-37`, `:1277` |
-| `Io(std::io::Error)` | `io error: {0}` | ソース読み込み・pack 書き出し・ディレクトリ作成の失敗（`?` 伝播、保存領域外を指す pack パスの拒否を含む） | `import/mod.rs:38-39`, `:1014-1018` |
-| `Pack(opfspack::PackError)` | `pack error: {0}` | pack 構築・読み出しの失敗（`builder.build` / `PackReader::open` / `read_entry`） | `import/mod.rs:40-41`, `:1009`, `:829`, `:861`, `:1835` |
-| `Db(sqlx::Error)` | `database error: {0}` | すべての DB 書き込み・読み出し失敗（`books::*` / `documents::*` / `contents::*` / `tags::*` の `?` 伝播） | `import/mod.rs:42-43` |
-| `Pdf(String)` | `pdf error: {0}` | `pdf.rs` の描画・読み込みエラーを文字列化（PDFium の `load` / `render` / RGB バッファ不正 / ライブラリのロード失敗 ほか）、および `import_rendered_pdf_pages` のページ 0 件 `"no pages rendered"` | `import/mod.rs:44-45`, `:1316`, `pdf.rs:57-79`, `:96-98`, `:110-116`, `:144-149`, `:166-183` |
-| `Image(String)` | `image error: {0}` | ① `image::load_from_memory` の失敗（壊れた画像。ページ単位では警告に落ちるが、単体画像取り込みやサムネ生成では致命） ② 主コンテンツのページ数 0 `"primary content has no pages: {display_name}"` ③ 改名時の `metadata.json` 再シリアライズ失敗を `Image(e.to_string())` として流用 | `import/mod.rs:46-47`, `:136`, `:154`, `:859`, `:1740`, `:2163` |
-| `Zip(String)` | `zip error: {0}` | `zip` crate のオープン/エントリ取得/伸長失敗、および内部不整合 `"entry index out of range"`（`plan` の ordinal が `metas` の範囲外） | `import/mod.rs:48-49`, `:296`, `:346`, `:1512`, `:1576` |
-| `EmptyArchive` | `empty archive` | ZIP のエントリが 0 件（`collect_metas_with_nested` の結果が空） | `import/mod.rs:50-51`, `:1518` |
-| `NotAReadableWork` | `not a readable work` | ① `commit_zip` で既定コンテンツが画像/PDF/EPUB 以外（音声・動画のみ） ② `plan.contents` が空（`get(plan.primary)` が `None`） | `import/mod.rs:54-55`, `:1569-1572`（UI 文言は `docs/import-patterns.md:687-691` §11.2 R3） |
-| `LoginRequired` | `本を取り込むには Google にログインしてください（本はアカウントごとの鍵で暗号化されます）` | 未ログイン（Google のプロフィールが無い）で取り込みを要求された。**平文 pack を作らない**（fail-closed。セキュリティ評価 F03）。UI はダウンロードを始める前にこれを出し、ログイン導線（Google の認証モーダル）を開く | `import/mod.rs:55-65`, `:252-255`, `crates/app/src/views/bookshelf.rs:3822`（`require_import_login`） |
-| `IdentityKeyUnavailable` | `Google にログイン済みですが、本を復号する鍵を取得できません。…`（長文。§10 §4.1 の fail-closed） | ログイン中なのに v3 のルート鍵（PRK）を用意できない（bundle が無い / どのラップも解けない / keyring 障害）。**平文 pack へは落とさない** | `import/mod.rs:66-76`, `:102` |
-| `PassphraseFailed` | `パスフレーズが違います。もう一度入力してください` | 入力されたパスフレーズでラップが解けない（**`sub` ラップへ黙って落ちない**） | `import/mod.rs:77-79`, `:103` |
-| `KeyStore(String)` | `本の鍵を取得できませんでした: {0}` | 鍵 bundle / keyring の入出力失敗（Drive の通信・壊れた bundle など）。`PackKeysError` のうち上 2 つ以外をここへ畳む | `import/mod.rs:80-82`, `:104-106` |
-| `IdentitySubMissing` | `Google アカウントの識別子（sub）を取得できません。設定画面からログインし直してください` | `sub` が空（userinfo の欠落・保存値の破損）。v3 では `owner_id` と `sub` ラップの鍵材料なので空文字は通さない | `import/mod.rs:83-91`, `:256-258` |
+| `UnsupportedType(String)` | `unsupported file type: {0}` | `import_file` の拡張子が `pdf`/`epub`/`zip` 以外（文字列は小文字化した拡張子。拡張子なしは空文字） | `import/mod.rs:46-47`, `:1668` |
+| `Io(std::io::Error)` | `io error: {0}` | ソース読み込み・pack 書き出し・ディレクトリ作成の失敗（`?` 伝播、保存領域外を指す pack パスの拒否を含む） | `import/mod.rs:48-49`, `:1346`, `:1385` |
+| `Pack(opfspack::PackError)` | `pack error: {0}` | pack 構築・読み出しの失敗（`build_to_file_streaming` / `PackReader::open` / `read_entry`。改名時の再構築も同じ） | `import/mod.rs:50-51`, `:1380-1382`, `:958-961`, `:993` |
+| `Db(sqlx::Error)` | `database error: {0}` | すべての DB 書き込み・読み出し失敗（`books::*` / `documents::*` / `contents::*` / `tags::*` の `?` 伝播） | `import/mod.rs:52-53` |
+| `Pdf(String)` | `pdf error: {0}` | `pdf.rs` の描画・読み込みエラーを文字列化（PDFium のロード失敗、PDF の読み込み、ページ数上限、描画・エンコード失敗、出力量の上限）、および `import_pdf_rendered` のページ 0 件 `"no pages rendered"` | `import/mod.rs:54-55`, `:1776-1778`, `pdf.rs:83`, `:175-186`, `:218-240`, `:289-308` |
+| `Image(String)` | `image error: {0}` | ① `image::load_from_memory` の失敗（壊れた画像。ページ単位では警告に落ちるが、単体画像取り込みやサムネ生成では致命） ② 主コンテンツのページ数 0 `"primary content has no pages: {display_name}"` ③ 改名時の `metadata.json` 再シリアライズ失敗を `Image(e.to_string())` として流用 | `import/mod.rs:56-57`, `:164-175`, `:193`, `:991`, `:2251-2255`, `:2859` |
+| `Zip(String)` | `zip error: {0}` | `zip` crate のオープン/エントリ取得/伸長失敗、および内部不整合 `"entry index out of range"`（`plan` の ordinal が `metas` の範囲外） | `import/mod.rs:58-59`, `:379`, `:1218`, `:2051`, `:2090` |
+| `EmptyArchive` | `empty archive` | ZIP のエントリが 0 件（`collect_metas_with_nested` の結果が空） | `import/mod.rs:60-61`, `:1977` |
+| `NotAReadableWork` | `not a readable work` | ① `commit_zip` で既定コンテンツが画像/PDF/EPUB 以外（音声・動画のみ） ② `plan.contents` が空（`get(plan.primary)` が `None`） | `import/mod.rs:62-65`, `:2083-2086`, `:2251-2255`（UI 文言は `docs/import-patterns.md:701-705` §11.2 R3） |
+| `LoginRequired` | `本を取り込むには Google にログインしてください（本はアカウントごとの鍵で暗号化されます）` | 未ログイン（Google のプロフィールが無い）で取り込みを要求された。**平文 pack を作らない**（fail-closed。セキュリティ評価 F03）。UI はダウンロードを始める前にこれを出し、ログイン導線（Google の認証モーダル）を開く | `import/mod.rs:66-76`, `:296`, `crates/app/src/views/bookshelf.rs:4178`（`require_import_login`） |
+| `ZipTooLarge { detail }` | `この ZIP は大きすぎて取り込めません（{detail}）` | 外側 ZIP のエントリ数（`opfspack::MAX_ENTRY_COUNT`）/ 中央ディレクトリが宣言する展開後サイズの合計（`opfspack::MAX_TOTAL_SIZE`）が上限を超える（**展開の前**に弾く） | `import/mod.rs:77-81`, `:1987`, `:1996` |
+| `SourceTooLarge { size, limit }` | `この本は大きすぎて取り込めません（{size} バイト。上限は {limit} バイト）` | 取り込み元ファイルが `MAX_IMPORT_SOURCE_BYTES`（10 GiB）超。**読む前**にメタデータで検査する | `import/mod.rs:82-85`, `:1649` |
+| `IdentityKeyUnavailable` | `Google にログイン済みですが、本を復号する鍵を取得できません。…`（長文。§10 §4.1 の fail-closed） | ログイン中なのに v3 のルート鍵（PRK）を用意できない（bundle が無い / どのラップも解けない / keyring 障害）。**平文 pack へは落とさない** | `import/mod.rs:86-96`, `:122` |
+| `PassphraseFailed` | `パスフレーズが違います。もう一度入力してください` | 入力されたパスフレーズでラップが解けない（**`sub` ラップへ黙って落ちない**） | `import/mod.rs:97-99`, `:123` |
+| `KeyStore(String)` | `本の鍵を取得できませんでした: {0}` | 鍵 bundle / keyring の入出力失敗（Drive の通信・壊れた bundle など）。`PackKeysError` のうち上 2 つ以外をここへ畳む | `import/mod.rs:100-102`, `:126` |
+| `IdentitySubMissing` | `Google アカウントの識別子（sub）を取得できません。設定画面からログインし直してください` | `sub` が空（userinfo の欠落・保存値の破損）。v3 では `owner_id` と `sub` ラップの鍵材料なので空文字は通さない | `import/mod.rs:103-111`, `:300` |
 
-非致命の扱い（エラーにしない）: `warnings: Vec<String>` に積む。形式は主に `"{エントリ名}: {理由}"`（例: 壊れた画像・入れ子上限・入れ子破損）。`ImportedBook.warnings` として呼び出し側へ返す（`import/mod.rs:26-29`, `:409-468`, `:1534`, `:1631`）。
+非致命の扱い（エラーにしない）: `warnings: Vec<String>` に積む。形式は主に `"{エントリ名}: {理由}"`（例: 壊れた画像・入れ子上限・入れ子破損）。`ImportedBook.warnings` として呼び出し側へ返す（`import/mod.rs:28-29`, `:517-580`（入れ子 ZIP）, `:2017`, `:2143`（壊れたページ画像））。
 
 ### 6.2 `PackError`（全 variant）
 
@@ -538,10 +548,10 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 |---|---|---|
 | エラー型 | リポジトリ層に専用エラー型は無く、すべて `Result<_, sqlx::Error>` | `crates/core/src/db/*.rs` 全関数 |
 | マイグレーション失敗 | `sqlx::migrate::MigrateError` を `sqlx::Error::Protocol(e.to_string())` に変換して返す | `crates/core/src/db/mod.rs:195-198` |
-| バックアップ取り込みの JSON 不正 | `serde_json` のエラーを `sqlx::Error::Protocol` に変換 | `crates/core/src/db/backup.rs:61-63` |
+| バックアップ取り込みの JSON 不正 | `serde_json` のエラーを `sqlx::Error::Protocol` に変換 | `crates/core/src/db/backup.rs:374-375` |
 | 初回クリアの失敗 | `DELETE`（16 テーブル）とファイル操作は `let _ =` で**握り潰し**、`settings::set` のフラグ書き込みだけ `?` で伝播 | `crates/core/src/db/mod.rs:419-457` |
-| トランザクション | `books::delete`（孫→子→親の 8 文）、`contents::insert_batch`、`documents::insert_*_batch`、`tags::set_for_book`（DELETE→INSERT）、`contents::set_primary`（2 文）は `pool.begin()` + `commit()`。途中失敗時はロールバック（`tx` の drop） | `db/books.rs:365-389`, `db/contents.rs:41-83`, `:148-165`, `db/documents.rs:260-371`, `db/tags.rs:18-44` |
-| 空スライス短絡 | `insert_images_batch` / `insert_texts_batch` / `insert_tokens_batch` は空入力で `Ok(())` | `db/documents.rs:261-263`, `:304-306`, `:339-341` |
+| トランザクション | `books::delete`（孫→子→親の 8 文）、`contents::insert_batch`、`documents::insert_*_batch`、`tags::set_for_book`（DELETE→INSERT）、`contents::set_primary`（2 文）は `pool.begin()` + `commit()`。途中失敗時はロールバック（`tx` の drop） | `db/books.rs:365-389`, `db/contents.rs:41-83`, `:148-165`, `db/documents.rs:271-382`, `db/tags.rs:18-44` |
+| 空スライス短絡 | `insert_images_batch` / `insert_texts_batch` / `insert_tokens_batch` は空入力で `Ok(())` | `db/documents.rs:282-284`, `:325-327`, `:367-369` |
 | 存在しない行 | `get` 系は `fetch_optional` → `Ok(None)`。`fetch_one` は `sqlx::Error::RowNotFound` になり得る（`pragma_table_info` の COUNT は常に 1 行を返す） | `db/books.rs:145-151`, `db/mod.rs:65-84` |
 | FK 制約違反 | `ON DELETE CASCADE` が無い子テーブルは明示削除が必要。`books::delete` のコメントが「呼び出し側が `let _ =` で握り潰すと無言で失敗する」と警告 | `db/books.rs:356-363` |
 | アプリ側の握り潰し例 | サイト表紙キャッシュやオプション処理は `let _ =` / `if let Err(error) = ... { log::warn!(...) }` | `crates/app/src/views/bookshelf.rs:3359`, `crates/core/src/drive/sync.rs:172-176` |
@@ -553,14 +563,14 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 
 | # | 不明点 | 理由 |
 |---|---|---|
-| 1 | `crates/core/src/db/schema.sql` がどうやって更新・検証されるか（Web 版スキーマとの同期手順、差分チェックの有無） | リポジトリ内に参照が一切無い（`db/mod.rs:200` のコメントと `docs/database.md:4` のみ）。生成スクリプト・テストも見つからない |
-| 2 | `document_text` / `token_analysis` の `content_id` を INSERT で埋めない理由（列は存在し既定値 `''` だが、常に空になる） | `db/documents.rs:240-258`, `:338-371` の INSERT 文に列が無く、意図を述べたコメントも無い |
-| 3 | `book_first_events` / `zenn_tag_metadata` の書き込み経路、`product_sample_pages.pack_id` / `pack_entry_path` を埋める経路 | `crates/core/src/db/**` に該当の書き込み関数が無い（`samples.rs` は `pack_id`/`pack_entry_path` を書かない）。範囲外モジュールにあるか未実装かは判断できない |
-| 4 | `books.page_count` / `bookshelf_items.page_count` に入る値の定義（何ページを指すか） | 本担当範囲（FANZA/DLsite 同期）にその代入コードが無い |
-| 5 | import が `entry_flags::COMPRESSED` を一切立てない理由 | 呼び出し側は全エントリ `compress=false` 固定（`import/mod.rs:1002`, `:1640-1645`, `:1672-1677`, `:1703-1710`, `:1746-1758`）。判断根拠のコメントは無い |
-| 6 | DEFLATE レベル `6` の根拠（TS の fflate 既定と一致するか） | `builder.rs:70` の値のみ。TS 側ソースは本リポジトリに無い |
+| 1 | `crates/core/src/db/schema.sql` がどうやって更新・検証されるか（Web 版スキーマとの同期手順、差分チェックの有無） **（未確認）** | 参照は `crates/core/src/db/mod.rs:200-201` のコメントと `docs/database.md:4` のみ（`schema.sql` を扱うビルド手順・スクリプト・テストはリポジトリ内に無い。`.mise.toml` / `scripts/` / `.github/` にも無い）。更新手順・差分チェックの有無は**未確認** |
+| 2 | ~~`document_text` / `token_analysis` の `content_id` を INSERT で埋めない理由（列は存在し既定値 `''` だが、常に空になる）~~ → **解消**（理由はコードにコメント済み。`db/documents.rs:44-52`, `:62-63`） | 書き込み元の構造体が `content_id` を持たず（`db/documents.rs:53-75`）、INSERT 文にも列が無い（`:264-266`, `:333-335`, `:375-377`, `:453-455`）。読み出しも `document_id` 単位（`all_text_for_document` = `:421-428`）で、タグ生成は全コンテンツ分のテキストを連結せず 1 回にまとめて渡す（`import/mod.rs:1537-1538`）。**コンテンツ別に本文を引く経路が無い**（コンテンツ別検索は未実装）ため、移行が足した列（`db/mod.rs:164-178`。`DEFAULT ''` のまま）は空で残す |
+| 3 | ~~`book_first_events` / `zenn_tag_metadata` の書き込み経路、`product_sample_pages.pack_id` / `pack_entry_path` を埋める経路~~ → **解消**（経路の有無は確定。**列を作る意図は未確認**） | `book_first_events` / `zenn_tag_metadata` を書くアプリの経路は無く、書き込みはバックアップ復元 `backup::import_json`（`backup.rs:385-388` が `TABLES` を総なめ。対象は `:37`, `:41`。PK は `:455`, `:457`）とテストの生 INSERT（`:1070-1073`）のみ。通常フローの生成コードは無い（`book_first_events` は `owner_sub` 付与の対象 = `backup.rs:172-178`、全消しの対象 = `db/mod.rs:437-441`, `:479-483`）。`product_sample_pages.pack_id` / `pack_entry_path` も書き込み経路が無く、`db/samples.rs` の構造体・INSERT・SELECT に列が無い（`:5-16`, `:22-26`, `:53-67`）。書き込み側は `samples::insert_sample_page`（呼び出しは `crates/app/src/views/checklist.rs:644-651`）だけ。列は schema にだけ存在する（`crates/core/migrations/0001_init.sql:225-226`, `db/schema.sql:285-286`） |
+| 4 | ~~`books.page_count` / `bookshelf_items.page_count` に入る値の定義（何ページを指すか）~~ → **解消**（プロダクション経路では常に NULL） | `books.page_count` を書くのは `books::set_source_metadata`（`db/books.rs:245-283`）だけで、呼び出しは DLsite 取り込み時のみ（`crates/app/src/views/bookshelf.rs:4659-4675`）。そこへ渡るのは `bookshelf_items.page_count` だが、同期はどのサイトも `None` を書く（FANZA = `crates/core/src/fanza/sync.rs:201`、DLsite = `dlsite/sync.rs:249`、技術書典 = `tbf/sync.rs:130`、BOOTH = `crates/app/src/views/bookshelf.rs:3492`）。取り込みが作る `books` 行も `None`（`import/mod.rs:1363`）。よって「何ページを指すか」の定義は現行コードに無い（`Some` を入れるのはテストだけ = `crates/core/tests/db.rs:1271`, `:1445`） |
+| 5 | ページ・表紙・サムネイル・EPUB 生エントリを `compress=false` のままにしている理由 **（未確認）** | これらのエントリは今も `compress=false` で、`store.push` / `pack_entries.push` に `compress` を渡す経路が無い（`import/mod.rs:1313`（メタ JSON）/ `:1774`（PDF ページ）/ `:1797-1805`（表紙・サムネイル）/ `:2151-2157`, `:2183-2189`（画像/PDF レンディション）/ `:2217-2222`（EPUB）/ `:2258-2272`（ZIP の表紙・サムネイル）/ `:2875-2888`（単体画像））。**本文エントリ（`documents/text.jsonl`）だけは `compress=true`**（`:1327-1333`。理由はコードコメント = テキストは deflate が効く）。既存 pack を組み直す `rename_content_in_pack` は元の flags を引き継ぐ（`:995`）。pack レベルは常に `true`（`:1355-1360`）。「中身が既圧縮（WebP / EPUB）で利得が小さい」は §8-2 の推測で、コード・TS 版ソースのどちらにも判断根拠が無いため**未確認**（根拠を述べたコメントも無い） |
+| 6 | DEFLATE レベル `6` の根拠（TS の fflate 既定と一致するか） **（未確認）** | 実装は `raw_deflate(&bytes, 6)`（`crates/opfspack/src/builder.rs:231`）でレベル 6 固定。`raw_deflate` の doc コメントも RAW DEFLATE（zlib ヘッダ無し・fflate `deflateSync` 互換）までで、レベルの根拠は書いていない（`:393-400`）。TS 版ソースは本リポジトリに無い（相互運用フィクスチャは TS 実装 + fflate 0.8.2 製 = `crates/opfspack/tests/interop.rs:1-22`）ため、fflate の既定値と一致するかは**未確認** |
 | 7 | ~~pack・エントリ単位のサイズ上限（1 pack 最大バイト数等）~~ → **実装済み（R04）**: `MAX_ENTRY_SIZE` = 512 MiB / `MAX_TOTAL_SIZE` = 2 GiB / `MAX_STORED_ENTRY_SIZE` = 2 GiB / `MAX_ENTRY_COUNT` = 10,000 を index 解析時に強制する（§4.6.1）。値は既知の正常本（展開後 1.33 GB・3,321 ページ）を通すため、1 エントリ 512 MiB は取り込み側の `MAX_ZIP_ENTRY_BYTES` と同値、件数は取り込み側の `MAX_NESTED_ENTRIES = 2000` とは**別物**として 10,000 とした | `lib.rs:58-72`, `reader.rs:177-262`, `tests/limits.rs`。取り込み側の上限（通常エントリ 512 MiB / 入れ子 ZIP 512 MiB / 2000 件、HTTP 応答 2 GiB）は §3.3 のままで、pack 読み出しとは独立 |
-| 8 | `books.cover_thumbnail` を埋める経路 | 取り込みは常に `None`（`import/mod.rs:933`）。Drive 取り込みも `None`（`drive/sync.rs:149`） |
+| 8 | `books.cover_thumbnail` を埋める経路 | 取り込みは常に `None`（`import/mod.rs:1347`）。Drive 取り込みも `None`（`drive/sync.rs:213`） |
 | 9 | `view_history.started_at` / `ended_at` をローカル時刻へ直す責務の所在（コメントは「表示側でローカルに直す」） | `db/view_history.rs:142-160` は `chrono::Local` で日付集計するが、どの層が正かは本担当範囲外（詳細は `local://spec-core.md` を参照） |
 | 10 | PDFium ライブラリ（`pdfium.dll` / `libpdfium.dylib`）の配布手順・バージョン整合（feature `pdfium_7881`） | 依存宣言のみで、取得の手順は本担当範囲のファイルに無い（配布物は `.github/workflows/release.yml`、開発/テスト用は `scripts/fetch-pdfium.sh` = `mise run pdfium` が `crates/core/` へ取得する） |
 
@@ -569,12 +579,12 @@ index の `size` / `compressed_size` / `entry_count` は攻撃者が自由に書
 | # | 推測 | 根拠 |
 |---|---|---|
 | 1 | `schema.sql` は Web 版から持ち込んだ「参照用の正本」で、実 DB の最終形は `0001_init.sql` + `migrate()` の runtime DDL が作る | コードからの参照がコメントのみ（`db/mod.rs:200`）、`docs/database.md:3-7` が「後発テーブルは migrate() 内の冪等 DDL で適用」と明記。`schema.sql` にしか無いテーブル・列と、runtime DDL にしか無いテーブル（`view_history` / `page_notes`）が混在している |
-| 2 | エントリ単位の圧縮を常に無効にしているのは、中身が WebP（既圧縮）で deflate の利得が小さいため | ページ・表紙・サムネイルはすべて `image/webp`（`import/mod.rs:1640-1645`, `:1746-1758`）。`build(pack_key.as_ref(), true)` で pack フラグだけ立てている（`:1009`） |
-| 3 | pack レベル `COMPRESSED` を常に立てるのは TS 実装のグローバル既定に合わせるため | `builder.rs:55-58` の doc コメント「`compress` sets the pack-level flag (and is the TS global default)」 |
-| 4 | `document_text` / `token_analysis` に `content_id` を入れないのは、テキスト利用（タグ生成）が本全体単位で、コンテンツ別検索が未実装だから | `finish_import` は全コンテンツのテキストを連結せずそのまま投入し、`tags::generate_tags` には全テキスト配列を渡す（`import/mod.rs:1192-1236`）。`content_id` 列は移行で `DEFAULT ''` として足されただけ（`db/mod.rs:164-177`） |
+| 2 | エントリ単位の圧縮を（本文エントリを除いて）無効にしているのは、中身が WebP / EPUB（どちらも既圧縮）で deflate の利得が小さいため | ページ・表紙・サムネイルはすべて `image/webp`、EPUB は `application/epub+zip` のまま 1 エントリで入る（`import/mod.rs:1774`, `:1797-1805`, `:2151-2157`, `:2183-2189`, `:2217-2222`, `:2258-2272`, `:2875-2888`）。pack フラグだけ立てている（`:1355-1360`）。**本文エントリ（`documents/text.jsonl`）は `compress=true`**（`:1327-1333`）で、テキストは実際に圧縮が効く（実測は §4.8 の本文エントリの項）。根拠がコードに無いため §7-5 は**未確認**のまま（推測であることを崩さない） |
+| 3 | pack レベル `COMPRESSED` を常に立てるのは TS 実装のグローバル既定に合わせるため | `crates/opfspack/src/builder.rs:63-64` の doc コメント「`compress` sets the pack-level flag (and is the TS global default)」 |
+| 4 | ~~`document_text` / `token_analysis` に `content_id` を入れないのは、テキスト利用（タグ生成）が本全体単位で、コンテンツ別検索が未実装だから~~ → **§7-2 で解消**（書き込み側の構造体が `content_id` を持たず、読み出しも document 単位。`import/mod.rs:1537-1538` が全コンテンツ分を連結せずまとめてタグ生成へ渡す） | 根拠は §7-2 と同じ（`db/documents.rs:44-52`, `:421-428`; `import/mod.rs:1537-1538`） |
 | 5 | 付箋 id を決定論的（`note-{book_id}-{content_id}-{page}`）にしたのは、リーダーと付箋画面の 2 経路から同じ行を UPSERT するため | 両画面が同一書式で id を作る（`crates/app/src/views/reader.rs:598-599`, `crates/app/src/views/notes.rs:305`）。UUID だと二重登録になる |
 | 6 | サムネイル行の `page_number` が常に `1` なのは「1 ページ目＝表紙」規約に合わせるため | `thumbnail_of` の入力は常に先頭ページ（`import/mod.rs:1063-1082` の `primary_thumbnail` は legacy 第 1 ページ、PDF 経路は `pages[0]`） |
-| 7 | `MAX_NESTED_BYTES = 512 MiB` は「外側 ZIP の実データ展開後 1.33 GB より小さく、実在する補助的な入れ子（1 階層）を弾かない」値として選ばれた | `import/mod.rs:187-191` のコメント（実データ最大 1.33GB / 入れ子は補助的 / 解凍爆弾対策）。`docs/import-patterns.md:672-681`（R1）と一致 |
+| 7 | `MAX_NESTED_BYTES = 512 MiB` は「外側 ZIP の実データ展開後 1.33 GB より小さく、実在する補助的な入れ子（1 階層）を弾かない」値として選ばれた | `import/mod.rs:187-191` のコメント（実データ最大 1.33GB / 入れ子は補助的 / 解凍爆弾対策）。`docs/import-patterns.md:686-695`（R1）と一致 |
 | 8 | `page_notes.page` が 1-indexed なのは `document_images.page_number`（1 始まり）に揃えたため | `import/mod.rs:1555-1556` がページを 1 始まりで採番し、`db/notes.rs:157-178` が `page > 0` を要求して `-1` して 0-indexed に変換している |
 
 ---

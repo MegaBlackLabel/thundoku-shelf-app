@@ -297,6 +297,14 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
     （`sync_all`）はサイト絞り込み中ならそのサイトだけ、絞り込み無しなら 4 サイトすべてを回す
     （同じ `sync_site` を使う。サイト id の一覧は `SYNC_SITE_IDS`）
   - ダウンロードはバックグラウンドで実行され、進捗（%・ラベル）がカードに表示
+  - **1 商品に複数のファイルがある本（BOOTH）は、どれを取り込むかを選べる**:
+    同期が `downloadables` の候補を文書順に全部集めて `bookshelf_items.download_options` に
+    保存し、候補が **2 件以上のときだけ**「ダウンロードするファイルを選んでください」を出す。
+    1 件以下は従来どおり即ダウンロード、キャンセルは何も始めない、選択は記憶しない。
+    お気に入りの自動ダウンロードはモーダルを出さず**先頭のファイル**を落とす
+    （`crates/core/src/booth.rs:645-712`, `:826-854`;
+    `crates/core/src/db/mod.rs:303-313`;
+    `crates/app/src/views/bookshelf.rs:4224-4239`, `:5958-5981`, `:9124-9195`）
   - **取り込みには Google ログインが要る**: pack の鍵（v3 の PRK）は Google アカウントごとに
     作るため、未ログインでは取り込めない（**平文 pack を作らない** = fail-closed。セキュリティ
     評価 F03）。ダウンロードを**始める前**に判定し、未ログインなら
@@ -744,7 +752,10 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
 - トークンは keyring に保存。401 時は自動リフレッシュ
 - **同期フォルダ**: My Drive 直下の `thundoku-shelf/` フォルダ（Web 版の
   appdata ではなく、ユーザー可視のフォルダで Web 版とファイルを共有する）
-  - フォルダ ID は初回同期時に作成し、`app_settings["drive.sync.folder_id"]` に保存
+  - フォルダ ID は初回同期時に確保する（`app_settings["drive.sync.folder_id"]` に保存）:
+    ルート直下の同名フォルダを先に探し、**あれば再利用**する。1 つも無ければ作成する。
+    複数あるときは `modifiedTime` が新しい方を使い、件数と ID を警告ログに出す
+    （むやみに増やさない・消さない）
 - **ファイル名**: `{bookId}.opfspack`（パック ID がそのままファイル名になる）。
   `appProperties: { app: "thundoku-shelf", packId }` を付与
 - **双方向同期**: Drive 側の `md5Checksum` と `drive_sync_state.md5` を比較し、
@@ -875,7 +886,7 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
 | シナリオ | できること |
 |---|---|
 | DB + パック両方無事 | 完全復元 |
-| DB だけ無事、パック消失 | メタ・進捗・属性は復元。ページ画像はパックが必要 → ① Drive からパック再取得（`drive.sync.enabled` 連動でバックアップ済み）② or サイトから再ダウンロード（`download_url` / `tbf_product_id` が DB に有る。ただしログインセッション（7 日で失効する暗号化保存）が要る） |
+| DB だけ無事、パック消失 | メタ・進捗・属性は復元。ページ画像はパックが必要 → ① Drive からパック再取得（`drive.sync.enabled` が ON かつ「書籍のバックアップ」が ON なら Drive に上がっている。1 GiB 超の pack は取り込み時に自動で対象外になる）② or サイトから再ダウンロード（`download_url` / `tbf_product_id` が DB に有る。ただしログインセッション（7 日で失効する暗号化保存）が要る） |
 | パックだけ無事、DB 消失 | パックは「名前の無い画像の山」。DB を Drive バックアップ（`thundoku-backup.json`）から復元すればパックと再リンク |
 
 > まとめ: **属性（どこ・何・どこから取るか）は DB、中身（画像）はパック。**
@@ -910,10 +921,16 @@ Windows: `rmdir /s %APPDATA%\thundoku-shelf`。表紙キャッシュや進捗・
 
 - [x] **PC の保存先を変更できるようにする** — 設定から変更でき、変更時は既存ファイル
   （DB / packs / thumbnails / downloads）を新しい保存先へ移動する（失敗時はロールバック）
-- [x] **opfspack も Google Drive にバックアップ** — 同期実装済み。残: 設定に
-  「書籍のバックアップ」ON/OFF を足す（現在は `drive.sync.enabled` に連動して常時同期）
-- [x] **チェックリストをバックアップ対象に** — `checked_items` / `tbf_events` は対象化。
-  残: `product_sample_pages`（試し読み）
+- [x] **opfspack も Google Drive にバックアップ** — 同期実装済み。設定の
+  「書籍のバックアップ」（`drive.sync.books`。**行が無ければ ON**）で pack の送受信だけを
+  止められる。OFF でも DB バックアップ（`thundoku-backup.json`）と pack 鍵 bundle
+  （`thundoku-keys.json`）は同期する（失うものが別なので止めない）
+  （`crates/core/src/drive/sync.rs:295-303`, `:369`, `:492`, `:823-833`;
+  `crates/app/src/views/settings.rs:1359`, `:2741-2787`）
+- [x] **チェックリストをバックアップ対象に** — `checked_items` / `tbf_events` /
+  `product_sample_pages`（試し読み）を対象化。試し読みは画像本体（`image_data`）を
+  除いたページのメタ（`image_url` / ページ番号 / 寸法）だけを運び、開くときに
+  自サイトの `/api/image/` から取り直す。所有者は親の `checked_items` を復号して判定する
 - [x] **チェックリストのポーリング受信** — イベント詳細のトグルで ON にしたイベントを
   Workspace 常駐ポーラーが取得（既定 5 分・下限 1 分）。**変化があったときだけ** Drive へ。
   注目イベント（現行の技術書典）は行を作るときに既定で ON。全データ削除や初回インストール

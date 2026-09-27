@@ -32,6 +32,7 @@ use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, documents, progress};
 use thundoku_core::dlsite::client::DlsiteClient;
 use thundoku_core::fanza::client::FanzaClient;
+use thundoku_core::import::ImportSource;
 use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE, UreqTransport};
 
 use crate::actions::{
@@ -1273,6 +1274,9 @@ pub struct BookshelfView {
     pending_download_confirm: Option<bookshelf::BookshelfItem>,
     /// 2 GiB 超の本のダウンロード確認（表示中だけ。UI が「取得する」で再開する）
     pending_large_download: Option<(bookshelf::BookshelfItem, u64)>,
+    /// 1 商品に複数のダウンロード（BOOTH の PDF + 画像 ZIP 等）がある本の
+    /// ファイル選択（表示中だけ。選んだら `start_download` を選び直して再開する）
+    pending_file_choice: Option<PendingFileChoice>,
     /// このセッションで「2 GiB 超でも取得する」と確認済みの本
     /// （再試行や同じ本の再ダウンロードで二度聞かない）
     confirmed_large_downloads: std::collections::HashSet<String>,
@@ -1337,6 +1341,19 @@ pub(crate) struct PendingCancelDownload {
     pub(crate) title: String,
 }
 
+/// 複数ダウンロードのファイル選択（表示中だけ持つ）。
+///
+/// BOOTH は 1 商品に複数ファイル（PDF + 画像 ZIP 等）がある本があり、
+/// `start_download` はどれを取得するか決められないため、いったんここで待つ。
+/// 選ばれたら [`choose_download`] で候補を差し替えて `start_download` を再開する。
+#[derive(Clone)]
+pub(crate) struct PendingFileChoice {
+    /// 選択前のアイテム（`start_download` に渡されたもの）
+    pub(crate) item: bookshelf::BookshelfItem,
+    /// 選ばせる候補（文書順。2 件以上）
+    pub(crate) options: Vec<thundoku_core::booth::DownloadOption>,
+}
+
 /// 確認モーダルに出す 1 コンテンツ分の要約。
 #[derive(Clone)]
 pub(crate) struct ImportChoice {
@@ -1391,6 +1408,21 @@ const DLSITE_TAG_FETCH_PER_RUN: usize = 100;
 /// 選択肢 1 行の高さ（名前 + 種別・詳細の 2 行ぶん）。
 /// リストの高さを「行数 × これ」で決めるために使う（上限で打ち切る）。
 const IMPORT_CHOICE_ROW_H: f32 = 48.0;
+
+/// 複数ダウンロードの選択リストの高さの上限と 1 行の高さ。
+/// 1 商品に何ファイルあるかは読めない（絵師のまとめ売りは数十件になる）ため、
+/// 高さを抑えてリストだけをスクロールさせ、フッターのボタンを画面内に残す。
+const FILE_CHOICE_MAX_H: f32 = 360.0;
+const FILE_CHOICE_ROW_H: f32 = 40.0;
+
+/// 複数ダウンロードの選択肢に出す名前（ファイル名が取れなければ連番）。
+fn file_choice_label(option: &thundoku_core::booth::DownloadOption, index: usize) -> String {
+    option
+        .name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("ファイル {}", index + 1))
+}
 
 /// 確認モーダルを出すか（§6.3: 形式が複数 / コンテンツが複数 / 差分セット）。
 fn import_needs_confirmation(plan: &thundoku_core::import::ImportPlan) -> bool {
@@ -1809,6 +1841,7 @@ impl BookshelfView {
             last_search: String::new(),
             pending_download_confirm: None,
             pending_large_download: None,
+            pending_file_choice: None,
             confirmed_large_downloads: std::collections::HashSet::new(),
             pending_sync_notice: None,
             pending_cancel_download: None,
@@ -2314,6 +2347,7 @@ impl BookshelfView {
                             event_id: None,
                             file_name: None,
                             download_url: None,
+                            download_options: None,
                             is_downloadable: 0,
                             is_checked: 0,
                             is_purchased: 0,
@@ -3469,6 +3503,11 @@ impl BookshelfView {
                             event_id: None,
                             file_name: item.file_name.clone(),
                             download_url: item.download_url.clone(),
+                            // 1 商品に複数ファイル（PDF + 画像 ZIP 等）がある本は
+                            // 候補を全部保存し、ダウンロード時に選ばせる
+                            download_options: thundoku_core::booth::encode_download_options(
+                                &item.download_options,
+                            ),
                             is_downloadable: 1,
                             is_checked: 0,
                             is_purchased: 1,
@@ -4124,7 +4163,7 @@ impl BookshelfView {
 
     /// 技術書典の本をダウンロードしてインポートする。
     pub fn download_item(&mut self, cx: &mut Context<Self>, item: bookshelf::BookshelfItem) {
-        self.start_download(cx, item, false);
+        self.start_download(cx, item, false, false);
     }
 
     /// 取り込み（ダウンロード）の前提を満たしているか（**F03 の fail-closed**）。
@@ -4157,12 +4196,17 @@ impl BookshelfView {
     }
 
     /// ダウンロードを開始する。`auto` = お気に入りの自動ダウンロード（終わったら
-    /// 待ち行列の次の 1 件を開始する）。開始できたら true。
+    /// 待ち行列の次の 1 件を開始する）。`file_choice_confirmed` = ファイル選択
+    /// （複数ダウンロード）を通ってきた（`false` なら必要に応じて確認を出す）。
+    ///
+    /// 戻り値: 開始した、または**ファイル選択の確認待ちに入った**ら true
+    /// （確認待ちは `pending_file_choice` が持つ。キャンセルされたら何も始まらない）。
     fn start_download(
         &mut self,
         cx: &mut Context<Self>,
         item: bookshelf::BookshelfItem,
         auto: bool,
+        file_choice_confirmed: bool,
     ) -> bool {
         // 未ログインでは取り込めない（鍵はアカウントごと。F03）。ダウンロードも
         // 取り込みも始める前にログインを促す（自動ダウンロードではモーダルを開かない）。
@@ -4176,6 +4220,22 @@ impl BookshelfView {
         // 終了時アップロード中はダウンロードを開始しない
         if Self::is_exit_uploading(cx) {
             return false;
+        }
+        // 1 商品に複数のダウンロード（BOOTH の PDF + 画像 ZIP 等）がある本は、
+        // **どれを取得するか**を先に選んでもらう（選ぶまで何も始めない）。
+        // 候補が 1 件以下の本は今までどおり即開始する。自動ダウンロード
+        // （お気に入り）は利用者が要求した操作ではないのでモーダルを出さず先頭を使う。
+        // 1 商品に複数のダウンロード（BOOTH の PDF + 画像 ZIP 等）がある本は、
+        // **どれを取得するか**を先に選んでもらう（選ぶまで何も始めない）。
+        // 候補が 1 件以下の本は今までどおり即開始する。自動ダウンロード
+        // （お気に入り）は利用者が要求した操作ではないのでモーダルを出さず先頭を使う。
+        if !auto && !file_choice_confirmed {
+            let options = item.download_choices();
+            if options.len() > 1 {
+                self.pending_file_choice = Some(PendingFileChoice { item, options });
+                cx.notify();
+                return true;
+            }
         }
         let database_id = item.database_id.clone();
         // 2 GiB 超の確認: このセッションで確認済みなら worker はそのまま進む
@@ -4504,6 +4564,13 @@ impl BookshelfView {
                             .flatten(),
                     }
                 };
+                // 取り込み元を pack の metadata.json に持たせる（Drive から pack だけで
+                // 復元したときも site 紐付け・重複抑止に乗るようにする）。サイトが
+                // 分からない経路（空の site_id）は書かない。
+                let import_source = (!site_id.is_empty()).then(|| ImportSource {
+                    site_id: site_id.clone(),
+                    product_id: product_id.clone(),
+                });
                 let imported = if extension == "pdf" {
                     // PDF のレンダリング（重い）は DB を触る前に終わる（`import_pdf_bytes` の
                     // 中で レンダリング → pack → DB の順に進む）。**1 ページずつ** pack へ
@@ -4517,6 +4584,7 @@ impl BookshelfView {
                         Some(&root_key),
                         &mut on_import,
                         reuse_book_id.as_deref(),
+                        import_source.as_ref(),
                     )
                     .map_err(import_failure)?;
                     // ダウンロード元のサイトを記録（ビューアー設定のサイト別キー用）
@@ -4576,6 +4644,7 @@ impl BookshelfView {
                                 &packs_dir,
                                 Some(&root_key),
                                 reuse_book_id.as_deref(),
+                                import_source.as_ref(),
                             )
                         }
                         "zip" => {
@@ -4608,6 +4677,7 @@ impl BookshelfView {
                                 Some(&root_key),
                                 &mut on_import,
                                 reuse_book_id.as_deref(),
+                                import_source.as_ref(),
                                 &plan,
                             )
                         }
@@ -4622,6 +4692,7 @@ impl BookshelfView {
                                 &packs_dir,
                                 Some(&root_key),
                                 reuse_book_id.as_deref(),
+                                import_source.as_ref(),
                             )
                         }
                         other => Err(thundoku_core::import::ImportError::UnsupportedType(
@@ -4877,7 +4948,7 @@ impl BookshelfView {
                 return;
             };
             self.auto_download_queue.remove(0);
-            if self.start_download(cx, item, true) {
+            if self.start_download(cx, item, true, false) {
                 self.auto_download_running += 1;
             }
         }
@@ -5148,6 +5219,11 @@ impl BookshelfView {
     /// 2 GiB 超のダウンロード確認が表示待ち/表示中か。
     pub(crate) fn has_pending_large_download(&self) -> bool {
         self.pending_large_download.is_some()
+    }
+
+    /// 複数ダウンロードのファイル選択が表示待ち/表示中か。
+    pub(crate) fn has_pending_file_choice(&self) -> bool {
+        self.pending_file_choice.is_some()
     }
 
     /// 取り込み確認モーダルが出ているか（ビューアーを重ねない判断に使う）。
@@ -5836,7 +5912,7 @@ impl BookshelfView {
             return;
         }
         self.pending_open_after_download = Some(item.database_id.clone());
-        if !self.start_download(cx, item.clone(), false) {
+        if !self.start_download(cx, item.clone(), false, false) {
             // 同期中などで開始できなかった（開始できていないのに開く約束はしない）
             self.pending_open_after_download = None;
             crate::app_state::set_toast_kind(
@@ -5858,7 +5934,7 @@ impl BookshelfView {
         };
         self.confirmed_large_downloads
             .insert(item.database_id.clone());
-        self.start_download(cx, item, false);
+        self.start_download(cx, item, false, false);
         cx.notify();
     }
 
@@ -5877,6 +5953,31 @@ impl BookshelfView {
     fn cancel_download_confirm(&mut self, cx: &mut Context<Self>) {
         self.pending_download_confirm = None;
         cx.notify();
+    }
+
+    /// 複数ダウンロードのファイル選択（ダイアログの 1 件を押した）。
+    ///
+    /// 選んだ候補を `download_url` / `file_name` に載せ替えて `start_download` を
+    /// やり直す（worker は今までどおりこの 2 列だけを見て取得する）。
+    /// 選択は記憶しない（再取得のたびに選ぶ）。
+    pub(crate) fn choose_file_choice(&mut self, cx: &mut Context<Self>, index: usize) {
+        let Some(pending) = self.pending_file_choice.take() else {
+            return;
+        };
+        let Some(item) = choose_download(&pending.item, index) else {
+            // 候補が変わった（同期で消えた等）ときは何も始めない
+            cx.notify();
+            return;
+        };
+        self.start_download(cx, item, false, true);
+        cx.notify();
+    }
+
+    /// 複数ダウンロードのファイル選択をやめる（何も始めない）。
+    pub(crate) fn cancel_file_choice(&mut self, cx: &mut Context<Self>) {
+        if self.pending_file_choice.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// ダウンロード完了時の後処理。トースト（取り込みメッセージ）は呼び出し側で設定済み。
@@ -7901,7 +8002,9 @@ impl Render for BookshelfView {
             set_modal(
                 cx,
                 ModalKind::DownloadConfirm,
-                self.pending_download_confirm.is_some() || self.pending_large_download.is_some(),
+                self.pending_download_confirm.is_some()
+                    || self.pending_large_download.is_some()
+                    || self.pending_file_choice.is_some(),
             );
             set_modal(
                 cx,
@@ -7923,6 +8026,12 @@ impl Render for BookshelfView {
         let pending_download_confirm = (modal == Some(crate::app_state::ModalKind::DownloadConfirm)
             && pending_large_download.is_none())
         .then(|| self.pending_download_confirm.clone())
+        .flatten();
+        // 複数ダウンロードのファイル選択（2 GiB 超・未ダウンロード確認より後に出す）
+        let pending_file_choice = (modal == Some(crate::app_state::ModalKind::DownloadConfirm)
+            && pending_large_download.is_none()
+            && pending_download_confirm.is_none())
+        .then(|| self.pending_file_choice.clone())
         .flatten();
         // 分割同期の続き（あと何回で完了するかを伝える）
         let pending_sync_notice = (modal == Some(crate::app_state::ModalKind::SyncNotice))
@@ -9003,6 +9112,91 @@ impl Render for BookshelfView {
                     None
                 },
             )
+            // 複数ダウンロードのファイル選択（BOOTH の PDF + 画像 ZIP 等）。
+            // 2 GiB 超・未ダウンロードの確認と同じ `DownloadConfirm` の枠を使う
+            // （同時には出さない。どれも「取得するか」を先に決める確認）。
+            .children(
+                if let Some(pending) = pending_file_choice {
+                    let cancel_handle = handle.clone();
+                    let content_handle = handle.clone();
+                    let title = pending.item.title.clone();
+                    let options = pending.options.clone();
+                    Dialog::new(cx)
+                        .bg(cx.theme().colors.popover)
+                        .title(div().child("ダウンロードするファイルを選んでください"))
+                        // バツは置かない（キャンセル / ファイルのどちらかで必ず答える）
+                        .close_button(false)
+                        .content(move |content, window, _cx| {
+                            // 取り込み確認と同じ流儀: 選択肢が多いときはリストだけを
+                            // スクロールさせ、フッターのボタンを画面内に残す。
+                            let max_height = FILE_CHOICE_MAX_H
+                                .min(f32::from(window.viewport_size().height) / 2.0);
+                            let list_height =
+                                (options.len() as f32 * FILE_CHOICE_ROW_H).min(max_height);
+                            let mut items = div()
+                                .id("file-choice-scroll")
+                                .debug_selector(|| "file-choice-content".into())
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .overflow_y_scrollbar();
+                            for (index, option) in options.iter().enumerate() {
+                                let handle = content_handle.clone();
+                                let label = file_choice_label(option, index);
+                                items = items.child(
+                                    div()
+                                        .id(SharedString::from(format!("file-choice-{index}")))
+                                        .debug_selector(move || format!("file-choice-{index}"))
+                                        .min_h(px(FILE_CHOICE_ROW_H))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .py_1()
+                                        .cursor_pointer()
+                                        .on_click(move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.choose_file_choice(cx, index);
+                                            });
+                                        })
+                                        .child(div().text_sm().child(label)),
+                                );
+                            }
+                            content
+                                .child(div().text_sm().child(format!(
+                                    "「{title}」には複数のファイルがあります。取り込むファイルを選んでください。"
+                                )))
+                                .child(div().h(px(list_height)).child(items))
+                        })
+                        .footer(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "file-choice-cancel".into())
+                                        .child(
+                                            dialog_button("file-choice-cancel", "キャンセル").on_click(
+                                                {
+                                                    let handle = cancel_handle.clone();
+                                                    move |_, _window, cx| {
+                                                        handle.update(cx, |this, cx| {
+                                                            this.cancel_file_choice(cx);
+                                                        });
+                                                    }
+                                                },
+                                            ),
+                                        ),
+                                ),
+                        )
+                        .into_any_element()
+                        .into()
+                } else {
+                    None
+                },
+            )
             // 分割同期の続き（あと何回で完了するかを伝える）
             .children(
                 if let Some(message) = pending_sync_notice {
@@ -9818,6 +10012,24 @@ fn item_file_name(title: &str, item: &bookshelf::BookshelfItem) -> String {
     }
 }
 
+/// 複数ダウンロードの選択（`index` 番目）を `download_url` / `file_name` に載せ替える。
+///
+/// worker は `download_url`（BOOTH の `downloadables/{id}`）だけを見て取得するため、
+/// 選んだ候補をこの 2 列に入れて `start_download` をやり直せばよい。範囲外は `None`
+/// （候補が消えた・壊れた JSON など。何も始めない）。
+fn choose_download(
+    item: &bookshelf::BookshelfItem,
+    index: usize,
+) -> Option<bookshelf::BookshelfItem> {
+    let choice = item.download_choices().into_iter().nth(index)?;
+    let mut item = item.clone();
+    item.download_url = Some(choice.url);
+    // 名前が取れなかった候補は空にする（先頭のファイル名を流用すると別の名前になる）。
+    // 空なら `item_file_name` がタイトルから作る。
+    item.file_name = choice.name;
+    Some(item)
+}
+
 /// 購入日を `YYYY/MM/DD` に正規化する（"2026年09月03日" / "2026-08-25 00:00:00" 対応）。
 pub(crate) fn format_purchase_date(raw: &str) -> String {
     let s = raw.trim();
@@ -9973,6 +10185,7 @@ mod tests {
                     event_id: None,
                     file_name: None,
                     download_url: None,
+                    download_options: None,
                     is_downloadable: 1,
                     is_checked: 0,
                     is_purchased: 1,
@@ -10431,6 +10644,7 @@ mod tests {
                     event_id: None,
                     file_name: None,
                     download_url: None,
+                    download_options: None,
                     is_downloadable: 1,
                     is_checked: 0,
                     is_purchased: 1,
@@ -10927,6 +11141,7 @@ mod tests {
                     event_id: None,
                     file_name: None,
                     download_url: None,
+                    download_options: None,
                     is_downloadable: 1,
                     is_checked: 0,
                     is_purchased: 1,
@@ -11373,6 +11588,7 @@ mod tests {
                     event_id: None,
                     file_name: None,
                     download_url: None,
+                    download_options: None,
                     is_downloadable: 1,
                     is_checked: 0,
                     is_purchased: 1,
@@ -11427,6 +11643,7 @@ mod tests {
                     event_id: None,
                     file_name: None,
                     download_url: None,
+                    download_options: None,
                     is_downloadable: 1,
                     is_checked: 0,
                     is_purchased: 1,
@@ -12829,6 +13046,300 @@ mod tests {
         );
     }
 
+    /// ダウンロード候補つきの本棚アイテム（BOOTH の「1 商品に複数ファイル」）。
+    fn booth_item_with_options(
+        database_id: &str,
+        title: &str,
+        options: &[thundoku_core::booth::DownloadOption],
+    ) -> bookshelf::BookshelfItem {
+        bookshelf::BookshelfItem {
+            site_id: "booth".into(),
+            database_id: database_id.into(),
+            title: title.into(),
+            circle_name: "サークルA".into(),
+            author: String::new(),
+            thumbnail_url: None,
+            format: "PDF".into(),
+            caused_at: None,
+            event_name: None,
+            event_slug: None,
+            event_id: None,
+            // 既存列は先頭の候補（同期と同じ）
+            file_name: options.first().and_then(|option| option.name.clone()),
+            download_url: options.first().map(|option| option.url.clone()),
+            download_options: thundoku_core::booth::encode_download_options(options),
+            is_downloadable: 1,
+            is_checked: 0,
+            is_purchased: 1,
+            is_new: 0,
+            is_active: 1,
+            is_favorite: 0,
+            is_hidden: 0,
+            hidden_at: None,
+            tags_json: None,
+            synced_at: "2026-08-21 00:00:00".into(),
+            created_at: "2026-08-21 00:00:00".into(),
+            updated_at: "2026-08-21 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        }
+    }
+
+    /// ダウンロード候補つきの本棚アイテムを DB へ入れる。
+    fn seed_booth_item_with_options(
+        cx: &mut TestAppContext,
+        database_id: &str,
+        title: &str,
+        options: &[thundoku_core::booth::DownloadOption],
+    ) {
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            bookshelf::upsert(db, &booth_item_with_options(database_id, title, options)).unwrap();
+        });
+    }
+
+    /// ダウンロード候補が 1 件だけの本は、確認を出さずに今までどおり即ダウンロードする
+    /// （複数ファイルの対応で 1 ファイルの本の挙動を変えない）。
+    #[gpui_kit::test]
+    async fn single_download_option_starts_without_asking(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        login_google_for_import(cx);
+        seed_booth_item_with_options(
+            cx,
+            "100",
+            "1 ファイルの本",
+            &[thundoku_core::booth::DownloadOption {
+                name: Some("book.pdf".into()),
+                url: "https://booth.pm/downloadables/111".into(),
+            }],
+        );
+        let view = cx.new(BookshelfView::new);
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let item = this
+                    .shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "100")
+                    .map(|card| card.shelf.clone())
+                    .expect("100 のカード");
+                this.download_item(cx, item);
+            });
+        });
+
+        let downloading = view.read_with(cx, |this, _| this.download_states.contains_key("100"));
+        let notified = cx.update(|cx| AppState::global(cx).toast_message.lock().is_some());
+        assert!(
+            view.read_with(cx, |this, _| this.pending_file_choice.is_none()),
+            "候補 1 件なのにファイル選択が出ている"
+        );
+        // テスト環境には BOOTH のセッションが無いため worker は途中で失敗し、
+        // `download_states` は同じフレームのうちに片付くことがある（既存のダウンロード
+        // テストと同じく「開始状態か完了通知」で見る）。
+        assert!(
+            downloading || notified,
+            "候補 1 件なのにダウンロードが始まっていない（開始状態も通知も無い）"
+        );
+    }
+
+    /// 候補が 2 件以上ある本は、**選ぶまで何も始めない**。選んだファイルで
+    /// ダウンロードを開始する（ダイアログの 2 件目を押す）。
+    #[gpui_kit::test]
+    async fn multiple_download_options_ask_and_start_the_chosen_file(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        login_google_for_import(cx);
+        seed_booth_item_with_options(
+            cx,
+            "100",
+            "2 ファイルの本",
+            &[
+                thundoku_core::booth::DownloadOption {
+                    name: Some("book.pdf".into()),
+                    url: "https://booth.pm/downloadables/111".into(),
+                },
+                thundoku_core::booth::DownloadOption {
+                    name: Some("images.zip".into()),
+                    url: "https://booth.pm/downloadables/222".into(),
+                },
+            ],
+        );
+        let view = cx.new(BookshelfView::new);
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let item = this
+                    .shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "100")
+                    .map(|card| card.shelf.clone())
+                    .expect("100 のカード");
+                this.download_item(cx, item);
+            });
+        });
+        assert!(
+            view.read_with(cx, |this, _| this.pending_file_choice.is_some()),
+            "候補 2 件なのにファイル選択が出ていない"
+        );
+        assert!(
+            !view.read_with(cx, |this, _| this.download_states.contains_key("100")),
+            "選ぶ前にダウンロードが始まっている"
+        );
+
+        // ダイアログの 2 件目（images.zip）を押す
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+        let second = visual
+            .debug_bounds("file-choice-1")
+            .expect("ファイル選択の 2 件目が出ていない");
+        visual.simulate_click(second.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+
+        let downloading = view.read_with(cx, |this, _| this.download_states.contains_key("100"));
+        let notified = cx.update(|cx| AppState::global(cx).toast_message.lock().is_some());
+        assert!(
+            view.read_with(cx, |this, _| this.pending_file_choice.is_none()),
+            "選んだのにファイル選択が閉じていない"
+        );
+        // 開始状態は同じフレームのうちに片付くことがある（上のテストと同じ）
+        assert!(
+            downloading || notified,
+            "選んだのにダウンロードが始まっていない（開始状態も通知も無い）"
+        );
+    }
+
+    /// 選んだ候補が `download_url` / `file_name` に載る（worker はこの 2 列だけを見て
+    /// 取得する）。範囲外の添字では何も始めない（`None`）。
+    #[test]
+    fn choose_download_replaces_the_url_and_name() {
+        let options = [
+            thundoku_core::booth::DownloadOption {
+                name: Some("book.pdf".into()),
+                url: "https://booth.pm/downloadables/111".into(),
+            },
+            thundoku_core::booth::DownloadOption {
+                name: Some("images.zip".into()),
+                url: "https://booth.pm/downloadables/222".into(),
+            },
+        ];
+        let item = booth_item_with_options("100", "2 ファイルの本", &options);
+
+        let chosen = choose_download(&item, 1).expect("2 件目を選べない");
+        assert_eq!(
+            chosen.download_url.as_deref(),
+            Some("https://booth.pm/downloadables/222")
+        );
+        assert_eq!(chosen.file_name.as_deref(), Some("images.zip"));
+        assert_eq!(
+            item.download_url.as_deref(),
+            Some("https://booth.pm/downloadables/111"),
+            "元のアイテムを書き換えている"
+        );
+        // ファイル名が無い候補は空にして、タイトル由来の名前に任せる
+        let unnamed = booth_item_with_options(
+            "200",
+            "名前なしの本",
+            &[
+                options[0].clone(),
+                thundoku_core::booth::DownloadOption {
+                    name: None,
+                    url: "https://booth.pm/downloadables/333".into(),
+                },
+            ],
+        );
+        let chosen = choose_download(&unnamed, 1).expect("2 件目を選べない");
+        assert_eq!(chosen.file_name, None);
+        assert_eq!(
+            item_file_name(&unnamed.title, &chosen),
+            "名前なしの本.pdf",
+            "名前が無い候補の既定のファイル名"
+        );
+        assert!(
+            choose_download(&item, 2).is_none(),
+            "範囲外で開始しようとしている"
+        );
+    }
+
+    /// ファイル選択をキャンセルしたら何も始めない。
+    #[gpui_kit::test]
+    async fn cancelling_the_file_choice_starts_nothing(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        login_google_for_import(cx);
+        seed_booth_item_with_options(
+            cx,
+            "100",
+            "2 ファイルの本",
+            &[
+                thundoku_core::booth::DownloadOption {
+                    name: Some("book.pdf".into()),
+                    url: "https://booth.pm/downloadables/111".into(),
+                },
+                thundoku_core::booth::DownloadOption {
+                    name: Some("images.zip".into()),
+                    url: "https://booth.pm/downloadables/222".into(),
+                },
+            ],
+        );
+        let view = cx.new(BookshelfView::new);
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let item = this
+                    .shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "100")
+                    .map(|card| card.shelf.clone())
+                    .expect("100 のカード");
+                this.download_item(cx, item);
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+        let cancel = visual
+            .debug_bounds("file-choice-cancel")
+            .expect("ファイル選択のキャンセルが出ていない");
+        visual.simulate_click(cancel.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            view.read_with(cx, |this, _| this.pending_file_choice.is_none()),
+            "キャンセルしてもファイル選択が閉じていない"
+        );
+        assert!(
+            !view.read_with(cx, |this, _| this.download_states.contains_key("100")),
+            "キャンセルしたのにダウンロードが始まっている"
+        );
+        assert_eq!(
+            cx.update(|cx| AppState::global(cx).toast_message.lock().clone()),
+            None,
+            "キャンセルしたのに何か始まっている"
+        );
+    }
+
     /// `packs_dir` 直下のファイル名一覧（ディレクトリが無ければ空）。
     ///
     /// 「取り込みに失敗したときに pack を残さない」ことを前後差分で見るために使う
@@ -14007,6 +14518,7 @@ mod tests {
                         event_id: None,
                         file_name: None,
                         download_url: None,
+                        download_options: None,
                         is_downloadable: 1,
                         is_checked: 0,
                         is_purchased: 1,
@@ -15057,6 +15569,7 @@ mod tests {
                     event_id: None,
                     file_name: None,
                     download_url: None,
+                    download_options: None,
                     is_downloadable: 1,
                     is_checked: 0,
                     is_purchased: 1,
@@ -15188,6 +15701,7 @@ mod tests {
                     event_id: None,
                     file_name: None,
                     download_url: None,
+                    download_options: None,
                     is_downloadable: 1,
                     is_checked: 0,
                     is_purchased: 1,

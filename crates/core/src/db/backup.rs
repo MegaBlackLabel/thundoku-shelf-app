@@ -21,6 +21,10 @@ const TABLES: &[&str] = &[
     "tbf_events",
     "bookshelf_items",
     "checked_items",
+    // 試し読み（`checklist_item_id REFERENCES checked_items(id)` なので、必ず
+    // checked_items より後に INSERT する）。画像本体（`image_data`）は
+    // [`EXCLUDED_COLUMNS`] で除外し、`image_url` とページのメタだけを運ぶ。
+    "product_sample_pages",
     "book_contents",
     "content_formats",
     "reading_progress",
@@ -38,6 +42,12 @@ const TABLES: &[&str] = &[
     "view_history",
 ];
 /// 画像・バイナリ・本文テキストとして除外するカラム名。
+///
+/// `thumbnail_data` / `image_data` は画像の base64（1 行が数百 KB になり、
+/// 同期のたびに Drive へ上げ直すには重すぎる）。`product_sample_pages` の
+/// `image_data` はこれに当たるが、**`image_url` は残す**ので復元先でも試し読みを
+/// 開ける（試し読みを開く経路は毎回 `/api/image/` から取り直して保存し直す。
+/// `crates/app/src/views/checklist.rs` の `fetch_sample`）。
 ///
 /// `extracted_text`（`document_images`）は暗号化 pack から取り出したページ本文で、
 /// 平文のまま Drive のバックアップ JSON に載ると、pack を暗号化した意味が失われる。
@@ -156,6 +166,9 @@ pub struct OwnerFilter<'a> {
 /// `owner_sub` で絞る（= Google アカウントに紐づくデータ）テーブル。
 /// 公開メタ（`tbf_events` / `zenn_tag_metadata`）と、`books` から id で辿れる
 /// テーブルは対象外。
+///
+/// `owner_sub` を持たない `product_sample_pages` はここには入れず、
+/// [`table_rows`] が親の `checked_items` を辿って絞る。
 const OWNER_SCOPED_TABLES: &[&str] = &[
     "bookshelf_items",
     "checked_items",
@@ -174,6 +187,31 @@ fn owner_matches(filter: &OwnerFilter<'_>, blob: Option<&str>) -> bool {
         }
         None => blob.is_none(),
     }
+}
+
+/// 現在の owner に属する `checked_items.id`。
+///
+/// `owner_sub` を持たない子テーブル（`product_sample_pages`）の所有者判定に使う。
+/// `checked_items.owner_sub` は毎回 IV が変わる暗号文なので SQL では比較できず、
+/// 復号して id 集合を作る（`books` の所有者を呼び出し側が復号して `book_ids` を
+/// 渡すのと同じ流儀）。`product_sample_pages` は `owner_sub` も `book_id` も
+/// 持たないため、この集合へ `checklist_item_id` が入る行だけを出す。
+async fn owner_checked_item_ids(
+    conn: &mut sqlx::SqliteConnection,
+    owner: &OwnerFilter<'_>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, owner_sub FROM checked_items")
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut ids = Vec::new();
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let blob: Option<String> = row.try_get("owner_sub")?;
+        if owner_matches(owner, blob.as_deref()) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
 }
 
 /// バックアップ JSON の形式版。
@@ -293,7 +331,8 @@ impl DriveBackup {
 /// 主要テーブルを JSON 文字列にエクスポートする。
 /// `book_ids` が `Some(ids)` のとき、所有者（本の id 集合）に連動して
 /// `books` とその下位テーブルだけをエクスポートする（P3）。`None` は全件。
-/// `owner` が `Some` のとき、[`OWNER_SCOPED_TABLES`] を現在の sub に絞る。
+/// `owner` が `Some` のとき、[`OWNER_SCOPED_TABLES`] と、その配下の
+/// `product_sample_pages`（親の `checked_items` 経由で判定）を現在の sub に絞る。
 #[allow(clippy::explicit_auto_deref)]
 pub fn export_json(
     pool: &SqlitePool,
@@ -402,6 +441,7 @@ fn pk_columns(table: &str) -> Option<&'static [&'static str]> {
         "books" => &["id"],
         "bookshelf_items" => &["site_id", "database_id"],
         "checked_items" => &["id"],
+        "product_sample_pages" => &["id"],
         "tbf_events" => &["id"],
         "book_contents" => &["content_id"],
         "content_formats" => &["format_id"],
@@ -471,6 +511,18 @@ async fn table_rows(
             }
             _ => {}
         }
+    }
+    // `product_sample_pages` は `owner_sub` も `book_id` も持たない（親は
+    // `checked_items`）。この表だけは親を復号して「現在の owner の項目 id」を作り、
+    // その id に紐づく行へ絞る（[`OWNER_SCOPED_TABLES`] のように行を読んでから
+    // 落とすのではなく、`books` の id 集合と同じく SQL 側で絞る）。
+    if where_sql.is_empty()
+        && table == "product_sample_pages"
+        && let Some(filter) = owner
+    {
+        let ids = owner_checked_item_ids(&mut *conn, filter).await?;
+        where_sql = " WHERE checklist_item_id IN (SELECT value FROM json_each(?))".into();
+        bind_json = Some(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into()));
     }
     // 行の並びを PK 順に固定する。物理順（挿入順・索引の選択）に依存すると、
     // 内容が同じでも JSON の md5 が変わり、無変更なのに再アップロードになる。
@@ -1106,6 +1158,153 @@ mod tests {
         assert_eq!(ids("favorite_tags", "tag_name"), vec!["tag-none"]);
         assert_eq!(ids("favorite_entities", "entity_name"), vec!["circle-none"]);
         assert!(ids("book_first_events", "database_id").is_empty());
+    }
+
+    /// 試し読みのテスト用に、イベントとチェック項目（所有者つき）を 1 件入れる。
+    fn seed_check_item(pool: &SqlitePool, item_id: &str, owner: Option<&str>) {
+        crate::db::block_on(async {
+            sqlx::query(
+                "INSERT OR IGNORE INTO tbf_events (id, site_id, event_name) \
+                 VALUES ('tbf20', 'techbookfest', '技術書典20')",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO checked_items (id, event_id, circle_name, product_id, owner_sub) \
+                 VALUES (?1, 'tbf20', 'サークル', 'p1', ?2)",
+            )
+            .bind(item_id)
+            .bind(owner)
+            .execute(pool)
+            .await
+            .unwrap();
+        });
+    }
+
+    /// 試し読みの 1 ページを入れる（本番と同じ [`crate::db::samples::insert_sample_page`] を通す）。
+    fn insert_sample_page(pool: &SqlitePool, id: &str, item_id: &str, page_number: i64) {
+        crate::db::samples::insert_sample_page(
+            pool,
+            &crate::db::samples::SamplePageRow {
+                id: id.into(),
+                checklist_item_id: item_id.into(),
+                product_id: Some("p1".into()),
+                page_number,
+                image_url: Some(format!("https://techbookfest.org/api/image/{id}.png")),
+                image_data: Some("aGVsbG8=".into()),
+                mime_type: "image/jpeg".into(),
+                width: Some(100),
+                height: Some(140),
+                file_size: Some(5),
+                fetched_at: "2026-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// 試し読み（`product_sample_pages`）もバックアップ対象に入る。
+    ///
+    /// 画像本体（`image_data`）は他の画像列と同じく入れない（[`EXCLUDED_COLUMNS`]）。
+    /// ページのメタ（`image_url` / `page_number` / 寸法）だけを運ぶ。
+    #[test]
+    fn export_json_includes_sample_pages_without_image_data() {
+        let pool = crate::db::test_pool();
+        crate::db::migrate(&pool).unwrap();
+        seed_check_item(&pool, "check-a", None);
+        insert_sample_page(&pool, "sp-1", "check-a", 1);
+        insert_sample_page(&pool, "sp-2", "check-a", 2);
+
+        let json = export_json(&pool, None, None).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let rows = value["product_sample_pages"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "試し読みの行がバックアップに無い");
+        // PK（`id`）順に並ぶ
+        assert_eq!(rows[0]["id"], "sp-1");
+        assert_eq!(rows[0]["checklist_item_id"], "check-a");
+        assert_eq!(rows[0]["page_number"], 1);
+        assert_eq!(
+            rows[0]["image_url"],
+            "https://techbookfest.org/api/image/sp-1.png"
+        );
+        assert_eq!(rows[0]["width"], 100);
+        assert_eq!(rows[0]["height"], 140);
+        assert_eq!(rows[1]["page_number"], 2);
+        assert!(
+            rows.iter().all(|row| row.get("image_data").is_none()),
+            "画像 base64 はバックアップに載せない"
+        );
+    }
+
+    /// 他アカウントのチェックリストに紐づく試し読みは混ざらない。
+    ///
+    /// `product_sample_pages` は `owner_sub` も `book_id` も持たないため、
+    /// 親の `checked_items` を復号して現在の owner の項目に絞る。
+    #[test]
+    fn export_json_filters_sample_pages_by_owner() {
+        let pool = crate::db::test_pool();
+        crate::db::migrate(&pool).unwrap();
+        let key = [37u8; 32];
+        let owner_a = crate::owner::encrypt(&key, "A");
+        let owner_b = crate::owner::encrypt(&key, "B");
+        seed_check_item(&pool, "check-a", Some(&owner_a));
+        seed_check_item(&pool, "check-b", Some(&owner_b));
+        seed_check_item(&pool, "check-none", None);
+        insert_sample_page(&pool, "sp-a", "check-a", 1);
+        insert_sample_page(&pool, "sp-b", "check-b", 1);
+        insert_sample_page(&pool, "sp-none", "check-none", 1);
+
+        let ids = |sub: Option<&str>| -> Vec<String> {
+            let filter = OwnerFilter { key: &key, sub };
+            let json = export_json(&pool, None, Some(&filter)).unwrap();
+            let value: Value = serde_json::from_str(&json).unwrap();
+            value["product_sample_pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(Some("A")), vec!["sp-a"]);
+        assert_eq!(ids(Some("B")), vec!["sp-b"]);
+        // 未ログイン（sub = None）は未所属の行だけ
+        assert_eq!(ids(None), vec!["sp-none"]);
+    }
+
+    /// export → import で試し読みの行が復元される。
+    ///
+    /// `checklist_item_id` の FK があるため、`TABLES` の順（`checked_items` より後）が
+    /// 正しくないと復元全体が失敗する。
+    #[test]
+    fn import_json_restores_sample_pages() {
+        let key = [41u8; 32];
+        let src = crate::db::test_pool();
+        crate::db::migrate(&src).unwrap();
+        seed_check_item(&src, "check-a", Some(&crate::owner::encrypt(&key, "A")));
+        insert_sample_page(&src, "sp-1", "check-a", 1);
+        insert_sample_page(&src, "sp-2", "check-a", 2);
+        let filter = OwnerFilter {
+            key: &key,
+            sub: Some("A"),
+        };
+        let json = export_json(&src, None, Some(&filter)).unwrap();
+
+        let dst = crate::db::test_pool();
+        import_json(&dst, &json).unwrap();
+        let rows = crate::db::samples::list_for_item(&dst, "check-a").unwrap();
+        assert_eq!(rows.len(), 2, "試し読みの行が復元されていない");
+        assert_eq!(rows[0].id, "sp-1");
+        assert_eq!(rows[0].page_number, 1);
+        assert_eq!(rows[0].mime_type, "image/jpeg");
+        assert_eq!(rows[0].width, Some(100));
+        assert_eq!(rows[0].height, Some(140));
+        assert_eq!(
+            rows[0].image_url.as_deref(),
+            Some("https://techbookfest.org/api/image/sp-1.png")
+        );
+        // 画像本体は対象外（開くたびに `/api/image/` から取り直す）
+        assert_eq!(rows[0].image_data, None);
+        assert_eq!(rows[1].page_number, 2);
     }
 
     /// `attribute_owner` は未所属（NULL）の行だけを埋める。

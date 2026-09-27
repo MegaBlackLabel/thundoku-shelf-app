@@ -1268,7 +1268,9 @@ impl Workspace {
             cx,
             ModalKind::DownloadConfirm,
             bookshelf_active
-                && (bookshelf.has_pending_download_confirm() || bookshelf.has_pending_large_download()),
+                && (bookshelf.has_pending_download_confirm()
+                    || bookshelf.has_pending_large_download()
+                    || bookshelf.has_pending_file_choice()),
         );
         set_modal(
             cx,
@@ -1485,17 +1487,21 @@ impl Workspace {
             );
             log::info!("exit upload: sync 開始");
             let progress_tx = progress_tx;
+            // 書籍のバックアップ ON/OFF（行が無ければ ON）。OFF でも DB バックアップと
+            // 鍵 bundle は同期する（本のファイルとは失うものが別）。
+            let sync_books = thundoku_core::drive::sync::books_backup_enabled(&db);
             let _ = thundoku_core::drive::sync::sync_with_progress(
                 thundoku_core::drive::sync::SyncRequest {
-                pool: &db,
-                drive: &mut drive,
-                packs_dir: &packs_dir,
-                downloads_dir: &downloads_dir,
-                identity_sub: google_sub.as_deref(),
-                pack_root_key: pack_root_key.as_ref(),
-                owner_key: db_key.as_ref(),
+                    pool: &db,
+                    drive: &mut drive,
+                    packs_dir: &packs_dir,
+                    downloads_dir: &downloads_dir,
+                    identity_sub: google_sub.as_deref(),
+                    pack_root_key: pack_root_key.as_ref(),
+                    owner_key: db_key.as_ref(),
                     folder_id: &folder_id,
                     db_path: Some(&db_path),
+                    sync_books,
                 },
                 // 進捗は UI の通知に出す（UI が消えていたら false = 中止）。
                 &mut |progress| progress_tx.send(progress.clone()).is_ok(),

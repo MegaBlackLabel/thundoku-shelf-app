@@ -107,6 +107,7 @@ pub fn save_bookshelf(
                     .map(String::from),
                 file_name: item.file_name.clone(),
                 download_url: item.download_url.clone(),
+                download_options: None,
                 is_downloadable: item.is_downloadable as i64,
                 is_checked: 1,
                 is_purchased: 1,

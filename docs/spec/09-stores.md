@@ -1025,33 +1025,32 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 | `bookshelf_items.database_id` | 商品 ID の 10 進文字列 | `crates/app/src/views/bookshelf.rs:2342` |
 | `books.tbf_product_id` | 同じ 10 進文字列（ダウンロード時に対応付け） | `crates/app/src/views/bookshelf.rs:2988`,`:3068`、`crates/core/src/db/books.rs:192-203` |
 | `books.site_id` | `"booth"`（`sites` テーブルの id） | `crates/core/src/db/schema.sql:22-23`、`crates/app/src/views/bookshelf.rs:2984` |
-| ダウンロード ID | `downloadables/{\d+}`（商品 ID とは別の数値。例: items/7825209 → downloadables/8191306） | `crates/core/src/booth.rs:567-591`、`crates/core/src/booth.rs:658-668` |
+| ダウンロード ID | `downloadables/{\d+}`（商品 ID とは別の数値。例: items/7825209 → downloadables/8191306）。**1 商品に複数あり得る**（文書順に全部集める） | `crates/core/src/booth.rs:826-854`（URL 正規表現は `:830-832`） |
 | `item_id` の逆引き | `database_id.parse::<u64>()`（失敗時は表紙の代替取得をスキップ） | `crates/app/src/views/bookshelf.rs:6996`、`:2775-2778` |
 
 #### 6.2 正規表現一覧（すべて `regex` crate、`booth.rs` 内）
 
 | 対象 | パターン | アンカー |
 |---|---|---|
-| 商品リンク + タイトル | `<a[^>]*href="https?://(?:[a-z0-9-]+\.)?booth\.pm/(?:ja/)?items/(\d+)"[^>]*><div class="text-text-default font-bold[^"]*"[^>]*>(.*?)</div></a>` | `crates/core/src/booth.rs:411-412` |
-| ページネーション検出 | `/library\?page=(\d+)` | `crates/core/src/booth.rs:204-205` |
-| ショップ名 | `<img alt="([^"]+)" class="rounded-\[50%\]"` | `crates/core/src/booth.rs:481` |
-| 作者名（優先 1） | `class="user-avatar"[^>]*title="([^"]+)"` | `crates/core/src/booth.rs:499` |
-| 作者名（優先 2） | `<div class="shop-name[^"]*">\s*<a[^>]*>([^<]+)</a>` | `crates/core/src/booth.rs:504` |
-| JSON-LD 抽出 | `(?s)<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>` → `brand.name`（trim、空は不採用、壊れた JSON は次へ） | `crates/core/src/booth.rs:527-543` |
-| ファイル名 | `class="min-w-0 break-words whitespace-pre-line"[^>]*>(.*?)</div>`（タグ除去 + trim、空は `None`） | `crates/core/src/booth.rs:550-556` |
-| DL URL（優先 1: 本体） | `data-href[" ]?="(https://booth\.pm/downloadables/\d+[^"]*)"[^>]*data-test="downloadable"` | `crates/core/src/booth.rs:567-568` |
-| DL URL（優先 2: browsable からクエリ除去） | `data-href="(https://booth\.pm/downloadables/\d+)\?browse=1"` | `crates/core/src/booth.rs:579` |
-| DL URL（後方互換フォールバック） | `data-href="(https://booth\.pm/downloadables/\d+[^"]*)""` → `?` 以降を切り捨て | `crates/core/src/booth.rs:587-591` |
-| サムネイル | `<img class="l-library-item-thumbnail" src="([^"]+)"` | `crates/core/src/booth.rs:598` |
-| 購入履歴（タグ→`|` 置換後、連続 `|` を 1 個に圧縮） | `発送完了\s*\|\s*(.+?)\s*\|\s*注文日時:\s*(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})` | `crates/core/src/booth.rs:608-613` |
-| タグ除去 | `<[^>]+>` → `""` + trim | `crates/core/src/booth.rs:471-476` |
-| CSRF トークン | 文字列分割（正規表現ではない）: `csrf-token" content="` の次を `"` まで | `crates/core/src/booth.rs:463-468` |
+| 商品リンク + タイトル | `<a[^>]*href="https?://(?:[a-z0-9-]+\.)?booth\.pm/(?:ja/)?items/(\d+)"[^>]*><div class="text-text-default font-bold[^"]*"[^>]*>(.*?)</div></a>` | `crates/core/src/booth.rs:650-653` |
+| ページネーション検出 | `/library\?page=(\d+)` | `crates/core/src/booth.rs:360` |
+| ショップ名 | `<img alt="([^"]+)" class="rounded-\[50%\]"` | `crates/core/src/booth.rs:733` |
+| 作者名（優先 1） | `class="user-avatar"[^>]*title="([^"]+)"` | `crates/core/src/booth.rs:751` |
+| 作者名（優先 2） | `<div class="shop-name[^"]*">\s*<a[^>]*>([^<]+)</a>` | `crates/core/src/booth.rs:756` |
+| JSON-LD 抽出 | `(?s)<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>` → `brand.name`（trim、空は不採用、壊れた JSON は次へ） | `crates/core/src/booth.rs:777-799`（正規表現は `:779-783`） |
+| ファイル名（単一・フォールバック） | `class="min-w-0 break-words whitespace-pre-line"[^>]*>(.*?)</div>`（タグ除去 + trim、空は `None`。ブロック内の**最初**の行） | `crates/core/src/booth.rs:800-808` |
+| DL URL（`data-href`、**全件**） | `data-href[" ]?="(https://booth\.pm/downloadables/\d+[^"]*)"` → `?browse=1` を除去し、同じ URL は 1 件に畳む。`data-test="downloadable"`（本体）と `browsable` の両方を拾う | `crates/core/src/booth.rs:830-832`, `:844-851` |
+| 候補のファイル名 | `class="min-w-0 break-words whitespace-pre-line"[^>]*>(.*?)</div>`（**そのボタンの直前**にある行から採る。ボタンの後ろの名前は次の候補のもの） | `crates/core/src/booth.rs:827-829`, `:838-842` |
+| サムネイル | `<img class="l-library-item-thumbnail" src="([^"]+)"` | `crates/core/src/booth.rs:857-864`（正規表現は `:858`） |
+| 購入履歴（タグ→`|` 置換後、連続 `|` を 1 個に圧縮） | `発送完了\s*\|\s*(.+?)\s*\|\s*注文日時:\s*(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})` | `crates/core/src/booth.rs:866-882`（正規表現は `:872-875`） |
+| タグ除去 | `<[^>]+>` → `""` + trim（購入履歴では `|` へ置換） | `crates/core/src/booth.rs:723-731`, `:868-870` |
+| CSRF トークン | 文字列分割（正規表現ではない）: `csrf-token" content="` の次を `"` まで | `crates/core/src/booth.rs:715-721` |
 
 #### 6.3 解析ブロックの切り出し（`parse_library` の補完処理）
 
-- 商品ごとに `html.find("items/{item_id}")` の位置から **4,000 バイト**を切り出し、UTF-8 文字境界へクランプ（`is_char_boundary` で後退）。その範囲からショップ名・ファイル名・DL URL・サムネイルを抽出 — `crates/core/src/booth.rs:431-442`。
-- 既知の制約: 1 商品に複数ダウンロードがある場合、`data-href` は**最初の 1 つ**しか拾えない（ブロック先頭 4,000 バイト制限 + 先頭一致） — `docs/import-patterns.md:705-717`。
-- DL URL が `None` かつ（ファイル名 or サムネイルが `Some`）のとき `log::warn!` で item_id / title / file_name / block 先頭 400 文字を出力 — `crates/core/src/booth.rs:447-457`。
+- 商品ブロックは**アイテム見出しのアンカーの位置から次の商品の手前まで**（`starts[index]..starts[index + 1]`、最後は HTML 末尾）。以前の「先頭から 4,000 バイト」制限は**廃止**した（2 個目以降のダウンロードボタンを取りこぼしていた） — `crates/core/src/booth.rs:654-682`。
+- ダウンロード候補はブロック内の `data-href`（`downloadables/{id}`）を**文書順に全部**集め、`?browse=1` を除去して同じ URL を 1 件に畳む。`download_url` / `file_name` には**先頭の候補**を入れる（1 ファイルの商品は従来と同じ値） — `crates/core/src/booth.rs:683-693`, `:826-854`。
+- DL URL が `None` かつ（ファイル名 or サムネイルが `Some`）のとき `log::warn!` で item_id / title / file_name / block 先頭 400 文字を出力 — `crates/core/src/booth.rs:695-709`。
 
 #### 6.4 URL・値のその他の規約
 
@@ -1059,12 +1058,14 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 |---|---|---|
 | 商品ページ URL | `https://booth.pm/ja/items/{id}` | `crates/core/src/booth.rs:362`,`:400` |
 | ショップ URL（サブドメイン） | `https://{subdomain}.booth.pm/`（作者名は `user-avatar` の `title`） | `crates/core/src/booth.rs:491-494` |
-| ダウンロード URL | `https://booth.pm/downloadables/{id}`（`?browse=1` は除去して保存） | `crates/core/src/booth.rs:57`,`:578-591` |
+| ダウンロード URL | `https://booth.pm/downloadables/{id}`（`?browse=1` は除去して保存）。**1 商品に複数あり得る**（文書順に全部集める）。取得を許可するホスト / パスは `BOOTH_DOWNLOAD_RULES` だけ | `crates/core/src/booth.rs:62-72`, `:830-832`, `:844-851` |
+| ダウンロード候補の保存先 | `bookshelf_items.download_options`（JSON 配列 `[{"name","url"}]`。runtime DDL の列）。`download_url` / `file_name` は**先頭の候補** | `crates/core/src/db/mod.rs:303-313`, `crates/core/src/db/bookshelf.rs:23-26`, `:59-76`, `:105-108`, `crates/app/src/views/bookshelf.rs:3508-3509` |
+| ファイル選択 UI | 候補が **2 件以上のときだけ**ダイアログを出す（1 件以下は従来どおり即、キャンセルは何も始めない、選択は記憶しない）。お気に入りの自動ダウンロードは先頭のファイルのみ | `crates/app/src/views/bookshelf.rs:4224-4239`, `:5958-5981`, `:9124-9195` |
 | サムネイル URL | `booth.pximg.net` の 300x300 サムネイル（公開画像、Cookie 不要） | `crates/core/src/booth.rs:55-56`、`crates/app/src/views/bookshelf.rs:6994-7005` |
 | 表紙（原寸）URL | `item_detail` JSON の `images[].original`（先頭のみ採用） | `crates/core/src/booth.rs:373-381`、`crates/app/src/views/bookshelf.rs:2313-2318` |
 | 購入日時文字列 | `"YYYY/MM/DD HH:MM:SS"`（例 `2026/01/01 19:36:23`）。並び替えは `date_sort_key` で正規化 | `crates/core/src/booth.rs:65`,`:613`、`crates/app/src/views/bookshelf.rs:363-367` |
 | `format` 値 | ライブラリ同期では常に `"PDF"`（実際のファイル種別は取り込み時に判定） | `crates/app/src/views/bookshelf.rs:2349`、`:2908-2921` |
-| 取り込みファイル名 | 本棚の `file_name` を優先、無ければ `"{title}.pdf"` | `crates/app/src/views/bookshelf.rs:7298-7302` |
+| 取り込みファイル名 | 選ばれた候補の `file_name` を優先、無ければ `"{title}.pdf"` | `crates/app/src/views/bookshelf.rs:10008-10013`, `:10020-10031` |
 | 作者名の反映先 | `books.author`（`set_metadata`）と `bookshelf_items.author`（`update_author`）。`site_id` が `booth`/`fanza`/`dlsite` のときだけ実行 | `crates/app/src/views/bookshelf.rs:6899-6933`、`crates/core/src/db/bookshelf.rs:214-231` |
 | `owner_sub` | 上記 3 章参照。BOOTH の商品 ID とは無関係 | `crates/core/src/db/books.rs:250-265` |
 | 重複ダウンロード抑止 | `books::resolve_reuse_id(&db, key, site_id, product_id, sub)` で同一 `(site_id, tbf_product_id)` の既存 `book_id` を再利用 | `crates/app/src/views/bookshelf.rs:2950-2964`、`crates/core/src/db/books.rs:336-360` |
@@ -1074,9 +1075,9 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 - `docs/features.md:234-235`: 技術書典・BOOTH の同期ボタンは「専用スレッド + タイムアウト付き」。
 - `docs/features.md:255-256`: 履歴カードのイベント名欄は BOOTH では購入日を表示。
 - `docs/database.md:13-24`: `sites` テーブル初期データに `booth`（BOOTH、`https://booth.pm`、display_order = 1、is_visible = 1）。
-- `docs/database.md:79-87`: `bookshelf_items` は「同期データのスナップショット」、PK は `site_id + database_id`、`author` は「技術書典は空、BOOTH 等は作成者名」。
-- `docs/database.md:314`: 同期 → `bookshelf_items` 等というデータフロー記載。
-- `docs/import-patterns.md:705-717`: BOOTH の 1 商品 2 ファイル問題（未解決制約、PDF 側のみ取得される）。
+- `docs/database.md:82-98`: `bookshelf_items` は「同期データのスナップショット」、PK は `site_id + database_id`、`author` は「技術書典は空、BOOTH 等は作成者名」、`download_options` は BOOTH の複数ダウンロード候補（runtime DDL の列）。
+- `docs/database.md:338`: 同期 → `bookshelf_items` 等というデータフロー記載。
+- `docs/import-patterns.md:731-766`: BOOTH の 1 商品 2 ファイル問題（**解消済み**。候補を全部保存し、2 件以上のときだけ選ばせる）。
 - `docs/logout.md:16-39`: ログアウト 2 段階（plaza → booth.pm）、CSRF は `GET https://booth.pm/ja` の meta、成功時 204、incognito の理由、Cookie 収集元 2 ドメイン。
 - `docs/account-switch.md`: BOOTH に関する記述は**無い**（grep で 0 件）。
 

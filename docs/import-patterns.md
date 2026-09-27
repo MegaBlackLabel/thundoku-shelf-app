@@ -518,25 +518,39 @@ DB に入る**（実 DB に `âMâUÄòé┼é⌐éφéóéóùtÄqé│é±.pdf
 - **保存先は DB を正**とする（`book_contents` + `content_formats` + `document_images.content_id`）
 - Pack 側（`metadata.json`）には `contents` を書き出して**同期復元用**にする
   - 現行 `metadata.json` は `schemaVersion` / `title` / `author` / `circleName` /
-    `purchaseDate` / `readingProgress` / `contents` のみ
+    `purchaseDate` / `readingProgress` / `contents` +（任意で）`source`
+  - **本文は `metadata.json` に入れず**、専用エントリ `documents/text.jsonl` が運ぶ
+    （1 行 = `{"pageNumber":<int>,"text":"..."}`、mime `application/x-ndjson`、per-entry deflate。
+    pack 鍵があるときは他エントリと同じく暗号化）
+    — `crates/core/src/import/mod.rs:212`, `:929-941`, `:1316-1333`
 - **Pack が消えても構造は復元できる**:
   - DB バックアップ（`backup.rs` の `TABLES`）に `book_contents` / `content_formats` を追加
-  - ✅ **Pack 復元は取り込み状態まで再構築する（2026-09-11 実装）**:
+  - ✅ **Pack 復元は取り込み状態まで再構築する（2026-09-11 実装 / 2026-09-27 に本文と source を追加）**:
     `import::rebuild_from_pack` が pack の `metadata.json`（`contents`）とエントリから
     `book_contents` / `content_formats` / `imported_documents` / `document_images` を作り直す。
-    すでに取り込み済みの本は何もしない（ローカルの取り込みを壊さない）。
+    すでに取り込み済みの本は何もしない（ローカルの取り込みを壊さない。**`source` の復元だけは行う**）。
     ページ画像の寸法はエントリのヘッダから読む（画素デコードはしない）
-    - **復元されないもの（pack だけでは戻せない）**:
-      - 本文テキスト（`document_text`）と `token_analysis` — `rebuild_from_pack` は復元しない。
-        ページ画像からは取り出せず、EPUB の生エントリは pack にあるが再抽出はしていない
-        （`document_images.extracted_text` は 2026-09-22 に廃止。読み出し側が無いまま
-        暗号化 pack の本文を平文で複製していたため、書き込みをやめた）
-      - `books.site_id` / `books.tbf_product_id` — `import_book` が `None` で作るため。
-        復元本は source 紐付けを失い、`find_by_source` の重複抑止や site 絞り込みに乗らない
+    - ✅ **pack から復元されるもの（2026-09-27 時点）**:
+      - 本文テキスト（`document_text`）— `documents/text.jsonl` を `read_texts_entry` が読み、
+        取り込みと同じ暗号化列の INSERT 経路（`documents::insert_texts_batch`）で入れる。
+        `token_analysis` は本文から `tags::extract_nouns` で**再生成**する
+        （解析器のバージョン差で取り込み時とずれうる = 仕様として許容）
+        — `crates/core/src/import/mod.rs:2584-2621`, `:2663-2691`,
+        `crates/core/src/db/documents.rs:324`, `:366`
+      - `books.site_id` / `books.tbf_product_id` — `metadata.json` の `source`
+        （`siteId` / `productId`）を `restore_source` が `books` 行へ戻す。
+        **すでにドキュメント行がある早期 return でも実行**する。端末が知らないサイト id の
+        ときは site_id を入れず product_id も入れない（片方だけにしない）。失敗しても復元は続ける
+        — `crates/core/src/import/mod.rs:2421-2429`, `:2631-2661`,
+        `crates/core/src/db/books.rs:531`, `:226`
+    - **まだ戻せないもの**: EPUB の生エントリからの本文再抽出
+      （`document_images.extracted_text` は 2026-09-22 に廃止。読み出し側が無いまま
+      暗号化 pack の本文を平文で複製していたため、書き込みをやめた）。
+      本文エントリを持たない pack（旧形式・Web 版が書いた pack）は**本文無しで復元**する
   - 進捗（`reading_progress`）・タグ（`book_tags`）は DB バックアップ（`thundoku-backup.json`）から復元される
     （pack からは戻さない）
   - FANZA 作品は `folder-structures` API で構造を再取得できる（§0）が、**ページ画像は Pack が必要**
-- 旧 Pack（`contents` なし）は「全ページ = 単一コンテンツ」にフォールバック
+- 旧 Pack（`contents` なし）は「全ページ = 単一コンテンツ」にフォールバック。本文エントリが無ければ本文も無し
 
 ### 7.4 カバー（表紙・裏表紙）の扱い（決定 D4）
 
@@ -638,7 +652,7 @@ DB に入る**（実 DB に `âMâUÄòé┼é⌐éφéóéóùtÄqé│é±.pdf
 | 音声・動画は junk（F2） | **音声作品はコンテンツ**（実在 2 件）。`media_kind` を追加（§3.3） |
 | 非書籍の想定なし | txt のみ / 0 ファイル / ゲームを**明示的に除外**（§5.4） |
 | 「txt を画像として取り込む」余地 | **不要**と結論。代わりに `_export.txt` → `document_text`（§4.3） |
-| Pack 復元の前提 | 旧版は「`drive/sync.rs::import_book` は `books` しか作らないため**未実装**」と明記（§7.3）。**現在は実装済み**（`import_book` → `import::rebuild_from_pack`。上記 §7.3 の「復元されないもの」が残件） |
+| Pack 復元の前提 | 旧版は「`drive/sync.rs::import_book` は `books` しか作らないため**未実装**」と明記（§7.3）。**現在は実装済み**（`import_book` → `import::rebuild_from_pack`）。本文（`documents/text.jsonl`）と `source` の復元も 2026-09-27 に対応し、pack だけでは戻せなかったギャップは**解消済み**（残るのは EPUB 生エントリからの本文再抽出なし） |
 | 旧版の想定のみだった A〜H | 実データで裏取り（§2.3）。観測不能な B1/B2・G2・G3 は「DL 後のみ判定」と明記 |
 
 **2026-09-10 の決定（§11.1）で変わった点**
@@ -698,29 +712,55 @@ DB に入る**（実 DB に `âMâUÄòé┼é⌐éφéóéóùtÄqé│é±.pdf
   - 対策 2: 取り込みのページ変換（デコード + webp 再圧縮）を**チャンク + 並列**化
     （ワーカーは `min(コア数, 8)`、順序は保持）→ 実測 **834ms → 211ms/ページ（約 4 倍）**。
     3,321 ページ換算で **44.5 分 → 11.7 分**（192 ページ本は 2.6 分 → 約 40 秒）
-  - ⚠ スクロール表示モードは**描画要素を全ページ分作る**（数千ページ作品では要素数も数千に
-    なる）が、デコード済み画像は **384MiB の予算内で現在ページの前後だけ**保持し、離れた
-    ページは CPU（`Arc<RenderImage>`）と GPU（sprite atlas）の両方から追い出す
-    （`SCROLL_CACHE_BUDGET_BYTES` / `trim_scroll_cache`）。1 ページ 47MiB の本なら前後
-    8 ページ程度、16MiB の本なら前後 24 ページ程度を残す
+  - ⚠ スクロール表示モードは**描画要素を全ページ分作る**（`render` が `pages = (0..total)` を
+    組んで全ページを `div` にする。数千ページ作品では要素数も数千になる。
+    `crates/app/src/components/image_viewer/mod.rs:2565-2566`, `:2611-2650`）。デコード済み
+    画像は **384MiB の予算内で現在ページの前後だけ**保持し、離れたページは CPU
+    （`Arc<RenderImage>`）と GPU（sprite atlas）の両方から追い出す。予算は `page_cache_budget`
+    の既定 = `SCROLL_CACHE_BUDGET_BYTES`（`:564`, `:735`）、保持半径は `scroll_keep_radius`
+    = 「予算 ÷ 現在ページのバイト数 ÷ 2、最低 1」（`:1528-1535`）、追い出しは
+    `trim_scroll_cache`（`:1540-1562`。`window.drop_image` は `:1554`、render からの呼び出しは
+    `:2517`）。半径は現在ページの実寸から計算するため、1 ページ 47MiB の本なら**前後 4
+    ページ（計 9）**、16MiB の本なら**前後 12 ページ（計 25）**を残す
+  - ⚠ **一部の遷移では未ロードの全ページへ load request が飛ぶ**: 実行中に Scroll へ切替えた
+    とき（`set_mode` が `images` の空きスロット全部へ `ensure_loaded`。`:1835-1846`）と、
+    Scroll 中に content loader を切替えたとき（`set_loader`。`:809-811`）。開いた時点の復元は
+    前後だけ（`:742-753`）。保持は次の render の `trim_scroll_cache` が予算内へ切り戻すため、
+    全ページ分のデコード負荷が**一時的に**かかる（負荷の実測は未実施）
 
-## 12. 補足: BOOTH ライブラリの「1 商品 2 ファイル」問題（2026-08-27 調査）
+## 12. 補足: BOOTH ライブラリの「1 商品 2 ファイル」問題（2026-08-27 調査 / 2026-09-27 解消）
 
-廃止した設計メモ（旧 `docs/import-variations.md`）から引き継いだ**未解決の制約**。
+廃止した設計メモ（旧 `docs/import-variations.md`）から引き継いだ制約。
+**パーサー（全件収集）と UI（2 件以上のときだけ選ばせる）の両方を実装して解消した。**
 
-### 事実
+### 事実（2026-08-27 時点の調査）
 
 - BOOTH のライブラリには **1 商品に複数ダウンロード**（PDF + 画像 ZIP 等）があるケースがある
-- 現行の `booth.rs::parse_library` は各商品ブロックから **`data-href`（downloadables/{id}）を
-  最初の 1 つだけ**抽出する（`extract_download_url` の先頭一致 + ブロックを先頭から
-  4000 文字で切るため、2 個目以降のボタンを拾えない）
+- 旧 `booth.rs::extract_download_url` は各商品ブロックから `data-href`（`downloadables/{id}`）を
+  **最初の 1 つだけ**抽出していた（先頭一致 + ブロックを先頭から 4,000 文字で切る）
 - DB 実績: BOOTH 系の本は全て `file_name = *.pdf` / `source_type = pdf`（HTML で PDF が
-  先頭に並ぶため PDF 側を取得していた）→ **2 個目のファイル（画像 ZIP 等）は永久に無視される**
+  先頭に並ぶため PDF 側を取得していた）→ **2 個目のファイル（画像 ZIP 等）は無視されていた**
 
-### 課題と対応案（未着手）
+### 実装（解消）
 
-- パターン 2（同じ内容の PDF と画像一式）は「取り込み時の選択」では解決せず、
-  **同期（どのファイルを取得するか）の段階で選択/列挙**が必要
-- 案: (1) ファイルごとに 1 アイテムとして列挙（「作品名 (PDF)」「作品名 (画像)」）/
-  (2) 常に優先する形式を決める / (3) 複数検出時だけ確認モーダル
-- どの案でも**パーサーの強化**（ブロック内の `data-href` を全列挙 + ファイル名抽出）が前提
+- パーサー: 商品ブロックを**次の商品の見出しの手前まで**丸ごと使い（4,000 文字制限は廃止）、
+  `https://booth.pm/downloadables/{id}` の `data-href` を**文書順に全部**集める
+  （`?browse=1` は除去、同じ URL は 1 件に畳む）
+  — `crates/core/src/booth.rs:645-712`, `:826-854`
+- 保存: 候補を `bookshelf_items.download_options`（JSON 配列 `[{"name","url"}]`）に持つ。
+  `download_url` / `file_name` には従来どおり**先頭の候補**が入る（1 ファイルの商品は
+  今までと同じ値 = 古い行・古い読み手のフォールバック）
+  — `crates/core/src/db/mod.rs:303-313`（runtime DDL）、
+  `crates/core/src/db/bookshelf.rs:23-26`, `:53-57`, `:59-76`, `:105-108`
+- UI: 候補が **2 件以上のときだけ**ファイル選択ダイアログを出す。1 件以下は従来どおり即ダウンロード、
+  キャンセルは何も始めない、**選択は記憶しない**（再取得のたびに選ぶ）
+  — `crates/app/src/views/bookshelf.rs:1344-1355`（`PendingFileChoice`）,
+  `:4224-4239`（2 件以上のときだけ確認へ）, `:5958-5981`（選択 / キャンセル）,
+  `:9124-9195`（ダイアログ）
+
+### 残る制約
+
+- **お気に入りの自動ダウンロードは先頭のファイルのみ**（利用者が要求した操作ではないので
+  確認モーダルを出さない。`crates/app/src/views/bookshelf.rs:4226-4238`）
+- ファイル名が取れない候補を選ぶと既定名 `{タイトル}.pdf` になる。**名前なしの ZIP は
+  取り込みに失敗しうる**（`crates/app/src/views/bookshelf.rs:10008-10013`）

@@ -41,6 +41,15 @@ pub struct DocumentImage {
     pub created_at: String,
 }
 
+/// ページ本文の 1 行（`document_text`）。
+///
+/// テーブルには移行が足した `content_id TEXT NOT NULL DEFAULT ''`（`db/mod.rs:164-178`）が
+/// あるが、ここには持たせず INSERT もしない（[`insert_text`] / [`insert_texts_batch`]）。
+/// 本文は document（= 本 1 冊）単位で書き、読み出しも `document_id` だけ
+/// （[`all_text_for_document`]）で、タグ生成は全コンテンツ分のテキストをまとめて 1 回渡す
+/// （`import/mod.rs:1537-1538`）。**コンテンツ別に本文を引く経路が無い**ため、列は空のまま
+/// 既定値で残す（コンテンツ別検索は未実装）。ページ画像（[`DocumentImage`]）はビューアーが
+/// コンテンツ／レンディション単位で選ぶので `content_id` / `format_id` を持つ。
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct DocumentText {
     pub id: String,
@@ -50,6 +59,8 @@ pub struct DocumentText {
     pub created_at: String,
 }
 
+/// 形態素解析の 1 行（`token_analysis`）。`content_id` を書かない理由は
+/// [`DocumentText`] と同じ（`import/mod.rs:1515-1528` がページ単位で積むだけ）。
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct TokenRow {
     pub id: String,

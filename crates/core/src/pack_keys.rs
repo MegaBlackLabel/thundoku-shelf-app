@@ -548,6 +548,11 @@ mod tests {
             Ok(id)
         }
 
+        fn find_root_folders(&mut self, _name: &str) -> Result<Vec<DriveFile>, DriveError> {
+            // 同期フォルダの検索は使わない（呼ばれたら「無い」を返す）。
+            Ok(Vec::new())
+        }
+
         fn create_folder(&mut self, _name: &str) -> Result<String, DriveError> {
             Ok("folder-1".into())
         }

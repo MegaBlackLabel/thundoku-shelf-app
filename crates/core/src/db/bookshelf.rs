@@ -20,6 +20,10 @@ pub struct BookshelfItem {
     pub event_id: Option<String>,
     pub file_name: Option<String>,
     pub download_url: Option<String>,
+    /// ダウンロード候補の JSON 配列（`[{"name":...,"url":...}]`）。BOOTH の
+    /// 「1 商品に複数のダウンロード（PDF + 画像 ZIP 等）」を扱うための列。
+    /// 無ければ `download_url` 1 件として扱う（[`BookshelfItem::download_choices`]）。
+    pub download_options: Option<String>,
     pub is_downloadable: i64,
     pub is_checked: i64,
     pub is_purchased: i64,
@@ -47,10 +51,29 @@ pub struct BookshelfItem {
 }
 
 const COLUMNS: &str = "site_id, database_id, title, circle_name, author, thumbnail_url, format, \
-     causedAt, event_name, event_slug, event_id, file_name, download_url, is_downloadable, \
-     is_checked, is_purchased, is_new, is_active, is_favorite, is_hidden, hidden_at, tags_json, \
-     synced_at, created_at, updated_at, media_category, ai_type, is_drm, release_date, \
-     description, theme, maker_id, page_count, age_rating, series_name";
+     causedAt, event_name, event_slug, event_id, file_name, download_url, download_options, \
+     is_downloadable, is_checked, is_purchased, is_new, is_active, is_favorite, is_hidden, \
+     hidden_at, tags_json, synced_at, created_at, updated_at, media_category, ai_type, is_drm, \
+     release_date, description, theme, maker_id, page_count, age_rating, series_name";
+
+/// 本棚アイテムのダウンロード候補（BOOTH の 1 商品に複数ファイルがある場合）。
+impl BookshelfItem {
+    /// 保存済みの候補（`download_options`）。候補が無い行（他サイト・旧データ）は
+    /// `download_url` 1 件として返す。壊れた JSON も空にして、ダウンロードを止めない。
+    pub fn download_choices(&self) -> Vec<crate::booth::DownloadOption> {
+        let options = crate::booth::decode_download_options(self.download_options.as_deref());
+        if !options.is_empty() {
+            return options;
+        }
+        match self.download_url.as_deref().filter(|url| !url.is_empty()) {
+            Some(url) => vec![crate::booth::DownloadOption {
+                name: self.file_name.clone().filter(|name| !name.is_empty()),
+                url: url.to_string(),
+            }],
+            None => Vec::new(),
+        }
+    }
+}
 
 /// Upsert by (site_id, database_id).
 ///
@@ -65,7 +88,8 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
         sqlx::query(&format!(
             "INSERT INTO bookshelf_items ({COLUMNS}) VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
+             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, \
+             ?36)
              ON CONFLICT(site_id, database_id) DO UPDATE SET
                title = excluded.title,
                circle_name = excluded.circle_name,
@@ -78,6 +102,10 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
                event_id = excluded.event_id,
                file_name = excluded.file_name,
                download_url = excluded.download_url,
+               -- 候補を送らない同期（他サイト・候補が取れなかった BOOTH）は既存値を残す
+               download_options = COALESCE(
+                 excluded.download_options, bookshelf_items.download_options
+               ),
                is_downloadable = excluded.is_downloadable,
                is_checked = excluded.is_checked,
                is_purchased = excluded.is_purchased,
@@ -120,6 +148,7 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
         .bind(&item.event_id)
         .bind(&item.file_name)
         .bind(&item.download_url)
+        .bind(&item.download_options)
         .bind(item.is_downloadable)
         .bind(item.is_checked)
         .bind(item.is_purchased)
@@ -490,6 +519,147 @@ mod tests {
             .await
             .unwrap();
         });
+    }
+
+    /// テスト用の本棚アイテム（既定値 + ダウンロード列だけ差し替える）。
+    fn shelf_item(
+        site_id: &str,
+        database_id: &str,
+        download_url: Option<&str>,
+        file_name: Option<&str>,
+        download_options: Option<&str>,
+    ) -> BookshelfItem {
+        BookshelfItem {
+            site_id: site_id.into(),
+            database_id: database_id.into(),
+            title: "タイトル".into(),
+            circle_name: String::new(),
+            author: String::new(),
+            thumbnail_url: None,
+            format: "PDF".into(),
+            caused_at: None,
+            event_name: None,
+            event_slug: None,
+            event_id: None,
+            file_name: file_name.map(String::from),
+            download_url: download_url.map(String::from),
+            download_options: download_options.map(String::from),
+            is_downloadable: 1,
+            is_checked: 0,
+            is_purchased: 1,
+            is_new: 0,
+            is_active: 1,
+            is_favorite: 0,
+            is_hidden: 0,
+            hidden_at: None,
+            tags_json: None,
+            synced_at: "2026-08-25 00:00:00".into(),
+            created_at: "2026-08-25 00:00:00".into(),
+            updated_at: "2026-08-25 00:00:00".into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        }
+    }
+
+    /// 1 商品に複数のダウンロード（PDF + 画像 ZIP 等）がある本の候補を JSON 列へ
+    /// 保存し、読み出せる（文書順を保つ）。既存列（`download_url` / `file_name`）には
+    /// 先頭の候補が入る（互換）。候補を送らない同期は既存値を消さない。
+    #[test]
+    fn download_options_round_trip_in_document_order() {
+        let pool = crate::db::test_pool();
+        let options = vec![
+            crate::booth::DownloadOption {
+                name: Some("book.pdf".into()),
+                url: "https://booth.pm/downloadables/111".into(),
+            },
+            crate::booth::DownloadOption {
+                name: Some("images.zip".into()),
+                url: "https://booth.pm/downloadables/222".into(),
+            },
+        ];
+        let json = crate::booth::encode_download_options(&options).unwrap();
+        upsert(
+            &pool,
+            &shelf_item(
+                "booth",
+                "100",
+                Some("https://booth.pm/downloadables/111"),
+                Some("book.pdf"),
+                Some(&json),
+            ),
+        )
+        .unwrap();
+
+        let items = list(&pool, "booth").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].download_options.as_deref(), Some(json.as_str()));
+        assert_eq!(items[0].download_choices(), options);
+        assert_eq!(
+            items[0].download_url.as_deref(),
+            Some("https://booth.pm/downloadables/111")
+        );
+
+        // 候補を送らない同期（DLsite / 技術書典 / 候補が取れなかった BOOTH）は
+        // 既存の候補を消さない（tags_json と同じ扱い）
+        upsert(
+            &pool,
+            &shelf_item(
+                "booth",
+                "100",
+                Some("https://booth.pm/downloadables/111"),
+                Some("book.pdf"),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            list(&pool, "booth").unwrap()[0].download_choices(),
+            options,
+            "候補を送らない同期で既存の候補が消えている"
+        );
+    }
+
+    /// 候補が無い行は従来どおり `download_url` 1 件として扱う（ダイアログを出さない）。
+    /// 壊れた JSON も空にして、ダウンロードを止めない。
+    #[test]
+    fn download_choices_fall_back_to_the_single_url() {
+        let pool = crate::db::test_pool();
+        upsert(
+            &pool,
+            &shelf_item(
+                "techbookfest",
+                "db-1",
+                Some("https://example.com/dl"),
+                Some("book.pdf"),
+                None,
+            ),
+        )
+        .unwrap();
+        upsert(
+            &pool,
+            &shelf_item("booth", "100", None, None, Some("{壊れた")),
+        )
+        .unwrap();
+
+        let items = list(&pool, "techbookfest").unwrap();
+        assert_eq!(
+            items[0].download_choices(),
+            vec![crate::booth::DownloadOption {
+                name: Some("book.pdf".into()),
+                url: "https://example.com/dl".into(),
+            }]
+        );
+        // URL も候補も無い本は 0 件（何も選ばせない）
+        let booth = list(&pool, "booth").unwrap();
+        assert!(booth[0].download_choices().is_empty());
     }
 
     /// 渡した本のうち未取得だけを返す（取得済みの印が立っていれば返さない）。

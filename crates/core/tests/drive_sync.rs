@@ -119,6 +119,10 @@ impl DriveApi for FakeDrive {
         Ok(id)
     }
 
+    fn find_root_folders(&mut self, _name: &str) -> Result<Vec<DriveFile>, DriveError> {
+        Ok(Vec::new())
+    }
+
     fn create_folder(&mut self, _name: &str) -> Result<String, DriveError> {
         Ok("folder-1".into())
     }
@@ -244,10 +248,31 @@ fn sync_env_with_progress(
             pack_root_key: None,
             owner_key: None,
             folder_id: "folder-1",
+            sync_books: true,
             db_path: None,
         },
         on_progress,
     )
+}
+
+/// 書籍 pack のバックアップ ON/OFF を明示した同期（未ログイン = 所有者なし）。
+fn sync_env_with_books(
+    env: &mut TestEnv,
+    drive: &mut dyn DriveApi,
+    sync_books: bool,
+) -> Result<thundoku_core::drive::sync::SyncOutcome, SyncError> {
+    sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: None,
+        pack_root_key: None,
+        owner_key: None,
+        folder_id: "folder-1",
+        sync_books,
+        db_path: None,
+    })
 }
 
 #[test]
@@ -323,6 +348,93 @@ fn pack_rebuild_is_idempotent_and_skips_existing_rows() {
             .unwrap()
             .is_some(),
         "document は 1 件のまま"
+    );
+}
+
+/// `metadata.json` に取り込み元（`source`）を持つ pack（§7.3 の残件 (a)）。
+fn metadata_pack_with_source(title: &str, site_id: &str, product_id: &str) -> Vec<u8> {
+    let meta = serde_json::json!({
+        "schemaVersion": 1,
+        "title": title,
+        "author": "",
+        "circleName": "",
+        "purchaseDate": serde_json::Value::Null,
+        "source": { "siteId": site_id, "productId": product_id },
+    });
+    let mut builder = PackBuilder::new(1_700_000_000_000);
+    builder.add_entry(
+        "metadata.json",
+        serde_json::to_vec(&meta).unwrap(),
+        "application/json",
+        false,
+    );
+    builder.add_entry(
+        "pages/page_0001.webp",
+        b"PAGE-1".to_vec(),
+        "image/webp",
+        false,
+    );
+    builder.build(None, true).unwrap()
+}
+
+/// pack だけで復元した本は `books.site_id` / `books.tbf_product_id` に乗る
+/// （重複抑止 `find_by_source` とサイト絞り込みが効くようになる）。
+#[test]
+fn pack_restore_restores_source_from_metadata() {
+    let mut env = TestEnv::new("pack-source");
+    let mut drive = FakeDrive::new();
+    let bytes = metadata_pack_with_source("source 付き", "fanza", "d_777");
+    drive.seed("pack-src.opfspack", &bytes);
+    sync_env(&mut env, &mut drive).unwrap();
+
+    let book = db::books::get(&env.pool, "pack-src").unwrap().unwrap();
+    assert_eq!(book.site_id.as_deref(), Some("fanza"));
+    assert_eq!(book.tbf_product_id.as_deref(), Some("d_777"));
+    // 重複抑止（同じ source の本を探す）に乗る。
+    let found = db::books::find_by_source(&env.pool, "fanza", "d_777").unwrap();
+    assert_eq!(found.len(), 1, "source で引ける: {found:?}");
+    assert_eq!(found[0].0, "pack-src");
+}
+
+/// 知らないサイト id を持つ pack でも、ページの復元は止めない（source は副次的）。
+#[test]
+fn pack_restore_ignores_unknown_site_id() {
+    let mut env = TestEnv::new("pack-unknown-site");
+    let mut drive = FakeDrive::new();
+    let bytes = metadata_pack_with_source("知らないサイト", "unknown-site", "d_1");
+    drive.seed("pack-unknown.opfspack", &bytes);
+    sync_env(&mut env, &mut drive).unwrap();
+
+    let book = db::books::get(&env.pool, "pack-unknown").unwrap().unwrap();
+    assert_eq!(book.site_id, None, "site 行が無い id は入れない");
+    assert_eq!(book.tbf_product_id, None);
+    assert!(
+        db::documents::get_document_by_book_id(&env.pool, "pack-unknown")
+            .unwrap()
+            .is_some(),
+        "ページは復元される"
+    );
+}
+
+/// `source` を持たない pack（旧形式 / Web 版が書いた pack）は今までどおり復元でき、
+/// source は未設定のままになる（回帰）。
+#[test]
+fn pack_restore_without_source_leaves_it_unset() {
+    let mut env = TestEnv::new("pack-no-source");
+    let mut drive = FakeDrive::new();
+    let bytes = metadata_pack("メタ本", "", "", "2026-08-21");
+    drive.seed("pack-old.opfspack", &bytes);
+    sync_env(&mut env, &mut drive).unwrap();
+
+    let book = db::books::get(&env.pool, "pack-old").unwrap().unwrap();
+    assert_eq!(book.title, "メタ本");
+    assert_eq!(book.site_id, None);
+    assert_eq!(book.tbf_product_id, None);
+    assert!(
+        db::documents::get_document_by_book_id(&env.pool, "pack-old")
+            .unwrap()
+            .is_some(),
+        "本文エントリが無くてもページは復元される"
     );
 }
 
@@ -486,6 +598,7 @@ fn owned_sync_with_progress(
             pack_root_key: None,
             owner_key: Some(key),
             folder_id: "folder-1",
+            sync_books: true,
             db_path,
         },
         on_progress,
@@ -673,6 +786,7 @@ fn uploads_local_pack_without_state_row() {
         pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
+        sync_books: true,
         db_path: None,
     })
     .unwrap();
@@ -723,6 +837,7 @@ fn reuploads_locally_modified_pack() {
         pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
+        sync_books: true,
         db_path: None,
     })
     .unwrap();
@@ -817,6 +932,7 @@ fn encrypted_pack_imports_with_the_root_key() {
         pack_root_key: Some(&root),
         owner_key: None,
         folder_id: "folder-1",
+        sync_books: true,
         db_path: None,
     })
     .unwrap();
@@ -854,6 +970,7 @@ fn plaintext_pack_downloads_while_logged_in() {
         pack_root_key: Some(&root),
         owner_key: None,
         folder_id: "folder-1",
+        sync_books: true,
         db_path: None,
     })
     .unwrap();
@@ -919,6 +1036,7 @@ fn sync_retries_pending_key_bundle_upload() {
         pack_root_key: Some(&root),
         owner_key: None,
         folder_id: "folder-1",
+        sync_books: true,
         db_path: None,
     })
     .unwrap();
@@ -963,6 +1081,7 @@ fn db_backup_is_not_replaced_when_owner_filter_is_unavailable() {
         pack_root_key: None,
         owner_key: None,
         folder_id: "folder-1",
+        sync_books: true,
         db_path: Some(&db_path),
     })
     .unwrap();
@@ -1037,6 +1156,7 @@ fn db_backup_is_uploaded_when_owner_filter_is_available() {
         pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
+        sync_books: true,
         db_path: Some(&db_path),
     })
     .unwrap();
@@ -1110,6 +1230,7 @@ fn db_backup_upload_records_the_baseline_for_the_next_check() {
         pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
+        sync_books: true,
         db_path: Some(&db_path),
     })
     .unwrap();
@@ -1221,6 +1342,7 @@ fn sync_with_backup(
         pack_root_key: root,
         owner_key: Some(owner_key),
         folder_id: "folder-1",
+        sync_books: true,
         db_path: Some(db_path),
     })
 }
@@ -1616,6 +1738,7 @@ fn upload_progress_reports_sent_bytes() {
             pack_root_key: None,
             owner_key: Some(&key),
             folder_id: "folder-1",
+            sync_books: true,
             db_path: None,
         },
         &mut |progress| {
@@ -1708,6 +1831,7 @@ fn excluded_book_is_not_uploaded() {
         pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
+        sync_books: true,
         db_path: None,
     })
     .unwrap();
@@ -1727,6 +1851,7 @@ fn excluded_book_is_not_uploaded() {
         pack_root_key: None,
         owner_key: Some(&key),
         folder_id: "folder-1",
+        sync_books: true,
         db_path: None,
     })
     .unwrap();
@@ -1784,4 +1909,151 @@ fn pack_can_be_deleted_from_drive_keeping_the_local_file() {
     )
     .unwrap();
     assert!(!again, "無いのに true を返している");
+}
+
+// ---- 書籍のバックアップ ON/OFF（`drive.sync.books`） ----
+//
+// OFF は pack（本のファイル）だけを止める。DB バックアップ（`thundoku-backup.json`）と
+// pack 鍵 bundle（`thundoku-keys.json`）は役割が別なので、これまでどおり同期する。
+
+/// OFF では pack を**上げない**。ON に戻せば同じ経路で上がる。
+#[test]
+fn sync_books_off_does_not_upload_packs() {
+    let env = TestEnv::new("books-off-upload");
+    let mut drive = FakeDrive::new();
+    let bytes = plain_pack("pages/page_0001.webp", b"BOOKS-OFF");
+    let key = seed_owned_local_pack(&env, "pack-11", &bytes);
+
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("test-sub"),
+        pack_root_key: None,
+        owner_key: Some(&key),
+        folder_id: "folder-1",
+        sync_books: false,
+        db_path: None,
+    })
+    .unwrap();
+
+    assert_eq!(drive.upload_count(), 0, "OFF なのに pack を上げている");
+    assert!(outcome.uploaded.is_empty(), "{:?}", outcome.uploaded);
+    assert!(!drive.files.contains_key("id-pack-11.opfspack"));
+    assert!(
+        db::sync_state::get(&env.pool, "pack-11").unwrap().is_none(),
+        "上げていないのに同期の状態行を書いている"
+    );
+
+    // ON なら上がる（フラグが効いている = OFF だから止まった）
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some("test-sub"),
+        pack_root_key: None,
+        owner_key: Some(&key),
+        folder_id: "folder-1",
+        sync_books: true,
+        db_path: None,
+    })
+    .unwrap();
+    assert_eq!(outcome.uploaded, vec!["pack-11"]);
+    assert_eq!(drive.upload_count(), 1);
+}
+
+/// OFF では Drive にある pack を**取得しない**（本の登録・置き場への書き込みもしない）。
+#[test]
+fn sync_books_off_does_not_download_packs() {
+    let mut env = TestEnv::new("books-off-download");
+    let mut drive = FakeDrive::new();
+    let bytes = metadata_pack("メタ本", "著者X", "サークルY", "2026-08-21");
+    drive.seed("pack-12.opfspack", &bytes);
+
+    let outcome = sync_env_with_books(&mut env, &mut drive, false).unwrap();
+
+    assert_eq!(drive.download_count(), 0, "OFF なのに pack を取得している");
+    assert!(outcome.downloaded.is_empty(), "{:?}", outcome.downloaded);
+    assert!(
+        !env.packs().join("pack-12.opfspack").exists(),
+        "OFF なのに置き場へ書いている"
+    );
+    assert!(
+        db::books::get(&env.pool, "pack-12").unwrap().is_none(),
+        "OFF なのに本を登録している"
+    );
+
+    // ON なら取得する（フラグが効いている = OFF だから止まった）
+    let outcome = sync_env_with_books(&mut env, &mut drive, true).unwrap();
+    assert_eq!(outcome.downloaded, vec!["pack-12"]);
+    assert_eq!(drive.download_count(), 1);
+    assert!(env.packs().join("pack-12.opfspack").exists());
+}
+
+/// OFF でも DB バックアップ（`thundoku-backup.json`）は今までどおり上がる。
+///
+/// 所有フィルタを空にしてしまうと Drive 上の控えを「本を含まない内容」で
+/// 置き換えてしまうため、中身に所有する本が入っていることまで確かめる。
+#[test]
+fn sync_books_off_still_uploads_the_database_backup() {
+    let env = TestEnv::new("books-off-backup");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-books-off";
+    let owner_key = [7u8; 32];
+    let db_path = env.root.join("thundoku-shelf.db");
+    insert_owned_book(&env.pool, "book-1", "自分の本", sub, &owner_key);
+    // ローカルに pack も置く（OFF なので上げてはいけない）
+    std::fs::write(
+        env.packs().join("book-1.opfspack"),
+        plain_pack("pages/page_0001.webp", b"LOCAL-ONLY"),
+    )
+    .unwrap();
+
+    let outcome = sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive: &mut drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some(sub),
+        pack_root_key: None,
+        owner_key: Some(&owner_key),
+        folder_id: "folder-1",
+        sync_books: false,
+        db_path: Some(&db_path),
+    })
+    .unwrap();
+
+    assert!(
+        outcome.database_backed_up,
+        "OFF でも DB バックアップは上げる"
+    );
+    let json = String::from_utf8(uploaded_backup(&drive)).unwrap();
+    assert!(json.contains("自分の本"), "所有する本が含まれること");
+    assert!(outcome.uploaded.is_empty(), "pack を上げてはいけない");
+    assert!(!drive.files.contains_key("id-book-1.opfspack"));
+    assert_eq!(drive.upload_count(), 1, "上がったのは DB バックアップだけ");
+}
+
+/// 設定キー `drive.sync.books` は**行が無ければ ON**（既定で本をバックアップする）。
+#[test]
+fn books_backup_is_on_without_a_setting_row() {
+    let pool = thundoku_core::db::test_pool();
+    thundoku_core::db::migrate(&pool).unwrap();
+
+    assert!(
+        thundoku_core::drive::sync::books_backup_enabled(&pool),
+        "未設定は ON（既定）"
+    );
+    thundoku_core::db::settings::set(&pool, "drive.sync.books", "false").unwrap();
+    assert!(
+        !thundoku_core::drive::sync::books_backup_enabled(&pool),
+        "\"false\" は OFF"
+    );
+    thundoku_core::db::settings::set(&pool, "drive.sync.books", "true").unwrap();
+    assert!(
+        thundoku_core::drive::sync::books_backup_enabled(&pool),
+        "\"true\" は ON"
+    );
 }

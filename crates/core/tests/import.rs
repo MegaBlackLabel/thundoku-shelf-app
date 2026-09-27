@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use opfspack::{PackBuilder, PackReader, PackRootKey};
 use thundoku_core::db;
 use thundoku_core::import::{
-    ImportError, MAX_NESTED_ENTRIES, MediaKind, analyze_zip, import_file, import_pdf_bytes,
+    ImportError, ImportSource, MAX_NESTED_ENTRIES, MediaKind, analyze_zip, import_file,
+    import_pdf_bytes, import_zip_bytes, rebuild_from_pack,
 };
 use thundoku_core::tags;
 
@@ -340,6 +341,7 @@ fn pdf_fixture_imports_pages_text_and_db_rows() {
         &env.packs(),
         None,
         &mut |p| progress_calls.push(p),
+        None,
     )
     .unwrap();
 
@@ -405,7 +407,7 @@ fn epub_imports_as_single_raw_entry() {
     std::fs::write(&epub_path, &epub_bytes).unwrap();
 
     let imported =
-        import_file(&env.pool, &epub_path, &env.packs(), None, &mut no_progress).unwrap();
+        import_file(&env.pool, &epub_path, &env.packs(), None, &mut no_progress, None).unwrap();
     assert_eq!(imported.document.source_type, "epub");
     assert_eq!(imported.document.total_pages, 0);
 
@@ -451,7 +453,23 @@ fn image_zip_imports_sorted_pages() {
     }
     zip.finish().unwrap();
 
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+
+        &env.pool,
+
+        &zip_path,
+
+        &env.packs(),
+
+        None,
+
+        &mut no_progress,
+
+        None,
+
+    )
+
+    .unwrap();
     assert_eq!(imported.document.source_type, "image-set");
     assert_eq!(imported.document.total_pages, 3);
 
@@ -493,6 +511,7 @@ fn zip_with_pdf_reuses_book_id_without_duplicate() {
         None,
         &mut no_progress,
         None,
+        None,
     )
     .unwrap();
     // 題名・file_name は ZIP 内パスではなくファイル名を使う（"inner/inside.pdf" ではなく "inside.pdf"）
@@ -514,6 +533,7 @@ fn zip_with_pdf_reuses_book_id_without_duplicate() {
         None,
         &mut no_progress,
         Some(&first.book.id),
+        None,
     )
     .unwrap();
     assert_eq!(second.book.id, first.book.id);
@@ -564,7 +584,23 @@ fn zip_entry_names_are_decoded_from_cp932() {
     assert!(hits > 0, "placeholder name not found in the zip");
     std::fs::write(&zip_path, &patched).unwrap();
 
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+
+        &env.pool,
+
+        &zip_path,
+
+        &env.packs(),
+
+        None,
+
+        &mut no_progress,
+
+        None,
+
+    )
+
+    .unwrap();
     // 文字化けせず CP932 の名前が復号されること
     assert_eq!(imported.book.file_name, "表紙.epub");
     assert_eq!(imported.book.title, "表紙");
@@ -580,6 +616,7 @@ fn single_image_imports_as_one_page_book() {
         "illust.png",
         &png,
         &env.packs(),
+        None,
         None,
         None,
     )
@@ -609,6 +646,7 @@ fn image_reuses_book_id_without_duplicate() {
         &env.packs(),
         None,
         None,
+        None,
     )
     .unwrap();
     db::books::set_favorite(&env.pool, &first.book.id, true).unwrap();
@@ -621,6 +659,7 @@ fn image_reuses_book_id_without_duplicate() {
         &env.packs(),
         None,
         Some(&first.book.id),
+        None,
     )
     .unwrap();
     assert_eq!(second.book.id, first.book.id);
@@ -682,7 +721,23 @@ fn bmp_only_zip_imports() {
     }
     zip.finish().unwrap();
 
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+
+        &env.pool,
+
+        &zip_path,
+
+        &env.packs(),
+
+        None,
+
+        &mut no_progress,
+
+        None,
+
+    )
+
+    .unwrap();
     assert_eq!(imported.document.source_type, "image-set");
     assert_eq!(imported.document.total_pages, 2);
 }
@@ -710,7 +765,23 @@ fn image_zip_with_export_text_imports_page_text() {
     }
     zip.finish().unwrap();
 
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+
+        &env.pool,
+
+        &zip_path,
+
+        &env.packs(),
+
+        None,
+
+        &mut no_progress,
+
+        None,
+
+    )
+
+    .unwrap();
     assert_eq!(imported.document.total_pages, 2);
 
     // マーカーのページ番号がそのまま document_text に入る（2 ページ目は欠番）。
@@ -770,7 +841,23 @@ fn corrupted_image_is_skipped_with_warning() {
     }
     zip.finish().unwrap();
 
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+
+        &env.pool,
+
+        &zip_path,
+
+        &env.packs(),
+
+        None,
+
+        &mut no_progress,
+
+        None,
+
+    )
+
+    .unwrap();
     assert_eq!(imported.document.total_pages, 2);
     assert_eq!(imported.warnings.len(), 1);
     assert!(
@@ -865,7 +952,23 @@ fn zip_with_directory_entries_imports_folder_contents() {
     assert_eq!(plan.contents[0].display_name, "book");
     assert_eq!(plan.contents[0].renditions[0].entries.len(), 2);
 
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+
+        &env.pool,
+
+        &zip_path,
+
+        &env.packs(),
+
+        None,
+
+        &mut no_progress,
+
+        None,
+
+    )
+
+    .unwrap();
     assert_eq!(imported.document.source_type, "image-set");
     assert_eq!(imported.document.total_pages, 2);
 
@@ -911,6 +1014,7 @@ fn reimport_preserves_custom_content_name_and_id() {
         None,
         &mut no_progress,
         None,
+        None,
     )
     .unwrap();
     let before = db::contents::list_for_book(&env.pool, &first.book.id).unwrap();
@@ -933,6 +1037,7 @@ fn reimport_preserves_custom_content_name_and_id() {
         None,
         &mut no_progress,
         Some(&first.book.id),
+        None,
     )
     .unwrap();
     assert_eq!(again.book.id, first.book.id);
@@ -986,7 +1091,23 @@ fn zip_with_two_folder_contents_persists_structure() {
     }
     zip.finish().unwrap();
 
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+
+        &env.pool,
+
+        &zip_path,
+
+        &env.packs(),
+
+        None,
+
+        &mut no_progress,
+
+        None,
+
+    )
+
+    .unwrap();
     // 本編（2 ページ）が既定表示
     assert_eq!(imported.document.source_type, "image-set");
     assert_eq!(imported.document.total_pages, 2);
@@ -1062,6 +1183,7 @@ fn zip_with_two_folder_contents_persists_structure() {
         None,
         &mut no_progress,
         Some(&imported.book.id),
+        None,
     )
     .unwrap();
     assert_eq!(again.book.id, imported.book.id);
@@ -1139,7 +1261,23 @@ fn zip_nested_folders_become_separate_contents() {
     }
     zip.finish().unwrap();
 
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+
+        &env.pool,
+
+        &zip_path,
+
+        &env.packs(),
+
+        None,
+
+        &mut no_progress,
+
+        None,
+
+    )
+
+    .unwrap();
     let stored = db::contents::list_with_formats(&env.pool, &imported.book.id).unwrap();
     let names: Vec<&str> = stored
         .iter()
@@ -1183,6 +1321,7 @@ fn import_with_root_key_writes_an_encrypted_v3_pack() {
         &env.packs(),
         Some(&root),
         None,
+        None,
     )
     .unwrap();
 
@@ -1211,7 +1350,15 @@ fn unsupported_extension_is_rejected() {
     let env = TestEnv::new("unsupported");
     let path = env.root.join("notes.txt");
     std::fs::write(&path, b"hello").unwrap();
-    let err = import_file(&env.pool, &path, &env.packs(), None, &mut no_progress).unwrap_err();
+    let err = import_file(
+        &env.pool,
+        &path,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap_err();
     assert!(matches!(err, ImportError::UnsupportedType(_)));
 }
 
@@ -1232,6 +1379,7 @@ fn pdf_import_binds_identity_when_provided() {
         Some(&root),
         &mut no_progress,
         Some(&book_id),
+        None,
     )
     .unwrap();
     assert_eq!(imported.book.id, book_id);
@@ -1485,6 +1633,7 @@ fn nested_zip_contents_are_imported() {
         None,
         &mut no_progress,
         None,
+        None,
     )
     .unwrap();
     assert_eq!(imported.document.source_type, "image-set");
@@ -1544,6 +1693,7 @@ fn nested_zip_depth_two_is_not_expanded() {
         None,
         &mut no_progress,
         None,
+        None,
     )
     .unwrap();
     assert_eq!(imported.document.total_pages, 1);
@@ -1569,6 +1719,7 @@ fn nested_zip_over_entry_limit_is_skipped_with_warning() {
         &env.packs(),
         None,
         &mut no_progress,
+        None,
         None,
     )
     .unwrap();
@@ -1602,6 +1753,7 @@ fn zip_without_readable_content_is_not_a_readable_work() {
         None,
         &mut no_progress,
         None,
+        None,
     )
     .unwrap_err();
     assert!(
@@ -1632,7 +1784,15 @@ fn image_pages_keep_their_order_with_parallel_rendering() {
     zip.finish().unwrap();
 
     let mut no_progress = |_p: f32| {};
-    let imported = import_file(&env.pool, &zip_path, &env.packs(), None, &mut no_progress).unwrap();
+    let imported = import_file(
+        &env.pool,
+        &zip_path,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
     assert_eq!(imported.document.total_pages, count as i64);
 
     let pack_bytes =
@@ -1672,7 +1832,7 @@ fn import_file_rejects_a_source_larger_than_the_limit_without_reading_it() {
     }
 
     let started = std::time::Instant::now();
-    let error = import_file(&env.pool, &path, &env.packs(), None, &mut no_progress)
+    let error = import_file(&env.pool, &path, &env.packs(), None, &mut no_progress, None)
         .expect_err("大きすぎるファイルは弾く");
     let elapsed = started.elapsed();
 
@@ -1787,6 +1947,7 @@ fn import_pdf_rejects_more_pages_than_the_limit() {
         None,
         &mut no_progress,
         None,
+        None,
     )
     .expect_err("ページ数超過は弾く");
     match error {
@@ -1868,4 +2029,336 @@ fn render_pdf_pages_into_stops_on_error() {
     .expect_err("エラーを返す");
     assert!(matches!(error, ImportError::Pdf(_)), "{error}");
     assert_eq!(calls, 1, "1 ページ目で止める（2 ページ目を渡さない）");
+}
+
+// ---- §7.3 残件: pack だけで復元したときに戻す source / ページ本文 ----
+
+/// `document_text` を復号して `(ページ番号, 本文)` で返す。
+///
+/// 本文は平文で保存されない（セキュリティ評価 F02）ので、生の列が暗号文であることと
+/// 復号できることをここで確かめる（復号できない行は panic する）。
+fn text_rows(pool: &db::SqlitePool, document_id: &str) -> Vec<(i64, String)> {
+    let rows: Vec<(String, i64, String)> = db::block_on(async {
+        sqlx::query_as(
+            "SELECT id, page_number, text_content FROM document_text \
+             WHERE document_id = ?1 ORDER BY page_number",
+        )
+        .bind(document_id)
+        .fetch_all(pool)
+        .await
+    })
+    .unwrap();
+    let key = db::column_crypto::db_key().unwrap();
+    let mut texts: Vec<(i64, String)> = rows
+        .into_iter()
+        .map(|(id, page_number, stored)| {
+            assert!(
+                stored.starts_with(db::column_crypto::PREFIX),
+                "本文が平文で保存されている: {stored}"
+            );
+            let text = db::column_crypto::decrypt(
+                &key,
+                &db::column_crypto::aad_document_text(&id, "text_content"),
+                &stored,
+            )
+            .expect("復号できること");
+            (page_number, text)
+        })
+        .collect();
+    // 暗号文の順序は当てにできない（nonce が毎回違う）ので、復号後に並べる。
+    texts.sort();
+    texts
+}
+
+/// `token_analysis` を復号して `(ページ番号, token)` で返す。
+fn token_rows(pool: &db::SqlitePool, document_id: &str) -> Vec<(i64, String)> {
+    let rows: Vec<(String, i64, String)> = db::block_on(async {
+        sqlx::query_as(
+            "SELECT id, page_number, token FROM token_analysis \
+             WHERE document_id = ?1 ORDER BY page_number, token",
+        )
+        .bind(document_id)
+        .fetch_all(pool)
+        .await
+    })
+    .unwrap();
+    let key = db::column_crypto::db_key().unwrap();
+    let mut tokens: Vec<(i64, String)> = rows
+        .into_iter()
+        .map(|(id, page_number, stored)| {
+            assert!(
+                stored.starts_with(db::column_crypto::PREFIX),
+                "token が平文で保存されている: {stored}"
+            );
+            let token = db::column_crypto::decrypt(
+                &key,
+                &db::column_crypto::aad_token_analysis(&id, "token"),
+                &stored,
+            )
+            .expect("復号できること");
+            (page_number, token)
+        })
+        .collect();
+    // token 列も暗号化されているため、SQL の並び順では比較できない。
+    tokens.sort();
+    tokens
+}
+
+/// pack の本文エントリ（`documents/text.jsonl`）を `(ページ番号, 本文)` で読む。
+fn read_text_entry(
+    reader: &PackReader,
+    key: Option<&opfspack::PackKey>,
+) -> Vec<(i64, String)> {
+    let raw = reader
+        .read_entry("documents/text.jsonl", key)
+        .expect("本文エントリが読めること");
+    String::from_utf8(raw)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            (
+                value["pageNumber"].as_i64().unwrap(),
+                value["text"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// 取り込み元（`books.site_id` / `books.tbf_product_id`）は pack の `metadata.json` に
+/// 追加フィールドとして入る（`schemaVersion` は上げない = 追加のみの後方互換）。
+#[test]
+fn import_writes_source_into_pack_metadata() {
+    let env = TestEnv::new("import-source");
+    let source = ImportSource {
+        site_id: "fanza".to_string(),
+        product_id: "d_12345".to_string(),
+    };
+    let zip = build_zip([("001.png".to_string(), make_png(64, 96, [200, 10, 10]))]);
+    let imported = import_zip_bytes(
+        &env.pool,
+        "source-book.zip",
+        &zip,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+        Some(&source),
+    )
+    .unwrap();
+
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&reader.read_entry("metadata.json", None).unwrap()).unwrap();
+    assert_eq!(
+        meta["schemaVersion"], 1,
+        "追加フィールドなので schemaVersion は上げない"
+    );
+    assert_eq!(meta["source"]["siteId"], "fanza");
+    assert_eq!(meta["source"]["productId"], "d_12345");
+
+    // 取り込み元を渡さないときは `source` を書かない（旧 pack と同じ形のまま）。
+    let plain = build_zip([("001.png".to_string(), make_png(64, 96, [10, 200, 10]))]);
+    let imported = import_zip_bytes(
+        &env.pool,
+        "no-source.zip",
+        &plain,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+        None,
+    )
+    .unwrap();
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&reader.read_entry("metadata.json", None).unwrap()).unwrap();
+    assert!(
+        meta.get("source").is_none(),
+        "取り込み元が無いときは source を書かない: {meta}"
+    );
+}
+
+/// pack だけで復元（[`thundoku_core::import::rebuild_from_pack`]）したとき、ページ本文
+/// （`documents/text.jsonl`）から `document_text` が戻り、`token_analysis` は取り込み時と
+/// 同じ解析（`tags::extract_nouns`）で再生成される。
+#[test]
+fn pack_rebuild_restores_document_text_and_regenerates_tokens() {
+    let env = TestEnv::new("text-restore");
+    let zip = build_zip([
+        ("001.png".to_string(), make_png(64, 96, [255, 0, 0])),
+        ("002.png".to_string(), make_png(64, 96, [0, 255, 0])),
+        (
+            "本文_export.txt".to_string(),
+            "<<1Page>>\n壊れた姉弟と壊れる僕\n<<3Page>>\n三人目\n"
+                .as_bytes()
+                .to_vec(),
+        ),
+    ]);
+    let imported = import_zip_bytes(
+        &env.pool,
+        "export.zip",
+        &zip,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+        None,
+    )
+    .unwrap();
+    let text_before = text_rows(&env.pool, &imported.document.id);
+    let tokens_before = token_rows(&env.pool, &imported.document.id);
+    assert_eq!(
+        text_before,
+        vec![
+            (1, "壊れた姉弟と壊れる僕".to_string()),
+            (3, "三人目".to_string()),
+        ]
+    );
+    assert!(!tokens_before.is_empty(), "取り込み時点で名詞が入る");
+
+    // pack に本文エントリ（1 ページ 1 行の JSON Lines）が入っている。
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    assert_eq!(
+        read_text_entry(&reader, None),
+        vec![
+            (1, "壊れた姉弟と壊れる僕".to_string()),
+            (3, "三人目".to_string()),
+        ]
+    );
+
+    // DB を失った状態（= Drive 復元）から pack だけで戻す。
+    db::documents::delete_for_book(&env.pool, &imported.book.id).unwrap();
+    db::contents::delete_for_book(&env.pool, &imported.book.id).unwrap();
+    assert!(
+        rebuild_from_pack(&env.pool, &imported.book.id, &reader, None).unwrap(),
+        "pack から再構築できる"
+    );
+
+    // 本文は暗号化列なので、復号できる形で戻る（書き込みは既存の INSERT 経路）。
+    // 再構築は document 行を作り直す（id も新しい）ので、新しい id で引く。
+    let restored = db::documents::get_document_by_book_id(&env.pool, &imported.book.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(text_rows(&env.pool, &restored.id), text_before);
+    // 名詞は本文から再生成される（取り込み時と同じ経路・同じ結果）。
+    assert_eq!(token_rows(&env.pool, &restored.id), tokens_before);
+}
+
+/// 暗号化 pack（v3）でも本文エントリは他エントリと同じ規則（pack 鍵で暗号化）に従う。
+#[test]
+fn pack_rebuild_reads_text_entry_from_encrypted_pack() {
+    let env = TestEnv::new("encrypted-text-restore");
+    let root = PackRootKey::generate();
+    let zip = build_zip([
+        ("001.png".to_string(), make_png(64, 96, [1, 2, 3])),
+        (
+            "本文_export.txt".to_string(),
+            "<<1Page>>\n暗号化された本文です\n".as_bytes().to_vec(),
+        ),
+    ]);
+    let imported = import_zip_bytes(
+        &env.pool,
+        "locked.zip",
+        &zip,
+        &env.packs(),
+        Some(&root),
+        &mut no_progress,
+        None,
+        None,
+    )
+    .unwrap();
+    let pack_bytes =
+        std::fs::read(env.packs().join(format!("{}.opfspack", imported.book.id))).unwrap();
+    let reader = PackReader::open(&pack_bytes).unwrap();
+    let key = root.derive_pack_key(&imported.book.id);
+    // 鍵なしでは読めない（平文で入っていない）。
+    assert!(reader.read_entry("documents/text.jsonl", None).is_err());
+    assert_eq!(
+        read_text_entry(&reader, Some(&key)),
+        vec![(1, "暗号化された本文です".to_string())]
+    );
+
+    db::documents::delete_for_book(&env.pool, &imported.book.id).unwrap();
+    db::contents::delete_for_book(&env.pool, &imported.book.id).unwrap();
+    assert!(rebuild_from_pack(&env.pool, &imported.book.id, &reader, Some(&root)).unwrap());
+    let restored = db::documents::get_document_by_book_id(&env.pool, &imported.book.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        text_rows(&env.pool, &restored.id),
+        vec![(1, "暗号化された本文です".to_string())]
+    );
+}
+
+/// 本文エントリを持たない pack（旧形式 / Web 版が書いた pack）は今までどおり復元でき、
+/// 本文だけが空になる（回帰）。
+#[test]
+fn pack_rebuild_without_text_entry_keeps_text_empty() {
+    let env = TestEnv::new("no-text-entry");
+    let timestamp = "2026-09-27 00:00:00".to_string();
+    db::books::insert(
+        &env.pool,
+        &db::books::Book {
+            id: "old-pack".to_string(),
+            title: "旧形式".to_string(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "old-pack.opfspack".to_string(),
+            file_size: 0,
+            opfs_path: "old-pack.opfspack".to_string(),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: None,
+            tags_fetched: 1,
+            pack_id: Some("old-pack".to_string()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+
+    let meta = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "title": "旧形式",
+        "readingProgress": { "currentPage": 0, "totalPages": 1 },
+    }))
+    .unwrap();
+    let mut builder = PackBuilder::new(1_700_000_000_000);
+    builder.add_entry("metadata.json", meta, "application/json", false);
+    builder.add_entry(
+        "pages/page_0001.webp",
+        make_png(64, 96, [9, 9, 9]),
+        "image/webp",
+        false,
+    );
+    let pack = builder.build(None, true).unwrap();
+    let reader = PackReader::open(&pack).unwrap();
+
+    assert!(rebuild_from_pack(&env.pool, "old-pack", &reader, None).unwrap());
+    let document = db::documents::get_document_by_book_id(&env.pool, "old-pack")
+        .unwrap()
+        .unwrap();
+    assert_eq!(document.total_pages, 1);
+    assert!(text_rows(&env.pool, &document.id).is_empty());
+    assert!(token_rows(&env.pool, &document.id).is_empty());
 }

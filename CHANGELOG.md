@@ -4,7 +4,47 @@
 
 ## [Unreleased]
 
+### Added
+
+- **設定の「書籍のバックアップ」ON/OFF**: 本のファイル（`.opfspack`）は `drive.sync.enabled` に
+  連動して常に同期しており、大きい本を上げたくないときの手段が無かった。Google Drive の設定に
+  「書籍のバックアップ」トグルを足し、OFF のときは pack のアップロードとダウンロードを行わない
+  （**本棚・進捗の DB バックアップ（`thundoku-backup.json`）と本の鍵（`thundoku-keys.json`）の
+  同期は続く**。失うものが別なので止めない）。設定キーは `drive.sync.books` で、行が無ければ ON
+  （既定はこれまでどおり）。`crates/core/src/drive/sync.rs`、
+  `crates/app/src/{workspace.rs,views/settings.rs}`
+
+- **BOOTH で 1 商品に複数のファイルがある本を選べるようにした**: BOOTH のライブラリは 1 商品に
+  複数のダウンロード（PDF + 画像 ZIP 等）を持ち得るが、パーサーが**先頭の 1 件だけ**を取り出し、
+  商品ブロックも先頭 4000 バイトで切っていたため **2 個目以降は永久に無視**されていた。
+  商品ブロック全体から `downloadables/{id}` を文書順に全部集めて
+  `bookshelf_items.download_options`（JSON 配列）に保存し、ダウンロード時に候補が 2 件以上の
+  ときだけファイル選択を出す（1 件以下は従来どおり即開始、キャンセルは何も始めない、選択は
+  **記憶しない**）。`download_url` / `file_name` には従来どおり先頭の候補が入る（互換）。
+  お気に入りの自動ダウンロードは先頭のファイルを使う（利用者が要求していない操作で
+  モーダルを出さない既存方針）。`crates/core/src/booth.rs`、
+  `crates/core/src/db/{bookshelf.rs,mod.rs}`、`crates/app/src/views/bookshelf.rs`
+
+- **Drive から pack だけで復元したときの欠落を埋めた**: `rebuild_from_pack` は
+  `books.site_id` / `tbf_product_id` を復元せず（復元本が再取得・重複抑止・サイト絞り込みに
+  乗らなかった）、ページ本文（`document_text` / `token_analysis`）も戻らなかった。
+  pack の `metadata.json` に `source`（site / product）を追加し、本文は専用エントリ
+  `documents/text.jsonl`（JSON Lines・per-entry deflate・pack 鍵があれば他エントリと同じく
+  暗号化）で運ぶ。復元時は本文を既存の暗号化 INSERT 経路で戻し、`token_analysis` は
+  取り込みと同じ経路で再生成する（解析器のバージョン差によるドリフトは許容）。
+  `schemaVersion` は 1 のままで、**source 無し / 本文エントリ無しの旧 pack は従来どおり**復元できる。
+  実測（120 ページ・本文約 453 B/ページ）: pack は +1.11%、復元は +0.2 ms/ページ。
+  `crates/core/src/import/mod.rs`、`crates/app/src/views/bookshelf.rs`
+
 ### Fixed
+
+- **同期フォルダを毎回作って My Drive 直下に同名フォルダが増える問題**:
+  同期フォルダ（`thundoku-shelf`）は `drive.sync.folder_id` が無いとき `create_folder` するだけで、
+  **既存の同名フォルダを探していなかった**。フォルダ ID を失う経路（設定の初期化・別プロファイル）を
+  通るたびに増え、My Drive 直下に 14 個まで溜まっていた。確保の前に `files.list`（`'root' in parents`）
+  でルート直下の同名フォルダを探して**再利用**し、複数あるときは `modifiedTime` 降順 → `id` 昇順で
+  決定的に選ぶ（件数と ID は警告ログに出す。古いフォルダは消さない）。
+  `crates/core/src/drive/mod.rs`、`crates/app/src/{pack_keys.rs,views/settings.rs}`
 
 - **鍵の初回作成が並行すると、別の鍵が保存されて復号できなくなる問題**:
   DB の暗号化鍵（`secrets::SecretStore::random_key`）と pack のルート鍵（`PackKeyStore::ensure`）は

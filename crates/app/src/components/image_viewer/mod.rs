@@ -1487,7 +1487,7 @@ impl ImageViewer {
         // 全スロットをクリアするとプリロード済みの隣接ページまで消えて
         // 読み込み待ちが増えるため、一度デコードしたページは直近 30 ページ
         // 保持して再デコードを避ける（ページを戻っても即表示される）。
-        // スクロールモードは全ページを保持したままにする（クリアしない）。
+        // スクロールモードの追い出しは render の trim_scroll_cache が行う（予算内の前後だけ保持）。
         if self.mode != ViewMode::Scroll {
             for (index, slot) in self.images.iter_mut().enumerate() {
                 if index.abs_diff(self.current_page) > 30

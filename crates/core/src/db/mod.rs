@@ -300,6 +300,17 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             "tags_fetched INTEGER NOT NULL DEFAULT 0",
         )
         .await?;
+        // ダウンロード候補（BOOTH の「1 商品に複数のダウンロード（PDF + 画像 ZIP 等）」）。
+        // JSON 配列 `[{"name":...,"url":...}]`。Web スキーマに無い列なので、
+        // hidden_at / tags_fetched と同じく PRAGMA で確認してから追加する。
+        // NULL = 候補なし（`download_url` 1 件として扱う）。
+        ensure_column(
+            &mut conn,
+            "bookshelf_items",
+            "download_options",
+            "download_options TEXT",
+        )
+        .await?;
         // 閲覧履歴（プログラム的マイグレーション。既存の migration ファイルは
         // checksum 管理されるため変更せず、IF NOT EXISTS で冪等に適用する）
         sqlx::query(

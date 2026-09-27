@@ -29,6 +29,18 @@ pub struct ImportedBook {
     pub warnings: Vec<String>,
 }
 
+/// 取り込み元（`books.site_id` / `books.tbf_product_id`）。
+///
+/// pack の `metadata.json` に `source` として書き、Drive 復元（[`rebuild_from_pack`]）が
+/// **DB バックアップ無しでも** source 紐付け（重複抑止 `books::find_by_source`・サイト
+/// 絞り込み・サイト別ビューアー設定）に乗るようにする。取り込み元が分からない経路
+/// （ローカルのファイル取り込み）は `None` を渡す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSource {
+    pub site_id: String,
+    pub product_id: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
     #[error("unsupported file type: {0}")]
@@ -187,6 +199,17 @@ fn render_page_image(data: &[u8]) -> Result<(Vec<u8>, u32, u32), ImportError> {
 /// 取り込み時に並列で扱うページ数（1 チャンク分の圧縮バイトを保持する）。
 /// 1 ページ約 0.5MB なので 64 ページで 30MB 程度。
 const PAGE_RENDER_CHUNK: usize = 64;
+
+/// pack 内のページ本文エントリ（1 行 1 ページの JSON Lines）。
+///
+/// `metadata.json` を太らせずに本文を運ぶための専用エントリ（`docs/import-patterns.md`
+/// §7.3 の「復元されないもの」）。行は `{"pageNumber": <n>, "text": "<本文>"}`。
+/// Drive 復元（[`rebuild_from_pack`]）がこれを読み、`document_text` へ既存の INSERT 経路
+/// （[`documents::insert_texts_batch`]、暗号化列）で入れ、`token_analysis` は本文から
+/// [`crate::tags::extract_nouns`] で再生成する。
+///
+/// 無い pack（旧形式・Web 版が書いた pack）は「本文無し」として扱う（後方互換）。
+const TEXT_ENTRY: &str = "documents/text.jsonl";
 
 /// ページ変換（デコード + webp 再圧縮）に使うワーカー数。
 /// 1 ページあたり実測 0.13 秒（release、1433×2024。重いのはほぼ webp 再圧縮で、
@@ -852,6 +875,7 @@ fn metadata_entry(
     title: &str,
     total_pages: Option<i64>,
     contents: &[ContentSpec],
+    source: Option<&ImportSource>,
 ) -> (Vec<u8>, String) {
     let contents_json: Vec<serde_json::Value> = contents
         .iter()
@@ -879,7 +903,7 @@ fn metadata_entry(
             })
         })
         .collect();
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "schemaVersion": 1,
         "title": title,
         "author": "",
@@ -888,10 +912,32 @@ fn metadata_entry(
         "readingProgress": { "currentPage": 0, "totalPages": total_pages },
         "contents": contents_json,
     });
+    // 取り込み元は**追加フィールド**（`schemaVersion` は上げない）。無い pack を読む側は
+    // 今までどおり `None` として扱う（後方互換）。
+    if let Some(source) = source.filter(|source| !source.site_id.is_empty()) {
+        metadata["source"] = serde_json::json!({
+            "siteId": source.site_id,
+            "productId": source.product_id,
+        });
+    }
     (
         serde_json::to_vec(&metadata).expect("metadata json"),
         "metadata.json".to_string(),
     )
+}
+
+/// ページ本文エントリ（[`TEXT_ENTRY`]）のバイト列。1 行 1 ページの JSON Lines。
+///
+/// 本文に改行が含まれても行が壊れないよう、JSON の文字列として書く（読み手は 1 行ずつ
+/// `serde_json::from_str` する）。
+fn texts_entry(texts: &[(i64, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (page_number, text) in texts {
+        let line = serde_json::json!({ "pageNumber": page_number, "text": text });
+        serde_json::to_writer(&mut out, &line).expect("text entry json");
+        out.push(b'\n');
+    }
+    out
 }
 
 /// pack の `metadata.json` に記録された 1 コンテンツの表示名を書き換えた
@@ -1016,6 +1062,9 @@ struct PackSpec {
     source_type: String,
     /// 既定表示（primary）コンテンツのページ数。
     total_pages: i64,
+    /// 取り込み元（`books.site_id` / `books.tbf_product_id`）。pack の `metadata.json` に
+    /// `source` として書く（Drive 復元が source 紐付けに乗るため）。
+    source: Option<ImportSource>,
 }
 
 /// 取り込み中にページデータを保持する場所。
@@ -1254,7 +1303,8 @@ fn finish_import(
 
     // Build the pack first (metadata + pages), so document.file_hash can
     // reference the real pack bytes.
-    let (metadata, metadata_path) = metadata_entry(&title, Some(spec.total_pages), &spec.contents);
+    let (metadata, metadata_path) =
+        metadata_entry(&title, Some(spec.total_pages), &spec.contents, spec.source.as_ref());
     // **エントリを 1 件ずつ供給して組み立てる**: ページデータは `PackEntryStore` から
     // 必要なときに取り出す（メモリか一時ファイル）。全ページを同時に持たない。
     let mut entries = vec![opfspack::EntrySpec {
@@ -1263,6 +1313,24 @@ fn finish_import(
         compress: false,
     }];
     entries.extend(spec.entries.specs());
+    // ページ本文は専用エントリ（[`TEXT_ENTRY`]）で運ぶ（`metadata.json` を太らせない）。
+    // 圧縮は他のエントリと同じ per-entry のフラグ機構（テキストは deflate が効く）。
+    // 暗号化は pack 鍵の有無に従う（同じ builder 経路）。
+    let texts_entry = (!spec.texts.is_empty()).then(|| texts_entry(&spec.texts));
+    if let Some(data) = &texts_entry {
+        log::info!(
+            "finish_import: 本文エントリを書く（{} ページ / {} バイト）",
+            spec.texts.len(),
+            data.len()
+        );
+    }
+    if texts_entry.is_some() {
+        entries.push(opfspack::EntrySpec {
+            path: TEXT_ENTRY.to_string(),
+            mime_type: "application/x-ndjson".to_string(),
+            compress: true,
+        });
+    }
     // サムネイルの寸法は DB 行に要るので、`store` を動かす前に読んでおく（小さい）。
     let thumbnail_entry = spec.entries.get("thumbnail.webp")?;
     let mut store = spec.entries;
@@ -1293,6 +1361,11 @@ fn finish_import(
             |path| {
                 if path == metadata_path {
                     return Ok(metadata_for_build.clone());
+                }
+                if path == TEXT_ENTRY {
+                    return texts_entry
+                        .clone()
+                        .ok_or_else(|| opfspack::PackError::Io("text entry missing".to_string()));
                 }
                 let index = remainder
                     .get_mut(path)
@@ -1558,6 +1631,7 @@ pub fn import_file(
     packs_dir: &Path,
     root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
+    source: Option<&ImportSource>,
 ) -> Result<ImportedBook, ImportError> {
     let file_name = source_path
         .file_name()
@@ -1580,16 +1654,16 @@ pub fn import_file(
     match extension.as_str() {
         // PDF は**ファイルから**読む（4 GiB 級をメモリに載せない）
         "pdf" => import_pdf_path(
-            pool, &file_name, source_path, packs_dir, root_key, progress, None,
+            pool, &file_name, source_path, packs_dir, root_key, progress, None, source,
         ),
         // EPUB は pack に 1 エントリとして入れるだけ（ビューアー非対応）なので全体を読む
         "epub" => {
             let bytes = std::fs::read(source_path)?;
-            import_epub_bytes(pool, &file_name, &bytes, packs_dir, root_key, None)
+            import_epub_bytes(pool, &file_name, &bytes, packs_dir, root_key, None, source)
         }
         // ZIP はファイルから読む（同じく大きい本があるため）
         "zip" => import_zip_path(
-            pool, &file_name, source_path, packs_dir, root_key, progress, None,
+            pool, &file_name, source_path, packs_dir, root_key, progress, None, source,
         ),
         _ => Err(ImportError::UnsupportedType(extension)),
     }
@@ -1601,6 +1675,9 @@ pub fn import_file(
 /// `Vec<PageImage>` に全ページを集めてから `clone` して entries を作っていたので、
 /// 200 ページ級の本で数百 MB を余分に持っていた）。レンダリングは DB を触る前に
 /// 終わるので、UI スレッドの DB 操作をブロックしない点は変わらない。
+// 取り込みの文脈（鍵・進捗・再利用 id・取り込み元）はそのまま受け取る
+// （束ね直すだけの構造体を作らない。`commit_zip` と同じ流儀）。
+#[allow(clippy::too_many_arguments)]
 pub fn import_pdf_bytes(
     pool: &SqlitePool,
     file_name: &str,
@@ -1609,6 +1686,7 @@ pub fn import_pdf_bytes(
     root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
 ) -> Result<ImportedBook, ImportError> {
     let file_size = bytes.len() as i64;
     import_pdf_rendered(
@@ -1618,12 +1696,16 @@ pub fn import_pdf_bytes(
         packs_dir,
         root_key,
         reuse_book_id,
+        source,
         progress,
         |progress, on_page| pdf::render_pdf_pages_into(bytes, progress, on_page),
     )
 }
 
 /// ファイルから PDF を取り込む（**ソース全体をメモリへ読まない**。4 GiB 級の本用）。
+// 取り込みの文脈（鍵・進捗・再利用 id・取り込み元）はそのまま受け取る
+// （束ね直すだけの構造体を作らない。`commit_zip` と同じ流儀）。
+#[allow(clippy::too_many_arguments)]
 pub fn import_pdf_path(
     pool: &SqlitePool,
     file_name: &str,
@@ -1632,6 +1714,7 @@ pub fn import_pdf_path(
     root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
 ) -> Result<ImportedBook, ImportError> {
     let file_size = std::fs::metadata(path)?.len() as i64;
     import_pdf_rendered(
@@ -1641,6 +1724,7 @@ pub fn import_pdf_path(
         packs_dir,
         root_key,
         reuse_book_id,
+        source,
         progress,
         |progress, on_page| pdf::render_pdf_file_into(path, progress, on_page),
     )
@@ -1655,6 +1739,7 @@ fn import_pdf_rendered(
     packs_dir: &Path,
     root_key: Option<&PackRootKey>,
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
     progress: &mut (dyn FnMut(f32) + Send),
     render: impl FnOnce(
         &mut (dyn FnMut(f32) + Send),
@@ -1734,6 +1819,7 @@ fn import_pdf_rendered(
             contents: vec![content],
             source_type: "pdf".to_string(),
             total_pages,
+            source: source.cloned(),
         },
         reuse_book_id,
     )
@@ -1747,6 +1833,7 @@ pub fn import_epub_bytes(
     packs_dir: &Path,
     root_key: Option<&PackRootKey>,
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
 ) -> Result<ImportedBook, ImportError> {
     let entry_path = file_name.to_string();
     finish_import(
@@ -1768,6 +1855,7 @@ pub fn import_epub_bytes(
             contents: vec![single_content(MediaKind::Epub, "EPUB", 0, None)],
             source_type: "epub".to_string(),
             total_pages: 0,
+            source: source.cloned(),
         },
         reuse_book_id,
     )
@@ -1956,6 +2044,7 @@ pub fn commit_zip(
     root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
     plan: &ImportPlan,
 ) -> Result<ImportedBook, ImportError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
@@ -1969,6 +2058,7 @@ pub fn commit_zip(
         root_key,
         progress,
         reuse_book_id,
+        source,
         plan,
     )
 }
@@ -1984,6 +2074,7 @@ pub fn commit_zip_with<R: std::io::Read + std::io::Seek>(
     root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
     plan: &ImportPlan,
 ) -> Result<ImportedBook, ImportError> {
     let primary = plan
@@ -2200,12 +2291,16 @@ pub fn commit_zip_with<R: std::io::Read + std::io::Seek>(
             contents: contents_spec,
             source_type: source_type.to_string(),
             total_pages: primary_pages,
+            source: source.cloned(),
         },
         reuse_book_id,
     )
 }
 
 /// Import a ZIP: `analyze_zip` で計画を立て、既定の優先コンテンツを取り込む。
+// 取り込みの文脈（鍵・進捗・再利用 id・取り込み元）はそのまま受け取る
+// （束ね直すだけの構造体を作らない。`commit_zip` と同じ流儀）。
+#[allow(clippy::too_many_arguments)]
 pub fn import_zip_bytes(
     pool: &SqlitePool,
     file_name: &str,
@@ -2214,6 +2309,7 @@ pub fn import_zip_bytes(
     root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
 ) -> Result<ImportedBook, ImportError> {
     let plan = analyze_zip(bytes)?;
     commit_zip(
@@ -2224,6 +2320,7 @@ pub fn import_zip_bytes(
         root_key,
         progress,
         reuse_book_id,
+        source,
         &plan,
     )
 }
@@ -2231,6 +2328,9 @@ pub fn import_zip_bytes(
 /// ファイルから ZIP を取り込む（**ソース全体をメモリへ読まない**。4 GiB 級の本用）。
 ///
 /// 解析と取り込みでアーカイブを 2 回開くが、どちらも `File` から読む。
+// 取り込みの文脈（鍵・進捗・再利用 id・取り込み元）はそのまま受け取る
+// （束ね直すだけの構造体を作らない。`commit_zip` と同じ流儀）。
+#[allow(clippy::too_many_arguments)]
 pub fn import_zip_path(
     pool: &SqlitePool,
     file_name: &str,
@@ -2239,6 +2339,7 @@ pub fn import_zip_path(
     root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
 ) -> Result<ImportedBook, ImportError> {
     let plan = analyze_zip_path(path)?;
     commit_zip_path(
@@ -2249,6 +2350,7 @@ pub fn import_zip_path(
         root_key,
         progress,
         reuse_book_id,
+        source,
         &plan,
     )
 }
@@ -2270,6 +2372,7 @@ pub fn commit_zip_path(
     root_key: Option<&PackRootKey>,
     progress: &mut (dyn FnMut(f32) + Send),
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
     plan: &ImportPlan,
 ) -> Result<ImportedBook, ImportError> {
     let file = std::fs::File::open(path)?;
@@ -2283,17 +2386,22 @@ pub fn commit_zip_path(
         root_key,
         progress,
         reuse_book_id,
+        source,
         plan,
     )
 }
 
 /// pack（`.opfspack`）から DB の取り込み状態（`imported_documents` / `book_contents` /
-/// `content_formats` / `document_images`）を再構築する（Drive 復元用）。
+/// `content_formats` / `document_images` / `document_text` / `token_analysis`）と、
+/// `books` の取り込み元（`site_id` / `tbf_product_id`）を再構築する（Drive 復元用）。
 ///
-/// - すでにその本のドキュメント行があるときは何もしない（ローカルの取り込みを壊さない）
+/// - すでにその本のドキュメント行があるときはページ以下を作り直さない
+///   （ローカルの取り込みを壊さない）。**取り込み元だけは pack の値で戻す**
 /// - 構造は pack の `metadata.json` の `contents`（フェーズ2で書き出し）を使い、
 ///   無い場合はエントリから 1 コンテンツとして推定する
 /// - ページ画像の寸法はエントリのヘッダから読む（画素デコードはしない）
+/// - ページ本文は [`TEXT_ENTRY`] から戻し、`token_analysis` は本文から再生成する
+///   （エントリの無い pack は本文無し = 後方互換）
 /// - 戻り値は再構築したかどうか
 pub fn rebuild_from_pack(
     pool: &SqlitePool,
@@ -2301,19 +2409,25 @@ pub fn rebuild_from_pack(
     reader: &dyn PackRead,
     root_key: Option<&PackRootKey>,
 ) -> Result<bool, ImportError> {
-    if documents::get_document_by_book_id(pool, pack_id)?.is_some() {
-        return Ok(false);
-    }
     // v3 の pack 鍵は pack id（= book id）から導出する。
     let pack_key = root_key.map(|root| root.derive_pack_key(pack_id));
     let timestamp = now();
-    let entry_paths: Vec<String> = reader.entries().iter().map(|e| e.path.clone()).collect();
 
-    // metadata.json から題名と構造を読む
+    // metadata.json から題名・取り込み元・構造を読む
     let metadata: Option<serde_json::Value> = reader
         .read_entry("metadata.json", pack_key.as_ref())
         .ok()
         .and_then(|data| serde_json::from_slice(&data).ok());
+    // 取り込み元（`books.site_id` / `tbf_product_id`）は、すでにドキュメント行がある場合も
+    // 戻す。`drive::sync::import_book` は source を持たずに `books` 行を作るので、ここで
+    // pack の値（`source`）を入れないと復元本が source 紐付け・重複抑止に乗らない。
+    // 失敗してもページの復元は続ける（取り込み元は副次的。未知のサイト id で本ごと
+    // 復元できないほうが困る）。
+    restore_source(pool, pack_id, metadata.as_ref());
+    if documents::get_document_by_book_id(pool, pack_id)?.is_some() {
+        return Ok(false);
+    }
+    let entry_paths: Vec<String> = reader.entries().iter().map(|e| e.path.clone()).collect();
     let title = metadata
         .as_ref()
         .and_then(|value| value.get("title").and_then(|v| v.as_str()))
@@ -2344,7 +2458,8 @@ pub fn rebuild_from_pack(
     let mut primary_pages = 0i64;
     for entry in reader.entries() {
         let path = &entry.path;
-        if path == "metadata.json" {
+        if path == "metadata.json" || path == TEXT_ENTRY {
+            // 本文エントリはページではない（下の本文復元で別に読む）。
             continue;
         }
         let Ok(data) = reader.read_entry(path, pack_key.as_ref()) else {
@@ -2466,12 +2581,113 @@ pub fn rebuild_from_pack(
         .collect();
     contents::insert_batch(pool, &content_rows, &format_rows)?;
     documents::insert_images_batch(pool, &image_rows)?;
+    // ページ本文（[`TEXT_ENTRY`]）。書き込みは取り込みと同じ暗号化列の INSERT 経路を通す。
+    let texts = read_texts_entry(reader, pack_key.as_ref());
+    if !texts.is_empty() {
+        let text_rows: Vec<documents::DocumentText> = texts
+            .iter()
+            .map(|(page_number, text)| documents::DocumentText {
+                id: uuid::Uuid::new_v4().to_string(),
+                document_id: document.id.clone(),
+                page_number: *page_number,
+                text_content: text.clone(),
+                created_at: timestamp.clone(),
+            })
+            .collect();
+        documents::insert_texts_batch(pool, &text_rows)?;
+        // トークンは**本文から再生成する**（取り込みと同じ `tags::extract_nouns` 経路。
+        // 解析器のバージョン差で取り込み時と結果がずれうるが、本文は pack の値が正）。
+        let mut token_rows = Vec::new();
+        for (page_number, text) in &texts {
+            for (word, count) in crate::tags::extract_nouns(text, &[&title]) {
+                token_rows.push(documents::TokenRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    document_id: document.id.clone(),
+                    page_number: *page_number,
+                    token: word.clone(),
+                    pos: "名詞".to_string(),
+                    base_form: Some(word.clone()),
+                    reading: None,
+                    frequency: count as i64,
+                    created_at: timestamp.clone(),
+                });
+            }
+        }
+        documents::insert_tokens_batch(pool, &token_rows)?;
+        log::info!(
+            "drive restore: 本文を復元（{pack_id}: {} ページ / {} トークン）",
+            text_rows.len(),
+            token_rows.len()
+        );
+    }
     log::info!(
         "drive restore: pack から再構築（{pack_id}: {} コンテンツ / {} ページ）",
         content_rows.len(),
         primary_pages
     );
     Ok(true)
+}
+
+/// `metadata.json` の `source`（取り込み元）を `books` 行へ戻す。
+///
+/// `source` を持たない pack（旧形式・Web 版が書いた pack）では**何もしない**（既存の
+/// 値を消さない）。`books` 行が無いとき（`books` を作らない呼び出し）は何も起きない。
+/// 更新に失敗しても**エラーにしない**（未知のサイト id などで本の復元ごと止めない）。
+fn restore_source(pool: &SqlitePool, pack_id: &str, metadata: Option<&serde_json::Value>) {
+    let Some(source) = metadata.and_then(|value| value.get("source")) else {
+        return;
+    };
+    let site_id = source
+        .get("siteId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let product_id = source
+        .get("productId")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    if let Some(site_id) = site_id
+        && let Err(error) = books::set_site_id(pool, pack_id, site_id)
+    {
+        // この端末が知らないサイト id（sites 行が無い）。**product も入れない**
+        // （source は 2 つで 1 組。片方だけ入れると中途半端な紐付けになる）。
+        log::warn!("drive restore: site_id を戻せない（{pack_id}: {site_id}）: {error}");
+        return;
+    }
+    if let Some(product_id) = product_id
+        && let Err(error) = books::set_tbf_product_id(pool, pack_id, product_id)
+    {
+        log::warn!("drive restore: tbf_product_id を戻せない（{pack_id}: {product_id}）: {error}");
+    }
+}
+
+/// pack のページ本文エントリ（[`TEXT_ENTRY`]）を `(ページ番号, 本文)` で読む。
+///
+/// エントリが無い pack（旧形式・Web 版が書いた pack）は空を返す。エントリはあるが読めない
+/// （鍵違い・壊れた行）ときは、その行だけを飛ばす（本文は副次的なので復元全体を止めない）。
+fn read_texts_entry(reader: &dyn PackRead, key: Option<&opfspack::PackKey>) -> Vec<(i64, String)> {
+    if reader.entry(TEXT_ENTRY).is_none() {
+        return Vec::new();
+    }
+    let Ok(raw) = reader.read_entry(TEXT_ENTRY, key) else {
+        log::warn!("drive restore: 本文エントリを読めない（{TEXT_ENTRY}）");
+        return Vec::new();
+    };
+    let mut texts = Vec::new();
+    for line in raw.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            log::warn!("drive restore: 本文エントリに壊れた行がある（{TEXT_ENTRY}）");
+            continue;
+        };
+        let page_number = value.get("pageNumber").and_then(|value| value.as_i64());
+        let text = value.get("text").and_then(|value| value.as_str());
+        if let (Some(page_number), Some(text)) = (page_number, text) {
+            texts.push((page_number, text.to_string()));
+        }
+    }
+    texts
 }
 
 /// `metadata.json` の 1 コンテンツ分を復元する。
@@ -2638,6 +2854,7 @@ pub fn import_image_bytes(
     packs_dir: &Path,
     root_key: Option<&PackRootKey>,
     reuse_book_id: Option<&str>,
+    source: Option<&ImportSource>,
 ) -> Result<ImportedBook, ImportError> {
     let decoded = image::load_from_memory(bytes).map_err(|e| ImportError::Image(e.to_string()))?;
     // 元画像が小さい場合は Lanczos3 で 1000px 幅まで拡大してから保存する
@@ -2683,6 +2900,7 @@ pub fn import_image_bytes(
             contents: vec![content],
             source_type: "image".to_string(),
             total_pages: 1,
+            source: source.cloned(),
         },
         reuse_book_id,
     )

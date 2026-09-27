@@ -22,6 +22,9 @@ const MULTIPART_BOUNDARY: &str = "thundoku_shelf_boundary";
 /// 巻き戻る範囲が小さく、進捗も細かく見える）。
 pub const RESUMABLE_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// My Drive 直下に作る同期フォルダの名前（`drive.sync.folder_id` に id を保存する）。
+pub const SYNC_FOLDER_NAME: &str = "thundoku-shelf";
+
 /// Drive API の size フィールドをパースする（number と string の両対応）。
 fn parse_size(value: &serde_json::Value) -> Option<i64> {
     value
@@ -65,6 +68,13 @@ impl From<TbfError> for DriveError {
 
 pub trait DriveApi {
     fn list_files(&mut self, folder_id: &str) -> Result<Vec<DriveFile>, DriveError>;
+
+    /// My Drive 直下にある `name` のフォルダを**全ページ**走査して返す（ゴミ箱は除く）。
+    ///
+    /// 同名が複数返り得る（過去の版は同期のたびに `create_folder` していたので孤児が残る）。
+    /// どれを使うかは [`ensure_folder`] が決める。
+    fn find_root_folders(&mut self, name: &str) -> Result<Vec<DriveFile>, DriveError>;
+
     fn download(&mut self, file_id: &str) -> Result<Vec<u8>, DriveError>;
 
     /// 進捗つきの取得（pack / DB JSON のような**大きくなり得る本文**用）。
@@ -170,6 +180,40 @@ pub trait DriveApi {
     fn delete(&mut self, file_id: &str) -> Result<(), DriveError>;
     /// ファイルの更新日時（modifiedTime）を現在時刻に更新する（PATCH）。
     fn touch(&mut self, file_id: &str) -> Result<(), DriveError>;
+}
+
+/// My Drive 直下の `name` フォルダを**再利用**する（1 つも無ければ作って返す）。
+///
+/// 以前は `create_folder` を呼ぶだけだったため、フォルダ id を失う経路（設定の初期化・
+/// 別プロファイル）を通るたびに同名フォルダが増え、My Drive 直下に 14 個まで溜まった。
+/// ここで既存を探して使えば、増えるのは「本当に 1 つも無いとき」だけになる。
+///
+/// 複数見つかったときの選択は **`modifiedTime` の降順 → 同値・欠落は `id` 昇順**。
+/// `modifiedTime` が無いものは最も古い扱いにする（作成直後のフォルダが `modifiedTime`
+/// を返さない場合に、孤児ではなく新しい方を掴むため）。順序を決めておかないと
+/// 「同期したのに本が増えない」（別のフォルダを掴む）状態になり得る。
+/// なお、どのフォルダもアプリ専用ではないので、**古いフォルダは消さない**
+/// （ユーザーが手で置いたファイルを失わないため）。件数だけ警告して気付けるようにする。
+pub fn ensure_folder(drive: &mut dyn DriveApi, name: &str) -> Result<String, DriveError> {
+    let mut folders = drive.find_root_folders(name)?;
+    if folders.len() > 1 {
+        let ids: Vec<&str> = folders.iter().map(|folder| folder.id.as_str()).collect();
+        log::warn!(
+            "drive: ルート直下に同名フォルダが {} 個あります（name={name}, ids={ids:?}）。\
+             最新の 1 つを使います（古いものは手で片付けてください）",
+            folders.len()
+        );
+    }
+    folders.sort_by(|a, b| {
+        b.modified_time
+            .as_deref()
+            .cmp(&a.modified_time.as_deref())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    match folders.first() {
+        Some(folder) => Ok(folder.id.clone()),
+        None => drive.create_folder(name),
+    }
 }
 
 /// multipart アップロードの前後の境界（メタデータ部分と本体の間に挟む）。
@@ -284,41 +328,15 @@ impl DriveClient {
         }
     }
 
-    fn request(
-        &mut self,
-        method: &str,
-        url: &str,
-        extra_headers: &[(&str, &str)],
-        body: Option<Vec<u8>>,
-        redirects: u32,
-    ) -> Result<ResponseSpec, DriveError> {
-        let mut headers: Vec<(String, String)> = vec![(
-            "Authorization".into(),
-            format!("Bearer {}", self.access_token),
-        )];
-        headers.extend(
-            extra_headers
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
-        );
-        self.transport
-            .send(RequestSpec {
-                method: method.to_string(),
-                url: url.to_string(),
-                headers,
-                body,
-                redirects,
-            })
-            .map_err(DriveError::from)
-    }
-}
-
-impl DriveApi for DriveClient {
-    fn list_files(&mut self, folder_id: &str) -> Result<Vec<DriveFile>, DriveError> {
+    /// `files.list` を `q` で回し、**全ページ**を集める（`pageToken` を辿る）。
+    ///
+    /// `list_files` / `find_root_folders` の共通部分（`fields`・`pageSize`・エラー処理を
+    /// 揃えるため）。
+    fn list_by_query(&mut self, query: &str) -> Result<Vec<DriveFile>, DriveError> {
+        let q = percent_encode(query);
         let mut files = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
-            let q = percent_encode(&format!("'{folder_id}' in parents and trashed=false"));
             let mut url =
                 format!("{DRIVE_FILES_URL}?q={q}&fields={FIELDS}&pageSize=100&spaces=drive");
             if let Some(token) = &page_token {
@@ -376,6 +394,48 @@ impl DriveApi for DriveClient {
             }
         }
         Ok(files)
+    }
+
+    fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+        redirects: u32,
+    ) -> Result<ResponseSpec, DriveError> {
+        let mut headers: Vec<(String, String)> = vec![(
+            "Authorization".into(),
+            format!("Bearer {}", self.access_token),
+        )];
+        headers.extend(
+            extra_headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+        );
+        self.transport
+            .send(RequestSpec {
+                method: method.to_string(),
+                url: url.to_string(),
+                headers,
+                body,
+                redirects,
+            })
+            .map_err(DriveError::from)
+    }
+}
+
+impl DriveApi for DriveClient {
+    fn list_files(&mut self, folder_id: &str) -> Result<Vec<DriveFile>, DriveError> {
+        self.list_by_query(&format!("'{folder_id}' in parents and trashed=false"))
+    }
+
+    fn find_root_folders(&mut self, name: &str) -> Result<Vec<DriveFile>, DriveError> {
+        // ルート直下（`'root' in parents`）の同名フォルダ。アプリが作ったものに限らず拾う
+        // （ユーザーが手で作った同名フォルダも同期先として使える）。
+        self.list_by_query(&format!(
+            "mimeType='application/vnd.google-apps.folder' and name='{name}' and 'root' in parents and trashed=false"
+        ))
     }
 
     fn download(&mut self, file_id: &str) -> Result<Vec<u8>, DriveError> {
@@ -1279,5 +1339,205 @@ mod tests {
             .download_with_progress("file-1", &mut |_, _| false)
             .expect_err("中止が伝わっていない");
         assert!(matches!(error, DriveError::Cancelled), "{error:?}");
+    }
+
+    /// ルート直下の同名フォルダを `files.list` で探し、**全ページ**を走査する。
+    ///
+    /// クエリは「フォルダ」かつ「同名」かつ「`root` の直下」かつ「ゴミ箱に無い」。
+    /// こうしないと、過去に作られた同名フォルダ（孤児）を拾えない。
+    #[test]
+    fn find_root_folders_queries_root_by_name_and_follows_pages() {
+        struct Paged {
+            urls: Arc<Mutex<Vec<String>>>,
+        }
+        impl Transport for Paged {
+            fn send(&mut self, spec: RequestSpec) -> Result<ResponseSpec, TbfError> {
+                let page = {
+                    let mut urls = self.urls.lock();
+                    urls.push(spec.url.clone());
+                    urls.len()
+                };
+                let body = if page == 1 {
+                    json!({
+                        "nextPageToken": "page-2",
+                        "files": [{
+                            "id": "old",
+                            "name": "thundoku-shelf",
+                            "modifiedTime": "2024-01-01T00:00:00.000Z",
+                        }],
+                    })
+                } else {
+                    json!({
+                        "files": [{
+                            "id": "new",
+                            "name": "thundoku-shelf",
+                            "modifiedTime": "2025-01-01T00:00:00.000Z",
+                        }],
+                    })
+                };
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&body).expect("json"),
+                })
+            }
+        }
+
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let mut client = DriveClient::new(
+            Box::new(Paged {
+                urls: Arc::clone(&urls),
+            }),
+            "token",
+        );
+        let folders = client
+            .find_root_folders("thundoku-shelf")
+            .expect("探せるはず");
+        assert_eq!(
+            folders
+                .iter()
+                .map(|f| (f.id.as_str(), f.modified_time.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("old", Some("2024-01-01T00:00:00.000Z")),
+                ("new", Some("2025-01-01T00:00:00.000Z")),
+            ]
+        );
+
+        let urls = urls.lock().clone();
+        assert_eq!(urls.len(), 2, "pageToken で全ページを走査する: {urls:?}");
+        let encoded = urls[0]
+            .split("q=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("q がある");
+        let query = percent_encoding::percent_decode_str(encoded)
+            .decode_utf8()
+            .expect("utf-8");
+        assert_eq!(
+            query,
+            "mimeType='application/vnd.google-apps.folder' and name='thundoku-shelf' and 'root' in parents and trashed=false"
+        );
+        assert!(
+            urls[1].contains("pageToken=page%2D2"),
+            "pageToken を送る（`list_files` と同じくパーセントエンコードする）: {}",
+            urls[1]
+        );
+    }
+
+    /// `ensure_folder` 用のモック（ルート直下の同名フォルダと `create_folder` の記録）。
+    struct FolderDrive {
+        roots: Vec<DriveFile>,
+        created: Vec<String>,
+    }
+
+    impl FolderDrive {
+        fn with_roots(roots: Vec<DriveFile>) -> Self {
+            Self {
+                roots,
+                created: Vec::new(),
+            }
+        }
+    }
+
+    fn root_folder(id: &str, modified_time: Option<&str>) -> DriveFile {
+        DriveFile {
+            id: id.to_string(),
+            name: "thundoku-shelf".to_string(),
+            size: None,
+            md5_checksum: None,
+            modified_time: modified_time.map(String::from),
+        }
+    }
+
+    impl DriveApi for FolderDrive {
+        fn list_files(&mut self, _folder_id: &str) -> Result<Vec<DriveFile>, DriveError> {
+            Ok(Vec::new())
+        }
+
+        fn download(&mut self, _file_id: &str) -> Result<Vec<u8>, DriveError> {
+            Err(DriveError::Http(404, "not used".into()))
+        }
+
+        fn upload_multipart(
+            &mut self,
+            _name: &str,
+            _folder_id: &str,
+            _bytes: &[u8],
+        ) -> Result<String, DriveError> {
+            Err(DriveError::Http(500, "not used".into()))
+        }
+
+        fn find_root_folders(&mut self, _name: &str) -> Result<Vec<DriveFile>, DriveError> {
+            Ok(self.roots.clone())
+        }
+
+        fn create_folder(&mut self, name: &str) -> Result<String, DriveError> {
+            self.created.push(name.to_string());
+            Ok("created-folder".to_string())
+        }
+
+        fn delete(&mut self, _file_id: &str) -> Result<(), DriveError> {
+            Ok(())
+        }
+
+        fn touch(&mut self, _file_id: &str) -> Result<(), DriveError> {
+            Ok(())
+        }
+    }
+
+    /// 既存があるときは**作らない**（`create_folder` を呼ばない）。
+    #[test]
+    fn ensure_folder_reuses_an_existing_folder() {
+        let mut drive = FolderDrive::with_roots(vec![root_folder(
+            "existing",
+            Some("2025-05-01T00:00:00.000Z"),
+        )]);
+        let id = ensure_folder(&mut drive, "thundoku-shelf").expect("既存を使える");
+        assert_eq!(id, "existing");
+        assert!(
+            drive.created.is_empty(),
+            "既存があるのに作ろうとした: {:?}",
+            drive.created
+        );
+    }
+
+    /// 1 つも無ければ従来どおり作る。
+    #[test]
+    fn ensure_folder_creates_when_none_exists() {
+        let mut drive = FolderDrive::with_roots(Vec::new());
+        let id = ensure_folder(&mut drive, "thundoku-shelf").expect("作れる");
+        assert_eq!(id, "created-folder");
+        assert_eq!(drive.created, vec!["thundoku-shelf".to_string()]);
+    }
+
+    /// 複数あるときの選択は決定的: `modifiedTime` 降順 → 同値・欠落は `id` 昇順。
+    ///
+    /// 過去の版は毎回 `create_folder` していたため孤児が増え得る。順序が揺れると
+    /// 別のフォルダを掴んで「同期したのに本が増えない」状態になる。
+    #[test]
+    fn ensure_folder_picks_the_newest_deterministically() {
+        let roots = vec![
+            root_folder("b", Some("2025-01-01T00:00:00.000Z")),
+            root_folder("a", Some("2025-06-01T00:00:00.000Z")),
+            root_folder("c", Some("2025-06-01T00:00:00.000Z")),
+            // `modifiedTime` が無いものは最も古い扱い（最後に作ったものが返る方が危ない）
+            root_folder("d", None),
+        ];
+        let mut drive = FolderDrive::with_roots(roots.clone());
+        assert_eq!(
+            ensure_folder(&mut drive, "thundoku-shelf").expect("選べる"),
+            "a",
+            "新しい順 → 同時刻は id 昇順"
+        );
+        // 並び順を変えても同じ結果（入力の順序に依存しない）
+        let mut reversed = roots;
+        reversed.reverse();
+        let mut drive = FolderDrive::with_roots(reversed);
+        assert_eq!(
+            ensure_folder(&mut drive, "thundoku-shelf").expect("選べる"),
+            "a"
+        );
+        assert!(drive.created.is_empty(), "既存があるので作らない");
     }
 }

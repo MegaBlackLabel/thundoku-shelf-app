@@ -223,6 +223,7 @@ fn save_purchase(
         event_id: None,
         file_name: None,
         download_url: p.down_url,
+        download_options: None,
         is_downloadable: 1,
         is_checked: 0,
         is_purchased: 1,

@@ -9,6 +9,10 @@
 //! - Conflict (both changed, different content): Drive wins; the local pack
 //!   is backed up to `{packId}.conflict-local.opfspack`.
 //! - Deletions are never propagated in either direction.
+//! - Pack sync (upload and download) can be switched off with the
+//!   `drive.sync.books` setting (`SyncRequest::sync_books`). The metadata
+//!   backup and the pack key bundle keep syncing: they cover a different loss
+//!   (the database / the keys), so turning the books off must not stop them.
 //! - The metadata backup (`thundoku-backup.json`) is uploaded as an encrypted
 //!   envelope (v3) when the PRK is available, and as plaintext (v2) otherwise.
 //!   Change detection uses the envelope's `content_hmac` — never the ciphertext
@@ -292,6 +296,11 @@ pub struct SyncRequest<'a> {
     pub folder_id: &'a str,
     /// DB バックアップのローカルパス（None なら DB バックアップ／復元をしない）
     pub db_path: Option<&'a Path>,
+    /// 書籍 pack のバックアップ（設定 `drive.sync.books`。呼び出し側は
+    /// [`books_backup_enabled`] で読む）。`false` なら pack のアップロードと
+    /// ダウンロードをどちらも行わない。**DB バックアップ（`thundoku-backup.json`）と
+    /// pack 鍵 bundle（`thundoku-keys.json`）は役割が別なので止めない**。
+    pub sync_books: bool,
 }
 
 /// Run one full sync pass.
@@ -320,6 +329,7 @@ pub fn sync_with_progress(
         owner_key,
         folder_id,
         db_path,
+        sync_books,
     } = request;
     log::info!("drive sync: list_files start");
     let files = drive.list_files(folder_id)?;
@@ -351,20 +361,26 @@ pub fn sync_with_progress(
 
     log::info!("drive sync: download direction start");
     // -- download direction -------------------------------------------------
+    // 「書籍のバックアップ」OFF のときは pack を取得しない（本のファイルだけが対象。
+    // DB バックアップと pack 鍵 bundle は役割が別なので続ける）。
     // 進捗の分母（転送対象の総数）を確定させるため、md5 一致でスキップする分を先に外す
     // （スキップを分母に数えると「2/5」のまま終わらず、利用者に進まないように見える）。
     let mut pending_downloads: Vec<(&str, &DriveFile, String)> = Vec::new();
-    for (pack_id, file) in &drive_pack_by_id {
-        let state = sync_state::get(pool, pack_id)?;
-        let drive_md5 = file.md5_checksum.clone().unwrap_or_default();
-        if let Some(state) = &state
-            && !drive_md5.is_empty()
-            && drive_md5 == state.md5
-        {
-            outcome.skipped.push((*pack_id).to_string());
-            continue;
+    if sync_books {
+        for (pack_id, file) in &drive_pack_by_id {
+            let state = sync_state::get(pool, pack_id)?;
+            let drive_md5 = file.md5_checksum.clone().unwrap_or_default();
+            if let Some(state) = &state
+                && !drive_md5.is_empty()
+                && drive_md5 == state.md5
+            {
+                outcome.skipped.push((*pack_id).to_string());
+                continue;
+            }
+            pending_downloads.push((pack_id, file, drive_md5));
         }
-        pending_downloads.push((pack_id, file, drive_md5));
+    } else {
+        log::info!("drive sync: 書籍のバックアップが OFF のため pack のダウンロードをスキップ");
     }
     let download_count = pending_downloads.len();
     // 進捗コールバックが中止を求めた（`false`）。転送が進捗を報告しない場合
@@ -471,7 +487,15 @@ pub fn sync_with_progress(
     // バックアップ対象外の本（`books.backup_excluded = 1`）を 1 回だけ読む。
     // 終了時のアップロードもこの経路を通るので、ここで skip すれば終了時も上がらない。
     let backup_excluded = books::backup_excluded_ids(pool).unwrap_or_default();
-    for book in books::list(pool)? {
+    // 「書籍のバックアップ」OFF のときはアップロード対象を空にする（本のファイルだけが対象。
+    // `upload_ids` は DB バックアップの所有フィルタにも使うので**こちらは触らない**）。
+    let books_to_upload = if sync_books {
+        books::list(pool)?
+    } else {
+        log::info!("drive sync: 書籍のバックアップが OFF のため pack のアップロードをスキップ");
+        Vec::new()
+    };
+    for book in books_to_upload {
         let pack_id = book
             .pack_id
             .clone()
@@ -794,6 +818,21 @@ fn keyring_root_key(owner_id: &str) -> Option<PackRootKey> {
 ///   毎回変わるため、暗号文の md5 を基準値にはできない（仕様 §11）
 /// - v2（平文のバックアップ JSON）= 正規形 md5（[`crate::db::backup::canonical_md5_str`]）
 pub const BACKUP_BASELINE_KEY: &str = "drive.backup.md5";
+
+/// 書籍 pack のバックアップ ON/OFF を保存する設定キー（`"true"` / `"false"`）。
+pub const BOOKS_BACKUP_KEY: &str = "drive.sync.books";
+
+/// 書籍 pack のバックアップが有効か（[`BOOKS_BACKUP_KEY`]）。
+///
+/// **行が無ければ ON**（既定で本をバックアップする）。`"false"` のときだけ OFF
+/// （他の値・読めない値は ON に倒す = 利用者の控えを失う側に倒さない）。
+pub fn books_backup_enabled(pool: &SqlitePool) -> bool {
+    crate::db::settings::get(pool, BOOKS_BACKUP_KEY)
+        .ok()
+        .flatten()
+        .map(|value| value != "false")
+        .unwrap_or(true)
+}
 
 /// Drive の DB バックアップとローカルの比較結果（起動時の復元確認の判定材料）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1369,6 +1408,12 @@ mod tests {
             });
             Ok(format!("id-{name}"))
         }
+        fn find_root_folders(
+            &mut self,
+            _name: &str,
+        ) -> Result<Vec<crate::drive::DriveFile>, crate::drive::DriveError> {
+            Ok(Vec::new())
+        }
         fn create_folder(&mut self, _name: &str) -> Result<String, crate::drive::DriveError> {
             Ok("folder".into())
         }
@@ -1450,6 +1495,7 @@ mod tests {
             pack_root_key: None,
             owner_key: Some(&key),
             folder_id: "folder",
+            sync_books: true,
             db_path: Some(&db_path),
         })
         .unwrap();
@@ -1470,6 +1516,7 @@ mod tests {
             pack_root_key: None,
             owner_key: Some(&key),
             folder_id: "folder",
+            sync_books: true,
             db_path: Some(&db_path),
         })
         .unwrap();
@@ -1532,6 +1579,7 @@ mod tests {
             pack_root_key: None,
             owner_key: Some(&key),
             folder_id: "folder",
+            sync_books: true,
             db_path: Some(&db_path),
         })
         .unwrap();

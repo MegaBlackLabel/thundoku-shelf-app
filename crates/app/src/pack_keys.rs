@@ -21,7 +21,7 @@ use gpui_kit::ReadGlobal as _;
 use opfspack::{PackKeyBundle, PackRootKey, WrapKind, derive_owner_id};
 use parking_lot::Mutex;
 use thundoku_core::db::{self, SqlitePool};
-use thundoku_core::drive::{DriveApi, DriveClient};
+use thundoku_core::drive::{DriveApi, DriveClient, SYNC_FOLDER_NAME, ensure_folder};
 use thundoku_core::google::{GoogleClient, GoogleProfile};
 use thundoku_core::import::{ImportError, pack_root_key_for_import};
 use thundoku_core::pack_keys::{PackKeyStore, PackKeysError};
@@ -327,7 +327,7 @@ impl KeyContext {
         Some(root)
     }
 
-    /// Drive の同期フォルダ id（未設定なら作る）。
+    /// Drive の同期フォルダ id（未設定なら既存を探して使い、無ければ作る）。
     pub fn drive_folder(&self, drive: &mut dyn DriveApi) -> Result<String, String> {
         if let Some(id) = db::settings::get(&self.pool, DRIVE_FOLDER_KEY)
             .ok()
@@ -335,9 +335,8 @@ impl KeyContext {
         {
             return Ok(id);
         }
-        let id = drive
-            .create_folder("thundoku-shelf")
-            .map_err(|error| error.to_string())?;
+        // 既存の同名フォルダを先に探す（毎回作ると My Drive 直下に孤児が増える）
+        let id = ensure_folder(drive, SYNC_FOLDER_NAME).map_err(|error| error.to_string())?;
         let _ = db::settings::set(&self.pool, DRIVE_FOLDER_KEY, &id);
         Ok(id)
     }
@@ -810,6 +809,10 @@ mod tests {
     struct FakeDrive {
         files: HashMap<String, (String, Vec<u8>)>,
         next_id: usize,
+        /// ルート直下にある同名フォルダ（`ensure_folder` の検索結果）。
+        root_folders: Vec<DriveFile>,
+        /// `create_folder` を呼ばれた名前（**既存があるときに呼ばない**ことの検証用）。
+        created_folders: Vec<String>,
     }
 
     impl FakeDrive {
@@ -817,6 +820,8 @@ mod tests {
             Self {
                 files: HashMap::new(),
                 next_id: 1,
+                root_folders: Vec::new(),
+                created_folders: Vec::new(),
             }
         }
 
@@ -870,7 +875,12 @@ mod tests {
             Ok(self.seed(name, bytes))
         }
 
-        fn create_folder(&mut self, _name: &str) -> Result<String, DriveError> {
+        fn find_root_folders(&mut self, _name: &str) -> Result<Vec<DriveFile>, DriveError> {
+            Ok(self.root_folders.clone())
+        }
+
+        fn create_folder(&mut self, name: &str) -> Result<String, DriveError> {
+            self.created_folders.push(name.to_string());
             Ok("folder-1".to_string())
         }
 
@@ -1372,6 +1382,91 @@ mod tests {
             created.as_bytes(),
             "bundle から同じ鍵が戻る"
         );
+    }
+
+    /// `drive_folder` のテスト用 `KeyContext`（Drive はモックを渡すのでロックは使わない）。
+    fn folder_context(pool: SqlitePool) -> KeyContext {
+        KeyContext {
+            secrets: SecretStore::new(),
+            pool,
+            google: Arc::new(Mutex::new(None)),
+            profile: Arc::new(Mutex::new(None)),
+            prompt: Arc::new(PackKeyPrompt::default()),
+            slot: Arc::new(Mutex::new(None)),
+            lock_wait: DEFAULT_LOCK_WAIT,
+        }
+    }
+
+    fn root_folder(id: &str, modified_time: &str) -> DriveFile {
+        DriveFile {
+            id: id.to_string(),
+            name: "thundoku-shelf".to_string(),
+            size: None,
+            md5_checksum: None,
+            modified_time: Some(modified_time.to_string()),
+        }
+    }
+
+    /// 同期フォルダは**既存を使い**、選んだ id を `drive.sync.folder_id` に保存する。
+    ///
+    /// 以前は毎回 `create_folder` していたため、My Drive 直下に同名フォルダが
+    /// 14 個まで増えた（2026-09-27 に 13 個を手でゴミ箱へ入れた）。
+    #[test]
+    fn drive_folder_reuses_the_newest_existing_folder_and_saves_it() {
+        let pool = thundoku_core::db::test_pool();
+        thundoku_core::db::migrate(&pool).unwrap();
+        let context = folder_context(pool.clone());
+        let mut drive = FakeDrive::new();
+        drive.root_folders = vec![
+            root_folder("older", "2024-01-01T00:00:00.000Z"),
+            root_folder("newer", "2025-06-01T00:00:00.000Z"),
+        ];
+        let id = context.drive_folder(&mut drive).expect("確保できる");
+        assert_eq!(id, "newer", "新しい方を選ぶ");
+        assert!(
+            drive.created_folders.is_empty(),
+            "既存があるのに作った: {:?}",
+            drive.created_folders
+        );
+        assert_eq!(
+            db::settings::get(&pool, DRIVE_FOLDER_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("newer"),
+            "選んだ id を設定に保存する"
+        );
+    }
+
+    /// 既存が無ければ従来どおり作り、その id を保存する。
+    #[test]
+    fn drive_folder_creates_and_saves_when_none_exists() {
+        let pool = thundoku_core::db::test_pool();
+        thundoku_core::db::migrate(&pool).unwrap();
+        let context = folder_context(pool.clone());
+        let mut drive = FakeDrive::new();
+        let id = context.drive_folder(&mut drive).expect("確保できる");
+        assert_eq!(id, "folder-1");
+        assert_eq!(drive.created_folders, vec!["thundoku-shelf".to_string()]);
+        assert_eq!(
+            db::settings::get(&pool, DRIVE_FOLDER_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("folder-1"),
+            "作った id を設定に保存する"
+        );
+    }
+
+    /// 設定に id があるときは Drive を探さない（保存済みの id が優先）。
+    #[test]
+    fn drive_folder_prefers_the_saved_id() {
+        let pool = thundoku_core::db::test_pool();
+        thundoku_core::db::migrate(&pool).unwrap();
+        db::settings::set(&pool, DRIVE_FOLDER_KEY, "saved").unwrap();
+        let context = folder_context(pool.clone());
+        let mut drive = FakeDrive::new();
+        drive.root_folders = vec![root_folder("other", "2026-01-01T00:00:00.000Z")];
+        assert_eq!(context.drive_folder(&mut drive).unwrap(), "saved");
+        assert!(drive.created_folders.is_empty(), "作らない");
     }
 }
 

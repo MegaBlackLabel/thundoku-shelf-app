@@ -195,13 +195,14 @@
 
 | アップロード（ファイル直結） `upload_multipart_from_file(name, folder_id, path)` | 上と同じ multipart を、前後の境界だけメモリに持って**本体は `File` からストリーム**して送る（`Transport::send_stream` に `Content-Length` = 前後 + ファイル長を渡す）。pack 全体を RAM に載せない | `crates/core/src/drive/mod.rs`（`DriveClient` の実装。既定実装はメモリ経由 = テストのモック用） |
 | アップロード（メモリ） `upload_multipart(name, folder_id, bytes)` | `POST https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`（`DRIVE_UPLOAD_URL`）、`Content-Type: multipart/related; boundary=thundoku_shelf_boundary`（`MULTIPART_BOUNDARY`）。metadata は `{"name","parents":[folder_id],"mimeType":"application/octet-stream","appProperties":{"app":"thundoku-shelf","packId":<拡張子を除いた name>}}`。応答 JSON の `id` を返す | `crates/core/src/drive/mod.rs:12`, `:14`, `:236-285` |
-| フォルダ作成 `create_folder(name)` | `POST .../files`、`{"name","mimeType":"application/vnd.google-apps.folder"}`。応答 `id` を返す | `crates/core/src/drive/mod.rs:287-309` |
+| フォルダ作成 `create_folder(name)` | `POST .../files`、`{"name","mimeType":"application/vnd.google-apps.folder"}`。応答 `id` を返す（**同期フォルダの確保は `ensure_folder` 経由**なので、既存があれば呼ばれない） | `crates/core/src/drive/mod.rs:718-740` |
+| フォルダ検索 `find_root_folders(name)` | `files.list` に `q=mimeType='application/vnd.google-apps.folder' and name='{name}' and 'root' in parents and trashed=false` を渡し、**全ページ走査**して返す（同名が複数返り得る）。`q` の `percent_encode`・`fields`・`pageSize=100`・`pageToken`・401/403 の扱いは `list_files` と同じ共通関数 `list_by_query` | `crates/core/src/drive/mod.rs:335-397`, `:433-439` |
 | 更新日時更新 `touch(file_id)` | `PATCH .../files/{file_id}`、`{"modifiedTime": <現在 UTC の RFC3339>}` | `crates/core/src/drive/mod.rs:311-328` |
 | 削除 `delete(file_id)` | `DELETE .../files/{file_id}` | `crates/core/src/drive/mod.rs:330-341` |
 | 共通 | すべて `Authorization: Bearer {access_token}`。`redirects = 5`。`list_files` は 401/403 で「authorization failed」を返す | `crates/core/src/drive/mod.rs:103-130`, `:146-149` |
 
 - `size` は Drive API が number / string のどちらでも返し得るため両対応 `crates/core/src/drive/mod.rs:16-22`。
-- `DriveApi` trait（テストでモック差し替え可能）: `list_files` / `download` / `download_with_progress` / `upload_multipart` / `create_folder` / `delete` / `touch` `crates/core/src/drive/mod.rs:54-88`。
+- `DriveApi` trait（テストでモック差し替え可能）: `list_files` / `find_root_folders` / `download` / `download_with_progress` / `upload_multipart` / `create_folder` / `delete` / `touch` `crates/core/src/drive/mod.rs:69-183`。
 - **Google クライアントの `Mutex` は「取得 → すぐ手放す」を守る**: `parking_lot::Mutex` は
   **再入不可**で、同じスレッドが保持したまま `lock()` すると永久に待つ（デッドロック）。
   実害が出た経路: 終了時のアップロードと「今すぐ同期」が `google.lock()` を保持したまま
@@ -216,7 +217,10 @@
 - `DriveError::Cancelled` を追加（進捗コールバックが `false` を返したとき。**部分的な本文は返さない**）。`From<TbfError>` は `TbfError::Cancelled` だけ `DriveError::Cancelled` に写し、他は `Network` にする `crates/core/src/drive/mod.rs:41-42`, `:45-51`。
 - **Content-Length が無い応答でも進捗・キャンセルは効く**: `read_body_with_progress` が `total = 0` のとき **1 MiB 刻み**で通知し（`UNKNOWN_TOTAL_STEP`）、読み切ったら最後のサイズを一度通知する `crates/core/src/tbf/transport.rs:175-227`（`:182`, `:207`, `:224-226`）。
 - 同期エンジン（`drive/sync.rs`）は pack の取得に `drive.download_with_progress(...)` を通す（進捗 = `sync_with_progress` の報告、キャンセル = コールバックが `false`）。DB バックアップの復元（`:545`）と差分検査（`:649`）は `drive.download(...)`（＝`download_with_progress` に委譲）で、こちらは 2 GiB 経路だけを使い進捗は報告しない（1 ファイルの小さな JSON のため）`crates/core/src/drive/sync.rs:312-331`, `crates/core/src/drive/mod.rs:414-432`。
-- 同期フォルダは My Drive 直下の `thundoku-shelf/`（Web 版 appdata ではなくユーザー可視フォルダ）`docs/features.md:440-442`。フォルダ ID は初回同期時に `create_folder("thundoku-shelf")` で作成し `app_settings['drive.sync.folder_id']` に保存 `crates/app/src/views/settings.rs:799-808`。
+- 同期フォルダは My Drive 直下の `thundoku-shelf/`（Web 版 appdata ではなくユーザー可視フォルダ）`docs/features.md:745-750`。確保は `drive::ensure_folder(drive, SYNC_FOLDER_NAME)`（`crates/core/src/drive/mod.rs:185-217`）が行う: `find_root_folders` でルート直下の同名フォルダを探し、**あれば再利用**し、1 つも無ければ `create_folder` する。id は `app_settings['drive.sync.folder_id']` に保存する（`crates/app/src/pack_keys.rs:330-342` と `crates/app/src/views/settings.rs:1455-1467` の 2 経路。設定に id があれば Drive を触らない）。
+  - 複数見つかったときの選択は **`modifiedTime` 降順 → 同値・欠落は `id` 昇順**（決定的）。`modifiedTime` が無いものは最も古い扱い。同期先が呼び出しごとに揺れると「同期したのに本が増えない」状態になるため順序を固定する。件数と id は `log::warn!` に出す（孤児に気付けるように）。古いフォルダは**自動で消さない**（ユーザーが手で置いたファイルを失わないため）。
+  - 背景: 以前は拾えず毎回 `create_folder("thundoku-shelf")` を呼んでいたため、フォルダ id を失う経路（設定の初期化・別プロファイル）を通るたびに同名フォルダが増え、My Drive 直下に 14 個まで溜まった（2026-09-27 に 13 個を手でゴミ箱へ）。
+  - テスト: `crates/core/src/drive/mod.rs:1349-1542`（`find_root_folders` のクエリと全ページ走査・`ensure_folder` の再利用/作成/決定的な選択）と `crates/app/src/pack_keys.rs:1388-1471`（再利用して `drive.sync.folder_id` に保存・既存が無ければ作成・保存済み id の優先）。
 - **鍵 bundle `thundoku-keys.json`（v3）**: 同じフォルダに、`sub` / パスフレーズで**ラップした** PRK を置く（ファイル形式・ラップの計算は `docs/spec/10-pack-keys.md` §3.2、実装は `crates/core/src/pack_keys.rs`）。
   - 取得 `pack_keys::load_bundle(drive, folder_id, owner_id)`: 名前で一覧から探してダウンロードし、**`owner_id` が一致しない bundle は使わない**（`PackKeysError::OwnerMismatch`。黙って上書きすると相手の鍵を失うため）。無ければ `None`。
   - 保存 `pack_keys::upload_bundle`: **新しいファイルを上げてから**同名の旧ファイルを消す（先に消すと途中で失敗したときに鍵を失う。`thundoku-backup.json` と同じ順序）。
@@ -282,7 +286,7 @@
 ### 3.4 DB バックアップの中身（`db/backup.rs`）
 
 - 目的（モジュールコメント）: 画像 base64 を含む DB ファイル全体（200MB 級）を上げるのは重いため、主要テーブルのテキストのみ JSON 化する。`thumbnail_data` / `image_data` と環境依存設定（`drive.*` / `api.last_sync_at` 等）は含めない `crates/core/src/db/backup.rs:1-8`。
-- 対象テーブル（16 個、この順で処理。FK 参照元が先）: `books`, `bookshelf_items`, `checked_items`, `tbf_events`, `book_contents`, `content_formats`, `reading_progress`, `page_views`, `book_tags`, `favorite_tags`, `favorite_entities`, `imported_documents`, `document_images`, `book_first_events`, `zenn_tag_metadata`, `view_history` `crates/core/src/db/backup.rs:17-33`。
+- 対象テーブル（17 個、この順で処理。FK 参照元が先）: `books`, `bookshelf_items`, `checked_items`, `product_sample_pages`, `tbf_events`, `book_contents`, `content_formats`, `reading_progress`, `page_views`, `book_tags`, `favorite_tags`, `favorite_entities`, `imported_documents`, `document_images`, `book_first_events`, `zenn_tag_metadata`, `view_history` `crates/core/src/db/backup.rs:17-43`。
 - 除外カラム: `thumbnail_data`, `image_data`, `extracted_text`（`document_images` の
   ページ本文。暗号化 pack から取り出した平文で、バックアップに載ると暗号化の意味が
   失われる。アプリはこの列を読まない）`crates/core/src/db/backup.rs:46`。
@@ -291,9 +295,12 @@
   `favorite_tags` / `favorite_entities`）を `owner_sub` の復号比較で絞る `crates/core/src/db/backup.rs`。
   - `book_first_events` は `bookshelf_items` の子（FK）なので、親と同じ規則で絞らないと
     復元時に FK 違反で全体がロールバックする。
+  - `product_sample_pages` は `owner_sub` も `book_id` も持たないため、親の
+    `checked_items` を復号した id 集合で `checklist_item_id` を絞る
+    （他アカウントのチェックリストの試し読みを混ぜない）`crates/core/src/db/backup.rs:192-214`, `:515-526`。
   - 復元 `import_json` は `books.id` / `books.pack_id` が安全な id でなければ**復元を中止**する
     （`pack_path::is_safe_id`。保存領域外を指す pack パスを作らせない）。
-- 復元 `import_json`: 各テーブルを PK 競合時 `DO UPDATE` の UPSERT でマージ（**Drive 側優先**）。`INSERT ... ON CONFLICT DO UPDATE` は DELETE を伴わないため FK の `ON DELETE CASCADE` を発火させない `crates/core/src/db/backup.rs:331-379`, `:526-`。PK 定義は `books:[id]`, `bookshelf_items:[site_id,database_id]`, `checked_items:[id]`, `tbf_events:[id]`, `book_contents:[content_id]`, `content_formats:[format_id]`, `reading_progress:[book_id,content_id]`, `page_views:[book_id,content_id,page_number]`, `book_tags:[id]`, `favorite_tags:[tag_name]`, `favorite_entities:[entity_kind,entity_name]`, `imported_documents:[id]`, `document_images:[id]`, `book_first_events:[site_id,database_id]`, `zenn_tag_metadata:[tag_name]`, `view_history:[id]` `crates/core/src/db/backup.rs:398-419`。
+- 復元 `import_json`: 各テーブルを PK 競合時 `DO UPDATE` の UPSERT でマージ（**Drive 側優先**）。`INSERT ... ON CONFLICT DO UPDATE` は DELETE を伴わないため FK の `ON DELETE CASCADE` を発火させない `crates/core/src/db/backup.rs:331-379`, `:526-`。PK 定義は `books:[id]`, `bookshelf_items:[site_id,database_id]`, `checked_items:[id]`, `product_sample_pages:[id]`, `tbf_events:[id]`, `book_contents:[content_id]`, `content_formats:[format_id]`, `reading_progress:[book_id,content_id]`, `page_views:[book_id,content_id,page_number]`, `book_tags:[id]`, `favorite_tags:[tag_name]`, `favorite_entities:[entity_kind,entity_name]`, `imported_documents:[id]`, `document_images:[id]`, `book_first_events:[site_id,database_id]`, `zenn_tag_metadata:[tag_name]`, `view_history:[id]` `crates/core/src/db/backup.rs:439-461`。
 - Drive 上のファイル名: `const DB_BACKUP_NAME = "thundoku-backup.json"` `crates/core/src/drive/sync.rs:501`。
 - **暗号化（v3 / R06）**: Drive 上の `thundoku-backup.json` は 2 形式ある（仕様の正は `docs/spec/10-pack-keys.md` §11）:
   - **v3 = 暗号化された封筒**（`format_version: 3` + `encryption`）。平文は従来のバックアップ JSON そのもので、鍵は PRK から導出した `backup_cipher_key` / `backup_hash_key`
@@ -320,7 +327,8 @@
 | 起動時 | ログイン済み かつ `drive.sync.enabled` が `"true"`/`"1"` かつ `drive.sync.folder_id` があり、`inspect_drive_backup` が「Drive 側が最後のアップロードから動いた」と判定したときだけ復元確認ダイアログ（ローカル側だけが進んだ場合は出さない）。v3 の封筒は keyring の PRK で復号してから比較する | `crates/app/src/workspace.rs:582-673`, `:1359-1364` |
 | 暗号化バックアップだが鍵が無い | 起動時の `inspect_drive_backup` は内容を比較せず復元確認を出さない（`local_differs = false`）。復元を実行しても `SyncError::BackupKeyRequired` で失敗し**1 行も取り込まない**（`docs/spec/10-pack-keys.md` §11.4） | `crates/core/src/drive/sync.rs:538-569`, `:638-687` |
 | OFF スイッチ | 設定のトグルで `drive.sync.enabled` に `"true"`/`"false"` を保存（起動時読み込み時に `"true"` のみ有効） | `crates/app/src/views/settings.rs:754-766`, `:133` |
-| 同期情報のクリア | `drive_sync_state` を全 DELETE し、`drive.sync.enabled` / `drive.sync.folder_id` / `drive.last_sync_at` / `drive.file_count` / `drive.total_bytes` / `drive.backup.md5` を削除（次回は全ファイルが再送/再取得対象） | `crates/core/src/drive/sync.rs:691-709`, `crates/app/src/views/settings.rs:2478-2509` |
+| 書籍のバックアップ OFF | 設定のトグルで `drive.sync.books` に `"true"`/`"false"`（**行が無ければ ON**）。OFF の同期は pack のアップロード / ダウンロードだけをスキップし（MD5 照会もしない）、DB バックアップと鍵 bundle は続ける。既定 ON に倒すのは「利用者の控えを失う側に倒さない」ため | `crates/core/src/drive/sync.rs:295-303`, `:369`, `:492`, `:823-833`; `crates/app/src/views/settings.rs:1359-1373`, `:2741-2787` |
+| 同期情報のクリア | `drive_sync_state` を全 DELETE し、`drive.sync.enabled` / `drive.sync.folder_id` / `drive.last_sync_at` / `drive.file_count` / `drive.total_bytes` / `drive.backup.md5` を削除（次回は全ファイルが再送/再取得対象）。`drive.sync.books` は**消さない**（同期状態ではなく利用者の設定） | `crates/core/src/drive/sync.rs:691-709`, `crates/app/src/views/settings.rs:2478-2509` |
 | 未ログイン | `sync_drive_now` は「Google にログインしてください」で失敗。同期エンジン側も `identity_sub=None` でアップロード対象ゼロ | `crates/app/src/views/settings.rs:792-795`, `crates/core/src/drive/sync.rs:231-238` |
 | 暗号化 pack だが鍵が無い | `SyncError::PackKeyRequired`（同期全体を中断。**平文として読む・平文で上書きする経路は無い**）。UI はログインとパスフレーズによる鍵の復元を案内する | `crates/core/src/drive/sync.rs:279-281` |
 | v2 以前の pack を取得 | `SyncError::UnsupportedPackVersion { pack_id, version }`（`PackReader::open` の `Version` を写す）。**ストアからの取り込み直し**を案内する | `crates/core/src/drive/sync.rs:269-277` |

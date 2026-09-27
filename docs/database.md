@@ -38,7 +38,9 @@ Drive 同期設定など）。
 `viewer.wheel_direction`（`down-to-next` / `up-to-next`）、`viewer.autoplay_interval.{site}`、
 `bookshelf.site_filter`、`bookshelf.view_mode`（`card` / `list`）、`bookshelf.sort_field` /
 `bookshelf.sort_ascending`、`tag.fetch.enabled`、`drive.sync.folder_id`、
-`drive.sync.enabled`、`api.last_sync_at`、`theme.mode`、`checklist.poll.interval_min`。
+`drive.sync.enabled`、`drive.sync.books`（`true` / `false`。**行が無ければ ON**。
+OFF のとき Drive 同期は pack の送受信をスキップする）、`api.last_sync_at`、`theme.mode`、
+`checklist.poll.interval_min`。
 
 ### books
 
@@ -89,7 +91,8 @@ Drive 同期設定など）。
 | format | TEXT | PDF / EPUB 等 |
 | causedAt | TEXT | 購入日時 |
 | event_name / event_slug / event_id | TEXT/INT | イベント情報（event_id は FK→tbf_events） |
-| file_name / download_url | TEXT | ダウンロード情報 |
+| file_name / download_url | TEXT | ダウンロード情報。**1 商品に複数ファイルがある BOOTH の本**は先頭の候補が入る |
+| download_options | TEXT | BOOTH の複数ダウンロードの候補（JSON 配列 `[{"name","url"}]`）。**Web スキーマ（`schema.sql`）に無い列**で、`hidden_at` / `tags_fetched` と同じく `ensure_column` が runtime DDL で追加する（`crates/core/src/db/mod.rs:303-313`）。NULL = 候補なし（`download_url` 1 件として扱う。読み出しは `crates/core/src/db/bookshelf.rs:59-76`） |
 | is_downloadable / is_checked / is_purchased / is_new / is_active | INTEGER | フラグ群 |
 | is_favorite / is_hidden | INTEGER | お気に入り・非表示 |
 | tags_json | TEXT | タグの JSON スナップショット |
@@ -317,6 +320,11 @@ Google Drive との同期状態（pack ごと）。
 - `bookshelf_items.tags_fetched` は `ensure_column`
   （`bookshelf_items` / `tags_fetched` / `tags_fetched INTEGER NOT NULL DEFAULT 0`）で
   冪等に追加する（未ダウンロード本のタグ取得済みフラグ）
+- `bookshelf_items.download_options` も `ensure_column`
+  （`bookshelf_items` / `download_options` / `download_options TEXT`）で冪等に追加する
+  （BOOTH の 1 商品複数ダウンロードの候補。JSON 配列 `[{"name","url"}]`。
+  `schema.sql` にも `0001_init.sql` にも無いため、Web スキーマとの差分はここで吸収する
+  — `crates/core/src/db/mod.rs:303-313`）
 - `content_formats.label` の旧値（`画像` / `PDF` / `EPUB`）は `migrate()` 内の
   データ移行（`contents::migrate_legacy_labels`）で実データに合わせて書き換える
   （画像 = 拡張子名、PDF/EPUB = 種別名）

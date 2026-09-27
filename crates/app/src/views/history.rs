@@ -1915,6 +1915,7 @@ mod tests {
             event_id: None,
             file_name: None,
             download_url: None,
+            download_options: None,
             is_downloadable: 1,
             is_checked: 0,
             is_purchased: 1,

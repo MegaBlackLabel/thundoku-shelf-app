@@ -20,7 +20,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName};
 use thundoku_core::db;
 use thundoku_core::drive::sync;
-use thundoku_core::drive::{DriveApi, DriveClient};
+use thundoku_core::drive::{DriveClient, SYNC_FOLDER_NAME, ensure_folder};
 use thundoku_core::secrets;
 use thundoku_core::tbf::UreqTransport;
 
@@ -83,6 +83,9 @@ pub struct SettingsView {
     book_count: usize,
     /// Drive 同期有効フラグ（render での毎回の DB 読みを避けるためのキャッシュ）
     drive_enabled: bool,
+    /// 書籍 pack のバックアップ ON/OFF（`drive.sync.books`。行が無ければ ON）。
+    /// 同じく render のためにキャッシュする。
+    drive_books_enabled: bool,
     /// Drive の最終同期時刻 / 件数 / 合計バイト数（同じくキャッシュ。`reload` で更新）
     drive_last_sync: Option<String>,
     drive_file_count: usize,
@@ -316,6 +319,8 @@ impl SettingsView {
             book_count: 0,
             drive_enabled: Self::read_setting(cx, "drive.sync.enabled")
                 .is_some_and(|v| v == "true"),
+            // 書籍のバックアップは**行が無ければ ON**（既定で本をバックアップする）
+            drive_books_enabled: sync::books_backup_enabled(&AppState::global(cx).db_pool),
             drive_last_sync: None,
             drive_file_count: 0,
             drive_total_bytes: 0,
@@ -461,6 +466,7 @@ impl SettingsView {
         self.refresh_status_counts(cx);
         self.drive_enabled =
             Self::read_setting(cx, "drive.sync.enabled").is_some_and(|v| v == "true");
+        self.drive_books_enabled = sync::books_backup_enabled(&AppState::global(cx).db_pool);
         self.drive_last_sync = Self::read_setting(cx, "drive.last_sync_at");
         self.drive_file_count = Self::read_setting(cx, "drive.file_count")
             .and_then(|v| v.parse::<usize>().ok())
@@ -1346,6 +1352,24 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// 書籍 pack のバックアップ ON/OFF（`drive.sync.books`）。
+    ///
+    /// OFF でも DB バックアップ（`thundoku-backup.json`）と鍵 bundle（`thundoku-keys.json`）は
+    /// 同期する（本のファイルとは失うものが別のため）。
+    pub fn toggle_drive_books(&mut self, cx: &mut Context<Self>, enabled: bool) {
+        {
+            let state = AppState::global(cx);
+            let db = &state.db_pool;
+            let _ = db::settings::set(
+                db,
+                sync::BOOKS_BACKUP_KEY,
+                if enabled { "true" } else { "false" },
+            );
+        }
+        self.drive_books_enabled = enabled;
+        cx.notify();
+    }
+
     /// Google の認証が失効していたとき（リフレッシュトークンの失効・取り消し）の後始末。
     ///
     /// 保存済みトークンを破棄し、再ログインの導線を自動で出す。画面に出す日本語の文言を返す
@@ -1455,10 +1479,9 @@ impl SettingsView {
             let folder_id = match folder_id {
                 Some(id) => id,
                 None => {
-                    log::info!("sync_drive_now: creating folder");
-                    let id = drive
-                        .create_folder("thundoku-shelf")
-                        .map_err(|e| e.to_string())?;
+                    log::info!("sync_drive_now: looking for an existing folder");
+                    // 既存の同名フォルダを先に探す（毎回作ると My Drive 直下に孤児が増える）
+                    let id = ensure_folder(&mut drive, SYNC_FOLDER_NAME).map_err(|e| e.to_string())?;
                     let _ = db::settings::set(&db, "drive.sync.folder_id", &id);
                     id
                 }
@@ -1469,6 +1492,9 @@ impl SettingsView {
                 .unlock("同期")
                 .map_err(crate::pack_keys::SyncFailure::unlock)?;
             log::info!("sync_drive_now: running sync engine");
+            // 書籍のバックアップ ON/OFF（行が無ければ ON）。OFF でも DB バックアップと
+            // 鍵 bundle は同期する（本のファイルとは失うものが別）。
+            let sync_books = sync::books_backup_enabled(&db);
             // メインの DB プールをそのまま使う（WAL により同期タスクと並行可能）
             let outcome = sync::sync_with_progress(
                 sync::SyncRequest {
@@ -1481,6 +1507,7 @@ impl SettingsView {
                     owner_key: db_key.as_ref(),
                     folder_id: &folder_id,
                     db_path: Some(&db_path),
+                    sync_books,
                 },
                 &mut |progress| {
                     // UI 側が閉じている（送れない）か、中止が要求されていれば止める
@@ -2512,6 +2539,7 @@ impl Render for SettingsView {
         let confirm_remove_passphrase = settings_confirm && self.confirm_remove_passphrase;
         let pending_data_dir = self.pending_data_dir.clone();
         let drive_enabled = self.drive_enabled;
+        let drive_books_enabled = self.drive_books_enabled;
         let drive_last_sync = self
             .drive_last_sync
             .clone()
@@ -2708,6 +2736,53 @@ impl Render for SettingsView {
                                             });
                                         }
                                     }),
+                            ),
+                    )
+                    // 書籍のバックアップ（本のファイル本体）。OFF でも DB バックアップと
+                    // 鍵 bundle は同期する（本のファイルとは失うものが別のため）。
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("書籍のバックアップ"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted_fg)
+                                            .child("OFF にすると、本のファイル（.opfspack）のアップロードとダウンロードを行いません。本棚・進捗のデータと本の鍵はこれまでどおりバックアップします。"),
+                                    ),
+                            )
+                            .child(
+                                // `Switch` は `InteractiveElement` ではないので、
+                                // テスト用の目印は包む div に付ける
+                                div()
+                                    .debug_selector(|| "drive-books-toggle".into())
+                                    .child(
+                                        Switch::new("drive-books-toggle")
+                                            .checked(drive_books_enabled)
+                                            .cursor_pointer()
+                                            .on_click({
+                                                let handle = handle.clone();
+                                                move |checked, _window, cx| {
+                                                    handle.update(cx, |this, cx| {
+                                                        this.toggle_drive_books(cx, *checked)
+                                                    });
+                                                }
+                                            }),
+                                    ),
                             ),
                     )
                     .child(
@@ -3977,6 +4052,7 @@ mod tests {
                     event_id: None,
                     file_name: None,
                     download_url: None,
+                    download_options: None,
                     is_downloadable: 1,
                     is_checked: 0,
                     is_purchased: 1,
@@ -4172,6 +4248,76 @@ mod tests {
             db::settings::get(db, "drive.sync.enabled").unwrap()
         });
         assert_eq!(enabled.as_deref(), Some("true"));
+    }
+
+    /// 保存済みの `drive.sync.books` を読む（view のキャッシュではなく設定そのものを見る）。
+    fn stored_books_setting(cx: &TestAppContext) -> Option<String> {
+        cx.read(|cx| db::settings::get(&AppState::global(cx).db_pool, "drive.sync.books").unwrap())
+    }
+
+    #[gpui_kit::test]
+    async fn drive_books_toggle_defaults_to_on_and_persists(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(SettingsView::new);
+        // 設定の行が無ければ ON（既定で本をバックアップする）
+        assert!(
+            cx.read(|cx| view.read(cx).drive_books_enabled),
+            "未設定は ON（既定）であること"
+        );
+        assert_eq!(
+            stored_books_setting(cx),
+            None,
+            "既定を読むだけで設定を書き込まない"
+        );
+        cx.update(|cx| view.update(cx, |this, cx| this.toggle_drive_books(cx, false)));
+        assert!(
+            !cx.read(|cx| view.read(cx).drive_books_enabled),
+            "画面の状態が OFF になっていない"
+        );
+        assert_eq!(stored_books_setting(cx).as_deref(), Some("false"));
+        // ON に戻せる
+        cx.update(|cx| view.update(cx, |this, cx| this.toggle_drive_books(cx, true)));
+        assert_eq!(stored_books_setting(cx).as_deref(), Some("true"));
+    }
+
+    /// 設定画面の Drive セクションに「書籍のバックアップ」トグルが実際に描かれ、
+    /// クリックが `drive.sync.books` に反映される。
+    #[gpui_kit::test]
+    async fn drive_books_toggle_is_rendered_and_persists_on_click(cx: &mut TestAppContext) {
+        // Drive カードは設定画面の下の方にあるので、縦に長いウィンドウで描く
+        const WINDOW_H: f32 = 3400.0;
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| *AppState::global(cx).google_logged_in.lock() = true);
+        let view = cx.new(SettingsView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(WINDOW_H),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..3 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        let toggle = visual
+            .debug_bounds("drive-books-toggle")
+            .expect("「書籍のバックアップ」トグルが描かれていない");
+        assert!(
+            toggle.center().y < gpui_kit::px(WINDOW_H),
+            "トグルがウィンドウの外にある（ウィンドウを高くする）: {toggle:?}"
+        );
+        visual.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        assert_eq!(
+            stored_books_setting(cx).as_deref(),
+            Some("false"),
+            "クリックが設定に反映されない"
+        );
     }
 
     #[gpui_kit::test]

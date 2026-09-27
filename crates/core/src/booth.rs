@@ -105,6 +105,37 @@ pub struct BoothLibraryItem {
     pub thumbnail_url: Option<String>,
     /// ダウンロード URL（booth.pm/downloadables/{id}）
     pub download_url: Option<String>,
+    /// ダウンロード候補（**文書順**）。1 商品に複数ファイル（PDF + 画像 ZIP 等）が
+    /// ある場合は 2 件以上になる。1 件目は `download_url` / `file_name` と同じもの。
+    pub download_options: Vec<DownloadOption>,
+}
+
+/// ダウンロード候補 1 件（ファイル名 + URL）。
+///
+/// 1 商品に複数のダウンロードがある場合、どのファイルを取得するかを利用者に
+/// 選ばせるために使う。`bookshelf_items.download_options` へ JSON 配列で保存する
+/// （[`encode_download_options`] / [`decode_download_options`]）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DownloadOption {
+    /// ファイル名（ライブラリの行に出る名前。取れなければ `None`）
+    pub name: Option<String>,
+    /// ダウンロード URL（`https://booth.pm/downloadables/{id}`）
+    pub url: String,
+}
+
+/// 候補を `bookshelf_items.download_options` 用の JSON にする（空なら `None` = NULL）。
+pub fn encode_download_options(options: &[DownloadOption]) -> Option<String> {
+    if options.is_empty() {
+        return None;
+    }
+    serde_json::to_string(options).ok()
+}
+
+/// `bookshelf_items.download_options` の JSON を候補にする。
+/// 空・壊れた JSON は空（1 商品 = 1 ファイルの従来どおりの扱いに戻る）。
+pub fn decode_download_options(json: Option<&str>) -> Vec<DownloadOption> {
+    json.and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default()
 }
 
 /// 購入履歴の 1 注文（商品名 + 注文日時）。
@@ -620,12 +651,15 @@ fn parse_library(html: &str) -> Vec<BoothLibraryItem> {
         r#"<a[^>]*href="https?://(?:[a-z0-9-]+\.)?booth\.pm/(?:ja/)?items/(\d+)"[^>]*><div class="text-text-default font-bold[^"]*"[^>]*>(.*?)</div></a>"#,
     )
     .unwrap();
+    // 各アイテムブロックの開始位置（次のアイテムの開始までが 1 商品のブロック）
+    let mut starts = Vec::new();
     for cap in re.captures_iter(html) {
         let item_id = cap[1].parse::<u64>().unwrap_or(0);
         let title = strip_tags(&cap[2]);
         if item_id == 0 || title.is_empty() {
             continue;
         }
+        starts.push(cap.get(0).map(|matched| matched.start()).unwrap_or(0));
         items.push(BoothLibraryItem {
             item_id,
             title,
@@ -633,33 +667,43 @@ fn parse_library(html: &str) -> Vec<BoothLibraryItem> {
             file_name: None,
             thumbnail_url: None,
             download_url: None,
+            download_options: Vec::new(),
         });
     }
     // 各アイテムにショップ名・ファイル名・DL URL・サムネイルを補完する
-    for item in items.iter_mut() {
-        let start = html.find(&format!("items/{}", item.item_id)).unwrap_or(0);
-        // UTF-8 の文字境界でクランプする（マルチバイト文字の途中で切るとパニックする）
-        let mut end = (start + 4000).min(html.len());
-        while end > start && !html.is_char_boundary(end) {
-            end -= 1;
-        }
+    for (index, item) in items.iter_mut().enumerate() {
+        // ブロックは**次の商品の手前まで**丸ごと使う（以前は先頭から 4000 文字で
+        // 切っていたため、2 個目以降のダウンロードボタンを取りこぼしていた）。
+        // 境界はアイテム見出しのアンカーなので、隣の商品と混ざらない。
+        let start = starts[index];
+        let end = starts.get(index + 1).copied().unwrap_or(html.len());
         let block = &html[start..end];
         item.shop_name = extract_shop_name(block);
-        item.file_name = extract_file_name(block);
-        item.download_url = extract_download_url(block);
+        item.download_options = extract_download_options(block);
+        // 既存列（`download_url` / `file_name`）には**先頭の候補**を従来どおり入れる
+        // （1 ファイルの商品は今までと同じ値になる。古い行・古い読み手のフォールバック）。
+        if let Some(first) = item.download_options.first() {
+            item.download_url = Some(first.url.clone());
+        }
+        let row_file_name = extract_file_name(block);
+        item.file_name = item
+            .download_options
+            .first()
+            .and_then(|option| option.name.clone())
+            .or(row_file_name.clone());
         item.thumbnail_url = extract_thumbnail_url(block);
         // リンク先が見つからないアイテム（ファイルはあるが downloadables の
         // data-href が消えている本）を特定する。ダウンロード可能な場合は
         // ブロック内の別の手がかり（JSON・data 属性）から URL を復元するため、
         // ブロックの実物をログに残す。
-        if item.download_url.is_none() && item.file_name.is_some()
+        if item.download_url.is_none() && row_file_name.is_some()
             || (item.download_url.is_none() && item.thumbnail_url.is_some())
         {
             log::warn!(
                 "booth library: download_url なし item_id={} title={:?} file_name={:?} block_head={:?}",
                 item.item_id,
                 item.title,
-                item.file_name,
+                row_file_name,
                 block.chars().take(400).collect::<String>()
             );
         }
@@ -752,7 +796,7 @@ pub fn parse_item_brand(html: &str) -> Option<String> {
     None
 }
 
-/// ファイル名（タイトル直後の min-w-0 break-words ブロック内のテキスト）
+/// ファイル名（行の見出し `min-w-0 break-words whitespace-pre-line` ブロック内のテキスト）
 fn extract_file_name(block: &str) -> Option<String> {
     // ファイル名は「.pdf」「.zip」等の拡張子を含む最初のテキスト行
     regex::Regex::new(r#"class="min-w-0 break-words whitespace-pre-line"[^>]*>(.*?)</div>"#)
@@ -763,42 +807,50 @@ fn extract_file_name(block: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// ダウンロード URL（js-download-button の data-href）。
+/// 商品ブロック内のダウンロード候補を**文書順に全部**集める。
 ///
-/// ライブラリのボタンは 2 種類ある:
+/// 1 商品に複数ファイル（PDF + 画像 ZIP 等）がある本はボタンも複数ある。以前は
+/// 先頭の 1 つだけを返していたため、2 個目以降が永久に無視されていた。
+///
+/// ライブラリのボタンは 3 種類ある:
+/// - `data-test="downloadable"`: ファイル本体
 /// - `data-test="browsable"`（`?browse=1` 付き）: ブラウザプレビュー用。
-///   この URL から取得すると HTML（プレビュー画面）が返る。
-/// - `data-test="downloadable"`: ファイル本体。こちらを優先する。
-/// - `other-downloads-button`（deeplink）: アプリ起動用。無視する。
-fn extract_download_url(block: &str) -> Option<String> {
-    // 1) 本体（downloadable）の data-href を優先
-    let downloadable = regex::Regex::new(
-        r#"data-href[" ]?="(https://booth\.pm/downloadables/\d+[^"]*)"[^>]*data-test="downloadable""#,
-    )
-    .unwrap()
-    .captures(block)
-    .and_then(|c| c.get(1))
-    .map(|m| m.as_str().to_string());
-    if downloadable.is_some() {
-        return downloadable;
+///   同じ `downloadables/{id}` を返すので、クエリを落としてファイル URL として使う
+///   （既存規則）
+/// - `other-downloads-button`（deeplink）: アプリ起動用。`downloadables` の
+///   `data-href` を持たないためここには入らない
+///
+/// 同じ `downloadables/{id}`（`?browse=1` 違い・同名の重複ボタン）は 1 件に畳む。
+/// ファイル名は各ボタンの**直前**にある行から取る（ボタンの後ろにある名前は
+/// 次の候補のものなので混ぜない）。
+fn extract_download_options(block: &str) -> Vec<DownloadOption> {
+    let name_re =
+        regex::Regex::new(r#"class="min-w-0 break-words whitespace-pre-line"[^>]*>(.*?)</div>"#)
+            .unwrap();
+    let url_re =
+        regex::Regex::new(r#"data-href[" ]?="(https://booth\.pm/downloadables/\d+[^"]*)""#)
+            .unwrap();
+    let mut options: Vec<DownloadOption> = Vec::new();
+    // 直前のボタンの終端。名前を次の行へ使い回さないための区切り。
+    let mut row_start = 0usize;
+    for cap in url_re.captures_iter(block) {
+        let Some(matched) = cap.get(1) else { continue };
+        let name = name_re
+            .captures_iter(&block[row_start..matched.start()])
+            .last()
+            .map(|name| strip_tags(&name[1]))
+            .filter(|name| !name.is_empty());
+        row_start = matched.end();
+        // `?browse=1`（ブラウザで開く）はプレビュー用のクエリで、外すと同じ
+        // `downloadables/{id}`（ファイル本体）になる（既存規則）。
+        let raw = matched.as_str();
+        let url = raw.split('?').next().unwrap_or(raw).to_string();
+        if options.iter().any(|option| option.url == url) {
+            continue;
+        }
+        options.push(DownloadOption { name, url });
     }
-    // 2) ブラウザ用（browsable）しか無い本はクエリ（?browse=1）を除去して
-    //    ファイル URL として使う（同一 downloadables/{id} が返る）。
-    regex::Regex::new(r#"data-href="(https://booth\.pm/downloadables/\d+)\?browse=1""#)
-        .unwrap()
-        .captures(block)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-        .or_else(|| {
-            // 後方互換: サーバー側の構造変化に備えて、downloadables を含む
-            // data-href を最初の 1 件にフォールバック（?browse=1 除去）。
-            regex::Regex::new(r#"data-href="(https://booth\.pm/downloadables/\d+[^"]*)""#)
-                .unwrap()
-                .captures(block)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_string())
-                .map(|url| url.split('?').next().unwrap_or(&url).to_string())
-        })
+    options
 }
 
 /// サムネイル URL（l-library-item-thumbnail）
@@ -934,6 +986,105 @@ mod tests {
                 .unwrap_or_default()
                 .contains("300x300")
         );
+        // ブラウザ用（?browse=1）しか無い本も、クエリを落として 1 件の候補にする
+        assert_eq!(
+            item.download_options,
+            vec![DownloadOption {
+                name: Some("sample-book.pdf".to_string()),
+                url: "https://booth.pm/downloadables/8191306".to_string(),
+            }]
+        );
+    }
+
+    /// 1 商品に複数のダウンロード（PDF + 画像 ZIP 等）がある場合、`data-href` を
+    /// **文書順に全部**集める（2 個目以降が無視される制約の解消）。
+    ///
+    /// ブロックは 4000 文字で切らないので、間に長い説明文があっても取りこぼさない。
+    /// 末尾に別の商品を置き、隣の商品のボタンを混ぜないことも見る。
+    #[test]
+    fn parse_library_collects_every_download_in_document_order() {
+        // 1 文字 3 バイト × 3000 = 9000 バイト（旧実装の 4000 バイト境界の外）
+        let filler = "説".repeat(3000);
+        let html = format!(
+            r#"<a href="https://booth.pm/ja/items/100"><div class="text-text-default font-bold text-16">二冊セット (電子版)</div></a>\
+<div class="desktop:flex"><div class="min-w-0 break-words whitespace-pre-line"><div>book.pdf</div></div>\
+<div><div class="js-download-button" data-href="https://booth.pm/downloadables/111?browse=1" data-is-browsable="true" data-label="ブラウザで開く"></div></div></div>\
+<div class="text-14">{filler}</div>\
+<div class="desktop:flex"><div class="min-w-0 break-words whitespace-pre-line"><div>images.zip</div></div>\
+<div><div class="js-download-button" data-href="https://booth.pm/downloadables/222" data-test="downloadable" data-label="ダウンロード"></div></div></div>\
+<a href="https://booth.pm/ja/items/200"><div class="text-text-default font-bold text-16">別の本</div></a>\
+<div class="desktop:flex"><div class="min-w-0 break-words whitespace-pre-line"><div>only.pdf</div></div>\
+<div><div class="js-download-button" data-href="https://booth.pm/downloadables/333?browse=1" data-is-browsable="true"></div></div></div>"#
+        );
+        let items = parse_library(&html);
+        assert_eq!(items.len(), 2);
+        let options: Vec<(Option<&str>, &str)> = items[0]
+            .download_options
+            .iter()
+            .map(|option| (option.name.as_deref(), option.url.as_str()))
+            .collect();
+        assert_eq!(
+            options,
+            vec![
+                (Some("book.pdf"), "https://booth.pm/downloadables/111"),
+                (Some("images.zip"), "https://booth.pm/downloadables/222"),
+            ],
+            "2 個目以降のダウンロードを文書順で集めていない"
+        );
+        // 既存列には従来どおり先頭の候補を入れる（互換・フォールバック）
+        assert_eq!(
+            items[0].download_url.as_deref(),
+            Some("https://booth.pm/downloadables/111")
+        );
+        assert_eq!(items[0].file_name.as_deref(), Some("book.pdf"));
+        // 隣の商品のボタンは混ざらない
+        assert_eq!(
+            items[1]
+                .download_options
+                .iter()
+                .map(|option| option.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://booth.pm/downloadables/333"]
+        );
+    }
+
+    /// `?browse=1`（ブラウザで開く）はクエリを落としてファイル URL として使う
+    /// （既存規則）。同じ `downloadables/{id}` の重複は 1 件に畳む。
+    /// ファイル名は各ボタンの**直前**の行から取る（取れなければ `None`）。
+    #[test]
+    fn extract_download_options_strips_browse_and_dedupes() {
+        let block = r#"<div class="min-w-0 break-words whitespace-pre-line"><div>book.pdf</div></div>\
+<div><div class="js-download-button" data-href="https://booth.pm/downloadables/111?browse=1" data-is-browsable="true" data-label="ブラウザで開く"></div></div>\
+<div class="min-w-0 break-words whitespace-pre-line"><div>book.pdf</div></div>\
+<div><div class="js-download-button" data-href="https://booth.pm/downloadables/111" data-test="downloadable" data-label="ダウンロード"></div></div>\
+<div class="min-w-0 break-words whitespace-pre-line"><div>images.zip</div></div>\
+<div><div class="js-download-button" data-href="https://booth.pm/downloadables/222" data-test="downloadable" data-label="ダウンロード"></div></div>"#;
+        let options = extract_download_options(block);
+        assert_eq!(
+            options,
+            vec![
+                DownloadOption {
+                    name: Some("book.pdf".to_string()),
+                    url: "https://booth.pm/downloadables/111".to_string(),
+                },
+                DownloadOption {
+                    name: Some("images.zip".to_string()),
+                    url: "https://booth.pm/downloadables/222".to_string(),
+                },
+            ]
+        );
+        assert!(
+            !options.iter().any(|option| option.url.contains("browse=1")),
+            "?browse=1 が残っている"
+        );
+        // ファイル名が無い行は None（ファイル名は必須ではない）
+        let unnamed = extract_download_options(
+            r#"<div class="js-download-button" data-href="https://booth.pm/downloadables/999"></div>"#,
+        );
+        assert_eq!(unnamed.len(), 1);
+        assert_eq!(unnamed[0].name, None);
+        // downloadables を含まないブロックは空
+        assert!(extract_download_options("<div>画像もファイルも無い</div>").is_empty());
     }
 
     #[test]
