@@ -9,7 +9,7 @@
 use serde_json::{Map, Number, Value};
 use sqlx::{Row, TypeInfo, ValueRef};
 
-use opfspack::{BackupEnvelope, PackRootKey};
+use opfspack::{BACKUP_LABEL, PackRootKey, SealedEnvelope};
 
 use crate::db::SqlitePool;
 
@@ -179,14 +179,7 @@ const OWNER_SCOPED_TABLES: &[&str] = &[
 
 /// 行の `owner_sub`（暗号文 or NULL）が現在の sub に帰属するか。
 fn owner_matches(filter: &OwnerFilter<'_>, blob: Option<&str>) -> bool {
-    match filter.sub {
-        Some(sub) => {
-            blob.and_then(|blob| crate::owner::decrypt(filter.key, blob))
-                .as_deref()
-                == Some(sub)
-        }
-        None => blob.is_none(),
-    }
+    crate::owner::matches(filter.key, blob, filter.sub)
 }
 
 /// 現在の owner に属する `checked_items.id`。
@@ -231,7 +224,7 @@ pub const FORMAT_VERSION: i64 = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriveBackup {
     /// v3: 暗号化された封筒（ファイルの `format_version` = 3）。
-    Encrypted(BackupEnvelope),
+    Encrypted(SealedEnvelope),
     /// v2 以前: 平文のバックアップ JSON。
     Plain(String),
 }
@@ -275,7 +268,7 @@ impl DriveBackup {
             if version != i64::from(opfspack::BACKUP_FORMAT_VERSION) {
                 return Err(BackupError::UnsupportedVersion(version));
             }
-            let envelope = BackupEnvelope::from_json(bytes)
+            let envelope = SealedEnvelope::from_json(&BACKUP_LABEL, bytes)
                 .map_err(|error| BackupError::Corrupt(error.to_string()))?;
             return Ok(Self::Encrypted(envelope));
         }
@@ -1370,8 +1363,9 @@ mod tests {
     fn encrypted_backups_need_the_right_root_key() {
         let root = PackRootKey::from_bytes([3u8; 32]);
         let json = plain_backup();
-        let envelope =
-            BackupEnvelope::seal(json.as_bytes(), &root, OWNER_ID).to_json().unwrap();
+        let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &root, OWNER_ID)
+            .to_json()
+            .unwrap();
 
         let backup = DriveBackup::parse(&envelope).unwrap();
         assert!(backup.is_encrypted());
@@ -1400,7 +1394,7 @@ mod tests {
     fn encrypted_backups_are_never_treated_as_plaintext() {
         // 壊れた封筒・未知の版はエラーにする（暗号文を内容として取り込まない）
         let root = PackRootKey::from_bytes([5u8; 32]);
-        let envelope = BackupEnvelope::seal(b"{}", &root, OWNER_ID)
+        let envelope = SealedEnvelope::seal(&BACKUP_LABEL, b"{}", &root, OWNER_ID)
             .to_json()
             .unwrap();
         let json = String::from_utf8(envelope).unwrap();
@@ -1452,7 +1446,7 @@ mod tests {
         let json = export_json(&pool, None, None).unwrap();
 
         let root = PackRootKey::from_bytes([6u8; 32]);
-        let envelope = BackupEnvelope::seal(json.as_bytes(), &root, OWNER_ID)
+        let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &root, OWNER_ID)
             .to_json()
             .unwrap();
         let restored = DriveBackup::parse(&envelope)

@@ -18,6 +18,10 @@
 //!   Change detection uses the envelope's `content_hmac` — never the ciphertext
 //!   md5, because the nonce is random on every upload
 //!   (`docs/spec/10-pack-keys.md` §11).
+//! - The cover bundle (`thundoku-thumbs.json`) shares that envelope shape with
+//!   its own label (§11.8). It is **never** uploaded in plaintext: covers reveal
+//!   the whole library, and they can be re-fetched from the stores, so there is
+//!   nothing to gain by leaking them. A failure here never fails the sync.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,6 +49,8 @@ pub struct SyncOutcome {
     pub database_backed_up: bool,
     /// Drive の `thundoku-backup.json` から DB へ復元したか
     pub database_restored: bool,
+    /// 表紙バンドル（`thundoku-thumbs.json`）を Drive にアップロードしたか
+    pub thumbnails_backed_up: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -296,6 +302,9 @@ pub struct SyncRequest<'a> {
     pub folder_id: &'a str,
     /// DB バックアップのローカルパス（None なら DB バックアップ／復元をしない）
     pub db_path: Option<&'a Path>,
+    /// 表紙キャッシュ（`<data_dir>/thumbnails`）のディレクトリ。
+    /// `None` なら表紙バンドル（`thundoku-thumbs.json`）を上げない。
+    pub thumbnails_dir: Option<&'a Path>,
     /// 書籍 pack のバックアップ（設定 `drive.sync.books`。呼び出し側は
     /// [`books_backup_enabled`] で読む）。`false` なら pack のアップロードと
     /// ダウンロードをどちらも行わない。**DB バックアップ（`thundoku-backup.json`）と
@@ -329,6 +338,7 @@ pub fn sync_with_progress(
         owner_key,
         folder_id,
         db_path,
+        thumbnails_dir,
         sync_books,
     } = request;
     log::info!("drive sync: list_files start");
@@ -617,7 +627,8 @@ pub fn sync_with_progress(
         // Drive 同期はログイン必須なので通常は鍵がある。鍵が用意できないだけで
         // バックアップを止める＝利用者の唯一の控えを失う方が危険、という判断。
         let envelope = match (pack_root_key, identity_sub) {
-            (Some(root), Some(sub)) => Some(opfspack::BackupEnvelope::seal(
+            (Some(root), Some(sub)) => Some(opfspack::SealedEnvelope::seal(
+                &opfspack::BACKUP_LABEL,
                 json.as_bytes(),
                 root,
                 &opfspack::derive_owner_id(sub),
@@ -653,7 +664,7 @@ pub fn sync_with_progress(
             // 封印（base64 化）は上げるときだけ行い、平文のコピーは作らない。
             let envelope_json = envelope
                 .as_ref()
-                .map(opfspack::BackupEnvelope::to_json)
+                .map(opfspack::SealedEnvelope::to_json)
                 .transpose()?;
             let bytes: &[u8] = envelope_json.as_deref().unwrap_or(json.as_bytes());
             log::info!(
@@ -706,6 +717,40 @@ pub fn sync_with_progress(
         }
     }
 
+    // -- 表紙バンドル（`thundoku-thumbs.json`）-----------------------------
+    // Web 版が本棚の表紙を出すための画像を 1 ファイルにまとめて上げる
+    // （仕様 §11.8）。**PRK があるときだけ**上げる: 表紙は「どの本を持っているか」
+    // を丸ごと晒すので、鍵が無いときに平文で上げることはしない（DB バックアップの
+    // 平文フォールバックとは判断が違う。表紙は再取得できる派生データなので、
+    // 漏らしてまで控えを残す理由が無い）。
+    // 失敗しても同期全体は成功として扱う（次の同期でやり直す）。
+    if let (Some(dir), Some(root), Some(sub)) = (thumbnails_dir, pack_root_key, identity_sub)
+        && let Some(owner_key) = owner_key
+    {
+        match backup_thumbnails(
+            pool,
+            drive,
+            folder_id,
+            dir,
+            root,
+            sub,
+            owner_key,
+            &files,
+            on_progress,
+        ) {
+            Ok(true) => outcome.thumbnails_backed_up = true,
+            Ok(false) => {}
+            // 中止は利用者操作なので、そのまま伝える
+            Err(SyncError::Cancelled) => return Err(SyncError::Cancelled),
+            Err(error) => {
+                log::warn!("drive sync: 表紙バンドルを上げられない（次の同期で再試行）: {error}");
+                if let Err(error) = crate::db::settings::set(pool, THUMBS_FAILED_KEY, "1") {
+                    log::warn!("drive sync: 表紙バンドルの失敗印を保存できない: {error}");
+                }
+            }
+        }
+    }
+
     // -- pack 鍵 bundle の再試行 -------------------------------------------
     // 初回作成時にアップロードできなかった鍵 bundle をここで上げ直す（仕様 §5.1）。
     // 失敗しても同期全体は成功として扱う（本の同期と鍵の同期は独立。印は残る）。
@@ -724,6 +769,120 @@ pub fn sync_with_progress(
 
 /// Drive 上の DB バックアップのファイル名。
 const DB_BACKUP_NAME: &str = "thundoku-backup.json";
+
+/// Drive 上の表紙バンドルのファイル名（仕様 §11.8）。
+const THUMBS_NAME: &str = "thundoku-thumbs.json";
+
+/// 最後にアップロードした表紙バンドルの基準値（封筒の `content_hmac`）。
+pub const THUMBS_BASELINE_KEY: &str = "drive.thumbs.hash";
+
+/// 表紙バンドルの作成に失敗した印（設定画面で知らせる。成功したら消す）。
+pub const THUMBS_FAILED_KEY: &str = "drive.thumbs.failed";
+
+/// 1 回の同期で新しくエンコードする表紙の上限。
+///
+/// 初回は 600 枚級になることがあり、同期（起動時・終了時にも走る）を
+/// 長くしないために少しずつ埋める。埋まった分は `thumbnail_share` に入るので
+/// 次の同期はエンコードしない（数回で収束する）。
+const THUMBS_ENCODE_PER_SYNC: usize = 100;
+
+/// 表紙バンドルを組み立てて Drive へ上げる。戻り値は「上げたか」。
+///
+/// DB バックアップと同じ流儀: 先に新しいファイルを上げてから旧ファイルを消し、
+/// 内容が変わらなければ `touch` だけして `content_hmac` を基準値に残す。
+#[allow(clippy::too_many_arguments)]
+fn backup_thumbnails(
+    pool: &SqlitePool,
+    drive: &mut dyn DriveApi,
+    folder_id: &str,
+    thumbnails_dir: &Path,
+    root: &PackRootKey,
+    sub: &str,
+    owner_key: &[u8; 32],
+    files: &[DriveFile],
+    on_progress: &mut dyn FnMut(&SyncProgress) -> bool,
+) -> Result<bool, SyncError> {
+    // 書き出す前が中止の区切り（DB バックアップと同じ）
+    if !on_progress(&SyncProgress {
+        phase: SyncPhase::Upload,
+        name: THUMBS_NAME.to_string(),
+        index: 0,
+        count: 0,
+        bytes: 0,
+        total_bytes: None,
+    }) {
+        return Err(SyncError::Cancelled);
+    }
+    let existing = files.iter().find(|file| file.name == THUMBS_NAME);
+    let built = crate::thumbs::build_plaintext(
+        pool,
+        owner_key,
+        Some(sub),
+        thumbnails_dir,
+        THUMBS_ENCODE_PER_SYNC,
+    )?;
+    // 1 枚も作れないときは既存のバンドルを空で置き換えない。表紙キャッシュの無い
+    // 端末（再インストール直後・保存先を変えた後）が、Web 側の表紙を全部消して
+    // しまうのを防ぐ。削除は伝播させない、という pack と同じ方針。
+    if built.entries == 0 && existing.is_some() {
+        log::warn!(
+            "drive sync: 表紙を 1 枚も作れないため、既存の {} を残す（{} 件が取得待ち）",
+            THUMBS_NAME,
+            built.deferred
+        );
+        return Ok(false);
+    }
+
+    let owner_id = opfspack::derive_owner_id(sub);
+    let envelope =
+        opfspack::SealedEnvelope::seal(&opfspack::THUMBS_LABEL, &built.plaintext, root, &owner_id);
+    let baseline = crate::db::settings::get(pool, THUMBS_BASELINE_KEY)?;
+    let unchanged = existing.is_some() && baseline.as_deref() == Some(&envelope.content_hmac_hex());
+    if !unchanged {
+        let bytes = envelope.to_json()?;
+        log::info!(
+            "drive sync: uploading thumbnails ({} bytes, {} 枚, 新規エンコード {})",
+            bytes.len(),
+            built.entries,
+            built.encoded
+        );
+        drive.upload_multipart_with_progress(
+            THUMBS_NAME,
+            folder_id,
+            &bytes,
+            &mut |sent, total| {
+                on_progress(&SyncProgress {
+                    phase: SyncPhase::Upload,
+                    name: THUMBS_NAME.to_string(),
+                    index: 0,
+                    count: 0,
+                    bytes: sent,
+                    total_bytes: Some(total),
+                })
+            },
+        )?;
+        if let Some(file) = existing
+            && let Err(error) = drive.delete(&file.id)
+        {
+            // 旧ファイルが残っても新しいバンドルは存在するので致命的ではない
+            log::warn!("drive sync: 旧い表紙バンドルを消せない: {error}");
+        }
+    } else if let Some(file) = existing {
+        // 内容が変わらなくても更新日時だけ進める（DB バックアップと同じ）
+        log::info!("drive sync: thumbnails unchanged, touching modified time");
+        drive.touch(&file.id)?;
+    }
+
+    if let Err(error) =
+        crate::db::settings::set(pool, THUMBS_BASELINE_KEY, &envelope.content_hmac_hex())
+    {
+        log::warn!("drive sync: 表紙バンドルの基準値を保存できない: {error}");
+    }
+    if let Err(error) = crate::db::settings::delete(pool, THUMBS_FAILED_KEY) {
+        log::warn!("drive sync: 表紙バンドルの失敗印を消せない: {error}");
+    }
+    Ok(!unchanged)
+}
 
 /// Drive 上の `thundoku-backup.json` の要約（復元確認ダイアログの表示に使う）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -939,6 +1098,8 @@ pub fn clear_sync_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "drive.file_count",
         "drive.total_bytes",
         BACKUP_BASELINE_KEY,
+        THUMBS_BASELINE_KEY,
+        THUMBS_FAILED_KEY,
     ] {
         let _ = crate::db::settings::delete(pool, key);
     }
@@ -1497,6 +1658,7 @@ mod tests {
             folder_id: "folder",
             sync_books: true,
             db_path: Some(&db_path),
+            thumbnails_dir: None,
         })
         .unwrap();
         assert!(
@@ -1518,6 +1680,7 @@ mod tests {
             folder_id: "folder",
             sync_books: true,
             db_path: Some(&db_path),
+            thumbnails_dir: None,
         })
         .unwrap();
         assert!(
@@ -1581,6 +1744,7 @@ mod tests {
             folder_id: "folder",
             sync_books: true,
             db_path: Some(&db_path),
+            thumbnails_dir: None,
         })
         .unwrap();
         assert!(

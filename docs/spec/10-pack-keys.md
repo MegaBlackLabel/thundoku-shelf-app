@@ -312,9 +312,10 @@ UI は `crates/app/src/views/settings.rs`（「本の鍵」カード）、解錠
 ## 11. バックアップの暗号化（`thundoku-backup.json` v3 / R06）
 
 > **状態: Rust 側は実装済み（2026-09-25）/ Web 版は未対応**。実装の正は
-> `crates/opfspack/src/keys.rs`（鍵導出と封筒 `BackupEnvelope`）と
+> `crates/opfspack/src/keys.rs`（鍵導出と封筒 `SealedEnvelope` + ラベル
+> `BACKUP_LABEL` / `THUMBS_LABEL`）と
 > `crates/core/src/db/backup.rs`（`DriveBackup` = v3/v2 の判別と復号）、同期への配線は
-> `crates/core/src/drive/sync.rs`。
+> `crates/core/src/drive/sync.rs`。同じ封筒を**表紙バンドル**（§11.8）でも使う。
 
 ### 11.1 何を守るか（線引き）
 
@@ -467,3 +468,169 @@ backup_hash_key   = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1", info = 
 - [ ] アップロード要否は `content_hmac` の比較。暗号文の md5 / ファイルサイズで判定しない。
 - [ ] PRK が無いときのフォールバック（平文で書く + 警告）と、その結果 Drive 上に平文の
    バックアップが載り得ることを UI / ログで利用者に伝える。
+
+### 11.8 表紙バンドル（`thundoku-thumbs.json` / 2026-09-28）
+
+> **状態: デスクトップ側は実装済み / Web 版は未対応**。実装の正は
+> `crates/opfspack/src/keys.rs`（ラベル `THUMBS_LABEL`）と `crates/core/src/thumbs.rs`
+> （平文の組み立て・エンコード）、配線は `crates/core/src/drive/sync.rs`
+> （`backup_thumbnails`）と `crates/core/src/db/thumbs.rs`（派生キャッシュ）。
+
+#### 何のために
+
+Web 版の本棚が**未ダウンロードの本の表紙**を出せるようにする。`bookshelf_items.thumbnail_url`
+（外部 URL）はバックアップ JSON に元から入っているが、URL をそのまま読ませる方法は
+サイトごとの規則（FANZA の原寸置換・TBF の `/api/image/` など）やホットリンク・参照元の
+消滅に弱い。**デスクトップが取得済みの画像そのもの**を 1 ファイルにまとめて共有フォルダへ置く。
+
+#### 形式
+
+| 項目 | 値 |
+|---|---|
+| ファイル名 | `thundoku-thumbs.json`（`thundoku-backup.json` と同じフォルダ） |
+| 封筒 | §11.3 と同じ（`aes-256-gcm` / `hkdf-sha256`）。**ラベルだけ別**（AAD は `thundoku-thumbs:1:<owner_id>`、`format_version` は 1） |
+| 鍵 | `thumbs_cipher_key` / `thumbs_hash_key`（§11.2 の式の `salt` / `info` を `thundoku-thumbs:*` に差し替え） |
+| 平文 | `{"entries":[…],"format_version":1}` |
+| 対象 | 本棚（`bookshelf_items`）の表紙と、チェックリスト（`checked_items.thumbnail_data`）のサムネイル |
+| 平文で上げるフォールバック | **無い**。PRK が無い端末では上げない（表紙は蔵書そのものを晒し、かつ再取得できる派生データなので、DB バックアップとは判断が違う） |
+
+平文の 1 件（kind ごとに識別子の形が違う。Web 側に文字列を分割させない）:
+
+| kind | フィールド |
+|---|---|
+| `shelf` | `site_id`, `database_id`, `mime`, `width`, `height`, `sha256`, `data`(base64) |
+| `checklist` | `item_id`, `mime`, `width`, `height`, `sha256`, `data`(base64) |
+
+- `entries` は `(kind, item_key)` 順に固定。**平文に時刻や mtime を入れない**（入れると
+  `content_hmac` が毎回変わり、毎回アップロードになる）。キー順は `serde_json` の既定（辞書順）。
+
+#### 画像
+
+| 対象 | 変換 | 根拠 |
+|---|---|---|
+| 本棚 | 448px キャッシュ PNG → **256px WebP lossy q80** | 実測（実データ 618 枚）: 合計 9.5MB / 平均 15.5KB / p95 24KB / 最大 41KB。448px PNG のままなら 169MB、448px WebP でも 21.8MB |
+| チェックリスト | `checked_items.thumbnail_data` の 256px JPEG を**そのまま** | 保存時点で目的の寸法・形式（`crates/app/src/views/checklist.rs` の `thumbnail_jpeg_base64`） |
+
+- 1 枚が 64 KiB を超えたら q60 で作り直し、256 KiB を超える 1 枚は載せない（病的な画像対策）。
+- 平文が 48 MiB を超えたら警告ログ（**分割は未実装**。上げるのは上げる）。
+- 本棚の取得元は `<data_dir>/thumbnails/{site_id}_{database_id}_448.png` **だけ**。
+  pack 内の `thumbnail.webp` へのフォールバックは未実装（本棚を開けば `fetch_remote_covers` が
+  全カード分を取得するので、通常は埋まる）。
+
+#### 変更検知と同期
+
+- 基準値は `app_settings['drive.thumbs.hash']`（封筒の `content_hmac`）。`drive.backup.md5` と同じ流儀。
+- 1 回の同期で新しくエンコードするのは 100 枚まで（起動時・終了時にも同期が走るため）。
+  残りは次の同期で載る。`thumbnail_share` に入った分は再エンコードしない。
+- **表紙を 1 枚も作れないときは既存のバンドルを残す**（表紙キャッシュの無い端末が Web 側の
+  表紙を全部消すのを防ぐ。削除は伝播させない、という pack と同じ方針）。
+- 失敗しても同期全体は失敗させない。`drive.thumbs.failed` を立てて設定画面に警告を出し、
+  成功したら消す。中止（利用者操作）だけはそのまま伝播する。
+- `drive.sync.books`（pack の送受信）を OFF にしても止めない（失うものが別。§11.5 と同じ理屈）。
+- 同期の前に `SyncPhase::Upload` で中止を判定する（DB バックアップと同じく書き出す前が区切り）。
+
+#### ローカルの派生キャッシュ
+
+`thumbnail_share(kind, item_key, mime, width, height, sha256, bytes, source_mtime, source_size, updated_at)`
+（PK = `(kind, item_key)`）。`item_key` は本棚 `{site_id}:{database_id}` / チェックリスト
+`checked_items.id`。
+
+- **DB バックアップの対象外**（`db::backup::TABLES` の許可リストに入れない）。復元先で作り直せる。
+- 書き込み点は 3 つ: 表紙を取得した直後（`write_cover_cache` → `core::thumbs::cache_shelf_cover`）、
+  チェックリストのサムネイル保存直後（`cache_checklist_thumbnail`）、同期時の埋め戻し
+  （足りない分だけを上限まで）。
+- 所有者フィルタは親テーブル（`bookshelf_items` / `checked_items`）の `owner_sub` を復号して
+  求めたキー集合で行う（§11.5 と同じ。他アカウントの表紙を混ぜない）。親が消えたキーの行は
+  上げない（同期のたびに書き直すので Drive 側に孤児は残らない）。
+
+#### テストベクタ
+
+**鍵導出**（PRK = `00 01 … 1f`。HKDF-SHA256 と AES-256-GCM を Python（hashlib / pycryptodome）で
+独立実装して検算済み。同じ手順で §11.6 の値も再現できることを確認している）
+
+| 入力 | 期待値 |
+|---|---|
+| `derive_thumbs_cipher_key()` | `c6bcc317a110145e9c2ab08f079195fd43790f37a54a5217a8ac58e050cea8e1` |
+| `derive_thumbs_hash_key()` | `43ea28b23b2dab950943cf6a97ee9266560b2ca1781eaee08fa28e9f8b168d25` |
+
+**封筒**（`PRK = 00 01 … 1f` / `owner_id = derive_owner_id("test-sub")` /
+`nonce = 0b 0a 09 08 07 06 05 04 03 02 01 00` / 平文 = `{"format_version":1,"entries":[]}`）
+
+| 項目 | 期待値 |
+|---|---|
+| `AAD` (UTF-8) | `thundoku-thumbs:1:6366bfc3b6ab37feaf2adb385aeaa515c4aa52cf09e70cac890d888e4409f3b0` |
+| `nonce` (hex) | `0b0a09080706050403020100` |
+| `ciphertext` (hex) | `61697d8103eb4a2fc6440c6230179c9ca86081b45f26bdb39a34cfd01d7bef36609fc48cd14c8cf74c6c5e9b65b1c4c091` |
+| `content_hmac` (hex) | `46fba895ee29f2dcdddd05c9e7ee8e0f690d8722f6b337744ecc8d87f4e6e7e6` |
+
+固定は `crates/opfspack/tests/thumbs_envelope.rs`。`format_version` が違うので
+**表紙の封筒をバックアップとして読むことはできない**（逆も同じ。AAD のラベルと鍵も別）。
+既存のバックアップ側のベクタ（§11.6）はバイト単位で不変であることが回帰条件
+（`crates/opfspack/tests/backup_envelope.rs`）。
+
+#### Web 実装チェックリスト（§11.7 に追加）
+
+- [ ] `deriveThumbsKey(prk)`: HKDF で 2 本（`info` = `thundoku-thumbs-key` /
+  `thundoku-thumbs-hash`、`salt` = `thundoku-thumbs:v1`）。§11.2 の式と一致させる。
+- [ ] 封筒の AAD は `UTF8("thundoku-thumbs:1:" + ownerId)`、`format_version` は 1。
+- [ ] `entries` を `kind` で分岐（`shelf` = `site_id` + `database_id` / `checklist` = `item_id`）。
+  `data` は base64 をデコードして `Blob` → `URL.createObjectURL` で表示する（CORS 不要）。
+- [ ] 保存は `content_hmac` をキーに OPFS / IndexedDB へ。`modifiedTime` が変わっていなければ
+  再ダウンロードしない。
+- [ ] ファイルが無い・PRK が無いときは `thumbnail_url` の直読み → それも失敗ならプレースホルダへ
+  退化する（表紙が出ないだけで本棚は壊さない）。
+
+#### 平文の読み方（Web が守ること）
+
+- **書き込まない**。`thundoku-thumbs.json` の所有者はデスクトップ（毎回全体を書き直す）。
+  Web は読み取り専用で扱う（書き換えると次回の同期で戻るか、`content_hmac` の比較が壊れる）。
+- **`entries` は部分集合**。表紙キャッシュがまだ無い本・アカウントに紐づかない本は入らない。
+  1 冊も入っていない（`entries` が空・ファイルが無い）状態も正常系として扱う。
+- **未知のキーは無視**する（前方互換）。未知の `kind` の entry はその 1 件だけ捨てる。
+  `format_version` が 1 以外なら**エラー**（平文として扱わない。§11.4 と同じ方針）。
+- **`data` の base64** は STANDARD アルファベット + padding（`Buffer.toString("base64")` /
+  `btoa` 互換。base64url ではない）。
+- `width` / `height` は**エンコード後の**寸法（縦横比の確保に使える。本棚の行の高さを
+  先に決めると画像の到着でガタつかない）。
+- `sha256` は `data` をデコードしたバイト列の SHA-256（小文字 hex）。省略可能な最適化に
+  だけ使い、**値の検証は必須ではない**（`content_hmac` が封筒全体を守っている）。
+- どの entry がどの本かは、バックアップ JSON の表と**この 2 つのキーで結合**する:
+
+| kind | entry のキー | 結合先 |
+|---|---|---|
+| `shelf` | `site_id` + `database_id` | `bookshelf_items` の PK（`site_id`, `database_id`） |
+| `checklist` | `item_id` | `checked_items.id` |
+
+形の例（`data` は実際には base64 の画像。ここでは省略）:
+
+```json
+{"entries":[{"kind":"shelf","site_id":"booth","database_id":"1141786","mime":"image/webp",
+ "width":256,"height":364,"sha256":"735cbaa2…","data":"<base64>"}],"format_version":1}
+```
+
+実測の目安: 実データ 612 枚で **17.3 MB**（1 枚 ≒ 28 KB、base64 と JSON を含む）。
+
+#### Web の実装手順
+
+1. バックアップ JSON（`thundoku-backup.json`）を読める状態にする（§11.7。PRK の解決も同じ）。
+2. 同期フォルダの一覧から `thundoku-thumbs.json` を探す。**無ければ**手順 6 へ。
+3. `encryption` があれば封筒として `open(prk, ownerId)` する。AAD・鍵は §11.8 の値
+   （`thundoku-thumbs:1` / `thundoku-thumbs:v1` / `-key` / `-hash`）。`format_version: 1`。
+4. 平文の `entries` を `kind` ごとの Map（`shelf` = `site_id:database_id` /
+   `checklist` = `item_id`）にする。
+5. `content_hmac` をキーにして OPFS / IndexedDB へ保存し、次回は Drive の `modifiedTime` /
+   封筒の `content_hmac` が変わっていなければ再ダウンロードも再復号もしない。
+6. 表示は `data` を base64 デコード → `Blob` → `URL.createObjectURL`（CORS 不要）。
+   オブジェクト URL は不要になったら `revokeObjectURL` する。
+7. entry が無い本は `thumbnail_url` を `<img>` で直読み → それも失敗したら
+   プレースホルダへ退化する（**表紙が出ないだけで本棚は壊さない**）。
+
+#### 前提（Web 側で確認が要る）
+
+- 同期フォルダ（My Drive 直下の `thundoku-shelf/`）へ Web 側の `drive.file` で到達できること。
+  別クライアント（別 OAuth クライアント ID）から見るには、**同じ Google Cloud プロジェクト**で
+  クライアントを作る（Picker の `setAppId` にプロジェクト番号を渡す）か、Picker でフォルダを
+  開いて利用者に許可させる必要がある。ここが満たせないと表紙バンドルは読めない
+  （＝本棚のメタデータだけは出せる）。
+- 復号に PRK が要る点は DB バックアップと同じ（`sub` ラップ、必要ならパスフレーズ。
+  `docs/spec/10-pack-keys.md` §4.2 / §11.4）。PRK が取れないときは手順 7 の退化経路に落ちる。

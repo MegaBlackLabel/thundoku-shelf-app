@@ -327,8 +327,8 @@
 | 起動時 | ログイン済み かつ `drive.sync.enabled` が `"true"`/`"1"` かつ `drive.sync.folder_id` があり、`inspect_drive_backup` が「Drive 側が最後のアップロードから動いた」と判定したときだけ復元確認ダイアログ（ローカル側だけが進んだ場合は出さない）。v3 の封筒は keyring の PRK で復号してから比較する | `crates/app/src/workspace.rs:582-673`, `:1359-1364` |
 | 暗号化バックアップだが鍵が無い | 起動時の `inspect_drive_backup` は内容を比較せず復元確認を出さない（`local_differs = false`）。復元を実行しても `SyncError::BackupKeyRequired` で失敗し**1 行も取り込まない**（`docs/spec/10-pack-keys.md` §11.4） | `crates/core/src/drive/sync.rs:538-569`, `:638-687` |
 | OFF スイッチ | 設定のトグルで `drive.sync.enabled` に `"true"`/`"false"` を保存（起動時読み込み時に `"true"` のみ有効） | `crates/app/src/views/settings.rs:754-766`, `:133` |
-| 書籍のバックアップ OFF | 設定のトグルで `drive.sync.books` に `"true"`/`"false"`（**行が無ければ ON**）。OFF の同期は pack のアップロード / ダウンロードだけをスキップし（MD5 照会もしない）、DB バックアップと鍵 bundle は続ける。既定 ON に倒すのは「利用者の控えを失う側に倒さない」ため | `crates/core/src/drive/sync.rs:295-303`, `:369`, `:492`, `:823-833`; `crates/app/src/views/settings.rs:1359-1373`, `:2741-2787` |
-| 同期情報のクリア | `drive_sync_state` を全 DELETE し、`drive.sync.enabled` / `drive.sync.folder_id` / `drive.last_sync_at` / `drive.file_count` / `drive.total_bytes` / `drive.backup.md5` を削除（次回は全ファイルが再送/再取得対象）。`drive.sync.books` は**消さない**（同期状態ではなく利用者の設定） | `crates/core/src/drive/sync.rs:691-709`, `crates/app/src/views/settings.rs:2478-2509` |
+| 書籍のバックアップ OFF | 設定のトグルで `drive.sync.books` に `"true"`/`"false"`（**行が無ければ ON**）。OFF の同期は pack のアップロード / ダウンロードだけをスキップし（MD5 照会もしない）、DB バックアップ・鍵 bundle・表紙バンドル（§3.6）は続ける。既定 ON に倒すのは「利用者の控えを失う側に倒さない」ため | `crates/core/src/drive/sync.rs:295-303`, `:369`, `:492`, `:823-833`; `crates/app/src/views/settings.rs:1359-1373`, `:2741-2787` |
+| 同期情報のクリア | `drive_sync_state` を全 DELETE し、`drive.sync.enabled` / `drive.sync.folder_id` / `drive.last_sync_at` / `drive.file_count` / `drive.total_bytes` / `drive.backup.md5` / `drive.thumbs.hash` / `drive.thumbs.failed` を削除（次回は全ファイルが再送/再取得対象）。`drive.sync.books` は**消さない**（同期状態ではなく利用者の設定） | `crates/core/src/drive/sync.rs`（`clear_sync_state`）, `crates/app/src/views/settings.rs:2478-2509` |
 | 未ログイン | `sync_drive_now` は「Google にログインしてください」で失敗。同期エンジン側も `identity_sub=None` でアップロード対象ゼロ | `crates/app/src/views/settings.rs:792-795`, `crates/core/src/drive/sync.rs:231-238` |
 | 暗号化 pack だが鍵が無い | `SyncError::PackKeyRequired`（同期全体を中断。**平文として読む・平文で上書きする経路は無い**）。UI はログインとパスフレーズによる鍵の復元を案内する | `crates/core/src/drive/sync.rs:279-281` |
 | v2 以前の pack を取得 | `SyncError::UnsupportedPackVersion { pack_id, version }`（`PackReader::open` の `Version` を写す）。**ストアからの取り込み直し**を案内する | `crates/core/src/drive/sync.rs:269-277` |
@@ -337,5 +337,28 @@
 - 同期後に `drive.last_sync_at`（UTC `%Y-%m-%d %H:%M:%S`）/ `drive.file_count` / `drive.total_bytes` を保存し、設定画面に表示（ローカル時間に変換して表示）`crates/app/src/views/settings.rs:845-858`, `:1645-1663`。
 - 同期完了トーストは「同期完了（DL n / UL n / スキップ n / 競合 n）[/ DB バックアップ]」`crates/app/src/views/settings.rs:868-882`。
 - 同期は `drive_enabled` 設定に関わらず**手動実行は可能**（無効時もエンジンは動く）。無効化は「終了時アップロード」等の自動導線を止める意味を持つ `crates/app/src/views/settings.rs:754-766`（※意図の明記はコード上なし → 「推測」節）。
+
+### 3.6 表紙バンドル（`thundoku-thumbs.json`）
+
+Web 版の本棚が**未ダウンロードの本の表紙**を出せるように、表紙画像を 1 ファイルにまとめて
+同じフォルダへ置く。形式・鍵・画像の仕様は `docs/spec/10-pack-keys.md` §11.8。
+
+| 項目 | 値 / 挙動 | アンカー |
+|---|---|---|
+| ファイル名 | `thundoku-thumbs.json`（`thundoku-backup.json` と同じフォルダ） | `crates/core/src/drive/sync.rs`（`THUMBS_NAME`） |
+| 平文 | 本棚の表紙（256px WebP）とチェックリストのサムネイル（256px JPEG）を base64 で持つ `entries` 配列 | `crates/core/src/thumbs.rs`（`build_plaintext`） |
+| 封筒 | `thundoku-backup.json` と同じ AES-256-GCM の封筒（ラベルだけ別）。**PRK があるときだけ上げる**（平文フォールバックは無い） | `crates/opfspack/src/keys.rs`（`THUMBS_LABEL`） |
+| 変更検知 | `app_settings['drive.thumbs.hash']`（封筒の `content_hmac`）。同じ内容なら `touch` だけ | `crates/core/src/drive/sync.rs`（`THUMBS_BASELINE_KEY`） |
+| 1 回の同期でエンコードする枚数 | 100 枚まで。残りは次の同期で載る（派生キャッシュに入った分は再エンコードしない） | `crates/core/src/drive/sync.rs`（`THUMBS_ENCODE_PER_SYNC`） |
+| 空のとき | 1 枚も作れなければ**既存のバンドルを残す**（表紙キャッシュの無い端末が Web 側の表紙を消さない） | 同上 |
+| 失敗時 | 同期全体を失敗させない。`drive.thumbs.failed` を立てて設定画面に警告を出す（成功したら消す）。中止だけは伝播する | `crates/app/src/views/settings.rs` |
+| 派生キャッシュ | `thumbnail_share`（**DB バックアップの対象外**）。表紙取得の直後とチェックリスト保存の直後にも書く | `crates/core/src/db/thumbs.rs`, `crates/core/src/thumbs.rs` |
+| `drive.sync.books` = OFF | **止めない**（DB バックアップと同じで、失うものが別） | `crates/core/src/drive/sync.rs` |
+
+- 画像の取得元は `<data_dir>/thumbnails/{site_id}_{database_id}_448.png` と
+  `checked_items.thumbnail_data`。pack 内の `thumbnail.webp` へのフォールバックは未実装
+  （本棚を開けば `fetch_remote_covers` が全カード分を取得するので通常は埋まる）。
+- 所有者フィルタは `bookshelf_items` / `checked_items` の `owner_sub` を復号して求めた
+  キー集合で行う（§3.4 と同じ。他アカウントの表紙を混ぜない）。
 
 ---

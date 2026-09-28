@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use opfspack::{BackupEnvelope, PackBuilder, PackRootKey};
+use opfspack::{BACKUP_LABEL, PackBuilder, PackRootKey, SealedEnvelope};
 use thundoku_core::db;
 use thundoku_core::drive::sync::{
     BACKUP_BASELINE_KEY, SyncError, SyncPhase, SyncProgress, sync, sync_with_progress,
@@ -250,6 +250,7 @@ fn sync_env_with_progress(
             folder_id: "folder-1",
             sync_books: true,
             db_path: None,
+            thumbnails_dir: None,
         },
         on_progress,
     )
@@ -272,6 +273,7 @@ fn sync_env_with_books(
         folder_id: "folder-1",
         sync_books,
         db_path: None,
+        thumbnails_dir: None,
     })
 }
 
@@ -600,6 +602,7 @@ fn owned_sync_with_progress(
             folder_id: "folder-1",
             sync_books: true,
             db_path,
+            thumbnails_dir: None,
         },
         on_progress,
     )
@@ -788,6 +791,7 @@ fn uploads_local_pack_without_state_row() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
     assert_eq!(outcome.uploaded, vec!["pack-9"]);
@@ -839,6 +843,7 @@ fn reuploads_locally_modified_pack() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
     assert_eq!(outcome.uploaded, vec!["pack-2"]);
@@ -934,6 +939,7 @@ fn encrypted_pack_imports_with_the_root_key() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
     assert_eq!(outcome.downloaded, vec!["pack-e"]);
@@ -972,6 +978,7 @@ fn plaintext_pack_downloads_while_logged_in() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
     assert_eq!(outcome.downloaded, vec!["pack-plain"]);
@@ -1038,6 +1045,7 @@ fn sync_retries_pending_key_bundle_upload() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
     assert!(outcome.downloaded.is_empty());
@@ -1083,6 +1091,7 @@ fn db_backup_is_not_replaced_when_owner_filter_is_unavailable() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: Some(&db_path),
+        thumbnails_dir: None,
     })
     .unwrap();
 
@@ -1158,6 +1167,7 @@ fn db_backup_is_uploaded_when_owner_filter_is_available() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: Some(&db_path),
+        thumbnails_dir: None,
     })
     .unwrap();
 
@@ -1232,6 +1242,7 @@ fn db_backup_upload_records_the_baseline_for_the_next_check() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: Some(&db_path),
+        thumbnails_dir: None,
     })
     .unwrap();
     assert!(outcome.database_backed_up);
@@ -1344,6 +1355,7 @@ fn sync_with_backup(
         folder_id: "folder-1",
         sync_books: true,
         db_path: Some(db_path),
+        thumbnails_dir: None,
     })
 }
 
@@ -1408,7 +1420,8 @@ fn db_backup_is_encrypted_when_the_root_key_is_available() {
         "平文（本のタイトル）が Drive のファイルに残っている"
     );
     let owner_id = opfspack::derive_owner_id(sub);
-    let envelope = BackupEnvelope::from_json(&uploaded).expect("v3 の封筒として読める");
+    let envelope =
+        SealedEnvelope::from_json(&BACKUP_LABEL, &uploaded).expect("v3 の封筒として読める");
     assert_eq!(envelope.format_version(), 3);
     assert_eq!(envelope.owner_id(), owner_id);
     let plaintext = envelope.open(&root, &owner_id).expect("PRK で復号できる");
@@ -1453,9 +1466,9 @@ fn db_backup_is_not_reuploaded_when_the_content_is_unchanged() {
     // 参考: 同じ平文を封印し直すと暗号文（とファイルの md5）は変わるが、
     // 変更検知に使う content_hmac は同じ（＝暗号文 md5 を基準にしてはいけない理由）
     let owner_id = opfspack::derive_owner_id(sub);
-    let envelope = BackupEnvelope::from_json(&first).unwrap();
+    let envelope = SealedEnvelope::from_json(&BACKUP_LABEL, &first).unwrap();
     let plaintext = envelope.open(&root, &owner_id).unwrap();
-    let resealed = BackupEnvelope::seal(&plaintext, &root, &owner_id);
+    let resealed = SealedEnvelope::seal(&BACKUP_LABEL, &plaintext, &root, &owner_id);
     assert_eq!(resealed.content_hmac_hex(), envelope.content_hmac_hex());
     assert_ne!(resealed.to_json().unwrap(), first);
     assert_ne!(
@@ -1525,15 +1538,13 @@ fn inspect_drive_backup_handles_v3_envelopes() {
     db::migrate(&other).unwrap();
     insert_owned_book(&other, "b9", "他端末の本", sub, &owner_key);
     let other_json = thundoku_core::db::backup::export_json(&other, None, None).unwrap();
-    let other_envelope = BackupEnvelope::seal(
+    let other_envelope = SealedEnvelope::seal(
+        &BACKUP_LABEL,
         other_json.as_bytes(),
         &root,
         &opfspack::derive_owner_id(sub),
     );
-    drive.seed(
-        "thundoku-backup.json",
-        &other_envelope.to_json().unwrap(),
-    );
+    drive.seed("thundoku-backup.json", &other_envelope.to_json().unwrap());
 
     let status = inspect_owned(&env, &mut drive, sub, &owner_key, baseline.as_deref())
         .expect("バックアップが存在すること");
@@ -1554,17 +1565,14 @@ fn inspect_drive_backup_without_the_key_does_not_offer_a_restore() {
     insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
 
     let source = thundoku_core::db::backup::export_json(&env.pool, None, None).unwrap();
-    let envelope = BackupEnvelope::seal(source.as_bytes(), &root, &owner_id);
+    let envelope = SealedEnvelope::seal(&BACKUP_LABEL, source.as_bytes(), &root, &owner_id);
     drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
     delete_root_key(sub);
 
     let status = inspect_owned(&env, &mut drive, sub, &owner_key, Some("stale-baseline"))
         .expect("バックアップが存在すること");
     assert!(status.drive_changed, "基準値とは違う");
-    assert!(
-        !status.local_differs,
-        "復号できないので内容の比較はしない"
-    );
+    assert!(!status.local_differs, "復号できないので内容の比較はしない");
     assert!(
         !status.should_offer_restore(),
         "復元できないバックアップで確認を出さない"
@@ -1587,20 +1595,28 @@ fn restore_decrypts_a_v3_envelope() {
     db::migrate(&source).unwrap();
     insert_owned_book(&source, "b1", "復元される本", sub, &owner_key);
     let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
-    let envelope = BackupEnvelope::seal(json.as_bytes(), &root, &owner_id);
+    let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &root, &owner_id);
     drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
 
     thundoku_core::drive::sync::restore_drive_backup(&mut drive, "folder-1", &env.pool).unwrap();
 
-    let book = db::books::get(&env.pool, "b1").unwrap().expect("復元される");
+    let book = db::books::get(&env.pool, "b1")
+        .unwrap()
+        .expect("復元される");
     assert_eq!(book.title, "復元される本");
     // 復元後は基準値が封筒の content_hmac になり、次の起動で「動いた」と言わない
     assert_eq!(
         baseline_of(&env.pool).as_deref(),
         Some(envelope.content_hmac_hex().as_str())
     );
-    let status = inspect_owned(&env, &mut drive, sub, &owner_key, baseline_of(&env.pool).as_deref())
-        .expect("バックアップが存在すること");
+    let status = inspect_owned(
+        &env,
+        &mut drive,
+        sub,
+        &owner_key,
+        baseline_of(&env.pool).as_deref(),
+    )
+    .expect("バックアップが存在すること");
     assert!(!status.drive_changed, "復元直後は静かであること");
 }
 
@@ -1618,13 +1634,12 @@ fn restore_without_the_key_is_rejected_and_imports_nothing() {
     db::migrate(&source).unwrap();
     insert_owned_book(&source, "b1", "復元される本", sub, &owner_key);
     let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
-    let envelope = BackupEnvelope::seal(json.as_bytes(), &root, &owner_id);
+    let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &root, &owner_id);
     drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
     delete_root_key(sub);
 
-    let error =
-        thundoku_core::drive::sync::restore_drive_backup(&mut drive, "folder-1", &env.pool)
-            .expect_err("鍵が無ければ復元しない");
+    let error = thundoku_core::drive::sync::restore_drive_backup(&mut drive, "folder-1", &env.pool)
+        .expect_err("鍵が無ければ復元しない");
     assert!(
         matches!(&error, SyncError::BackupKeyRequired(id) if id == &owner_id),
         "{error:?}"
@@ -1654,13 +1669,12 @@ fn a_v3_envelope_from_another_account_is_not_restored() {
     db::migrate(&source).unwrap();
     insert_owned_book(&source, "b1", "別アカウントの本", other_sub, &owner_key);
     let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
-    let envelope = BackupEnvelope::seal(json.as_bytes(), &other_root, &other_owner);
+    let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &other_root, &other_owner);
     drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
 
     // 封筒の owner_id に対応する鍵が keyring に無い → 復号も取り込みもしない
-    let error =
-        thundoku_core::drive::sync::restore_drive_backup(&mut drive, "folder-1", &env.pool)
-            .expect_err("鍵が無ければ復元しない");
+    let error = thundoku_core::drive::sync::restore_drive_backup(&mut drive, "folder-1", &env.pool)
+        .expect_err("鍵が無ければ復元しない");
     assert!(
         matches!(&error, SyncError::BackupKeyRequired(id) if id == &other_owner),
         "{error:?}"
@@ -1740,6 +1754,7 @@ fn upload_progress_reports_sent_bytes() {
             folder_id: "folder-1",
             sync_books: true,
             db_path: None,
+            thumbnails_dir: None,
         },
         &mut |progress| {
             if progress.phase == SyncPhase::Upload {
@@ -1833,6 +1848,7 @@ fn excluded_book_is_not_uploaded() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
     assert_eq!(drive.upload_count(), 0, "対象外なのに上げている");
@@ -1853,6 +1869,7 @@ fn excluded_book_is_not_uploaded() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
     assert_eq!(drive.upload_count(), 1, "戻したのに上げていない");
@@ -1935,6 +1952,7 @@ fn sync_books_off_does_not_upload_packs() {
         folder_id: "folder-1",
         sync_books: false,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
 
@@ -1958,6 +1976,7 @@ fn sync_books_off_does_not_upload_packs() {
         folder_id: "folder-1",
         sync_books: true,
         db_path: None,
+        thumbnails_dir: None,
     })
     .unwrap();
     assert_eq!(outcome.uploaded, vec!["pack-11"]);
@@ -2022,6 +2041,7 @@ fn sync_books_off_still_uploads_the_database_backup() {
         folder_id: "folder-1",
         sync_books: false,
         db_path: Some(&db_path),
+        thumbnails_dir: None,
     })
     .unwrap();
 
@@ -2055,5 +2075,293 @@ fn books_backup_is_on_without_a_setting_row() {
     assert!(
         thundoku_core::drive::sync::books_backup_enabled(&pool),
         "\"true\" は ON"
+    );
+}
+
+// ---- 表紙バンドル（`thundoku-thumbs.json`、仕様 §11.8）-----------------------
+
+/// 表紙バンドル（と必要なら DB バックアップ）を上げる同期。
+#[allow(clippy::too_many_arguments)]
+fn sync_thumbnails(
+    env: &TestEnv,
+    drive: &mut dyn DriveApi,
+    sub: &str,
+    root: Option<&PackRootKey>,
+    owner_key: Option<&[u8; 32]>,
+    db_path: Option<&std::path::Path>,
+    thumbnails_dir: Option<&std::path::Path>,
+) -> Result<thundoku_core::drive::sync::SyncOutcome, SyncError> {
+    sync(thundoku_core::drive::sync::SyncRequest {
+        pool: &env.pool,
+        drive,
+        packs_dir: &env.packs(),
+        downloads_dir: &env.downloads(),
+        identity_sub: Some(sub),
+        pack_root_key: root,
+        owner_key,
+        folder_id: "folder-1",
+        sync_books: false,
+        db_path,
+        thumbnails_dir,
+    })
+}
+
+/// 所有する本棚アイテムを作り、448px の表紙キャッシュを置く。
+fn seed_owned_shelf_cover(
+    env: &TestEnv,
+    sub: &str,
+    owner_key: &[u8; 32],
+    site_id: &str,
+    database_id: &str,
+    thumbnails_dir: &std::path::Path,
+) {
+    thundoku_core::db::block_on(async {
+        sqlx::query(
+            "INSERT INTO bookshelf_items (site_id, database_id, title, owner_sub) \
+             VALUES (?1, ?2, '本', ?3)",
+        )
+        .bind(site_id)
+        .bind(database_id)
+        .bind(thundoku_core::owner::encrypt(owner_key, sub))
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    });
+    std::fs::create_dir_all(thumbnails_dir).unwrap();
+    let image = image::RgbaImage::from_fn(448, 672, |x, y| {
+        image::Rgba([(x % 251) as u8, (y % 241) as u8, 96, 255])
+    });
+    image
+        .save(thumbnails_dir.join(format!("{site_id}_{database_id}_448.png")))
+        .unwrap();
+}
+
+fn uploaded_thumbnails(drive: &FakeDrive) -> Vec<u8> {
+    drive
+        .files
+        .get("id-thundoku-thumbs.json")
+        .expect("表紙バンドルが存在すること")
+        .bytes
+        .clone()
+}
+
+/// 表紙バンドルは PRK で封をして `thundoku-thumbs.json` として上がる。
+#[test]
+fn thumbnail_bundle_is_uploaded_as_an_encrypted_envelope() {
+    let env = TestEnv::new("thumbs-v3");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-thumbs-v3";
+    let owner_key = [51u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    let dir = env.root.join("thumbnails");
+    seed_owned_shelf_cover(&env, sub, &owner_key, "dlsite", "RJ1", &dir);
+
+    let outcome = sync_thumbnails(
+        &env,
+        &mut drive,
+        sub,
+        Some(&root),
+        Some(&owner_key),
+        None,
+        Some(&dir),
+    )
+    .unwrap();
+    assert!(outcome.thumbnails_backed_up, "初回はアップロードすること");
+
+    let uploaded = uploaded_thumbnails(&drive);
+    let raw = String::from_utf8_lossy(&uploaded);
+    assert!(
+        !raw.contains("database_id") && !raw.contains("dlsite"),
+        "平文（表紙のキー）が Drive のファイルに残っている"
+    );
+    let owner_id = opfspack::derive_owner_id(sub);
+    let envelope = SealedEnvelope::from_json(&opfspack::THUMBS_LABEL, &uploaded)
+        .expect("表紙バンドルの封筒として読める");
+    assert_eq!(
+        envelope.format_version(),
+        1,
+        "バックアップの封筒（3）と別の版"
+    );
+    assert_eq!(envelope.owner_id(), owner_id);
+    let plaintext = envelope.open(&root, &owner_id).expect("PRK で復号できる");
+    let value: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+    assert_eq!(value["format_version"], 1);
+    let entries = value["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["kind"], "shelf");
+    assert_eq!(entries[0]["site_id"], "dlsite");
+    assert_eq!(entries[0]["database_id"], "RJ1");
+    assert_eq!(entries[0]["mime"], "image/webp");
+
+    assert_eq!(
+        db::settings::get(&env.pool, "drive.thumbs.hash")
+            .unwrap()
+            .as_deref(),
+        Some(envelope.content_hmac_hex().as_str()),
+        "変更検知の基準値は封筒の content_hmac"
+    );
+    assert_eq!(
+        db::settings::get(&env.pool, "drive.thumbs.failed").unwrap(),
+        None,
+        "成功したら失敗の印を残さない"
+    );
+}
+
+/// 同じ内容を再度同期しても上げ直さない（暗号文は毎回変わるので md5 では判定できない）。
+#[test]
+fn thumbnail_bundle_is_not_reuploaded_when_unchanged() {
+    let env = TestEnv::new("thumbs-skip");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-thumbs-skip";
+    let owner_key = [52u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    let dir = env.root.join("thumbnails");
+    seed_owned_shelf_cover(&env, sub, &owner_key, "dlsite", "RJ1", &dir);
+
+    assert!(
+        sync_thumbnails(
+            &env,
+            &mut drive,
+            sub,
+            Some(&root),
+            Some(&owner_key),
+            None,
+            Some(&dir)
+        )
+        .unwrap()
+        .thumbnails_backed_up
+    );
+    let first = uploaded_thumbnails(&drive);
+
+    let outcome = sync_thumbnails(
+        &env,
+        &mut drive,
+        sub,
+        Some(&root),
+        Some(&owner_key),
+        None,
+        Some(&dir),
+    )
+    .unwrap();
+    assert!(!outcome.thumbnails_backed_up, "内容が同じなら上げ直さない");
+    assert_eq!(
+        uploaded_thumbnails(&drive),
+        first,
+        "ファイルは置き換わらない"
+    );
+    assert_eq!(drive.upload_count(), 1, "アップロードは 1 回だけ");
+}
+
+/// PRK が無いときは表紙バンドルを上げない（平文で蔵書を晒さない。
+/// DB バックアップの平文フォールバックとは判断が違う — 表紙は再取得できる）。
+#[test]
+fn thumbnail_bundle_is_not_uploaded_without_the_root_key() {
+    let env = TestEnv::new("thumbs-no-key");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-thumbs-no-key";
+    let owner_key = [53u8; 32];
+    let dir = env.root.join("thumbnails");
+    seed_owned_shelf_cover(&env, sub, &owner_key, "dlsite", "RJ1", &dir);
+
+    let outcome = sync_thumbnails(
+        &env,
+        &mut drive,
+        sub,
+        None,
+        Some(&owner_key),
+        None,
+        Some(&dir),
+    )
+    .unwrap();
+
+    assert!(!outcome.thumbnails_backed_up);
+    assert!(
+        !drive.files.contains_key("id-thundoku-thumbs.json"),
+        "鍵が無いときは平文でも上げない"
+    );
+    assert_eq!(drive.upload_count(), 0);
+}
+
+/// 表紙を 1 枚も作れないときは、Drive 上の既存バンドルを空で置き換えない
+/// （表紙キャッシュを消した端末が、Web 側の表紙を全部消してしまうのを防ぐ）。
+#[test]
+fn an_empty_bundle_never_replaces_the_existing_one() {
+    let env = TestEnv::new("thumbs-empty-guard");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-thumbs-empty-guard";
+    let owner_key = [54u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    let dir = env.root.join("thumbnails");
+    // 本はあるが表紙キャッシュは無い（＝取得元が無い）
+    seed_owned_shelf_cover(&env, sub, &owner_key, "dlsite", "RJ1", &dir);
+    std::fs::remove_file(dir.join("dlsite_RJ1_448.png")).unwrap();
+    let existing = b"{\"entries\":[{\"keep\":true}]}".to_vec();
+    let file_id = drive.seed("thundoku-thumbs.json", &existing);
+
+    let outcome = sync_thumbnails(
+        &env,
+        &mut drive,
+        sub,
+        Some(&root),
+        Some(&owner_key),
+        None,
+        Some(&dir),
+    )
+    .unwrap();
+
+    assert!(!outcome.thumbnails_backed_up);
+    assert_eq!(drive.upload_count(), 0, "空のバンドルを上げない");
+    assert_eq!(
+        drive.files.get(&file_id).unwrap().bytes,
+        existing,
+        "既存のバンドルが残ること"
+    );
+}
+
+/// 表紙バンドルの作成が失敗しても同期全体は失敗させない（再取得できる派生データ。
+/// 次の同期でやり直す）。
+#[test]
+fn a_broken_thumbnail_store_does_not_fail_the_sync() {
+    let env = TestEnv::new("thumbs-broken");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-thumbs-broken";
+    let owner_key = [55u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    let dir = env.root.join("thumbnails");
+    seed_owned_shelf_cover(&env, sub, &owner_key, "dlsite", "RJ1", &dir);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    let db_path = env.packs().join("thundoku-shelf.db");
+    // 派生キャッシュのテーブルを壊す（バンドルの組み立てだけが失敗する）
+    thundoku_core::db::block_on(async {
+        sqlx::query("DROP TABLE thumbnail_share")
+            .execute(&env.pool)
+            .await
+            .unwrap();
+    });
+
+    let outcome = sync_thumbnails(
+        &env,
+        &mut drive,
+        sub,
+        Some(&root),
+        Some(&owner_key),
+        Some(&db_path),
+        Some(&dir),
+    )
+    .expect("表紙の失敗で同期全体を落とさない");
+
+    assert!(outcome.database_backed_up, "DB バックアップは上がること");
+    assert!(!outcome.thumbnails_backed_up);
+    assert!(!drive.files.contains_key("id-thundoku-thumbs.json"));
+    assert_eq!(
+        db::settings::get(&env.pool, "drive.thumbs.failed")
+            .unwrap()
+            .as_deref(),
+        Some("1"),
+        "失敗の印を残して設定画面に出せるようにする"
     );
 }

@@ -230,6 +230,31 @@ pub fn set_checked(pool: &SqlitePool, item_id: &str, checked: bool) -> Result<()
     })
 }
 
+/// 指定した id のサムネイル（base64 の 256px JPEG）。
+///
+/// 表紙バンドル（`crates/core/src/thumbs.rs`）が、まだ派生キャッシュへ入れて
+/// いない項目の分だけを読むために使う。`thumbnail_data` は 1 件 20KB 程度あるので
+/// **全件は読まない**（`json_each` で id を渡して絞る）。
+pub fn thumbnails_of(
+    pool: &SqlitePool,
+    ids: &[String],
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json = serde_json::to_string(ids).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    crate::db::block_on(async {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, thumbnail_data FROM checked_items \
+             WHERE thumbnail_data IS NOT NULL AND id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(json)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows)
+    })
+}
+
 /// チェックリスト項目のサムネイル（base64 データ）を保存する。
 pub fn update_thumbnail_data(
     pool: &SqlitePool,

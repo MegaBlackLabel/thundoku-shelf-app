@@ -81,7 +81,7 @@
 | `<data_dir>/thundoku-shelf.db` | SQLite（WAL） | `packs` / `downloads` / `thumbnails` への参照を持つ |
 | `<data_dir>/packs/{book_id}.opfspack` | 書籍ファイル（自前形式） | 1 冊 1 ファイル |
 | `<data_dir>/downloads/` | ダウンロード直後の一時ファイル | 取り込み後に pack へ変換 |
-| `<data_dir>/thumbnails/` | 表紙サムネイル（PNG） | 命名規則は `docs/spec/03-import-and-pack.md` |
+| `<data_dir>/thumbnails/` | 表紙サムネイル（PNG） | 命名規則は `docs/spec/03-import-and-pack.md`。Drive へ上げるための 256px 版は DB の `thumbnail_share` に持つ（`docs/spec/10-pack-keys.md` §11.8） |
 | `<data_dir>/instance.lock` | 単一インスタンス用 | |
 
 - 既定の `data_dir` = `dirs::data_dir()/thundoku-shelf`（Windows: `%APPDATA%`、macOS: `~/Library/Application Support`）

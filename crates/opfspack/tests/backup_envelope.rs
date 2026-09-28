@@ -3,7 +3,7 @@
 //! 期待値は `docs/spec/10-pack-keys.md` §11 のテストベクタ（独立実装で検算済み）。
 //! **ここが Rust / TS 間のバイト一致の正**なので、値を書き換えるときは仕様書も直すこと。
 
-use opfspack::{BackupEnvelope, PackRootKey};
+use opfspack::{BACKUP_LABEL, PackRootKey, SealedEnvelope};
 
 /// §11 のベクタで使う PRK（`00 01 … 1f`）。
 fn vector_root() -> PackRootKey {
@@ -58,8 +58,13 @@ fn envelope_matches_the_spec_vectors() {
         VECTOR_OWNER_ID,
         "AAD に埋める owner_id（§2 の式）"
     );
-    let envelope =
-        BackupEnvelope::seal_with_nonce(VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID, VECTOR_NONCE);
+    let envelope = SealedEnvelope::seal_with_nonce(
+        &BACKUP_LABEL,
+        VECTOR_PLAINTEXT,
+        &root,
+        VECTOR_OWNER_ID,
+        VECTOR_NONCE,
+    );
 
     assert_eq!(envelope.format_version(), 3);
     assert_eq!(envelope.owner_id(), VECTOR_OWNER_ID);
@@ -84,7 +89,7 @@ fn envelope_matches_the_spec_vectors() {
 #[test]
 fn envelope_roundtrips_through_json() {
     let root = vector_root();
-    let envelope = BackupEnvelope::seal(VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
+    let envelope = SealedEnvelope::seal(&BACKUP_LABEL, VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
     let json = envelope.to_json().expect("JSON にできるはず");
 
     let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
@@ -98,16 +103,19 @@ fn envelope_roundtrips_through_json() {
         "平文が封筒に残っている"
     );
 
-    let parsed = BackupEnvelope::from_json(&json).expect("読み戻せるはず");
+    let parsed = SealedEnvelope::from_json(&BACKUP_LABEL, &json).expect("読み戻せるはず");
     assert_eq!(parsed, envelope);
-    assert_eq!(parsed.open(&root, VECTOR_OWNER_ID).unwrap(), VECTOR_PLAINTEXT);
+    assert_eq!(
+        parsed.open(&root, VECTOR_OWNER_ID).unwrap(),
+        VECTOR_PLAINTEXT
+    );
 }
 
 #[test]
 fn sealing_the_same_content_keeps_the_hmac_but_changes_the_ciphertext() {
     let root = vector_root();
-    let first = BackupEnvelope::seal(VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
-    let second = BackupEnvelope::seal(VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
+    let first = SealedEnvelope::seal(&BACKUP_LABEL, VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
+    let second = SealedEnvelope::seal(&BACKUP_LABEL, VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
 
     assert_eq!(
         first.content_hmac_hex(),
@@ -129,7 +137,7 @@ fn sealing_the_same_content_keeps_the_hmac_but_changes_the_ciphertext() {
 #[test]
 fn opening_with_the_wrong_key_or_owner_fails() {
     let root = vector_root();
-    let envelope = BackupEnvelope::seal(VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
+    let envelope = SealedEnvelope::seal(&BACKUP_LABEL, VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
 
     // 別の PRK（別アカウント相当）
     let other = PackRootKey::from_bytes([7u8; 32]);
@@ -148,12 +156,13 @@ fn opening_with_the_wrong_key_or_owner_fails() {
 #[test]
 fn tampered_ciphertext_or_hmac_is_rejected_without_plaintext() {
     let root = vector_root();
-    let envelope = BackupEnvelope::seal(VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
+    let envelope = SealedEnvelope::seal(&BACKUP_LABEL, VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
 
     // 暗号文の 1 バイトを反転（AES-GCM のタグ検証で落ちる）
     let mut ciphertext = envelope.ciphertext().to_vec();
     ciphertext[0] ^= 1;
-    let broken = BackupEnvelope::from_json(
+    let broken = SealedEnvelope::from_json(
+        &BACKUP_LABEL,
         &tamper_json(&envelope.to_json().unwrap(), "ciphertext", |_| {
             base64_encode(&ciphertext)
         })
@@ -166,7 +175,8 @@ fn tampered_ciphertext_or_hmac_is_rejected_without_plaintext() {
     );
 
     // content_hmac だけを差し替えた封筒（平文は同じ）
-    let tampered = BackupEnvelope::from_json(
+    let tampered = SealedEnvelope::from_json(
+        &BACKUP_LABEL,
         &tamper_json(&envelope.to_json().unwrap(), "content_hmac", |_| {
             "00".repeat(32)
         })
@@ -182,20 +192,20 @@ fn tampered_ciphertext_or_hmac_is_rejected_without_plaintext() {
 #[test]
 fn envelopes_of_other_versions_are_rejected() {
     let root = vector_root();
-    let envelope = BackupEnvelope::seal(VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
+    let envelope = SealedEnvelope::seal(&BACKUP_LABEL, VECTOR_PLAINTEXT, &root, VECTOR_OWNER_ID);
     let json = String::from_utf8(envelope.to_json().unwrap()).unwrap();
     let bumped = json.replace("\"format_version\":3", "\"format_version\":4");
     assert!(
-        BackupEnvelope::from_json(bumped.as_bytes()).is_err(),
+        SealedEnvelope::from_json(&BACKUP_LABEL, bumped.as_bytes()).is_err(),
         "未知の版の封筒は読まない（平文として扱わない）"
     );
     // 壊れた封筒（base64 でない nonce）
     let broken = json.replace(&base64_encode(envelope.nonce()), "not-base64-but-long");
     assert_ne!(broken, json, "前提: nonce を差し替えられている");
-    assert!(BackupEnvelope::from_json(broken.as_bytes()).is_err());
+    assert!(SealedEnvelope::from_json(&BACKUP_LABEL, broken.as_bytes()).is_err());
     // 壊れた封筒（content_hmac が 64 hex でない）
     let broken = json.replace(&envelope.content_hmac_hex(), "abcd");
-    assert!(BackupEnvelope::from_json(broken.as_bytes()).is_err());
+    assert!(SealedEnvelope::from_json(&BACKUP_LABEL, broken.as_bytes()).is_err());
 }
 
 // ---- テスト用の小さなヘルパ ------------------------------------------------

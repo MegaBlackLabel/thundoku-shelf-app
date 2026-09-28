@@ -3,8 +3,8 @@
 アプリのデータは SQLite（`thundoku-shelf.db`）に保存されます。スキーマの正本は
 `crates/core/src/db/schema.sql`、マイグレーションは `crates/core/migrations/0001_init.sql`
 （`sqlx::migrate!` 管理）です。後から追加されたテーブル（`view_history` / `page_views` /
-`favorite_entities` など）はマイグレーションファイルではなく、`migrate()` 内の冪等な DDL
-（`CREATE TABLE IF NOT EXISTS`）で適用されます。
+`favorite_entities` / `thumbnail_share` など）はマイグレーションファイルではなく、`migrate()` 内の
+冪等な DDL（`CREATE TABLE IF NOT EXISTS`）で適用されます。
 
 ## テーブル一覧
 
@@ -306,6 +306,23 @@ Google Drive との同期状態（pack ごと）。
 ### product_sample_pages
 
 試し読みページ（base64 の `image_data`）。
+
+### thumbnail_share
+
+Drive の表紙バンドル（`thundoku-thumbs.json`。未ダウンロードの本の表紙を Web 版の本棚へ渡す）に
+載せる**アップロード用にエンコード済みの画像**の派生キャッシュ。**DB バックアップの対象外**
+（復元先で作り直せる派生データ）。`crates/core/src/db/thumbs.rs`。
+
+| カラム | 型 | 説明 |
+|---|---|---|
+| kind | TEXT PK | `shelf`（本棚の表紙）/ `checklist`（チェックリストのサムネイル） |
+| item_key | TEXT PK | `shelf` = `{site_id}:{database_id}` / `checklist` = `checked_items.id` |
+| mime | TEXT | `image/webp`（本棚は 256px WebP q80）/ `image/jpeg`（チェックリストは既存の 256px JPEG） |
+| width / height | INTEGER | エンコード後の寸法 |
+| sha256 | TEXT | エンコード後バイト列の SHA-256（小文字 hex） |
+| bytes | BLOB | 画像そのもの |
+| source_mtime / source_size | INTEGER | 生成元（448px PNG キャッシュ）の mtime・サイズ。変化検出用（チェックリストは NULL） |
+| updated_at | TEXT | 更新時刻（UTC） |
 
 ## マイグレーション
 

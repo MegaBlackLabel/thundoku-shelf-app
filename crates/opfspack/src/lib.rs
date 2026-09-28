@@ -30,16 +30,9 @@ mod reader;
 
 pub use builder::{EntrySpec, PackBuilder};
 pub use keys::{
-    BACKUP_FORMAT_VERSION,
-    BackupEnvelope,
-    KEY_BUNDLE_FORMAT_VERSION,
-    MAX_PASSPHRASE_ITERATIONS,
-    PackKey,
-    PackKeyBundle,
-    PackRootKey,
-    PackRootKeyWrap,
-    WrapKind,
-    sub_wrap_kek,
+    BACKUP_FORMAT_VERSION, BACKUP_LABEL, EnvelopeLabel, KEY_BUNDLE_FORMAT_VERSION,
+    MAX_PASSPHRASE_ITERATIONS, PackKey, PackKeyBundle, PackRootKey, PackRootKeyWrap,
+    SealedEnvelope, THUMBS_LABEL, WrapKind, sub_wrap_kek,
 };
 pub use reader::{PackFileReader, PackRead, PackReader};
 

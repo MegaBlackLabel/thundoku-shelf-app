@@ -19,4 +19,5 @@ pub mod single_instance;
 pub mod store_size;
 pub mod tags;
 pub mod tbf;
+pub mod thumbs;
 pub mod ua;

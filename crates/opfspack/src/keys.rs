@@ -12,8 +12,8 @@
 //!   ラップの AAD    = UTF8("thundoku-pack-root:1:" + owner_id)
 //! ```
 //!
-//! §11 のメタデータバックアップ（`thundoku-backup.json` v3）も同じ PRK から導出する
-//! （[`BackupEnvelope`]）:
+//! Drive に置く暗号化ファイル（[`SealedEnvelope`]）は同じ PRK から**ラベルごとに**
+//! 鍵を導出する。`thundoku-backup.json`（§11）と `thundoku-thumbs.json`（§11.8）:
 //!
 //! ```text
 //! backup_cipher_key = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1",
@@ -57,35 +57,75 @@ const NONCE_LEN: usize = 12;
 /// ラップされた PRK の長さ（32B + 16B タグ・仕様 §3.2）。
 const WRAP_CIPHERTEXT_LEN: usize = 32 + 16;
 
-/// Drive に置くメタデータバックアップ（`thundoku-backup.json`）の v3 封筒の
+/// 封筒（[`SealedEnvelope`]）の用途ラベル。
+///
+/// AAD の接頭辞・`format_version`・鍵導出の salt / info をひとまとめにする。
+/// **ファイルの取り違え**（表紙バンドルをバックアップとして読ませる等）を、
+/// 版の不一致（`from_json`）と AAD・鍵の不一致（`open`）の二段で検出する。
+/// 値は仕様書（`docs/spec/10-pack-keys.md` §11 / §11.8）が正。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvelopeLabel {
+    /// AAD の接頭辞（`"{aad_prefix}:{format_version}:{owner_id}"` を AAD にする）。
+    pub aad_prefix: &'static str,
+    /// 封筒の `format_version`。
+    pub format_version: u32,
+    /// 鍵導出の HKDF salt（PRK から用途分離した 2 本の鍵を作る）。
+    pub kdf_salt: &'static [u8],
+    /// 暗号鍵の HKDF info。
+    pub cipher_info: &'static [u8],
+    /// 平文の HMAC 鍵の HKDF info。
+    pub hash_info: &'static [u8],
+}
+
+/// Drive に置くメタデータバックアップ（`thundoku-backup.json`）の封筒のラベル
+/// （仕様 §11）。
+pub const BACKUP_LABEL: EnvelopeLabel = EnvelopeLabel {
+    aad_prefix: "thundoku-backup",
+    format_version: 3,
+    kdf_salt: b"thundoku-backup:v1",
+    cipher_info: b"thundoku-backup-key",
+    hash_info: b"thundoku-backup-hash",
+};
+
+/// Drive に置く表紙バンドル（`thundoku-thumbs.json`）の封筒のラベル
+/// （仕様 §11.8）。
+pub const THUMBS_LABEL: EnvelopeLabel = EnvelopeLabel {
+    aad_prefix: "thundoku-thumbs",
+    format_version: 1,
+    kdf_salt: b"thundoku-thumbs:v1",
+    cipher_info: b"thundoku-thumbs-key",
+    hash_info: b"thundoku-thumbs-hash",
+};
+
+/// Drive に置くメタデータバックアップ（`thundoku-backup.json`）の封筒の
 /// `format_version`（仕様 §11）。v2 以前は平文のバックアップ JSON。
-pub const BACKUP_FORMAT_VERSION: u32 = 3;
-
-/// 封筒の AAD 接頭辞（`"{AAD}:{format_version}:{owner_id}"` を AAD にする）。
-/// 別アカウントの封筒・別版の封筒への差し替えを検出する。
-const BACKUP_AAD_PREFIX: &str = "thundoku-backup";
-
-/// バックアップ鍵の HKDF salt（PRK から用途分離した 2 本の鍵を作る）。
-const BACKUP_KDF_SALT: &[u8] = b"thundoku-backup:v1";
-
-/// 封筒の暗号鍵の HKDF info。
-const BACKUP_CIPHER_INFO: &[u8] = b"thundoku-backup-key";
-
-/// 平文の HMAC 鍵の HKDF info。
-const BACKUP_HASH_INFO: &[u8] = b"thundoku-backup-hash";
+pub const BACKUP_FORMAT_VERSION: u32 = BACKUP_LABEL.format_version;
 
 /// 封筒の `encryption.alg`（唯一の値）。
-pub const BACKUP_ALG: &str = "aes-256-gcm";
+pub const ENVELOPE_ALG: &str = "aes-256-gcm";
 
 /// 封筒の `encryption.kdf`（唯一の値）。
-pub const BACKUP_KDF: &str = "hkdf-sha256";
+pub const ENVELOPE_KDF: &str = "hkdf-sha256";
 
 /// 封筒の暗号文の最小長（AES-GCM のタグ 16B）。
-const BACKUP_TAG_LEN: usize = 16;
+const ENVELOPE_TAG_LEN: usize = 16;
 
-/// 封筒の AAD バイト列。
-fn backup_aad(owner_id: &str) -> Vec<u8> {
-    format!("{BACKUP_AAD_PREFIX}:{BACKUP_FORMAT_VERSION}:{owner_id}").into_bytes()
+/// 封筒の AAD バイト列（`"{aad_prefix}:{format_version}:{owner_id}"`）。
+///
+/// ラベルごとに接頭辞と版が違うので、**別ラベルの封筒・別アカウントの封筒・
+/// 別版の封筒への差し替え**は復号に失敗する。
+fn envelope_aad(label: &EnvelopeLabel, owner_id: &str) -> Vec<u8> {
+    format!("{}:{}:{}", label.aad_prefix, label.format_version, owner_id).into_bytes()
+}
+
+/// ラベルの salt / info で封筒の暗号鍵を導出する（PRK から用途分離した 1 本）。
+fn envelope_cipher_key(label: &EnvelopeLabel, root: &PackRootKey) -> [u8; 32] {
+    root.derive_envelope_key(label.kdf_salt, label.cipher_info)
+}
+
+/// ラベルの salt / info で平文 HMAC 鍵を導出する（同じく用途分離した 1 本）。
+fn envelope_hash_key(label: &EnvelopeLabel, root: &PackRootKey) -> [u8; 32] {
+    root.derive_envelope_key(label.kdf_salt, label.hash_info)
 }
 
 /// HMAC-SHA256（RFC 2104。`backup_envelope.rs` のベクタで固定している）。
@@ -178,13 +218,19 @@ impl PackRootKey {
         ))
     }
 
-    /// メタデータバックアップ（`thundoku-backup.json` v3 の封筒）の暗号鍵
+    /// ラベルの salt / info で PRK から 32 バイトを導出する
+    /// （用途分離の実体。同じ PRK から用途ごとに別の鍵を作る）。
+    fn derive_envelope_key(&self, salt: &[u8], info: &[u8]) -> [u8; 32] {
+        crate::crypto::hkdf_sha256(&self.0, salt, info)
+    }
+
+    /// メタデータバックアップ（`thundoku-backup.json` の封筒）の暗号鍵
     /// = `HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1",
     /// info = b"thundoku-backup-key")`（仕様 §11）。
     ///
     /// pack 鍵とは別の `info` を使う（同じ PRK から用途ごとに鍵を分ける）。
     pub fn derive_backup_cipher_key(&self) -> [u8; 32] {
-        crate::crypto::hkdf_sha256(&self.0, BACKUP_KDF_SALT, BACKUP_CIPHER_INFO)
+        self.derive_envelope_key(BACKUP_LABEL.kdf_salt, BACKUP_LABEL.cipher_info)
     }
 
     /// バックアップ平文の HMAC 鍵
@@ -194,7 +240,23 @@ impl PackRootKey {
     /// 変更検知（アップロード要否・復元提案）に使う。暗号文は nonce が乱数で
     /// 毎回変わるため、暗号文の md5 では比較できない。
     pub fn derive_backup_hash_key(&self) -> [u8; 32] {
-        crate::crypto::hkdf_sha256(&self.0, BACKUP_KDF_SALT, BACKUP_HASH_INFO)
+        self.derive_envelope_key(BACKUP_LABEL.kdf_salt, BACKUP_LABEL.hash_info)
+    }
+
+    /// 表紙バンドル（`thundoku-thumbs.json` の封筒）の暗号鍵
+    /// = `HKDF-SHA256(ikm = PRK, salt = b"thundoku-thumbs:v1",
+    /// info = b"thundoku-thumbs-key")`（仕様 §11.8）。
+    pub fn derive_thumbs_cipher_key(&self) -> [u8; 32] {
+        self.derive_envelope_key(THUMBS_LABEL.kdf_salt, THUMBS_LABEL.cipher_info)
+    }
+
+    /// 表紙バンドルの平文 HMAC 鍵
+    /// = `HKDF-SHA256(ikm = PRK, salt = b"thundoku-thumbs:v1",
+    /// info = b"thundoku-thumbs-hash")`（仕様 §11.8）。
+    ///
+    /// 変更検知（アップロード要否）に使う。
+    pub fn derive_thumbs_hash_key(&self) -> [u8; 32] {
+        self.derive_envelope_key(THUMBS_LABEL.kdf_salt, THUMBS_LABEL.hash_info)
     }
 }
 
@@ -584,19 +646,20 @@ impl WireWrap {
     }
 }
 
-// ---- §11: メタデータバックアップ（`thundoku-backup.json` v3）の封筒 -------------
+// ---- 暗号化封筒（§11 メタデータバックアップ / §11.8 表紙バンドル） --------------
 
-/// Drive のメタデータバックアップ（`thundoku-backup.json`）v3 の封筒（仕様 §11）。
+/// Drive に置く暗号化コンテナ（封筒）。メタデータバックアップ
+/// （`thundoku-backup.json`。仕様 §11）と表紙バンドル（`thundoku-thumbs.json`。
+/// 仕様 §11.8）で共有する。
 ///
-/// - 平文は**現行のバックアップ JSON そのもの**（`db::backup::export_json` の出力）
-/// - 暗号化は `AES-256-GCM(backup_cipher_key)`、AAD は `thundoku-backup:3:<owner_id>`
+/// - 平文は用途ごとの JSON（バックアップ = `db::backup::export_json` の出力）
+/// - 暗号化は `AES-256-GCM`、AAD は `"{aad_prefix}:{format_version}:{owner_id}"`
+/// - 鍵は PRK から**ラベルごとに**導出する（[`EnvelopeLabel`] の salt / info）
 /// - `nonce` は乱数なので**暗号文は毎回変わる** — 変更検知は [`Self::content_hmac`]
 ///   （平文の HMAC-SHA256）で行い、暗号文の md5 は使わない
-///
-/// 鍵は PRK から導出した [`PackRootKey::derive_backup_cipher_key`] /
-/// [`PackRootKey::derive_backup_hash_key`] だけを使う（新しい鍵管理を増やさない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackupEnvelope {
+pub struct SealedEnvelope {
+    label: &'static EnvelopeLabel,
     format_version: u32,
     owner_id: String,
     alg: String,
@@ -606,16 +669,22 @@ pub struct BackupEnvelope {
     content_hmac: [u8; 32],
 }
 
-impl BackupEnvelope {
+impl SealedEnvelope {
     /// 平文を封筒に入れる（nonce は乱数）。本番の作成経路。
-    pub fn seal(plaintext: &[u8], root: &PackRootKey, owner_id: &str) -> Self {
+    pub fn seal(
+        label: &'static EnvelopeLabel,
+        plaintext: &[u8],
+        root: &PackRootKey,
+        owner_id: &str,
+    ) -> Self {
         let mut nonce = [0u8; NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        Self::seal_with_nonce(plaintext, root, owner_id, nonce)
+        Self::seal_with_nonce(label, plaintext, root, owner_id, nonce)
     }
 
     /// nonce を指定して封をする（**決定的**。テストベクタの検算に使う）。
     pub fn seal_with_nonce(
+        label: &'static EnvelopeLabel,
         plaintext: &[u8],
         root: &PackRootKey,
         owner_id: &str,
@@ -623,20 +692,26 @@ impl BackupEnvelope {
     ) -> Self {
         let ciphertext = crate::crypto::encrypt_with(
             plaintext,
-            &root.derive_backup_cipher_key(),
+            &envelope_cipher_key(label, root),
             &nonce,
-            &backup_aad(owner_id),
+            &envelope_aad(label, owner_id),
         );
-        let content_hmac = hmac_sha256(&root.derive_backup_hash_key(), plaintext);
+        let content_hmac = hmac_sha256(&envelope_hash_key(label, root), plaintext);
         Self {
-            format_version: BACKUP_FORMAT_VERSION,
+            label,
+            format_version: label.format_version,
             owner_id: owner_id.to_owned(),
-            alg: BACKUP_ALG.to_owned(),
-            kdf: BACKUP_KDF.to_owned(),
+            alg: ENVELOPE_ALG.to_owned(),
+            kdf: ENVELOPE_KDF.to_owned(),
             nonce,
             ciphertext,
             content_hmac,
         }
+    }
+
+    /// この封筒の用途ラベル（`from_json` に渡した値）。
+    pub fn label(&self) -> &'static EnvelopeLabel {
+        self.label
     }
 
     pub fn format_version(&self) -> u32 {
@@ -676,20 +751,23 @@ impl BackupEnvelope {
         let plaintext = crate::crypto::decrypt_with(
             &self.ciphertext,
             &self.nonce,
-            &root.derive_backup_cipher_key(),
-            &backup_aad(owner_id),
+            &envelope_cipher_key(self.label, root),
+            &envelope_aad(self.label, owner_id),
         )
         .map_err(|_| {
-            PackError::Corrupted("backup decryption failed (wrong key or tampered)".into())
+            PackError::Corrupted("envelope decryption failed (wrong key or tampered)".into())
         })?;
-        let expected = hmac_sha256(&root.derive_backup_hash_key(), &plaintext);
+        let expected = hmac_sha256(&envelope_hash_key(self.label, root), &plaintext);
         if !constant_time_eq(&expected, &self.content_hmac) {
-            return Err(PackError::Corrupted("backup content hmac mismatch".into()));
+            return Err(PackError::Corrupted(
+                "envelope content hmac mismatch".into(),
+            ));
         }
         Ok(plaintext)
     }
 
-    /// 封筒（`thundoku-backup.json` の中身）のバイト列。TS `JSON.stringify` と同じ詰めた形。
+    /// 封筒のバイト列（`thundoku-backup.json` / `thundoku-thumbs.json` の中身）。
+    /// TS `JSON.stringify` と同じ詰めた形。
     pub fn to_json(&self) -> Result<Vec<u8>, PackError> {
         let wire = WireEnvelope {
             format_version: self.format_version,
@@ -703,26 +781,30 @@ impl BackupEnvelope {
             content_hmac: self.content_hmac_hex(),
         };
         serde_json::to_vec(&wire)
-            .map_err(|e| PackError::Corrupted(format!("failed to serialize backup envelope: {e}")))
+            .map_err(|e| PackError::Corrupted(format!("failed to serialize envelope: {e}")))
     }
 
-    /// 封筒を読む。`format_version` が 3 以外・構造が不正なら `Corrupted`
-    /// （**平文として扱える形では返さない**）。
-    pub fn from_json(bytes: &[u8]) -> Result<Self, PackError> {
-        let invalid =
-            |detail: String| PackError::Corrupted(format!("invalid backup envelope: {detail}"));
+    /// 封筒を読む。`label` は用途（バックアップ / 表紙バンドル）。
+    ///
+    /// `format_version` がラベルと違う・構造が不正なら `Corrupted`
+    /// （**平文として扱える形では返さない**）。ラベルを渡すのは、別の用途の
+    /// 封筒への差し替えを版の不一致で弾くため（残りは AAD と鍵で弾く）。
+    pub fn from_json(label: &'static EnvelopeLabel, bytes: &[u8]) -> Result<Self, PackError> {
+        let invalid = |detail: String| {
+            PackError::Corrupted(format!("invalid {} envelope: {detail}", label.aad_prefix))
+        };
         let wire: WireEnvelope = serde_json::from_slice(bytes)
             .map_err(|e| invalid(format!("not a JSON envelope: {e}")))?;
-        if wire.format_version != BACKUP_FORMAT_VERSION {
+        if wire.format_version != label.format_version {
             return Err(invalid(format!(
                 "unsupported format_version {}",
                 wire.format_version
             )));
         }
-        if wire.encryption.alg != BACKUP_ALG {
+        if wire.encryption.alg != ENVELOPE_ALG {
             return Err(invalid(format!("unknown alg {:?}", wire.encryption.alg)));
         }
-        if wire.encryption.kdf != BACKUP_KDF {
+        if wire.encryption.kdf != ENVELOPE_KDF {
             return Err(invalid(format!("unknown kdf {:?}", wire.encryption.kdf)));
         }
         let nonce: [u8; NONCE_LEN] = BASE64
@@ -733,12 +815,13 @@ impl BackupEnvelope {
         let ciphertext = BASE64
             .decode(&wire.encryption.ciphertext)
             .map_err(|_| invalid("ciphertext is not base64".into()))?;
-        if ciphertext.len() < BACKUP_TAG_LEN {
+        if ciphertext.len() < ENVELOPE_TAG_LEN {
             return Err(invalid("ciphertext is shorter than the GCM tag".into()));
         }
         let content_hmac = hex_decode_32(&wire.content_hmac)
             .ok_or_else(|| invalid("content_hmac is not 32 hex bytes".into()))?;
         Ok(Self {
+            label,
             format_version: wire.format_version,
             owner_id: wire.owner_id,
             alg: wire.encryption.alg,
@@ -751,15 +834,15 @@ impl BackupEnvelope {
 
     /// 読んだ値の自己検査（`open` の前段）。
     fn validate(&self) -> Result<(), PackError> {
-        if self.format_version != BACKUP_FORMAT_VERSION {
+        if self.format_version != self.label.format_version {
             return Err(PackError::Corrupted(format!(
-                "unsupported backup format version: {}",
-                self.format_version
+                "unsupported {} format version: {}",
+                self.label.aad_prefix, self.format_version
             )));
         }
-        if self.alg != BACKUP_ALG || self.kdf != BACKUP_KDF {
+        if self.alg != ENVELOPE_ALG || self.kdf != ENVELOPE_KDF {
             return Err(PackError::Corrupted(format!(
-                "unsupported backup encryption: {}/{}",
+                "unsupported envelope encryption: {}/{}",
                 self.alg, self.kdf
             )));
         }

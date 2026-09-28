@@ -109,6 +109,8 @@ pub struct SettingsView {
     key_has_passphrase: bool,
     /// 未アップロードの鍵 bundle の `owner_id`（あれば警告する。仕様 §5.1）。
     key_pending_owner: Option<String>,
+    /// 表紙バンドル（`thundoku-thumbs.json`）の作成に失敗した印（設定に残る）
+    thumbs_failed: bool,
     /// 鍵の操作（設定 / 解除 / アップロード）の実行中フラグ。
     key_busy: bool,
     /// パスフレーズ必須モードか（`sub` ラップが無い。Drive の bundle が正）。
@@ -333,6 +335,7 @@ impl SettingsView {
             key_has_local: false,
             key_has_passphrase: false,
             key_pending_owner: None,
+            thumbs_failed: false,
             key_busy: false,
             key_passphrase_only: false,
             confirm_remove_passphrase: false,
@@ -475,6 +478,8 @@ impl SettingsView {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         self.api_last_sync_at = Self::read_setting(cx, "api.last_sync_at");
+        // 表紙バンドルの失敗印（次の同期で再試行するが、続くときは原因を見せる）
+        self.thumbs_failed = Self::read_setting(cx, "drive.thumbs.failed").is_some();
         // ビューアのホイール方向（未知の値は既定に倒す）
         self.viewer_wheel_direction = Self::read_setting(cx, WHEEL_DIRECTION_KEY)
             .filter(|value| value == WHEEL_DIRECTION_UP || value == WHEEL_DIRECTION_DEFAULT)
@@ -867,6 +872,7 @@ impl SettingsView {
                     let ok = &ok;
                     let failed = &failed;
                     let thumbnails_dir = &thumbnails_dir;
+                    let db = &db;
                     let booth_session = booth_session.as_ref();
                     let tbf_client = &tbf_client;
                     scope.spawn(move || {
@@ -885,7 +891,7 @@ impl SettingsView {
                             );
                             match bytes {
                                 Some(bytes) => {
-                                    write_cover_cache(thumbnails_dir, site_id, database_id, &bytes);
+                                    write_cover_cache(db, thumbnails_dir, site_id, database_id, &bytes);
                                     ok.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 }
                                 None => {
@@ -950,6 +956,7 @@ impl SettingsView {
         }
         let state = AppState::global(cx);
         let data_dir = state.data_dir.clone();
+        let db = state.db_pool.clone();
         // キャッシュが無く、thumbnail_url がある項目を取得対象にする
         let targets: Vec<(String, String, String)> = self
             .hidden_items
@@ -992,7 +999,7 @@ impl SettingsView {
                     &tbf_client,
                 );
                 if let Some(bytes) = bytes {
-                    write_cover_cache(&thumbnails_dir, site_id, database_id, &bytes);
+                    write_cover_cache(&db, &thumbnails_dir, site_id, database_id, &bytes);
                 }
             }
             let _ = handle.update(cx, |this, cx| {
@@ -1450,6 +1457,7 @@ impl SettingsView {
         let packs_dir = state.packs_dir.clone();
         let downloads_dir = state.downloads_dir.clone();
         let db_path = state.data_dir.join("thundoku-shelf.db");
+        let thumbnails_dir = state.data_dir.join("thumbnails");
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
         let db_key = state.secrets.db_key().ok();
         // pack の鍵（v3 の PRK）の解決に要るもの（背景スレッドへ move する）
@@ -1507,6 +1515,7 @@ impl SettingsView {
                     owner_key: db_key.as_ref(),
                     folder_id: &folder_id,
                     db_path: Some(&db_path),
+                    thumbnails_dir: Some(&thumbnails_dir),
                     sync_books,
                 },
                 &mut |progress| {
@@ -1600,13 +1609,18 @@ impl SettingsView {
                         ) {
                             this.show_toast(
                                 format!(
-                                    "同期完了（DL {} / UL {} / スキップ {} / 競合 {}）{}",
+                                    "同期完了（DL {} / UL {} / スキップ {} / 競合 {}）{}{}",
                                     outcome.downloaded.len(),
                                     outcome.uploaded.len(),
                                     outcome.skipped.len(),
                                     outcome.conflicts.len(),
                                     if outcome.database_backed_up {
                                         " / DB バックアップ"
+                                    } else {
+                                        ""
+                                    },
+                                    if outcome.thumbnails_backed_up {
+                                        " / 表紙"
                                     } else {
                                         ""
                                     }
@@ -2721,7 +2735,7 @@ impl Render for SettingsView {
                                         div()
                                             .text_xs()
                                             .text_color(muted_fg)
-                                            .child("ON にすると、取り込んだ書籍ファイル本体（アプリの形式に変換したもの）と本棚・進捗のデータを Google Drive に自動バックアップします。"),
+                                            .child("ON にすると、取り込んだ書籍ファイル本体（アプリの形式に変換したもの）と本棚・進捗のデータを Google Drive に自動バックアップします。未ダウンロードの本の表紙も、Web 版の本棚で表示できるよう同じフォルダに置きます。"),
                                     ),
                             )
                              .child(
@@ -2927,6 +2941,17 @@ impl Render for SettingsView {
                                 },
                             )),
                     )
+                    // 表紙バンドルの失敗（Web 版の本棚の表紙が出ない原因）
+                    .children(if self.thumbs_failed {
+                        Some(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child("表紙のバックアップに失敗しました（次の同期で再試行します）"),
+                        )
+                    } else {
+                        None
+                    })
                     // 同期情報をクリア
                     .child(
                         div().border_t_1().border_color(border).pt_2()

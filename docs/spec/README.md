@@ -22,7 +22,7 @@
 | 07 | `docs/spec/07-decisions.md` | **なぜそうなっているか**（設計判断・代替案・実測に基づく再発防止・既知の制約） | 9KB |
 | 08 | `docs/spec/08-notifications-and-nonfunctional.md` | 通知（送出元一覧）/ 非機能（DB PRAGMA・並列度・メモリ上限・直列化・単一インスタンス）/ ログ / 不明点・推測 | 47KB |
 | 09 | `docs/spec/09-stores.md` | 技術書典 / BOOTH / FANZA / DLsite の同期手順（番号付き）と対象データ | 172KB |
-| 10 | `docs/spec/10-pack-keys.md` | **pack の鍵 v3（乱数ルート鍵 + ラップ）の仕様**（Rust 側は実装済み / Web 版は未対応）/ ラップ形式 / 解決順序 / Web 実装チェックリスト / テストベクタ | 17KB |
+| 10 | `docs/spec/10-pack-keys.md` | **pack の鍵 v3（乱数ルート鍵 + ラップ）の仕様**（Rust 側は実装済み / Web 版は未対応）/ ラップ形式 / 解決順序 / Web 実装チェックリスト / テストベクタ / §11 バックアップと表紙バンドルの封筒 | 17KB |
 
 > 全章を連結すると 1MB 近くになる（AI のコンテキストに収まらない）。**必要な章だけ読む**前提で分割している。
 
@@ -132,6 +132,7 @@ flowchart LR
 | セキュリティ（解消済み） | **F06**: 入力の総量・計算量に上限を入れた — 取り込み元は**読む前に** 2 GiB（`MAX_IMPORT_SOURCE_BYTES`）、外側 ZIP は**展開の前**に件数（`MAX_ENTRY_COUNT`）と宣言合計（2 GiB）、PDF は**描画の前**に総ページ数（`MAX_PDF_PAGES` = 9000）と累積出力量（2 GiB）、パスフレーズの `iterations` は **PBKDF2 の前**に 1000 万（`MAX_PASSPHRASE_ITERATIONS`）。**書き出し側でも読み出し側と同じ上限を検査**する（書けるが開けない pack を作らない）。2 GiB 超の本はダウンロード前に確認ダイアログ（`crates/core/src/store_size.rs`） |
 | セキュリティ（解消済み） | **F01**: 「パスフレーズ必須モード」を実装（設定 →「本の鍵」→「必須にする」）。bundle から `sub` ラップを削除し、Drive の `thundoku-keys.json` と `sub` を奪われても本を復号できない。**取消では `sub` へ戻らない**（`PackKeysError::PassphraseRequired`）。既定はオフ・明示的に選ぶ。端末の keyring は残るので、他の端末を切り離すにはログアウト/鍵の削除かパスフレーズ変更。**既に漏れた鍵の無効化（鍵ローテーション）は未実装**（`docs/spec/10-pack-keys.md` §5.2.1 / §9） |
 | 実装（Web 版のみ未対応） | pack の鍵は **v3（乱数ルート鍵 + `sub`／パスフレーズのラップ）へ移行済み**（`docs/spec/03-import-and-pack.md` §4.5 / `docs/spec/10-pack-keys.md`）。**v2 の pack は読めない**（`PackError::Version(2)`）ので、旧 pack は再取り込みが要る。残るのは **Web 版（`thundoku-shelf` モノレポの `packages/opfspack`）の対応**（§10 §7 のチェックリスト。Web が書く v2 pack はデスクトップでは開けない） |
+| 実装（Web 版のみ未対応） | **表紙バンドル**（`thundoku-thumbs.json`。未ダウンロードの本の表紙を Web 版の本棚へ渡す）はデスクトップ側が上げる（`docs/spec/10-pack-keys.md` §11.8 / `docs/spec/06-sync-auth-drive.md` §3.6）。残るのは Web 版の読み取り（同 §11.8 のチェックリスト） |
 | 運用（公開前の確認） | Google Cloud のクライアント種別・Web 版との secret 共用・同意画面の設定は**コードからは確認できない**。公開前に `docs/spec/06-sync-auth-drive.md` §2.5 の表で確認する |
 | 運用（継続） | macOS 配布物は **Developer ID で署名し、Apple の公証（Notarization）を受ける**（v0.2.6 以降。`release.yml` の Import signing certificate / Package (macOS)。鍵は GitHub Secrets から一時キーチェーンへ入れ、`if: always()` で必ず削除する）。**Windows の Authenticode 署名は証明書が要るため未実施**。配布物のハッシュは `release.yml` が発行する |
 | 運用（継続） | 依存の脆弱性は CI の `cargo audit` ジョブで確認する（2026-09-22 時点で**脆弱性 0 件**）。無視する例外は `.cargo/audit.toml` に理由と見直し時期つきで列挙（現在は `rsa` の 1 件のみ）。**脆弱性ではない警告 13 件**（未保守 11・unsound 2）は `docs/spec/07-decisions.md` §6.1 で「配布物に入るか」つきで分類済み。Actions はコミット SHA 固定、ビルド・テストは `--locked` |

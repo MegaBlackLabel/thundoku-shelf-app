@@ -287,3 +287,20 @@ CREATE TABLE IF NOT EXISTS product_sample_pages (
   fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 表紙バンドル（`thundoku-thumbs.json`）に載せる画像の派生キャッシュ（`db::thumbs`）。
+-- DB バックアップの対象外（復元先で作り直せる）。kind = 'shelf' | 'checklist'、
+-- item_key = `{site_id}:{database_id}`（本棚）/ `checked_items.id`（チェックリスト）。
+CREATE TABLE IF NOT EXISTS thumbnail_share (
+  kind TEXT NOT NULL,
+  item_key TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  bytes BLOB NOT NULL,
+  source_mtime INTEGER,
+  source_size INTEGER,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (kind, item_key)
+);

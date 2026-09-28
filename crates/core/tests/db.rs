@@ -88,6 +88,7 @@ fn migrate_creates_all_schema_tables() {
             "reading_progress",
             "sites",
             "tbf_events",
+            "thumbnail_share",
             "token_analysis",
             "view_history",
             "zenn_tag_metadata",

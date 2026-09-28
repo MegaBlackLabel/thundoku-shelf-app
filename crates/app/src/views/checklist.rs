@@ -364,6 +364,8 @@ impl ChecklistView {
             }
             for (id, data) in &stored {
                 let _ = db::checklist::update_thumbnail_data(&db, id, data);
+                // Drive の表紙バンドル用の共有キャッシュにも入れる（再エンコードしない）
+                let _ = thundoku_core::thumbs::cache_checklist_thumbnail(&db, id, data);
             }
             (failed, stored)
         });

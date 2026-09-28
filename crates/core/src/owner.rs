@@ -38,6 +38,18 @@ pub fn decrypt(key: &[u8; 32], blob: &str) -> Option<String> {
     String::from_utf8(pt).ok()
 }
 
+/// 行の `owner_sub`（暗号文 or NULL）が現在の `sub` に帰属するか。
+///
+/// `sub = None`（未ログイン）は未所属（`owner_sub IS NULL`）の行だけを指す。
+/// 復号できない行（別鍵・破損）はどの sub にも帰属させない（＝隠す側に倒す）。
+/// `owner_sub` は毎回 IV が変わる暗号文なので SQL では比較できない。
+pub fn matches(key: &[u8; 32], blob: Option<&str>, sub: Option<&str>) -> bool {
+    match sub {
+        Some(sub) => blob.and_then(|blob| decrypt(key, blob)).as_deref() == Some(sub),
+        None => blob.is_none(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

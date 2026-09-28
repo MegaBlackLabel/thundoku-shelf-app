@@ -4,6 +4,34 @@
 
 ## [Unreleased]
 
+### Added
+
+- **表紙バンドル（Web 版の本棚へ表紙を渡す）**: Web 版の本棚は未ダウンロードの本の表紙を
+  出せず、`thumbnail_url` を直接読ませる方法もサイトごとの URL 規則（FANZA の原寸置換・
+  TBF の `/api/image/`）やホットリンク・参照元の消滅に弱かった。本棚の表紙（256px WebP）と
+  チェックリストのサムネイル（256px JPEG）を 1 ファイル `thundoku-thumbs.json` にまとめ、
+  `thundoku-backup.json` と同じ封筒（**ラベルと鍵は別**。AAD は `thundoku-thumbs:1:<owner_id>`）で
+  暗号化して同じフォルダへ上げる。**PRK が無いときは上げない**（表紙は蔵書そのものを晒し、
+  かつ再取得できる派生データなので、DB バックアップの平文フォールバックとは判断を変える）。
+  内容が変わったときだけアップロードし、**1 枚も作れないときは既存のファイルを残す**
+  （表紙キャッシュの無い端末が Web 側の表紙を消さない）。失敗しても同期全体は失敗させず、
+  `drive.thumbs.failed` を立てて設定画面に警告を出す。画像は 448px キャッシュから 256px WebP
+  q80 にエンコードし、派生キャッシュ `thumbnail_share`（**DB バックアップの対象外**）に持つ
+  （1 回の同期で新規にエンコードするのは 100 枚まで。表紙の取得直後とチェックリスト保存の
+  直後にも書く）。仕様は `docs/spec/10-pack-keys.md` §11.8 /
+  `docs/spec/06-sync-auth-drive.md` §3.6。**Web 版の読み取りは未対応**（同 §11.8 の
+  チェックリスト）。`crates/opfspack/src/keys.rs`、
+  `crates/core/src/{thumbs.rs,db/thumbs.rs,db/mod.rs,drive/sync.rs}`、
+  `crates/app/src/views/{bookshelf.rs,checklist.rs,settings.rs}`、`crates/app/src/workspace.rs`
+
+### Changed
+
+- **封筒（`BackupEnvelope`）を用途ラベル付きの `SealedEnvelope` に一般化**: `thundoku-backup.json`
+  と `thundoku-thumbs.json` で AAD の接頭辞・`format_version`・鍵導出（HKDF の salt / info）を
+  ラベルで分ける。**既存のバックアップのバイト列は変えていない**（同じ PRK・nonce・平文で
+  従来と同じ暗号文 / `content_hmac` になることを `crates/opfspack/tests/backup_envelope.rs` が
+  固定）。`crates/opfspack/src/{keys.rs,lib.rs}`、`crates/core/src/{db/backup.rs,drive/sync.rs}`
+
 ## [0.2.11] - 2026-09-28
 
 ### Added

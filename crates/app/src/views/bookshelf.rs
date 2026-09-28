@@ -2630,6 +2630,7 @@ impl BookshelfView {
         let tbf_client = state.tbf.clone();
         let booth_session = state.booth_session.lock().clone();
         let data_dir = state.data_dir.clone();
+        let db = state.db_pool.clone();
         let handle = cx.entity();
         // タイムアウト付きのエージェント（ハングすると 5 分以上待つ原因になるため）
         let agent = ureq::AgentBuilder::new()
@@ -2662,6 +2663,7 @@ impl BookshelfView {
                     let tbf_client = &tbf_client;
                     let booth_session = &booth_session;
                     let thumbnails_dir = &thumbnails_dir;
+                    let db = &db;
                     let agent = &agent;
                     let tx = tx.clone();
                     let fail_tx = fail_tx.clone();
@@ -2706,7 +2708,7 @@ impl BookshelfView {
                             };
                             // 縮小済みサムネイルを PNG で保存する（reload 時のキャッシュ
                             // 読み込みがオリジナル（1MB 超）だと 300 件で 100 秒超かかるため）
-                            write_cover_cache(thumbnails_dir, site_id, database_id, &bytes);
+                            write_cover_cache(db, thumbnails_dir, site_id, database_id, &bytes);
                             // デコード + 縮小はこのスレッド（4 並列）で行い、UI には
                             // デコード済みサムネイルだけ送る（UI スレッドで 307 枚
                             // デコードすると固まるため）
@@ -9715,7 +9717,11 @@ pub(crate) fn fetch_cover_bytes(
 
 /// 取得した表紙画像を 448px の PNG キャッシュとして保存する（本棚と設定で共通）。
 /// カードのヘッダーは最大 ~320px 幅なので、粗くならないよう 448px で持つ。
+///
+/// 保存できたら、Drive の表紙バンドル用の共有キャッシュ（`core::thumbs`）も
+/// ここで作る（次の同期でエンコードし直さないため）。
 pub(crate) fn write_cover_cache(
+    pool: &thundoku_core::db::SqlitePool,
     thumbnails_dir: &std::path::Path,
     site_id: &str,
     database_id: &str,
@@ -9725,6 +9731,11 @@ pub(crate) fn write_cover_cache(
         let path = cover_cache_path(thumbnails_dir, site_id, database_id);
         let _ = std::fs::write(&path, &cached);
         remove_legacy_cover_cache(thumbnails_dir, site_id, database_id);
+        if let Err(error) =
+            thundoku_core::thumbs::cache_shelf_cover(pool, thumbnails_dir, site_id, database_id)
+        {
+            log::warn!("表紙の共有キャッシュを作れない: {site_id} / {database_id}: {error}");
+        }
     }
 }
 

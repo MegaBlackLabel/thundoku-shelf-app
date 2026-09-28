@@ -1445,6 +1445,7 @@ impl Workspace {
         let packs_dir = state.packs_dir.clone();
         let downloads_dir = state.downloads_dir.clone();
         let db_path = state.data_dir.join("thundoku-shelf.db");
+        let thumbnails_dir = state.data_dir.join("thumbnails");
         let google_sub = state.google_profile.lock().as_ref().map(|p| p.sub.clone());
         let db_key = state.secrets.db_key().ok();
         // pack の鍵（v3 の PRK）の解決に要るもの（背景スレッドへ move する）
@@ -1501,6 +1502,7 @@ impl Workspace {
                     owner_key: db_key.as_ref(),
                     folder_id: &folder_id,
                     db_path: Some(&db_path),
+                    thumbnails_dir: Some(&thumbnails_dir),
                     sync_books,
                 },
                 // 進捗は UI の通知に出す（UI が消えていたら false = 中止）。

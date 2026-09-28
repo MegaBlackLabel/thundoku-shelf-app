@@ -20,6 +20,7 @@ pub mod samples;
 pub mod settings;
 pub mod sync_state;
 pub mod tags;
+pub mod thumbs;
 pub mod view_history;
 
 use std::path::Path;
@@ -452,6 +453,28 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         ] {
             ensure_column(&mut conn, table, "owner_sub", "owner_sub TEXT").await?;
         }
+        // 表紙バンドル（`thundoku-thumbs.json`）に載せる画像の派生キャッシュ
+        // （`db::thumbs`）。α版なのでマイグレーションファイルを足さず、
+        // 上の runtime DDL と同様に冪等に作る（新規 DB も schema.sql が持つ）。
+        // **`db::backup::TABLES` の許可リストには入れない**（復元先で作り直せる
+        // 派生データで、DB バックアップを太らせる意味がない）。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS thumbnail_share (
+                 kind TEXT NOT NULL,
+                 item_key TEXT NOT NULL,
+                 mime TEXT NOT NULL,
+                 width INTEGER NOT NULL,
+                 height INTEGER NOT NULL,
+                 sha256 TEXT NOT NULL,
+                 bytes BLOB NOT NULL,
+                 source_mtime INTEGER,
+                 source_size INTEGER,
+                 updated_at TEXT NOT NULL,
+                 PRIMARY KEY (kind, item_key)
+             )",
+        )
+        .execute(&mut *conn)
+        .await?;
         Ok(())
     })
 }
@@ -493,6 +516,8 @@ pub fn clear_owner_model_if_first_run(
         "bookshelf_items",
         "books",
         "drive_sync_state",
+        // 表紙バンドルの派生キャッシュ（親を消すので一緒に消す）
+        "thumbnail_share",
     ] {
         let _ = block_on(async {
             sqlx::query(&format!("DELETE FROM {table}"))
@@ -511,6 +536,8 @@ pub fn clear_owner_model_if_first_run(
         "drive.sync.enabled",
         "drive.sync.folder_id",
         crate::drive::sync::BACKUP_BASELINE_KEY,
+        crate::drive::sync::THUMBS_BASELINE_KEY,
+        crate::drive::sync::THUMBS_FAILED_KEY,
     ] {
         let _ = settings::delete(pool, key);
     }

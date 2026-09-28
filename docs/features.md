@@ -758,6 +758,12 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
     （むやみに増やさない・消さない）
 - **ファイル名**: `{bookId}.opfspack`（パック ID がそのままファイル名になる）。
   `appProperties: { app: "thundoku-shelf", packId }` を付与
+- **表紙バンドル**: `thundoku-thumbs.json`（1 ファイル）。**未ダウンロードの本の表紙**を
+  Web 版の本棚で出せるように、本棚の表紙（256px WebP）とチェックリストのサムネイル
+  （256px JPEG）をまとめて同じフォルダに置く。DB バックアップと同じ封筒（v3。ラベルと鍵は
+  別）で暗号化し、**鍵（PRK）が無いときは上げない**（平文では上げない）。内容が変わったときだけ
+  アップロードし、失敗しても同期全体は失敗させない（`drive.thumbs.failed` を立てて設定画面に警告）。
+  詳細は `docs/spec/10-pack-keys.md` §11.8 / `docs/spec/06-sync-auth-drive.md` §3.6
 - **双方向同期**: Drive 側の `md5Checksum` と `drive_sync_state.md5` を比較し、
   差異があるファイルだけダウンロード / アップロード
 - **競合時のルール**: Drive 側を優先取得。ローカルの旧 pack は

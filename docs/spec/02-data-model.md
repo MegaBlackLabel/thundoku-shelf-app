@@ -49,9 +49,9 @@
 | `schema.sql` の位置づけ | スキーマの「正本」とされる参照用ファイル。**アプリのコードパスからは実行されない**（`include_str!` 等の参照なし。`grep -rn "schema.sql"` のヒットは `db/mod.rs:200` のコメントと `docs/database.md:4` のみ） | `crates/core/src/db/schema.sql` / `docs/database.md:3-7` |
 | シード行 | `sites` の `techbookfest` / `booth` は `0001_init.sql` と `schema.sql` の `INSERT OR IGNORE`。`fanza` / `dlsite` は `migrate()` が `INSERT OR IGNORE` で追加 | `crates/core/migrations/0001_init.sql:19-23`, `crates/core/src/db/schema.sql:19-23`, `crates/core/src/db/mod.rs:382-392` |
 
-### 1.2 `crates/core/src/db/schema.sql`（全文・282 行、verbatim）
+### 1.2 `crates/core/src/db/schema.sql`（全文・306 行、verbatim）
 
-テーブル定義位置: sites(:3) / app_settings(:25) / books(:32) / tbf_events(:55) / bookshelf_items(:76) / reading_progress(:108) / checked_items(:119) / book_contents(:138) / content_formats(:150) / imported_documents(:163) / document_images(:175) / page_views(:192) / document_text(:204) / token_analysis(:213) / book_tags(:226) / zenn_tag_metadata(:235) / favorite_tags(:243) / favorite_entities(:249) / book_first_events(:256) / product_sample_pages(:266)。
+テーブル定義位置: sites(:3) / app_settings(:25) / books(:32) / tbf_events(:55) / bookshelf_items(:76) / reading_progress(:108) / checked_items(:119) / book_contents(:138) / content_formats(:150) / imported_documents(:163) / document_images(:175) / page_views(:192) / document_text(:204) / token_analysis(:213) / book_tags(:226) / zenn_tag_metadata(:235) / favorite_tags(:243) / favorite_entities(:249) / book_first_events(:256) / product_sample_pages(:266) / thumbnail_share(:291)。
 
 ```sql
 -- TBF Cabinet SQLite Schema
@@ -336,6 +336,23 @@ CREATE TABLE IF NOT EXISTS product_sample_pages (
   pack_entry_path TEXT,
   fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 表紙バンドル（`thundoku-thumbs.json`）に載せる画像の派生キャッシュ（`db::thumbs`）。
+-- DB バックアップの対象外（復元先で作り直せる）。kind = 'shelf' | 'checklist'、
+-- item_key = `{site_id}:{database_id}`（本棚）/ `checked_items.id`（チェックリスト）。
+CREATE TABLE IF NOT EXISTS thumbnail_share (
+  kind TEXT NOT NULL,
+  item_key TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  width INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  bytes BLOB NOT NULL,
+  source_mtime INTEGER,
+  source_size INTEGER,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (kind, item_key)
 );```
 
 ### 1.3 `crates/core/migrations/0001_init.sql`（全文・238 行、verbatim）
@@ -598,6 +615,8 @@ CREATE TABLE IF NOT EXISTS drive_sync_state (
 - `crates/core/src/db/mod.rs:271-274`: `books` に `page_turn TEXT` を `ensure_column` で追加（本ごとの綴じ方向。リリース前のためマイグレーションファイルは増やしていない）。既存 DB で列が足されることはテスト `legacy_books_get_the_page_turn_column` が固定する（`crates/core/tests/db.rs:112-183`）。
 - `crates/core/src/db/mod.rs:303-313`: `bookshelf_items` に `download_options TEXT` を `ensure_column` で追加（BOOTH の**1 商品複数ダウンロード**の候補 = JSON 配列 `[{"name","url"}]`）。**`schema.sql`（Web スキーマ）にも `0001_init.sql` にも無い列**なので、`hidden_at` / `tags_fetched` と同じく PRAGMA で確認してから追加する。`NULL` = 候補なし（`download_url` 1 件として扱う）。読み書きは `crates/core/src/db/bookshelf.rs:23-26`, `:53-57`, `:59-76`, `:105-108`、同期側の保存は `crates/app/src/views/bookshelf.rs:3508-3509`
 
+- `crates/core/src/db/mod.rs`（`migrate`）: `CREATE TABLE IF NOT EXISTS thumbnail_share (kind, item_key, mime, width, height, sha256, bytes, source_mtime, source_size, updated_at, PK(kind, item_key))`。Drive の表紙バンドル（`thundoku-thumbs.json`）に載せる画像の派生キャッシュで、α版なのでマイグレーションファイルを足さず毎回冪等に作る。**DB バックアップの対象外**（`db::backup::TABLES` に入れない）。仕様は `docs/spec/10-pack-keys.md` §11.8。
+
 ### 1.5 `schema.sql` と `0001_init.sql` の差分（再実装時に効く）
 
 | 対象 | `0001_init.sql` | `schema.sql`（= 最終形） | 差分を作る runtime DDL |
@@ -642,6 +661,7 @@ CREATE TABLE IF NOT EXISTS drive_sync_state (
 | `favorite_entities` | サークル / 作者のお気に入り（種別ごとに独立） | `(entity_kind, entity_name)` | — | `schema.sql:249-254` |
 | `book_first_events` | 本の初出イベント | `(site_id, database_id)` | 複合 FK `(site_id, database_id) → bookshelf_items(site_id, database_id)` | `schema.sql:256-264` |
 | `product_sample_pages` | 試し読み画像 | `id` | `checklist_item_id → checked_items(id)` | `schema.sql:266-281` |
+| `thumbnail_share` | 表紙バンドル（Drive `thundoku-thumbs.json`）に載せる画像の派生キャッシュ。**DB バックアップの対象外**（復元先で作り直せる） | `(kind, item_key)` | — | `schema.sql:291-306` / `crates/core/src/db/mod.rs`（`migrate`） |
 | `drive_sync_state` | Drive 同期の記帳 | `pack_id` | — | `crates/core/src/db/desktop.sql:3-9` / `0001_init.sql:230-238` |
 | `view_history` | 閲覧セッション（開始/終了時刻） | `id` | `book_id → books(id) ON DELETE CASCADE` | `crates/core/src/db/mod.rs:274` |
 | `page_notes` | 付箋（1 ページ 1 件） | `id` + `UNIQUE(book_id, content_id, page)` | `book_id → books(id) ON DELETE CASCADE` | `crates/core/src/db/mod.rs:291` |
@@ -685,9 +705,10 @@ ON DELETE の注記（事実）: `books` の子のうち `imported_documents` / 
 | 進捗のコンテンツ単位化 | §1.4 参照。何度実行しても安全（`content_id` 列の有無で判定） | `crates/core/src/db/mod.rs:105-181` |
 | 同期ラッパー | `run_progress_content_migration(pool) -> Result<u64>`（移行件数） | `crates/core/src/db/mod.rs:183-189` |
 | 旧ラベルの書き換え | `content_formats.label` が旧値（`pdf`/`epub` で `PDF`/`EPUB` 以外、`image` で `画像`）の行だけ更新。画像は本のファイル名の拡張子 → `JPEG`/`PNG`/… へ、無ければ `JPEG` | `crates/core/src/db/contents.rs:214-282` |
-| 初回クリア | `app_settings['owner_sub_model.initialized']` が無い初回起動時のみ、FK 安全順（子→親）で 16 テーブルを `DELETE` し、`packs` / `thumbnails` ディレクトリを作り直し、`drive.last_sync_at` / `drive.sync.enabled` / `drive.sync.folder_id` を削除してからフラグを立てる。2 回目以降は `false` を返して何もしない | `crates/core/src/db/mod.rs:403-458` |
+| 初回クリア | `app_settings['owner_sub_model.initialized']` が無い初回起動時のみ、FK 安全順（子→親）で 17 テーブル（`thumbnail_share` を含む）を `DELETE` し、`packs` / `thumbnails` ディレクトリを作り直し、`drive.last_sync_at` / `drive.sync.enabled` / `drive.sync.folder_id` / `drive.backup.md5` / `drive.thumbs.hash` / `drive.thumbs.failed` を削除してからフラグを立てる。2 回目以降は `false` を返して何もしない | `crates/core/src/db/mod.rs`（`clear_owner_model_if_first_run`） |
 | 機密列の暗号化 | `document_text.text_content` / `token_analysis` の 4 列 / `page_notes.memo` の**平文を一度だけ暗号化**する（`app_settings['column_crypto.v1_migrated']` で 2 回目以降は何もしない）。平文の行が無ければ**鍵（keyring）に触れずに**フラグだけ立てる。鍵が取れない・書き込みに失敗したときはフラグを立てず、**次回起動で再試行**する（§1.11） | `crates/core/src/db/mod.rs`（`migrate_column_crypto_once`）、`crates/core/src/db/column_crypto.rs` |
-| クリア対象テーブル（順序そのまま） | `product_sample_pages` → `token_analysis` → `document_text` → `document_images` → `content_formats` → `book_contents` → `imported_documents` → `book_tags` → `reading_progress` → `view_history` → `page_views` → `book_first_events` → `checked_items` → `bookshelf_items` → `books` → `drive_sync_state`（`sites` / `tbf_events` は残す） | `crates/core/src/db/mod.rs:419-441` |
+| クリア対象テーブル（順序そのまま） | `product_sample_pages` → `token_analysis` → `document_text` → `document_images` → `content_formats` → `book_contents` → `imported_documents` → `book_tags` → `reading_progress` → `view_history` → `page_views` → `book_first_events` → `checked_items` → `bookshelf_items` → `books` → `drive_sync_state` → `thumbnail_share`（`sites` / `tbf_events` は残す） | `crates/core/src/db/mod.rs`（`clear_owner_model_if_first_run`） |
+| 表紙バンドルの派生キャッシュ | `thumbnail_share` は**DB バックアップに含めない**（復元先で作り直せる派生データ）。Drive の `thundoku-thumbs.json` は PRK があるときだけ上げ、1 枚も作れなければ既存のファイルを残す（上位の詳細は `docs/spec/10-pack-keys.md` §11.8） | `crates/core/src/db/thumbs.rs`, `crates/core/src/thumbs.rs`, `crates/core/src/drive/sync.rs`（`backup_thumbnails`） |
 | バックアップ対象テーブル（順序 = FK 参照元が先） | `books`, `bookshelf_items`, `checked_items`, `product_sample_pages`（所有者は親の `checked_items` 経由で判定）, `tbf_events`, `book_contents`, `content_formats`, `reading_progress`, `page_views`, `book_tags`, `favorite_tags`, `favorite_entities`, `imported_documents`, `document_images`, `book_first_events`, `zenn_tag_metadata`, `view_history`（17 件） | `crates/core/src/db/backup.rs:17-43,192-214,515-526` |
 | バックアップから除外する列 | `thumbnail_data`, `image_data`（画像 base64 を含めない。`product_sample_pages` は `image_url` を残し、開くたびに自サイトの `/api/image/` から取り直すので復元先でも開ける）, `extracted_text`（`document_images` のページ本文。暗号化 pack の本文を平文で載せない） | `crates/core/src/db/backup.rs` |
 | 比較で無視する揮発列 | `books.updated_at`, `bookshelf_items.synced_at,updated_at`, `tbf_events.updated_at`（アプリ自身が同期のたびに書き換える時刻。内容が同じでも変わるため差分判定から外す） | `crates/core/src/db/backup.rs:41-47` |
