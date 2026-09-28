@@ -475,6 +475,7 @@ backup_hash_key   = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1", info = 
 > `crates/opfspack/src/keys.rs`（ラベル `THUMBS_LABEL`）と `crates/core/src/thumbs.rs`
 > （平文の組み立て・エンコード）、配線は `crates/core/src/drive/sync.rs`
 > （`backup_thumbnails`）と `crates/core/src/db/thumbs.rs`（派生キャッシュ）。
+> コメント付きのサンプル（データはダミー）は `docs/thundoku-thumbs.jsonc`。
 
 #### 何のために
 
@@ -568,17 +569,155 @@ Web 版の本棚が**未ダウンロードの本の表紙**を出せるように
 既存のバックアップ側のベクタ（§11.6）はバイト単位で不変であることが回帰条件
 （`crates/opfspack/tests/backup_envelope.rs`）。
 
+#### Drive 上のファイル属性（探すための情報）
+
+Web は「同期フォルダの一覧 → 名前一致」でファイルを見つける。一覧から得られる属性は次の通り
+（アップロードの実装は `crates/core/src/drive/mod.rs` の `multipart_wrapper` と
+`crates/core/src/drive/sync.rs` の `backup_thumbnails`）:
+
+| 項目 | 値 |
+|---|---|
+| 名前 | `thundoku-thumbs.json`（完全一致。`sync.rs` の `THUMBS_NAME`） |
+| 親 | 同期フォルダ（My Drive 直下 `thundoku-shelf/`。`SYNC_FOLDER_NAME`） |
+| `mimeType` | `application/octet-stream`（**`application/json` ではない**ので、mime で絞り込まない） |
+| `appProperties.app` | `thundoku-shelf` |
+| `appProperties.packId` | `thundoku-thumbs.json`（`.opfspack` で終わらないので名前がそのまま入る） |
+| サイズ | 平文 + 16B タグを base64 した長さ + 封筒のフィールド。実データ 612 枚で平文 17.3 MB（`entries` 次第で増減。約 1.33 倍が base64） |
+
+- 一覧クエリの例（`folderId` は同期フォルダの id。`docs/spec/06-sync-auth-drive.md` の `list_files` と同じ形）:
+  `q = '<folderId>' in parents and trashed=false and name='thundoku-thumbs.json'`、
+  `fields = nextPageToken,files(id,name,size,md5Checksum,modifiedTime)`、`pageSize=100`・`pageToken` で全ページ。
+  `appProperties` を絞り込みに使うなら `and appProperties has { key='packId' and value='thundoku-thumbs.json' }`。
+- **同名が 2 つ以上あり得る**。デスクトップは「新しい方を上げてから旧い方を消す」ので、削除に失敗すると
+  そのまま残る（`sync.rs` は警告だけで続行）。デスクトップ自身は一覧の最初の一致を使うが、
+  **Web は `modifiedTime` が新しい方を採る**こと（古い方を読むと 1 世代前の表紙が出る）。
+- `drive.file` スコープでは「自分が作成した / Picker で許可された」ファイルしか列挙できない。
+  この制約の扱いは「前提（Web 側で確認が要る）」を参照。
+
+#### 暗号処理（WebCrypto の具体形）
+
+`thundoku-backup.json` と**同じ PRK**を使い、**ラベルだけ別**（この節の「形式」表）。
+Rust の実装（`hkdf` crate / `aes-gcm` crate）とバイト一致させる:
+
+| 段階 | Rust の式 | WebCrypto |
+|---|---|---|
+| 暗号鍵 | `HKDF-SHA256(ikm = PRK, salt = b"thundoku-thumbs:v1", info = b"thundoku-thumbs-key")` 32B | `importKey("raw", prk, "HKDF", false, ["deriveBits"])` → `deriveBits({ name: "HKDF", hash: "SHA-256", salt: UTF8("thundoku-thumbs:v1"), info: UTF8("thundoku-thumbs-key") }, key, 256)` |
+| HMAC 鍵 | 同式で `info = b"thundoku-thumbs-hash"` | 同上（`info` だけ差し替え） |
+| 復号 | `AES-256-GCM(key = cipherKey, nonce, AAD)(ciphertext)` | `importKey("raw", cipherKey, "AES-GCM", false, ["decrypt"])` → `decrypt({ name: "AES-GCM", iv: nonceBytes, additionalData: UTF8("thundoku-thumbs:1:" + ownerId), tagLength: 128 }, key, ciphertextBytes)` |
+| 平文の改変検出 | `HMAC-SHA256(hashKey, 平文)` を `content_hmac`（小文字 hex）と比較 | `importKey("raw", hashKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"])` → `sign("HMAC", key, plaintextBytes)` → 32B を hex 化して比較 |
+
+- **`ciphertext` は「平文 + 16B の GCM タグ」が連結された形**（WebCrypto の `decrypt` はこの形を
+  前提にするので、タグを別扱いしない）。
+- **AAD は文字列の UTF-8 バイト列**。`owner_id` は封筒の `owner_id`（＝自分と一致することを確認した値）を使う。
+- **HKDF の `salt` は必須**（backup と違って thumbs は salt を持つ）。WebCrypto の `"HKDF"` は
+  extract + expand で、Rust の `Hkdf::new(Some(salt), ikm)` と同じ結果になる。
+- `nonce` は 12B、`iv` にそのバイト列をそのまま渡す。base64 は**標準アルファベット + padding**
+  （base64url ではない）。`Uint8Array.from(atob(s), (c) => c.charCodeAt(0))` で足りる。
+- `content_hmac` は**必ず自分で計算して照合**する（封筒の値を信じない）。照合は定数時間比較が望ましい。
+- 鍵の導出結果にテストベクタがあるので、**移植直後に TS のテストで突き合わせる**（後述の「受け入れ確認」）。
+
+#### PRK の解決（Web）
+
+表紙バンドルの復号に使う PRK は **DB バックアップと同一の経路**で解く（§3.2 / §4.2 / §5.2.1）。
+Web は OS keyring を持たないので、`thundoku-keys.json`（同じフォルダ）から毎回解く:
+
+1. `thundoku-keys.json` を一覧から名前で探して取得（無ければ表紙は出せない → 退化経路）。
+2. `owner_id` が自分と一致する bundle だけを使う（不一致は `OwnerMismatch` 相当として無視）。
+3. `kind = "sub"` のラップ: `KEK_sub = PBKDF2-SHA256(password = UTF8(sub) ‖ APP_SALT, salt = APP_SALT, iterations = 100_000, 32B)`。
+   `sub` は Google の ID トークンの `sub` claim（`googleProfile.sub`）。
+   `APP_SALT = b"opfspack-v1-identity-salt-2024"`。**`sub` を UTF8 にしてから `APP_SALT` を後置連結**する
+   （区切り文字は入れない）。
+4. `AES-256-GCM(KEK)(wraps[].ciphertext)` を AAD `UTF8("thundoku-pack-root:1:" + owner_id)` で復号すると PRK 32B（`ciphertext` は 48B = 32B + 16B タグ）。
+5. パスフレーズラップがある場合は**先にパスフレーズを試す**（§4.2）。`NFKC` 正規化してから UTF-8 化する。
+6. **パスフレーズ必須モード**（`kind = "sub"` のラップが無い bundle）では `sub` からは戻せない。
+   パスフレーズを尋ね、「スキップ」では**復号しない**（`sub` へ落ちる経路が無い。§5.2.1）。
+7. PRK が取れない（未ログイン・bundle が無い・利用者がスキップ）なら、表紙は出さず
+   `thumbnail_url` → プレースホルダへ退化する。**メタデータだけは出せる**ので本棚は壊さない。
+
+#### 取得・キャッシュ・再取得の判定
+
+**`modifiedTime` は「変わった」の判定に使えない**（内容が同じでも進む）。`sync.rs` の
+`backup_thumbnails` は、`content_hmac` が前回と同じときも `drive.touch` で
+`modifiedTime` だけ現在時刻に更新する（DB バックアップと同じ流儀）。したがって:
+
+| 変化 | `modifiedTime` | ファイルのバイト列 | `content_hmac` |
+|---|---|---|---|
+| 内容が変わった（上げ直し） | 進む | 変わる（`nonce` が乱数なので毎回別物） | 変わる |
+| 内容が同じ（`touch` のみ） | **進む** | 変わらない | 変わらない |
+| デスクトップが同期していない | 変わらない | 変わらない | 変わらない |
+
+- **`md5Checksum` / サイズで「内容が変わった」を判定しない**（どちらも `nonce` と再エンコードで動く）。
+  ただし**サイズは平文長の関数**なので、「前回と同じサイズ」は同一内容の強いヒントになる（判定の正は `content_hmac`）。
+- 推奨の手順（無駄なダウンロードを抑えつつ正しさを優先する）:
+  1. 一覧で `name` 一致（複数あれば `modifiedTime` が新しい方）を探す。
+  2. 前回保存した `modifiedTime` と同じなら**何もしない**（ただし `touch` で進むので、これは
+     「変化が無かった」の十分条件でしかない）。
+  3. 進んでいたらダウンロードして復号し、平文から `content_hmac` を計算する。
+  4. 前回保存した `content_hmac` と同じなら、**画像のデコード結果をそのまま使い回す**
+     （17 MB を落とした無駄は戻らないが、デコードと再描画はしない）。
+- **キャッシュの格納先は OPFS / IndexedDB**（`localStorage` は 5 MB 級で入らない。平文 17 MB +
+  base64 のデコード結果を考えると IndexedDB / OPFS が前提）。
+  - 粗い単位: `content_hmac` をキーに**平文 JSON をそのまま**保存する（再ダウンロードしても復号を省ける）。
+  - 細かい単位: `{kind}:{item_key}:{sha256}` をキーに**デコード済み画像**（Blob / ImageBitmap）を保存する。
+    こちらは世代をまたいで再利用できる（`sha256` が同じ = 同じ画像）。
+  - **`content_hmac` が変わると平文全体が作り直される**ので、古い世代のキャッシュは
+    適当なタイミングで捨てる（直近 1〜2 世代を残す程度で十分）。
+- ダウンロードは 17 MB 級。**モバイル回線では重い**ので、
+  「初回は表紙を遅延してでもメタデータを先に描く」「再取得はアプリ起動時 / 明示操作時だけ」のように
+  頻度を絞る（デスクトップの同期は起動時と終了時にも走るため、頻繁に叩くと無駄が出る）。
+
+#### 表示の実装（性能と寿命）
+
+- **全部を一度にデコードしない**。612 枚 / 平文 17.3 MB を一括で `Blob` 化するとモバイルで落ちる。
+  本棚のカードは `IntersectionObserver` で**可視になった分だけ**デコードする。
+- `data`（base64）→ `Uint8Array` → `Blob` → `URL.createObjectURL`。**base64 のデコードは
+  メインスレッドを止めうる**ので、大きい画像は Worker に逃がすか、可視カードぶんに限る。
+- **オブジェクト URL の寿命**: 1 枚につき 1 本。カードが画面外へ出たら `revokeObjectURL` する。
+  スクロールで出し入れするなら上限つき LRU（可視枚数 + 数枚。デスクトップ側のページ一覧は
+  120 枚上限＝`docs/spec/04-ui.md` の `MAX_PAGE_THUMBS`）を目安にする。
+- `createImageBitmap` を使う場合は、不要になったら `bitmap.close()` を呼ぶ。
+- `width` / `height` を使って**画像の到着前に枠を確保**する（`aspect-ratio` / `padding-top`）。
+  これが無いと画像の到着ごとにカードがガタつく（表紙の縦横比は本ごとに違う）。
+- デコードに失敗した entry（壊れた画像・未知の `mime`）は、その 1 枚だけプレースホルダに落とす。
+
+#### エラー時の分岐（Web がどの状態で何を出すか）
+
+| 状況 | 判定 | Web の動作 |
+|---|---|---|
+| 同期フォルダにファイルが無い | 一覧で見つからない | 全カードを `thumbnail_url` → プレースホルダ。エラー扱いにしない（正常系） |
+| 一覧は取れるがファイルが読めない（権限・オフライン） | HTTP エラー | キャッシュがあればそれを使う。無ければ退化経路 |
+| 封筒に `encryption` が無い | 形式違い | **平文として扱わない**（thumbs は必ず封筒）。退化経路 |
+| `format_version` ≠ 1 | 読めない版 | エラー。平文として扱わない（§11.4 と同じ方針） |
+| `owner_id` が自分と違う | 別アカウントの封筒 | 使わない（自分の表紙ではない）。退化経路 |
+| 復号失敗・`content_hmac` 不一致 | 鍵違い / 改変 | 使わない。キャッシュも捨てる。退化経路 |
+| `entries` に未知の `kind` | 前方互換 | **その 1 件だけ捨てる**（他の entry は使う） |
+| `entries` が空 | 正常系 | 全カードを退化経路（表紙キャッシュがまだ無い端末が上げた結果） |
+| ある本の entry が無い | 正常系（部分集合） | その本だけ `thumbnail_url` → プレースホルダ |
+| PRK が取れない | 未ログイン / bundle 無し / スキップ | 表紙は出さない。メタデータだけ出す（退化経路） |
+| `data` の base64 が壊れている | 破損 | その 1 枚だけプレースホルダ |
+
+「退化経路」= `bookshelf_items.thumbnail_url` を `<img>` で直読み → 失敗ならプレースホルダ。
+**表紙が出ないだけで本棚は壊さない**のが原則。
+
 #### Web 実装チェックリスト（§11.7 に追加）
 
 - [ ] `deriveThumbsKey(prk)`: HKDF で 2 本（`info` = `thundoku-thumbs-key` /
   `thundoku-thumbs-hash`、`salt` = `thundoku-thumbs:v1`）。§11.2 の式と一致させる。
+  **移植直後にテストベクタ（後述）と突き合わせる**。
 - [ ] 封筒の AAD は `UTF8("thundoku-thumbs:1:" + ownerId)`、`format_version` は 1。
+- [ ] `ciphertext` を「平文 + 16B タグ」として `AES-GCM`（`tagLength: 128`）で復号し、
+  平文の `HMAC-SHA256` を計算して `content_hmac` と照合する（照合しない実装にしない）。
 - [ ] `entries` を `kind` で分岐（`shelf` = `site_id` + `database_id` / `checklist` = `item_id`）。
-  `data` は base64 をデコードして `Blob` → `URL.createObjectURL` で表示する（CORS 不要）。
-- [ ] 保存は `content_hmac` をキーに OPFS / IndexedDB へ。`modifiedTime` が変わっていなければ
-  再ダウンロードしない。
+  未知の `kind` は 1 件だけ捨て、未知のキーは無視する（前方互換）。
+- [ ] `data` は base64 をデコードして `Blob` → `URL.createObjectURL` で表示する（CORS 不要）。
+  **可視カードだけ**デコードし、不要になった URL は `revokeObjectURL` する。
+- [ ] 保存は `content_hmac` をキーに OPFS / IndexedDB へ。再取得の判定は
+  「`modifiedTime` が同じなら何もしない」→「変わっていたら落として `content_hmac` を比較」の順。
+  **`md5Checksum` / サイズを内容の判定に使わない**（`touch` と乱数 `nonce` で動く）。
+- [ ] 同名ファイルが複数あるときは `modifiedTime` が新しい方を採る。
 - [ ] ファイルが無い・PRK が無いときは `thumbnail_url` の直読み → それも失敗ならプレースホルダへ
   退化する（表紙が出ないだけで本棚は壊さない）。
+- [ ] 同期フォルダへの到達（`drive.file` スコープ）を実機で確認する（「前提」の項目）。
 
 #### 平文の読み方（Web が守ること）
 
@@ -612,18 +751,49 @@ Web 版の本棚が**未ダウンロードの本の表紙**を出せるように
 
 #### Web の実装手順
 
-1. バックアップ JSON（`thundoku-backup.json`）を読める状態にする（§11.7。PRK の解決も同じ）。
-2. 同期フォルダの一覧から `thundoku-thumbs.json` を探す。**無ければ**手順 6 へ。
-3. `encryption` があれば封筒として `open(prk, ownerId)` する。AAD・鍵は §11.8 の値
-   （`thundoku-thumbs:1` / `thundoku-thumbs:v1` / `-key` / `-hash`）。`format_version: 1`。
-4. 平文の `entries` を `kind` ごとの Map（`shelf` = `site_id:database_id` /
-   `checklist` = `item_id`）にする。
-5. `content_hmac` をキーにして OPFS / IndexedDB へ保存し、次回は Drive の `modifiedTime` /
-   封筒の `content_hmac` が変わっていなければ再ダウンロードも再復号もしない。
-6. 表示は `data` を base64 デコード → `Blob` → `URL.createObjectURL`（CORS 不要）。
-   オブジェクト URL は不要になったら `revokeObjectURL` する。
-7. entry が無い本は `thumbnail_url` を `<img>` で直読み → それも失敗したら
+1. バックアップ JSON（`thundoku-backup.json`）を読める状態にする（§11.7）。PRK の解決も同じ手順
+   （`thundoku-keys.json` → `owner_id` 照合 → `sub` ラップ / パスフレーズ。上の「PRK の解決（Web）」）。
+2. 同期フォルダの一覧から `thundoku-thumbs.json` を探す（**無ければ**手順 8 の退化経路へ）。同名が複数あれば
+   `modifiedTime` が新しい方を採る。
+3. 前回保存した `modifiedTime` と同じなら、**ダウンロードも復号もしない**（キャッシュを使う）。
+4. 変わっていたらダウンロードし、封筒として `open(prk, ownerId)` する。AAD・鍵はこの節の値
+   （`thundoku-thumbs:1` / `thundoku-thumbs:v1` / `-key` / `-hash`）。`format_version` は 1。
+   平文の `HMAC-SHA256` を計算して `content_hmac` と照合する（照合しない実装にしない）。
+5. 平文の `entries` を `kind` ごとの Map（`shelf` = `site_id:database_id` /
+   `checklist` = `item_id`）にする。未知のキーは無視、未知の `kind` は 1 件だけ捨てる。
+6. `content_hmac` をキーにして OPFS / IndexedDB へ保存する。前回と同じ `content_hmac` なら
+   **デコード結果を使い回す**（落としたバイト列は無駄になるが、デコードと再描画はしない）。
+7. 表示は `data` を base64 デコード → `Blob` → `URL.createObjectURL`（CORS 不要）。
+   **可視カードだけ**デコードし、不要になった URL は `revokeObjectURL` する。
+8. entry が無い本は `thumbnail_url` を `<img>` で直読み → それも失敗したら
    プレースホルダへ退化する（**表紙が出ないだけで本棚は壊さない**）。
+
+#### 受け入れ確認（TS で検算する）
+
+実装の前に、**`crates/opfspack/tests/thumbs_envelope.rs` と同じベクタを TS のテストとして書く**
+（Rust ⇔ TS のバイト一致が唯一の合格条件。値を書き換えるときは仕様書・Rust テスト・TS テストを同時に直す）。
+
+| 入力 | 期待値 |
+|---|---|
+| `deriveThumbsCipherKey(PRK)`（PRK = `00 01 … 1f`） | `c6bcc317a110145e9c2ab08f079195fd43790f37a54a5217a8ac58e050cea8e1` |
+| `deriveThumbsHashKey(PRK)` | `43ea28b23b2dab950943cf6a97ee9266560b2ca1781eaee08fa28e9f8b168d25` |
+| `ownerId("test-sub")` | `6366bfc3b6ab37feaf2adb385aeaa515c4aa52cf09e70cac890d888e4409f3b0` |
+| 平文 `{"format_version":1,"entries":[]}` / `nonce = 0b0a09080706050403020100` のときの `ciphertext` | `61697d8103eb4a2fc6440c6230179c9ca86081b45f26bdb39a34cfd01d7bef36609fc48cd14c8cf74c6c5e9b65b1c4c091` |
+| 同・`content_hmac` | `46fba895ee29f2dcdddd05c9e7ee8e0f690d8722f6b337744ecc8d87f4e6e7e6` |
+| 同・AAD (UTF-8) | `thundoku-thumbs:1:6366bfc3b6ab37feaf2adb385aeaa515c4aa52cf09e70cac890d888e4409f3b0` |
+
+確認すること:
+
+- [ ] 鍵 2 本が hex 一致（HKDF の `salt` / `info` の取り違えをここで潰す）。
+- [ ] 固定 `nonce` で封をして `ciphertext` / `content_hmac` が hex 一致
+      （＝復号が通るだけでなく、**暗号文のバイト列まで同じ**）。
+- [ ] 同じ平文で `nonce` を変えると `ciphertext` は変わり、`content_hmac` は変わらない。
+- [ ] 表紙の封筒をバックアップとして開けない（`format_version` と AAD で弾かれる）。
+- [ ] `owner_id` を変えると復号できない。
+- [ ] 平文を 1 バイト改変すると `content_hmac` の照合で落ちる。
+
+平文の形と実装者向けの注記は `docs/thundoku-thumbs.jsonc`（コメント付きサンプル。データはダミー）に
+まとめてある。実ファイルはこの `.jsonc` ではなく、Drive 上のコメント無し JSON である。
 
 #### 前提（Web 側で確認が要る）
 
@@ -633,4 +803,6 @@ Web 版の本棚が**未ダウンロードの本の表紙**を出せるように
   開いて利用者に許可させる必要がある。ここが満たせないと表紙バンドルは読めない
   （＝本棚のメタデータだけは出せる）。
 - 復号に PRK が要る点は DB バックアップと同じ（`sub` ラップ、必要ならパスフレーズ。
-  `docs/spec/10-pack-keys.md` §4.2 / §11.4）。PRK が取れないときは手順 7 の退化経路に落ちる。
+  `docs/spec/10-pack-keys.md` §4.2 / §11.4）。PRK が取れないときは手順 8 の退化経路に落ちる。
+- **Web はこのファイルを書かない**（所有者はデスクトップ。書き換えても次の同期で戻り、
+  `content_hmac` の比較も壊れる）。

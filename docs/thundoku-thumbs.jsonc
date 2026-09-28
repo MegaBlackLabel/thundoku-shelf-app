@@ -1,0 +1,141 @@
+// ---------------------------------------------------------------------------
+// thundoku-thumbs.json — 表紙バンドルのサンプル（コメント付き / データはダミー）
+// ---------------------------------------------------------------------------
+//
+// 仕様の正:  docs/spec/10-pack-keys.md §11.8
+// 実装の正:  crates/core/src/thumbs.rs          （平文の組み立て・画像エンコード）
+//            crates/core/src/drive/sync.rs       （THUMBS_NAME / backup_thumbnails / seal）
+//            crates/opfspack/src/keys.rs         （THUMBS_LABEL = 封筒のラベル）
+// バイト一致の基準: crates/opfspack/tests/thumbs_envelope.rs
+//
+// Drive 上の実ファイル名は `thundoku-thumbs.json`（コメント無しの JSON）。
+// この .jsonc は Web 実装の参照用サンプルで、Drive には置かれない。
+//
+// 置き場所: 同期フォルダ（My Drive 直下の `thundoku-shelf/`）。`thundoku-backup.json` と同じ。
+// 所有者:   デスクトップのみ。毎回ファイル全体を書き直す。
+//           → Web は **読み取り専用**。書き換えても次回の同期で戻る（content_hmac の比較も壊れる）。
+//
+// ファイルは 2 層になっている:
+//   1) Drive にある実体          = 封筒（暗号化。下の /* … */ の形）
+//   2) 復号して得られる平文      = ここから下の JSON 本体（Web がパースする形）
+//
+// 復号できないとき（PRK が無い / 別アカウントの owner_id / 改変）は、
+// 表紙を `bookshelf_items.thumbnail_url` の直読み → 失敗ならプレースホルダへ退化する。
+// 表紙が出ないだけで本棚は壊さない。
+
+/* ── 1) Drive 上の実体（封筒）。ファイル全体がこの 1 個の JSON ─────────────────
+
+{
+  "format_version": 1,
+  "owner_id": "6366bfc3b6ab37feaf2adb385aeaa515c4aa52cf09e70cac890d888e4409f3b0",
+  "encryption": {
+    "alg": "aes-256-gcm",
+    "kdf": "hkdf-sha256",
+    "nonce": "CwoJCAcGBQQDAgEA",
+    "ciphertext": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo="
+  },
+  "content_hmac": "46fba895ee29f2dcdddd05c9e7ee8e0f690d8722f6b337744ecc8d87f4e6e7e6"
+}
+
+  フィールド:
+    format_version   number  thumbs は `1` 固定。1 以外は「読めない版」として拒否（平文として扱わない）。
+                             ※ バックアップ（thundoku-backup.json）は 3。版が違うので相互に読み替えられない。
+    owner_id         string  SHA-256("opfspack:v1:" + sub) の小文字 hex（= derive_owner_id）。
+                             keyring のスロット選択と AAD に使う。自分と一致しない封筒は使わない。
+    encryption.alg   string  "aes-256-gcm" のみ。
+    encryption.kdf   string  "hkdf-sha256" のみ（nonce は乱数なので salt は持たない）。
+    encryption.nonce string  AES-GCM の 12B IV を base64。毎回乱数なので暗号文は毎回変わる。
+    encryption.ciphertext string  base64(平文 + 16B GCM タグ)。
+    content_hmac     string  HMAC-SHA256(thumbs_hash_key, 平文) を小文字 hex。
+                             変更検知に使う（同じ平文なら nonce が違っても同じ値）。
+                             復号時にも再計算して照合し、合わなければ平文を返さない。
+
+  暗号のパラメータ（バックアップとラベルだけ別）:
+    AAD   = UTF8("thundoku-thumbs:1:" + owner_id)
+    cipher key = HKDF-SHA256(ikm = PRK, salt = b"thundoku-thumbs:v1", info = b"thundoku-thumbs-key")
+    hash   key = HKDF-SHA256(ikm = PRK, salt = b"thundoku-thumbs:v1", info = b"thundoku-thumbs-hash")
+    ※ PRK は thundoku-keys.json（同じフォルダ）の sub ラップ / パスフレーズラップから解く。
+
+  テストベクタ（docs/spec/10-pack-keys.md §11.8 / thumbs_envelope.rs と一致）:
+    PRK = 00 01 02 … 1f
+    derive_thumbs_cipher_key = c6bcc317a110145e9c2ab08f079195fd43790f37a54a5217a8ac58e050cea8e1
+    derive_thumbs_hash_key   = 43ea28b23b2dab950943cf6a97ee9266560b2ca1781eaee08fa28e9f8b168d25
+    平文 {"format_version":1,"entries":[]} / nonce 0b0a09080706050403020100 のとき
+      ciphertext   = 61697d8103eb4a2fc6440c6230179c9ca86081b45f26bdb39a34cfd01d7bef36609fc48cd14c8cf74c6c5e9b65b1c4c091
+      content_hmac = 46fba895ee29f2dcdddd05c9e7ee8e0f690d8722f6b337744ecc8d87f4e6e7e6
+
+─────────────────────────────────────────────────────────────────────────── */
+
+{
+  // 平文の版。1 以外はエラー（前方互換のため未知のキーは無視するが、版は無視できない）。
+  "format_version": 1,
+
+  // 表紙の配列。すべてダミー。順序は (kind, item_key) 昇順で固定（決定論的）なので、
+  // 実ファイルは checklist → shelf の順に並ぶ。下のサンプルもその順にしてある。
+  // 「表紙キャッシュがまだ無い本」は載らないので、0 件（空配列）も正常系として扱うこと。
+  "entries": [
+    {
+      // "checklist" = チェックリスト（checked_items）のサムネイル。
+      // 元データの 256px JPEG をそのまま運ぶ（再エンコードしない）。
+      "kind": "checklist",
+
+      // 結合先: checked_items.id。
+      "item_id": "check-1",
+
+      // 画像形式。checklist は "image/jpeg"、shelf は "image/webp"。
+      "mime": "image/jpeg",
+
+      // エンコード後の寸法（px）。縦横比の確保に使える
+      // （行の高さを先に決めれば、画像の到着でガタつかない）。
+      "width": 256,
+      "height": 360,
+
+      // data を base64 デコードしたバイト列の SHA-256（小文字 hex）。
+      // 省略可能な最適化にだけ使い、値の検証は必須ではない（封筒の content_hmac が全体を守っている）。
+      "sha256": "1b2d3f405162738495a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2",
+
+      // 画像本体。base64 は標準アルファベット + padding（base64url ではない）。
+      // デコード → Blob → URL.createObjectURL で表示（CORS 不要）。不要になったら revoke する。
+      "data": "<base64: 256x360 の JPEG。ここではダミー>"
+    },
+    {
+      // "shelf" = 本棚カードの表紙。元データは <data_dir>/thumbnails/{site_id}_{database_id}_448.png で、
+      // 256px WebP(lossy q80) へ変換して載る。
+      "kind": "shelf",
+
+      // 結合先: bookshelf_items の PK。この 2 つで行を引く。
+      "site_id": "booth",
+      "database_id": "1141786",
+
+      "mime": "image/webp",
+      "width": 256,
+      "height": 364,
+      "sha256": "735cbaa2f0d6b0c1e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+      "data": "<base64: 256x364 の WebP。ここではダミー>"
+    },
+    {
+      "kind": "shelf",
+      "site_id": "dlsite",
+      "database_id": "RJ123456",
+      "mime": "image/webp",
+      "width": 256,
+      "height": 384,
+      "sha256": "9a1f3c5e7b0d2f4869ab07cd1e3f5a7b9c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f",
+      "data": "<base64: 256x384 の WebP。ここではダミー>"
+    }
+  ]
+}
+
+// ── 読む側が守ること（docs/spec/10-pack-keys.md §11.8「平文の読み方」）─────────
+//
+// - 書き込まない。所有者はデスクトップ（毎回全体を書き直す）。
+// - entries は部分集合。表紙キャッシュが無い本・アカウントに紐づかない本は入らない。
+// - 未知のキーは無視（前方互換）。未知の kind の entry はその 1 件だけ捨てる。
+//   format_version が 1 以外ならエラー（平文として扱わない）。
+// - 1 枚の上限: 64 KiB を超えたらデスクトップ側が q60 で作り直し、256 KiB を超える 1 枚は載せない。
+//   平文が 48 MiB を超えたら警告ログ（分割は未実装。上げるのは上げる）。
+// - キー順は決定的（同じ内容なら同じバイト列）だが、読む側は名前で引くこと（順序に依存しない）。
+// - 1 回の同期で新しくエンコードするのは 100 枚まで。残りは次の同期で載る。
+// - 表紙を 1 枚も作れないときは既存のバンドルを残す（他端末の表紙を消さない）。
+//
+// 実測の目安: 実データ 612 枚で平文 17.3 MB（base64 と JSON を含む）。
