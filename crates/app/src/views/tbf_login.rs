@@ -136,6 +136,8 @@ impl TbfLoginView {
                 // (a) 借用内: 世代・URL の確認とハンドルの取得（**wry を触らない = pump しない**）
                 let tick = match handle.update(cx, |this, cx| this.begin_check(generation, cx)) {
                     Ok(super::CheckStep::Collect(tick)) => tick,
+                    // この画面では使わない（BOOTH だけが購入ライブラリへ寄る）
+                    Ok(super::CheckStep::Visit(_, _)) => continue,
                     Ok(super::CheckStep::Wait) => continue,
                     Ok(super::CheckStep::Stop) => break,
                     // Err = ビューが drop された（監視する相手がいない）

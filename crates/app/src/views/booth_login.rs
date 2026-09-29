@@ -11,9 +11,25 @@ use gpui_kit::{
 };
 use gpui_wry::WebView;
 
-/// セッション Cookie を集める起点（`accounts.booth.pm` の `_plaza_session_*` は
-/// ログアウトにも必要なので両方集める）。
-const SESSION_ORIGINS: [&str; 2] = ["https://booth.pm", "https://accounts.booth.pm"];
+/// セッション Cookie を集める URL（`accounts.booth.pm` の `_plaza_session_*` は
+/// ログアウトにも必要なので、booth / プラザ / pixiv の 3 つを集める）。
+///
+/// **必ずパスまで指定する**。`cookies_for_url` は `Path` を見るため、`https://host` の形だと
+/// `Path=/` の Cookie しか返らず、`/library` や `/login` に置かれたセッションを取り落とす
+/// （実測: `https://accounts.pixiv.net` で集めると 0 件、`https://accounts.booth.pm` でも 0 件
+/// だったのが、パス付きにすると拾える）。
+const SESSION_ORIGINS: [&str; 3] = [
+    "https://booth.pm/ja",
+    "https://accounts.booth.pm/library?page=1",
+    "https://accounts.pixiv.net/",
+];
+
+/// ログイン成立後に**一度だけ**開く購入ライブラリ。
+///
+/// 同期が叩くのは `accounts.booth.pm/library` で、その Cookie はライブラリを開いた
+/// 時点で SSO が発行する。ここを開かずに `booth.pm` だけで集めると、同期先向けの
+/// Cookie が 0 件になり「ログインページを受信」で失敗する。
+const PLAZA_LIBRARY_URL: &str = "https://accounts.booth.pm/library?page=1";
 
 /// ログイン完了イベント（Cookie を取得して永続化した後に発行）。
 pub struct BoothLoginDone;
@@ -27,6 +43,13 @@ pub struct BoothLoginView {
     check_generation: u64,
     /// WebView を表示したいか。生成が非同期（Windows はタスク）なので、生成完了時に反映する。
     visible: bool,
+    /// ログイン成立後に購入ライブラリ（`accounts.booth.pm/library`）へ寄ったか。
+    ///
+    /// セッションは `booth.pm` で確立するが、同期が叩く購入ライブラリはプラザ側
+    /// （`accounts.booth.pm`）の Cookie を要求する。ブラウザならライブラリを開いた時点で
+    /// SSO が発行するため、WebView でも一度開いてから集める（実測: booth.pm だけで
+    /// 集めると `accounts.booth.pm` 向けが 0 件で、同期がログインページを受信していた）。
+    plaza_visited: bool,
 }
 
 impl BoothLoginView {
@@ -38,6 +61,7 @@ impl BoothLoginView {
             webview: None,
             check_generation: 0,
             visible: false,
+            plaza_visited: false,
         };
         // 生成は App の借用外（Windows はタスク）で行われる。理由は
         // `super::create_login_webview` のドキュメント参照。
@@ -45,11 +69,18 @@ impl BoothLoginView {
             &mut this,
             window,
             cx,
-            // incognito（non-persistent）WebView: Cookie はメモリのみ。
-            // 永続ストアだと pixiv/booth のセッションがアプリ再起動をまたいで
-            // 残り、ログアウト後に再ログイン WebView を開くと pixiv の SSO で
-            // 自動再ログインされてしまうため（ログアウトが効かないように見える）。
-            true,
+            // **永続** WebView（incognito にしない）。
+            //
+            // BOOTH のログインは booth.pm のセッションを作るが、購入ライブラリ
+            // （accounts.booth.pm）は pixiv の SSO セッションを要求する。incognito
+            // （メモリのみ・アプリ再起動をまたがない）だと SSO が通らず、同期が
+            // 「ログインページを受信」で失敗する（実測: プラザへ寄ると
+            // accounts.pixiv.net のログイン画面へリダイレクトされ、
+            // accounts.booth.pm 向け Cookie が 0 件だった）。
+            //
+            // ログアウト時に SSO で自動再ログインされる問題は、保存データの消去
+            // （`clear_login_webview_data`）で解決する（設定画面のログアウトで実行済み）。
+            false,
             "https://booth.pm/users/sign_in",
             |this, webview, window, cx| {
                 this.webview = Some(webview);
@@ -84,6 +115,34 @@ impl BoothLoginView {
                 // (a) 借用内: 世代・URL の確認とハンドルの取得（**wry を触らない = pump しない**）
                 let tick = match handle.update(cx, |this, cx| this.begin_check(generation, cx)) {
                     Ok(super::CheckStep::Collect(tick)) => tick,
+                    Ok(super::CheckStep::Visit(tick, url)) => {
+                        // ログ用: プラザへ寄る**前**に、SSO の鍵になるホストの Cookie を数える。
+                        // （incognito かどうか・SSO が通るかどうかを、憶測ではなくログで判断する）
+                        // ★`cookies_for_url` は Path/Domain の合わない Cookie を取り落とす
+                        //   （過少報告する）ため、「セッションが無い」判断には使えない。
+                        //   WebView が保持している**全 Cookie** を属性つきでダンプする。
+                        match tick.webview.raw().cookies() {
+                            Ok(cookies) => {
+                                log::info!("booth login: 寄る前の全 Cookie {} 件", cookies.len());
+                                for cookie in &cookies {
+                                    log::info!(
+                                        "booth login: pre-cookie name={:?} domain={:?} path={:?}",
+                                        cookie.name(),
+                                        cookie.domain(),
+                                        cookie.path()
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("booth login: 全 Cookie を取得できない: {error}")
+                            }
+                        }
+                        // (b') 借用の外: 購入ライブラリを一度開き、SSO に
+                        //      `accounts.booth.pm` の Cookie を発行させる。
+                        //      （同期が叩くのはこのホストなので、ここで寄らないと 0 件になる）
+                        let _ = tick.webview.raw().load_url(url);
+                        continue;
+                    }
                     Ok(super::CheckStep::Wait) => continue,
                     Ok(super::CheckStep::Stop) => break,
                     // Err = ビューが drop された（監視する相手がいない）
@@ -110,7 +169,7 @@ impl BoothLoginView {
     /// tick の前半（借用内・**wry を触らない**）。
     ///
     /// `booth.pm` に戻り、かつログインページでなくなったら収集する。
-    fn begin_check(&self, generation: u64, cx: &App) -> super::CheckStep {
+    fn begin_check(&mut self, generation: u64, cx: &App) -> super::CheckStep {
         if self.check_generation != generation {
             return super::CheckStep::Stop;
         }
@@ -123,20 +182,40 @@ impl BoothLoginView {
             return super::CheckStep::Wait;
         };
         // URL のクエリ/フラグメントには認可コードやトークンが載り得るため落とす。
-        log::debug!(
+        log::info!(
             "booth login check: url={}",
             url.split(['?', '#']).next().unwrap_or(&url)
         );
-        let is_booth = super::url_is_on_host(&url, "booth.pm");
         // ログインページ自体から pixiv に遷移している間は待つ。
-        // booth.pm に戻り、かつログインページでなければセッション確立とみなす。
-        let on_sign_in = url.contains("/users/sign_in");
-        if !is_booth || on_sign_in {
+        if url.contains("/users/sign_in") {
             return super::CheckStep::Wait;
         }
-        super::CheckStep::Collect(super::CheckTick {
-            webview: webview.handle(),
-        })
+        let is_booth = super::url_is_on_host(&url, "booth.pm");
+        let is_plaza = super::url_is_on_host(&url, "accounts.booth.pm");
+        // 1) booth.pm に戻ったら、まず購入ライブラリへ**一度だけ**寄る。
+        //    同期が叩くのは `accounts.booth.pm/library` で、そちらの Cookie は
+        //    ライブラリを開いた時点で SSO が発行する（booth.pm だけでは 0 件で、
+        //    同期がログインページを受信してしまう）。
+        if is_booth && !is_plaza && !self.plaza_visited {
+            self.plaza_visited = true;
+            log::info!(
+                "booth login: セッション確立。購入ライブラリへ一度寄ってから Cookie を集める"
+            );
+            return super::CheckStep::Visit(
+                super::CheckTick {
+                    webview: webview.handle(),
+                },
+                PLAZA_LIBRARY_URL,
+            );
+        }
+        // 2) 購入ライブラリへ着いたら集める。寄り直しが失敗しても詰まらないよう、
+        //    booth.pm に戻っていれば（一度寄った後なら）そこで集める。
+        if is_plaza || (is_booth && self.plaza_visited) {
+            return super::CheckStep::Collect(super::CheckTick {
+                webview: webview.handle(),
+            });
+        }
+        super::CheckStep::Wait
     }
 
     /// tick の後半（借用内・**wry を触らない**）。収集結果を解釈して保存・通知する。
@@ -159,10 +238,18 @@ impl BoothLoginView {
             return false;
         }
         log::info!("booth login: {} cookies captured", session.cookies_count());
+        log::info!(
+            "booth login: 完了処理に入る webview.is_some={} visible={}",
+            self.webview.is_some(),
+            self.visible
+        );
         crate::app_state::save_booth_session(cx, &session);
         // WebView を隠して完了を通知する
         if let Some(webview) = &self.webview {
             webview.update(cx, |view, _| view.hide());
+            log::info!("booth login: WebView を hide() した（完了）");
+        } else {
+            log::warn!("booth login: 完了時に WebView が無い（hide 不要）");
         }
         self.visible = false;
         cx.emit(BoothLoginDone);
@@ -189,8 +276,12 @@ impl BoothLoginView {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.check_generation += 1; // 監視を止める
         self.visible = false;
-        if let Some(webview) = self.webview.take() {
-            webview.update(cx, |view, _| view.hide());
+        match self.webview.take() {
+            Some(webview) => {
+                webview.update(cx, |view, _| view.hide());
+                log::info!("booth login: close で WebView を take()+hide() した");
+            }
+            None => log::info!("booth login: close（WebView は既に無い）"),
         }
     }
 
@@ -203,11 +294,24 @@ impl BoothLoginView {
             return;
         };
         let window_bounds = window.bounds();
+        log::debug!(
+            "booth login: window.bounds = {}x{}（scale={:?}）",
+            window_bounds.size.width.as_f32(),
+            window_bounds.size.height.as_f32(),
+            window.scale_factor()
+        );
         let geometry = super::login_modal_geometry(
             window_bounds.size.width.as_f32(),
             window_bounds.size.height.as_f32(),
             480.0,
             640.0,
+        );
+        log::debug!(
+            "booth login: set_bounds -> left={} top={} w={} h={}",
+            geometry.webview_left,
+            geometry.webview_top,
+            geometry.webview_width,
+            geometry.webview_height
         );
         webview.update(cx, |view, _| {
             let _ = view.raw().set_bounds(lb_wry::Rect {

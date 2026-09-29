@@ -607,7 +607,7 @@ impl Workspace {
                     });
                 }
                 if any_changed {
-                    let _ = settings_entity.update(cx, |settings, cx| settings.sync_drive_now(cx));
+                    let _ = settings_entity.update(cx, |settings, cx| settings.sync_drive_now(false, cx));
                 }
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(interval_min as u64 * 60))
@@ -1606,7 +1606,7 @@ impl Workspace {
     /// Drive 同期のトリガー（設定画面の同期ボタンと同じ処理を委譲）。
     pub fn sync_drive(&mut self, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
-        settings.update(cx, |s, cx| s.sync_drive_now(cx));
+        settings.update(cx, |s, cx| s.sync_drive_now(false, cx));
     }
 
     /// アカウントパネル（Web 版 AuthStatusPanel 相当）。

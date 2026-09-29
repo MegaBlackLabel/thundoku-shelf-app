@@ -1439,7 +1439,12 @@ impl SettingsView {
     }
 
     /// Drive 同期（接続済み前提）。エンジンは `drive::sync::sync_with_progress`。
-    pub fn sync_drive_now(&mut self, cx: &mut Context<Self>) {
+    /// `allow_restore` は Drive のバックアップを**この同期で取り込んでよいか**。
+    ///
+    /// 取り込みは Drive 優先で UPSERT するため、**利用者の同意が要る操作**。設定画面の
+    /// 「同期」ボタンのように利用者が起点のときだけ true にし、自動同期（チェックリスト
+    /// 変更・ログイン直後）からは false にして、同意なしの巻き戻しを起こさない。
+    pub fn sync_drive_now(&mut self, allow_restore: bool, cx: &mut Context<Self>) {
         self.busy = true;
         self.error = None;
         self.sync_progress = None;
@@ -1462,6 +1467,8 @@ impl SettingsView {
         let db_key = state.secrets.db_key().ok();
         // pack の鍵（v3 の PRK）の解決に要るもの（背景スレッドへ move する）
         let keys = crate::pack_keys::KeyContext::from_state(state);
+        // 復元でユーザーデータを取り込んだとき、本棚へ反映するための印
+        let bookshelf_invalidated = state.bookshelf_invalidated.clone();
         log::info!("sync_drive_now: start");
         let task: gpui_kit::Task<SyncTaskResult> = cx.background_executor().spawn(async move {
             let folder_id = {
@@ -1503,6 +1510,52 @@ impl SettingsView {
             // 書籍のバックアップ ON/OFF（行が無ければ ON）。OFF でも DB バックアップと
             // 鍵 bundle は同期する（本のファイルとは失うものが別）。
             let sync_books = sync::books_backup_enabled(&db);
+            // ★Drive の DB バックアップを**アップロードより前**に取り込む。
+            //
+            // 後ろに置くと「この PC の（空かもしれない）内容で Drive を上書きしてから
+            // 取り込む」順になり、他端末が入れたユーザーデータ（お気に入り・付箋・履歴）
+            // を失う。実測でこの事故が起きた。判定は起動時ダイアログと同じ
+            // `should_offer_restore`（drive_changed && local_differs）を必ず経由する
+            // （ローカルだけが進んでいるときに古いバックアップで巻き戻さないため）。
+            let mut restored = false;
+            if allow_restore
+                && let (Some(sub), Some(key)) = (google_sub.as_deref(), db_key.as_ref())
+            {
+                let book_ids = db::books::owned_book_ids(&db, key, Some(sub)).unwrap_or_default();
+                let owner = thundoku_core::db::backup::OwnerFilter {
+                    key,
+                    sub: Some(sub),
+                };
+                let baseline =
+                    db::settings::get(&db, "drive.backup.md5").ok().flatten();
+                match sync::inspect_drive_backup(
+                    &db,
+                    &mut drive,
+                    &folder_id,
+                    Some(&book_ids),
+                    Some(&owner),
+                    baseline.as_deref(),
+                ) {
+                    Ok(Some(status)) if status.should_offer_restore() => {
+                        log::info!("sync_drive_now: Drive のバックアップを取り込む");
+                        // 既存の復元関数を使う（取り込み後に基準値を更新するので、
+                        // 次回の判定が「Drive が動いた」のままにならない）。
+                        sync::restore_drive_backup(&mut drive, &folder_id, &db)
+                            .map_err(|error| crate::pack_keys::sync_failure(&error))?;
+                        restored = true;
+                        // 取り込んだ内容を本棚へ反映する（本棚は次回の描画で読み直す）
+                        *bookshelf_invalidated.lock() = true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        // 読めない控えの上にローカルを被せると唯一のオフサイト退避を失う。
+                        return Err(crate::pack_keys::sync_failure(&error));
+                    }
+                }
+            }
+            if restored {
+                log::info!("sync_drive_now: Drive のバックアップを取り込んだ");
+            }
             // メインの DB プールをそのまま使う（WAL により同期タスクと並行可能）
             let outcome = sync::sync_with_progress(
                 sync::SyncRequest {
@@ -2823,7 +2876,7 @@ impl Render for SettingsView {
                                     .on_click({
                                         let handle = handle.clone();
                                         move |_, _window, cx| {
-                                            handle.update(cx, |this, cx| this.sync_drive_now(cx));
+                                            handle.update(cx, |this, cx| this.sync_drive_now(true, cx));
                                         }
                                     }),
                             )
@@ -4554,7 +4607,7 @@ mod tests {
         cx.update(AppState::init_test);
         let view = cx.new(SettingsView::new);
         cx.update(|cx| {
-            view.update(cx, |this, cx| this.sync_drive_now(cx));
+            view.update(cx, |this, cx| this.sync_drive_now(true, cx));
         });
         assert!(cx.read(|cx| view.read(cx).busy), "実行中は busy");
 

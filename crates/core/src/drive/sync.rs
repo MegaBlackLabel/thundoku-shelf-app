@@ -622,7 +622,15 @@ pub fn sync_with_progress(
             }),
             _ => None,
         };
-        let json = crate::db::backup::export_json(pool, Some(&upload_ids), owner_filter.as_ref())?;
+        // 封筒を作れる（PRK + sub がある）ときだけ平文モード。v2（平文アップロード）では
+        // 端末鍵の暗号文のまま運ぶ（Drive に素のユーザーデータを置かない）。
+        let plaintext_user_data = pack_root_key.is_some() && identity_sub.is_some();
+        let json = crate::db::backup::export_json(
+            pool,
+            Some(&upload_ids),
+            owner_filter.as_ref(),
+            plaintext_user_data,
+        )?;
         // 鍵（PRK）があれば封をする。無ければ**平文（v2）で書く**（仕様 §11）。
         // Drive 同期はログイン必須なので通常は鍵がある。鍵が用意できないだけで
         // バックアップを止める＝利用者の唯一の控えを失う方が危険、という判断。
@@ -659,7 +667,21 @@ pub fn sync_with_progress(
                     .unwrap_or(true)
             }
         };
-        if needs_upload {
+        // ★門: ローカルのユーザーデータが空で Drive に既存バックアップがあるときは、
+        // **上書きしない**。他端末が入れたお気に入り・付箋・履歴を空のローカルで潰す
+        // 事故を防ぐ（実測: この端末で 0 件のまま 2 回アップロードし、他端末の内容を
+        // 失った）。全呼び出し元（設定の同期 / 終了時アップロード / 自動同期）が
+        // ここを通るので 1 箇所で足りる。
+        let overwrite_guard_blocks = needs_upload
+            && existing.is_some()
+            && crate::db::backup::user_data_row_count(pool).unwrap_or(1) == 0;
+        if overwrite_guard_blocks {
+            log::warn!(
+                "drive sync: ローカルのユーザーデータが空のため DB バックアップの上書きを中止\
+                 （Drive 上の既存バックアップを保護）"
+            );
+        }
+        if needs_upload && !overwrite_guard_blocks {
             // 上げるバイト列: v3 は封筒の JSON、v2 はエクスポートそのもの。
             // 封印（base64 化）は上げるときだけ行い、平文のコピーは作らない。
             let envelope_json = envelope
@@ -940,7 +962,7 @@ pub fn restore_drive_backup(
         info.md5,
         if root.is_some() { "encrypted v3" } else { "plaintext v2" }
     );
-    crate::db::backup::import_json(pool, &json)?;
+    crate::db::backup::import_json(pool, &json, None)?;
     // 復元直後はローカルが Drive の内容を含んでいる。ここで基準値を更新しないと、
     // 次回起動でも「Drive が動いた」と見えて同じバックアップを復元し続けてしまう
     // （ローカルに Drive に無い行が残っている限り差分は消えないため）。
@@ -1066,9 +1088,18 @@ pub fn inspect_drive_backup(
     };
     let drive_json: serde_json::Value = serde_json::from_str(&drive_text)
         .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
+    // ローカル側は **Drive と同じ形式**で出す。ローカルの能力で決めると、Drive が
+    // v2（暗号文）なのにローカルを平文で出して値空間が食い違い、`local_differs` が
+    // 恒常 true（毎起動で復元確認）になる。形式は Drive の JSON のマーカーで決まる。
+    let plaintext_user_data = crate::db::backup::user_data_is_plaintext(&drive_json);
     let local_json: serde_json::Value =
-        serde_json::from_str(&crate::db::backup::export_json(pool, book_ids, owner)?)
-            .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
+        serde_json::from_str(&crate::db::backup::export_json(
+            pool,
+            book_ids,
+            owner,
+            plaintext_user_data,
+        )?)
+        .map_err(|e| SyncError::Db(sqlx::Error::Protocol(e.to_string())))?;
     let table_names: Vec<String> = drive_json
         .as_object()
         .map(|object| object.keys().cloned().collect())
@@ -1245,7 +1276,7 @@ mod tests {
             },
         )
         .unwrap();
-        let json = crate::db::backup::export_json(&src, None, None).unwrap();
+        let json = crate::db::backup::export_json(&src, None, None, false).unwrap();
 
         let mut drive = MockDrive {
             files: vec![crate::drive::DriveFile {
@@ -1328,7 +1359,7 @@ mod tests {
             },
         )
         .unwrap();
-        let json = crate::db::backup::export_json(&src, None, None).unwrap();
+        let json = crate::db::backup::export_json(&src, None, None, false).unwrap();
         let json_md5 = format!("{:x}", md5::compute(json.as_bytes()));
 
         // 同一データの DB: md5 一致 -> 差分なし
@@ -1494,7 +1525,7 @@ mod tests {
 
         // Drive のバックアップは古い形式: view_history キーを含まない
         let local_json: serde_json::Value =
-            serde_json::from_str(&crate::db::backup::export_json(&local, None, None).unwrap())
+            serde_json::from_str(&crate::db::backup::export_json(&local, None, None, false).unwrap())
                 .unwrap();
         let mut drive_obj = local_json.as_object().cloned().unwrap();
         drive_obj.remove("view_history");
@@ -1864,7 +1895,7 @@ mod tests {
         let pool = crate::db::test_pool();
         migrate(&pool).unwrap();
         crate::db::books::insert(&pool, &test_book("book-1")).unwrap();
-        let uploaded = crate::db::backup::export_json(&pool, None, None).unwrap();
+        let uploaded = crate::db::backup::export_json(&pool, None, None, false).unwrap();
         let baseline = crate::db::backup::canonical_md5_str(&uploaded, None).unwrap();
         let mut drive = drive_with_backup(&uploaded);
 
@@ -1888,7 +1919,7 @@ mod tests {
         crate::db::books::insert(&other, &test_book("book-1")).unwrap();
         crate::db::progress::upsert(&other, &progress("book-1", 42, "2026-09-19 01:00:00"))
             .unwrap();
-        let moved = crate::db::backup::export_json(&other, None, None).unwrap();
+        let moved = crate::db::backup::export_json(&other, None, None, false).unwrap();
         let mut drive = drive_with_backup(&moved);
 
         let status = inspect_backup(&pool, &mut drive, Some(&baseline)).expect("backup exists");
@@ -1907,7 +1938,7 @@ mod tests {
         migrate(&pool).unwrap();
         crate::db::checklist::upsert_event(&pool, &test_event("tbf20", "2026-09-14 10:00:00"))
             .unwrap();
-        let uploaded = crate::db::backup::export_json(&pool, None, None).unwrap();
+        let uploaded = crate::db::backup::export_json(&pool, None, None, false).unwrap();
         let baseline = crate::db::backup::canonical_md5_str(&uploaded, None).unwrap();
         let mut drive = drive_with_backup(&uploaded);
 
@@ -1934,7 +1965,7 @@ mod tests {
             crate::db::checklist::upsert_event(&pool, &test_event(id, "2026-09-14 10:00:00"))
                 .unwrap();
         }
-        let uploaded = crate::db::backup::export_json(&pool, None, None).unwrap();
+        let uploaded = crate::db::backup::export_json(&pool, None, None, false).unwrap();
         let baseline = crate::db::backup::canonical_md5_str(&uploaded, None).unwrap();
 
         // Drive 側のファイルは行の並びが逆
@@ -1963,7 +1994,7 @@ mod tests {
         let pool = crate::db::test_pool();
         migrate(&pool).unwrap();
         crate::db::books::insert(&pool, &test_book("book-1")).unwrap();
-        let uploaded = crate::db::backup::export_json(&pool, None, None).unwrap();
+        let uploaded = crate::db::backup::export_json(&pool, None, None, false).unwrap();
         let mut drive = drive_with_backup(&uploaded);
         // ローカルには Drive のバックアップに無い本がある
         crate::db::books::insert(&pool, &test_book("book-2")).unwrap();
@@ -1991,8 +2022,8 @@ mod tests {
             crate::db::checklist::upsert_event(&b, &test_event(id, "2026-09-14 10:00:00")).unwrap();
         }
         assert_eq!(
-            crate::db::backup::export_json(&a, None, None).unwrap(),
-            crate::db::backup::export_json(&b, None, None).unwrap(),
+            crate::db::backup::export_json(&a, None, None, false).unwrap(),
+            crate::db::backup::export_json(&b, None, None, false).unwrap(),
             "同じ内容の DB からは同じ JSON を書き出す"
         );
     }
@@ -2010,7 +2041,7 @@ mod tests {
         let src = crate::db::test_pool();
         migrate(&src).unwrap();
         crate::db::books::insert(&src, &test_book("book-1")).unwrap();
-        let backup = crate::db::backup::export_json(&src, None, None).unwrap();
+        let backup = crate::db::backup::export_json(&src, None, None, false).unwrap();
         let mut drive = drive_with_backup(&backup);
 
         super::restore_drive_backup(&mut drive, "folder", &pool).unwrap();
@@ -2031,7 +2062,7 @@ mod tests {
         migrate(&other).unwrap();
         crate::db::books::insert(&other, &test_book("book-1")).unwrap();
         crate::db::books::insert(&other, &test_book("book-3")).unwrap();
-        let moved = crate::db::backup::export_json(&other, None, None).unwrap();
+        let moved = crate::db::backup::export_json(&other, None, None, false).unwrap();
         let mut drive = drive_with_backup(&moved);
 
         let status = inspect_backup(&pool, &mut drive, baseline.as_deref()).expect("backup exists");

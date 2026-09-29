@@ -314,6 +314,30 @@
   - **v3 で鍵が無いとき**: 内容を復号できないので `drive_changed` だけを判定し `local_differs` は false＝復元確認を出さない（復元しても失敗するため）。
   - `should_offer_restore()` = `drive_changed && local_differs`。**ローカル側だけが進んだ場合は復元確認を出さない**（出すと新しいローカルを古いバックアップで上書きしてしまう）`crates/core/src/drive/sync.rs:611-620`。
 - `restore_drive_backup` は復元後に**同じ内容を基準値として保存**する（ローカルに Drive に無い行が残っていると差分は消えないため、更新しないと次回起動でまた復元を促し続ける）。v3 は封筒の `content_hmac` を保存する `crates/core/src/drive/sync.rs:563-569`。
+- **ユーザーデータ（`owner_sub` / `page_notes.memo`）は v3 では平文で運ぶ**（2026-09-29）:
+  これらは端末ローカル鍵で暗号化されているため、暗号文のままでは他端末で復号できず、
+  取り込んでも**付箋は空メモ・所有者は不一致で行が消える**。機密は外側の PRK 封筒が
+  担保するので内側の二重暗号は不要（詳細は `docs/spec/10-pack-keys.md` §11.3）。
+  - 形式はトップレベルの **`"user_data": "plaintext" | "sealed"`** で明示する。
+    `import_json` は **`plaintext` のときだけ**端末鍵で暗号化し直す（prefix の無い
+    `owner_sub` を値から推定すると、他端末の暗号文を二重暗号化して行を消す）。
+  - **比較側（`inspect_drive_backup` の `local_differs`）は Drive の形式に合わせる**
+    （ローカルの能力で決めると値空間が食い違い、毎起動で復元確認が出る）。
+- **上書き防止（門）** `crates/core/src/drive/sync.rs`: ローカルのユーザーデータ
+  （`favorite_tags` / `favorite_entities` / `page_notes` / `owner_sub` 付き `books`）が
+  **0 件で Drive に既存バックアップがあるときは DB バックアップをアップロードしない**。
+  他端末が入れたユーザーデータを空のローカルで潰す事故を防ぐ。判定は
+  `sync_with_progress` の 1 箇所にあり、**設定の同期 / 終了時アップロード / 自動同期の
+  すべて**がそこを通る（`db::backup::user_data_row_count`）。
+- **同期時の取り込み（復元）**: `sync_drive_now(allow_restore, cx)` は `check_drive_backup`
+  → `inspect_drive_backup` → **`should_offer_restore` を経由** → `restore_drive_backup` を
+  **アップロードより前**に実行する（後ろだと「この PC の内容で Drive を上書きしてから
+  取り込む」順になり、他端末のユーザーデータを失う。実測でこの事故が起きた）。
+  - **`allow_restore` は利用者が起点の同期（設定の「同期」ボタン）だけ true**。自動同期
+    （チェックリスト変更・ログイン直後）は false（＝同意なしの Drive 優先 UPSERT をしない）。
+  - 復号できない／形式不正な控えは**中断して利用者に見せる**（読めない控えの上に
+    ローカルを被せると唯一のオフサイト退避を失う）。
+  - 復元後は基準値が更新され（`BACKUP_BASELINE_KEY`）、直後のアップロードは差分なしになる。
 - 同期状態テーブル `drive_sync_state(pack_id PK, drive_file_id, md5, modified_time, last_synced_at)` の get/upsert/list/delete `crates/core/src/db/sync_state.rs:6-55`。
 
 ### 3.5 同期のトリガーと OFF 条件

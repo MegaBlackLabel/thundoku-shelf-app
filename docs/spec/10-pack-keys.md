@@ -377,6 +377,22 @@ backup_hash_key   = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1", info = 
 
 - **平文は現行のバックアップ JSON そのもの**（`db::backup::export_json` の出力。
   いまの `format_version` は 2）。封筒は**外側だけ**で、中身の形式は変えない。
+- **ただしユーザーデータ（`owner_sub` と `page_notes.memo`）は v3 では平文で載せる**
+  （2026-09-29）。これらは端末ローカル鍵（§1.2 の DB 鍵・`column_crypto`）で暗号化
+  されているため、暗号文のまま運ぶと**他端末で復号できず、取り込んでも値が空になる**
+  （付箋は空メモ、所有者は不一致で行が消える）。機密は**外側の封筒（PRK）が担保する**ので
+  内側の二重暗号は不要。中身を平文にすると nonce が JSON に入らないため、
+  `content_hmac` / 差分判定が安定する（決定論的）。
+  - 形式の明示: トップレベルに **`"user_data": "plaintext" | "sealed"`** を書く。
+    取込側は **`plaintext` のときだけ**その端末の鍵で暗号化し直す（欠落時は `sealed` 扱い）。
+    表ではないので `canonicalize_json` の比較対象には入らない。
+  - v2（PRK 不在で平文アップロード）は **`sealed`** のまま＝**暗号文を Drive に置く**
+    （素のユーザーデータを上げない）。
+  - 対象列は `crates/core/src/db/backup.rs` の `user_data_columns` が正
+    （`owner_sub` を持つ 6 表と `page_notes.memo` のみ。`document_text` / `token_analysis` は
+    `TABLES` 外、`document_images.extracted_text` は除外済み）。
+  - `page_notes` の AAD は**自然キー** `book_id/content_id/page`
+    （`id` を使うと読み出し側と食い違って付箋が空になる）。
 - base64 は標準アルファベット + padding（§3.2 と同じ。base64url は使わない）。
 - **`content_hmac` の主目的は変更検知**。`nonce` が乱数なので**暗号文（＝ファイルの md5）は
   毎回変わる** — 暗号文の md5 を「変わったか」の判定に使うと毎回無駄なアップロードになる。

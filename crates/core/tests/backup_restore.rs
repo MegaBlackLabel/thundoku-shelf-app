@@ -73,10 +73,10 @@ fn seed_source_pool() -> sqlx::SqlitePool {
 #[test]
 fn restore_into_fresh_db_keeps_event_children() {
     let src = seed_source_pool();
-    let json = backup::export_json(&src, None, None).unwrap();
+    let json = backup::export_json(&src, None, None, false).unwrap();
 
     let dst = thundoku_core::db::test_pool(); // 空の新規 DB（sites のみ seed 済み）
-    backup::import_json(&dst, &json).expect("restore into a fresh DB should succeed");
+    backup::import_json(&dst, &json, None).expect("restore into a fresh DB should succeed");
 
     let count =
         |sql: &'static str| -> i64 { block_on(sqlx::query_scalar(sql).fetch_one(&dst)).unwrap() };
@@ -117,14 +117,14 @@ fn restore_keeps_user_page_notes() {
     )
     .unwrap();
 
-    let json = backup::export_json(&src, None, None).unwrap();
+    let json = backup::export_json(&src, None, None, false).unwrap();
     assert!(
         json.contains("page_notes"),
         "エクスポートに page_notes が含まれること"
     );
 
     let dst = thundoku_core::db::test_pool();
-    backup::import_json(&dst, &json).unwrap();
+    backup::import_json(&dst, &json, None).unwrap();
     let notes = thundoku_core::db::notes::list_newest_first(&dst).unwrap();
     assert_eq!(notes.len(), 1, "付箋が復元されること");
     assert_eq!(notes[0].memo, "ここ重要");
@@ -137,7 +137,7 @@ fn old_backup_does_not_null_out_newer_columns() {
     let src = thundoku_core::db::test_pool();
     books::insert(&src, &book("b1")).unwrap();
     let mut json: serde_json::Value =
-        serde_json::from_str(&backup::export_json(&src, None, None).unwrap()).unwrap();
+        serde_json::from_str(&backup::export_json(&src, None, None, false).unwrap()).unwrap();
     // 旧バージョンのバックアップを模す: 後から追加された列を落とす
     for row in json["books"].as_array_mut().unwrap() {
         let obj = row.as_object_mut().unwrap();
@@ -159,7 +159,7 @@ fn old_backup_does_not_null_out_newer_columns() {
     )
     .unwrap();
 
-    backup::import_json(&dst, &old_json).expect("old backup should import");
+    backup::import_json(&dst, &old_json, None).expect("old backup should import");
 
     let after = books::get(&dst, "b1").unwrap().unwrap();
     assert_eq!(
@@ -186,14 +186,14 @@ fn old_backup_missing_is_drm_restores_as_unknown() {
     let src = thundoku_core::db::test_pool();
     books::insert(&src, &book("b1")).unwrap();
     let mut json: serde_json::Value =
-        serde_json::from_str(&backup::export_json(&src, None, None).unwrap()).unwrap();
+        serde_json::from_str(&backup::export_json(&src, None, None, false).unwrap()).unwrap();
     for row in json["books"].as_array_mut().unwrap() {
         row.as_object_mut().unwrap().remove("is_drm");
     }
     let old_json = serde_json::to_string(&json).unwrap();
 
     let dst = thundoku_core::db::test_pool();
-    backup::import_json(&dst, &old_json).expect("old backup should import");
+    backup::import_json(&dst, &old_json, None).expect("old backup should import");
     let after = books::get(&dst, "b1").unwrap().unwrap();
     assert_eq!(
         after.is_drm,
@@ -217,7 +217,7 @@ fn legacy_backup_without_format_version_treats_is_drm_zero_as_unknown() {
     let mut drm_book = book("b1");
     drm_book.is_drm = 1;
     books::insert(&src, &drm_book).unwrap();
-    let exported = backup::export_json(&src, None, None).unwrap();
+    let exported = backup::export_json(&src, None, None, false).unwrap();
     let mut value: serde_json::Value = serde_json::from_str(&exported).unwrap();
     value
         .as_object_mut()
@@ -227,7 +227,7 @@ fn legacy_backup_without_format_version_treats_is_drm_zero_as_unknown() {
     let legacy = value.to_string();
 
     let dst = thundoku_core::db::test_pool();
-    backup::import_json(&dst, &legacy).expect("旧バックアップの復元に失敗した");
+    backup::import_json(&dst, &legacy, None).expect("旧バックアップの復元に失敗した");
 
     let is_drm = |id: &str| -> i64 {
         block_on(
@@ -247,7 +247,7 @@ fn legacy_backup_without_format_version_treats_is_drm_zero_as_unknown() {
 fn current_backup_keeps_is_drm_zero_as_verified_none() {
     let src = thundoku_core::db::test_pool();
     books::insert(&src, &book("b0")).unwrap();
-    let json = backup::export_json(&src, None, None).unwrap();
+    let json = backup::export_json(&src, None, None, false).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(
         parsed.get("format_version").is_some(),
@@ -255,7 +255,7 @@ fn current_backup_keeps_is_drm_zero_as_verified_none() {
     );
 
     let dst = thundoku_core::db::test_pool();
-    backup::import_json(&dst, &json).unwrap();
+    backup::import_json(&dst, &json, None).unwrap();
     let value: i64 =
         block_on(sqlx::query_scalar("SELECT is_drm FROM books WHERE id = 'b0'").fetch_one(&dst))
             .unwrap();
@@ -267,7 +267,7 @@ fn current_backup_keeps_is_drm_zero_as_verified_none() {
 fn failed_restore_rolls_back_completely() {
     let src = seed_source_pool();
     let mut json: serde_json::Value =
-        serde_json::from_str(&backup::export_json(&src, None, None).unwrap()).unwrap();
+        serde_json::from_str(&backup::export_json(&src, None, None, false).unwrap()).unwrap();
     // 存在しないサイトを参照させて FK 違反を起こす（books の後で失敗する）
     for row in json["bookshelf_items"].as_array_mut().unwrap() {
         row.as_object_mut()
@@ -277,7 +277,7 @@ fn failed_restore_rolls_back_completely() {
     let broken = serde_json::to_string(&json).unwrap();
 
     let dst = thundoku_core::db::test_pool();
-    let err = backup::import_json(&dst, &broken);
+    let err = backup::import_json(&dst, &broken, None);
     assert!(err.is_err(), "FK 違反で復元は失敗すること");
 
     // books は bookshelf_items より先に処理されるが、巻き戻されるので 0 件のはず
@@ -308,7 +308,7 @@ fn restore_merges_page_notes_that_differ_only_by_id() {
         },
     )
     .unwrap();
-    let json = backup::export_json(&src, None, None).unwrap();
+    let json = backup::export_json(&src, None, None, false).unwrap();
 
     // 復元先には同じページの付箋が別 id で存在する
     let dst = thundoku_core::db::test_pool();
@@ -326,7 +326,7 @@ fn restore_merges_page_notes_that_differ_only_by_id() {
     )
     .unwrap();
 
-    backup::import_json(&dst, &json).expect("restore should merge page notes by natural key");
+    backup::import_json(&dst, &json, None).expect("restore should merge page notes by natural key");
 
     let notes = thundoku_core::db::notes::list_newest_first(&dst).unwrap();
     assert_eq!(notes.len(), 1, "同じページの付箋は 1 件に統合されること");

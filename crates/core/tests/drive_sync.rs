@@ -1437,6 +1437,48 @@ fn db_backup_is_encrypted_when_the_root_key_is_available() {
 }
 
 /// 同じ内容を再度同期しても上げ直さない（暗号文は毎回変わるので md5 では判定できない）。
+/// ローカルのユーザーデータ（お気に入り・付箋・所有情報）が空のときは、Drive に既存
+/// バックアップがあっても **DB バックアップを上書きしない**。
+///
+/// 実測でこの事故が起きた（この端末が 0 件のまま 2 回アップロードし、他端末が入れた
+/// お気に入り・付箋を失った）。門は `sync_with_progress` の 1 箇所にあり、設定の同期 /
+/// 終了時アップロード / 自動同期のすべてがそこを通る。
+#[test]
+fn db_backup_upload_is_blocked_when_local_user_data_is_empty() {
+    let env = TestEnv::new("backup-guard");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-backup-guard";
+    let owner_key = [44u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    let db_path = env.packs().join("thundoku-shelf.db");
+
+    // ① ユーザーデータがある状態で 1 回目 → アップロードされる
+    let first =
+        sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+    assert!(first.database_backed_up, "通常時はアップロードされる");
+    let uploaded = uploaded_backup(&drive);
+
+    // ② ローカルのユーザーデータを空にして（＝別端末の内容をまだ取り込んでいない状態）
+    //    もう一度同期する → 門が働いて上書きしない
+    thundoku_core::db::block_on(async {
+        sqlx::query("DELETE FROM favorite_tags").execute(&env.pool).await.unwrap();
+        sqlx::query("UPDATE books SET owner_sub = NULL").execute(&env.pool).await.unwrap();
+    });
+    let second =
+        sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+    assert!(
+        !second.database_backed_up,
+        "ローカルのユーザーデータが空なら上書きしない（Drive の控えを保護）"
+    );
+    assert_eq!(
+        uploaded_backup(&drive),
+        uploaded,
+        "Drive 上のバックアップは置き換わらない"
+    );
+}
+
 #[test]
 fn db_backup_is_not_reuploaded_when_the_content_is_unchanged() {
     let env = TestEnv::new("backup-v3-skip");
@@ -1537,7 +1579,7 @@ fn inspect_drive_backup_handles_v3_envelopes() {
     let other = thundoku_core::db::test_pool();
     db::migrate(&other).unwrap();
     insert_owned_book(&other, "b9", "他端末の本", sub, &owner_key);
-    let other_json = thundoku_core::db::backup::export_json(&other, None, None).unwrap();
+    let other_json = thundoku_core::db::backup::export_json(&other, None, None, false).unwrap();
     let other_envelope = SealedEnvelope::seal(
         &BACKUP_LABEL,
         other_json.as_bytes(),
@@ -1564,7 +1606,7 @@ fn inspect_drive_backup_without_the_key_does_not_offer_a_restore() {
     let owner_id = opfspack::derive_owner_id(sub);
     insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
 
-    let source = thundoku_core::db::backup::export_json(&env.pool, None, None).unwrap();
+    let source = thundoku_core::db::backup::export_json(&env.pool, None, None, false).unwrap();
     let envelope = SealedEnvelope::seal(&BACKUP_LABEL, source.as_bytes(), &root, &owner_id);
     drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
     delete_root_key(sub);
@@ -1594,7 +1636,7 @@ fn restore_decrypts_a_v3_envelope() {
     let source = thundoku_core::db::test_pool();
     db::migrate(&source).unwrap();
     insert_owned_book(&source, "b1", "復元される本", sub, &owner_key);
-    let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
+    let json = thundoku_core::db::backup::export_json(&source, None, None, false).unwrap();
     let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &root, &owner_id);
     drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
 
@@ -1633,7 +1675,7 @@ fn restore_without_the_key_is_rejected_and_imports_nothing() {
     let source = thundoku_core::db::test_pool();
     db::migrate(&source).unwrap();
     insert_owned_book(&source, "b1", "復元される本", sub, &owner_key);
-    let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
+    let json = thundoku_core::db::backup::export_json(&source, None, None, false).unwrap();
     let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &root, &owner_id);
     drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
     delete_root_key(sub);
@@ -1668,7 +1710,7 @@ fn a_v3_envelope_from_another_account_is_not_restored() {
     let source = thundoku_core::db::test_pool();
     db::migrate(&source).unwrap();
     insert_owned_book(&source, "b1", "別アカウントの本", other_sub, &owner_key);
-    let json = thundoku_core::db::backup::export_json(&source, None, None).unwrap();
+    let json = thundoku_core::db::backup::export_json(&source, None, None, false).unwrap();
     let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &other_root, &other_owner);
     drive.seed("thundoku-backup.json", &envelope.to_json().unwrap());
 

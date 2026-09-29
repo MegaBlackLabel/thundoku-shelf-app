@@ -321,16 +321,202 @@ impl DriveBackup {
     }
 }
 
+/// ローカルにある「ユーザーが作ったデータ」の行数（お気に入り・付箋・所有情報）。
+///
+/// Drive の DB バックアップを**空のローカルで上書きしない**ための門で使う
+/// （他端末が入れたユーザーデータを失う事故を防ぐ。実測で発生した）。
+pub fn user_data_row_count(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    crate::db::block_on(async {
+        let mut total = 0i64;
+        for (table, where_sql) in [
+            ("favorite_tags", ""),
+            ("favorite_entities", ""),
+            ("page_notes", ""),
+            // 所有情報（どのアカウントの本か）もユーザー由来のデータ
+            ("books", " WHERE owner_sub IS NOT NULL"),
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table}{where_sql}");
+            let count: i64 = sqlx::query_scalar(&sql).fetch_one(pool).await?;
+            total += count;
+        }
+        Ok(total)
+    })
+}
+/// バックアップ JSON にユーザーデータの形式を明示するマーカーのキー。
+pub const USER_DATA_MARKER_KEY: &str = "user_data";
+/// 平文で載っている（取込側で暗号化し直す必要がある）。
+pub const USER_DATA_PLAINTEXT: &str = "plaintext";
+/// 端末鍵の暗号文のまま（他端末では復号できない。**再暗号化してはいけない**）。
+pub const USER_DATA_SEALED: &str = "sealed";
+
+/// バックアップ JSON のマーカーから「平文で運ばれているか」を読む（無ければ sealed 扱い）。
+pub fn user_data_is_plaintext(payload: &serde_json::Value) -> bool {
+    payload
+        .get(USER_DATA_MARKER_KEY)
+        .and_then(serde_json::Value::as_str)
+        == Some(USER_DATA_PLAINTEXT)
+}
+
+/// バックアップでユーザーデータの暗号列を平文で運ぶための開閉。
+///
+/// **端末ローカル鍵で暗号化されている列**（`owner_sub` と `column_crypto` の `enc:v1:`）は
+/// そのままでは他端末で復号できず、取り込んでも値が空になる。バックアップでは**平文で運び**、
+/// 取り込む端末の鍵で暗号化し直す。機密は外側の `SealedEnvelope`（PRK）が担保する。
+///
+/// 値ベースで判定する（`is_encrypted`）ので、列リストの取りこぼしで復号不能データを作らない。
+/// - `owner_sub` は AAD 無し・prefix 無しの生 base64（`owner::encrypt` / `decrypt`）
+/// - それ以外の `enc:v1:` は行キーから作った AAD で `column_crypto` を通す
+///   （`page_notes` は PK ではなく**自然キー** `book_id/content_id/page`。
+///    `id` を使うと読み出し側と食い違って**付箋が空になる**）
+fn user_data_row_key(table: &str, row: &Map<String, Value>) -> Option<String> {
+    let text = |column: &str| row.get(column).and_then(Value::as_str).map(str::to_owned);
+    match table {
+        "page_notes" => {
+            let book = text("book_id")?;
+            let content = text("content_id")?;
+            let page = row.get("page").and_then(Value::as_i64)?;
+            Some(format!("{book}/{content}/{page}"))
+        }
+        _ => {
+            let pk = pk_columns(table)?;
+            let mut parts = Vec::with_capacity(pk.len());
+            for column in pk {
+                parts.push(text(column)?);
+            }
+            Some(parts.join("/"))
+        }
+    }
+}
+
+/// 行に「平文のユーザーデータ」が含まれるか（＝端末鍵で暗号化し直す必要があるか）。
+///
+/// `owner_sub` は prefix が無い生 base64 なので、**復号を試して失敗したら平文**と判定する。
+/// それ以外は `enc:v1:` の有無で分かる。
+fn has_plaintext_user_data(table: &str, rows: &[Value]) -> bool {
+    let columns = user_data_columns(table);
+    if columns.is_empty() {
+        return false;
+    }
+    rows.iter().any(|row| {
+        let Some(object) = row.as_object() else {
+            return false;
+        };
+        columns.iter().any(|column| {
+            let Some(text) = object.get(*column).and_then(Value::as_str) else {
+                return false;
+            };
+            if *column == "owner_sub" {
+                // 生 base64 は復号できる（＝暗号文）。鍵を持たずに形状だけで判定する。
+                return !base64_looks_encrypted(text);
+            }
+            // 列暗号は prefix で分かる。空文字（移行前の平文）は触らない。
+            !text.is_empty() && !crate::db::column_crypto::is_encrypted(text)
+        })
+    })
+}
+
+/// `owner::encrypt` の出力（`B64(IV(12) || ct || tag)`）として妥当そうか。
+///
+/// 鍵を持たずに判定するための形状チェック（長さと base64 妥当性のみ）。
+fn base64_looks_encrypted(text: &str) -> bool {
+    use base64::Engine as _;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(text) else {
+        return false;
+    };
+    bytes.len() > 12
+}
+
+/// バックアップで平文に開く「端末鍵で暗号化される列」。
+///
+/// 暗号化は 2 系統あり、**値の prefix だけでは判定できない**（`owner_sub` は prefix 無しの
+/// 生 base64）。列リストの取りこぼしで復号不能データを作らないよう、ここを正とする。
+/// バックアップ対象は `TABLES` のみで、その中で暗号列を持つのは以下の表だけ
+/// （`document_text` / `token_analysis` は `TABLES` に無く、`document_images.extracted_text` は
+/// `EXCLUDED_COLUMNS` で除外済み）。
+fn user_data_columns(table: &str) -> &'static [&'static str] {
+    match table {
+        // 所有者（`owner::encrypt`: AAD 無し・prefix 無しの生 base64）
+        "books" | "bookshelf_items" | "checked_items" | "book_first_events"
+        | "favorite_tags" | "favorite_entities" => &["owner_sub"],
+        // 列暗号（`column_crypto`: `enc:v1:`）
+        "page_notes" => &["memo"],
+        _ => &[],
+    }
+}
+
+/// 行の端末鍵暗号列を**平文に開く**（エクスポート用）。
+///
+/// 復号できない値は**そのまま残す**（握り潰さず、バックアップ側を壊さない）。
+fn open_user_data_row(table: &str, row: &mut Map<String, Value>, key: &[u8; 32]) {
+    let row_key = user_data_row_key(table, row);
+    for column in user_data_columns(table) {
+        let Some(value) = row.get_mut(*column) else {
+            continue;
+        };
+        let Some(stored) = value.as_str() else { continue };
+        if *column == "owner_sub" {
+            if let Some(sub) = crate::owner::decrypt(key, stored) {
+                *value = Value::String(sub);
+            }
+            continue;
+        }
+        if !crate::db::column_crypto::is_encrypted(stored) {
+            continue;
+        }
+        let Some(row_key) = row_key.as_deref() else { continue };
+        let aad = crate::db::column_crypto::aad(table, row_key, column);
+        if let Some(plain) = crate::db::column_crypto::decrypt(key, &aad, stored) {
+            *value = Value::String(plain);
+        }
+    }
+}
+
+/// 行の平文ユーザーデータを**その端末の鍵で暗号化し直す**（インポート用）。
+///
+/// 取り込みは後方互換: **既に `enc:v1:` が付いた値（v2 バックアップ等）は再暗号化しない**
+/// （二重暗号化を防ぐ）。復号できない `owner_sub` はそのまま残し、後段の所有者フィルタで
+/// `matches` が false になる（＝他端末の暗号文は消さずに残す）。
+fn seal_user_data_row(table: &str, row: &mut Map<String, Value>, key: &[u8; 32]) {
+    let row_key = user_data_row_key(table, row);
+    for column in user_data_columns(table) {
+        let Some(value) = row.get_mut(*column) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else { continue };
+        if *column == "owner_sub" {
+            // 生 base64 の暗号文（復号できる）はそのまま。平文だけ暗号化する。
+            if crate::owner::decrypt(key, text).is_none() {
+                *value = Value::String(crate::owner::encrypt(key, text));
+            }
+            continue;
+        }
+        if crate::db::column_crypto::is_encrypted(text) {
+            continue; // 既に暗号文（v2 バックアップ）は触らない
+        }
+        let Some(row_key) = row_key.as_deref() else { continue };
+        let aad = crate::db::column_crypto::aad(table, row_key, column);
+        if let Ok(stored) = crate::db::column_crypto::encrypt(key, &aad, text) {
+            *value = Value::String(stored);
+        }
+    }
+}
+
 /// 主要テーブルを JSON 文字列にエクスポートする。
 /// `book_ids` が `Some(ids)` のとき、所有者（本の id 集合）に連動して
 /// `books` とその下位テーブルだけをエクスポートする（P3）。`None` は全件。
 /// `owner` が `Some` のとき、[`OWNER_SCOPED_TABLES`] と、その配下の
 /// `product_sample_pages`（親の `checked_items` 経由で判定）を現在の sub に絞る。
 #[allow(clippy::explicit_auto_deref)]
+/// `plaintext_user_data` が true のとき、端末ローカル鍵で暗号化されている列
+/// （`owner_sub` と `column_crypto` の `enc:v1:`）を**平文にして載せる**（v3 封筒の中身）。
+/// 外側の `SealedEnvelope`（PRK）が機密を担保するので内側の二重暗号は不要で、
+/// nonce が JSON に入らないため差分判定（`content_hmac` / `canonical_md5`）が安定する。
+/// v2（PRK 不在で平文アップロード）では **false** にして現行どおり暗号文のまま運ぶ。
 pub fn export_json(
     pool: &SqlitePool,
     book_ids: Option<&std::collections::HashSet<String>>,
     owner: Option<&OwnerFilter<'_>>,
+    plaintext_user_data: bool,
 ) -> Result<String, sqlx::Error> {
     crate::db::block_on(async {
         // 複数テーブルを跨いで読み出すため、トランザクションで一貫した
@@ -344,8 +530,36 @@ pub fn export_json(
             "format_version".to_string(),
             Value::Number(Number::from(FORMAT_VERSION)),
         );
+        // ユーザーデータ（`owner_sub` / `memo`）が平文で載っているかの**明示マーカー**。
+        // prefix が無い `owner_sub` は「平文」と「復号できない暗号文」を値から区別できないため、
+        // 取込側が二重暗号化しないよう（＝行を消さないよう）ここで明示する。表ではないので
+        // `canonicalize_json` の比較対象には入らない。
+        payload.insert(
+            USER_DATA_MARKER_KEY.to_string(),
+            Value::String(
+                if plaintext_user_data {
+                    USER_DATA_PLAINTEXT
+                } else {
+                    USER_DATA_SEALED
+                }
+                .to_string(),
+            ),
+        );
+        // 平文モードでは復号鍵が要る（`owner` の鍵 = 端末ローカル鍵と同じもの）。
+        let user_key = if plaintext_user_data {
+            owner.map(|filter| *filter.key)
+        } else {
+            None
+        };
         for table in TABLES {
-            let rows = table_rows(&mut *tx, table, book_ids, owner).await?;
+            let mut rows = table_rows(&mut *tx, table, book_ids, owner).await?;
+            if let Some(key) = user_key.as_ref() {
+                for row in rows.iter_mut() {
+                    if let Value::Object(object) = row {
+                        open_user_data_row(table, object, key);
+                    }
+                }
+            }
             payload.insert((*table).to_string(), Value::Array(rows));
         }
         tx.commit().await?;
@@ -362,7 +576,14 @@ pub fn export_json(
 /// SQLite の `INSERT ... ON CONFLICT DO UPDATE` は DELETE を伴わないため、
 /// FK の `ON DELETE CASCADE`（例: `books` → `view_history`）を発火させない。
 /// テーブルは `TABLES` の順（FK 参照元が先）で処理する。
-pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
+/// `user_key` は端末ローカル鍵（`None` なら `column_crypto::db_key()`＝この端末の鍵）。
+/// 平文で運ばれたユーザーデータを**この鍵で暗号化し直す**ために使う。テストから差し替えられる
+/// ように引数で受ける（本番の呼び出し元は `None` を渡す）。
+pub fn import_json(
+    pool: &SqlitePool,
+    json: &str,
+    user_key: Option<&[u8; 32]>,
+) -> Result<(), sqlx::Error> {
     let payload: serde_json::Value =
         serde_json::from_str(json).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
     // 形式版が無いバックアップは 1（`is_drm` の `0` が「未確認」の意味だった時代）。
@@ -372,6 +593,9 @@ pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(1);
     let legacy_drm = format_version < FORMAT_VERSION;
+    // ★平文マーカーがあるときだけ再暗号化する。無いバックアップ（v2 / 旧形式）は
+    // 端末鍵の暗号文のまま運ばれているので、**触ると二重暗号化で行が消える**。
+    let seal_plaintext = user_data_is_plaintext(&payload);
     crate::db::block_on(async {
         // 1 行でも失敗したら全て巻き戻す（部分復元を残さない）。
         let mut tx = pool.begin().await?;
@@ -402,6 +626,30 @@ pub fn import_json(pool: &SqlitePool, json: &str) -> Result<(), sqlx::Error> {
                     }
                 }
             }
+            // バックアップでは端末ローカル鍵の暗号列が**平文で運ばれている**（v3 封筒）。
+            // この端末の鍵で暗号化し直してから入れる。既に暗号文の値（v2 バックアップ）は
+            // 触らないので後方互換。鍵が要るのは実際に平文が含まれるときだけにする
+            // （鍵リングに触れないテストを壊さないため）。
+            let sealed_rows: Option<Vec<Value>> = if seal_plaintext && has_plaintext_user_data(table, rows) {
+                let key = match user_key {
+                    Some(key) => *key,
+                    None => crate::db::column_crypto::db_key()?,
+                };
+                Some(
+                    rows.iter()
+                        .cloned()
+                        .map(|mut row| {
+                            if let Value::Object(object) = &mut row {
+                                seal_user_data_row(table, object, &key);
+                            }
+                            row
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            let rows: &[Value] = sealed_rows.as_deref().unwrap_or(rows);
             // 競合判定は自然キーがあればそちらを使う（PK と別の UNIQUE 制約を
             // 持つ表で、もう片方の制約違反により復元が失敗するのを防ぐ）。
             let conflict = conflict_columns(table).unwrap_or(pk);
@@ -805,7 +1053,7 @@ mod tests {
         )
         .unwrap();
 
-        let json = export_json(&pool, None, None).unwrap();
+        let json = export_json(&pool, None, None, false).unwrap();
         let payload: Value = serde_json::from_str(&json).unwrap();
         // books テーブルに 1 件
         let books = payload["books"].as_array().unwrap();
@@ -904,7 +1152,7 @@ mod tests {
         crate::db::page_views::add_dwell(&src, "book-1", "c1", 1, 3.5).unwrap();
         crate::db::page_views::add_dwell(&src, "book-1", "c1", 2, 1.25).unwrap();
 
-        let json = export_json(&src, None, None).unwrap();
+        let json = export_json(&src, None, None, false).unwrap();
         // view_history がバックアップに含まれる
         let payload: Value = serde_json::from_str(&json).unwrap();
         let vh = payload["view_history"].as_array().unwrap();
@@ -921,7 +1169,7 @@ mod tests {
 
         // 空の DB にインポートすると本・進捗・閲覧履歴が復元される
         let dst = crate::db::test_pool();
-        import_json(&dst, &json).unwrap();
+        import_json(&dst, &json, None).unwrap();
         let restored = crate::db::books::get(&dst, "book-1").unwrap().unwrap();
         assert_eq!(restored.title, "テスト本");
         // コンテンツ構造も復元される（FK 順が正しくないと失敗する）
@@ -1005,7 +1253,7 @@ mod tests {
 
         // A の所有のみ → book-A とその進捗だけ
         let owned_a: std::collections::HashSet<String> = ["book-A".into()].into();
-        let json = export_json(&pool, Some(&owned_a), None).unwrap();
+        let json = export_json(&pool, Some(&owned_a), None, false).unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         let books = v["books"].as_array().unwrap();
         assert_eq!(books.len(), 1);
@@ -1015,7 +1263,7 @@ mod tests {
         assert_eq!(prog[0]["book_id"], "book-A");
 
         // 全件（None）→ 両方
-        let json_full = export_json(&pool, None, None).unwrap();
+        let json_full = export_json(&pool, None, None, false).unwrap();
         let vf: Value = serde_json::from_str(&json_full).unwrap();
         assert_eq!(vf["books"].as_array().unwrap().len(), 2);
         assert_eq!(vf["reading_progress"].as_array().unwrap().len(), 2);
@@ -1115,7 +1363,7 @@ mod tests {
             key: &key,
             sub: Some("A"),
         };
-        let json = export_json(&pool, None, Some(&filter_a)).unwrap();
+        let json = export_json(&pool, None, Some(&filter_a), false).unwrap();
         let value: Value = serde_json::from_str(&json).unwrap();
         let ids = |table: &str, column: &str| -> Vec<String> {
             value[table]
@@ -1136,7 +1384,7 @@ mod tests {
             key: &key,
             sub: None,
         };
-        let json = export_json(&pool, None, Some(&filter_anon)).unwrap();
+        let json = export_json(&pool, None, Some(&filter_anon), false).unwrap();
         let value: Value = serde_json::from_str(&json).unwrap();
         let ids = |table: &str, column: &str| -> Vec<String> {
             value[table]
@@ -1154,6 +1402,55 @@ mod tests {
     }
 
     /// 試し読みのテスト用に、イベントとチェック項目（所有者つき）を 1 件入れる。
+    /// 端末鍵で暗号化される列（`owner_sub` 等）はバックアップでは平文で運び、
+    /// 取り込み時にその端末の鍵で暗号化し直す。**往復で元のバックアップと同じ**
+    /// になること（＝ Drive の差分判定が安定し、毎回アップロードにならない）。
+    #[test]
+    fn export_import_round_trip_keeps_user_data_stable() {
+        let src = crate::db::test_pool();
+        // ★別端末を再現する: 取り込み先は**別の鍵**を持つ
+        let src_key = [9u8; 32];
+        let dst_key = [8u8; 32];
+        let owner_a = crate::owner::encrypt(&src_key, "A");
+        for (tag, owner) in [("tag-a", Some(owner_a.clone())), ("tag-anon", None)] {
+            crate::db::block_on(async {
+                sqlx::query("INSERT INTO favorite_tags (tag_name, owner_sub) VALUES (?1, ?2)")
+                    .bind(tag)
+                    .bind(owner)
+                    .execute(&src)
+                    .await
+                    .unwrap();
+            });
+        }
+        let src_filter = OwnerFilter {
+            key: &src_key,
+            sub: Some("A"),
+        };
+
+        // 平文モード: owner_sub が平文で載る（＝別端末の鍵でも読める形）
+        let plain = export_json(&src, None, Some(&src_filter), true).unwrap();
+        assert!(plain.contains("\"tag_name\":\"tag-a\""));
+        assert!(plain.contains("\"owner_sub\":\"A\""), "平文で載るはず: {plain}");
+
+        // 取り込み先（別の鍵）で取り込み、その端末の鍵で export し直す
+        let dst = crate::db::test_pool();
+        import_json(&dst, &plain, Some(&dst_key)).unwrap();
+        let dst_filter = OwnerFilter {
+            key: &dst_key,
+            sub: Some("A"),
+        };
+        let again = export_json(&dst, None, Some(&dst_filter), true).unwrap();
+        assert_eq!(again, plain, "別端末の鍵でも往復で同一になること");
+
+        // dst の鍵で所有者に一致している（＝行が消えていない）ことも固定する
+        assert!(again.contains("\"owner_sub\":\"A\""));
+
+        // 暗号文モード（v2 相当）は owner_sub を平文で載せず、マーカーも sealed になる
+        let sealed = export_json(&src, None, Some(&src_filter), false).unwrap();
+        assert!(!sealed.contains("\"owner_sub\":\"A\""), "v2 は平文で載せない");
+        assert!(sealed.contains("\"user_data\":\"sealed\""));
+    }
+
     fn seed_check_item(pool: &SqlitePool, item_id: &str, owner: Option<&str>) {
         crate::db::block_on(async {
             sqlx::query(
@@ -1208,7 +1505,7 @@ mod tests {
         insert_sample_page(&pool, "sp-1", "check-a", 1);
         insert_sample_page(&pool, "sp-2", "check-a", 2);
 
-        let json = export_json(&pool, None, None).unwrap();
+        let json = export_json(&pool, None, None, false).unwrap();
         let value: Value = serde_json::from_str(&json).unwrap();
         let rows = value["product_sample_pages"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "試し読みの行がバックアップに無い");
@@ -1249,7 +1546,7 @@ mod tests {
 
         let ids = |sub: Option<&str>| -> Vec<String> {
             let filter = OwnerFilter { key: &key, sub };
-            let json = export_json(&pool, None, Some(&filter)).unwrap();
+            let json = export_json(&pool, None, Some(&filter), false).unwrap();
             let value: Value = serde_json::from_str(&json).unwrap();
             value["product_sample_pages"]
                 .as_array()
@@ -1280,10 +1577,10 @@ mod tests {
             key: &key,
             sub: Some("A"),
         };
-        let json = export_json(&src, None, Some(&filter)).unwrap();
+        let json = export_json(&src, None, Some(&filter), false).unwrap();
 
         let dst = crate::db::test_pool();
-        import_json(&dst, &json).unwrap();
+        import_json(&dst, &json, None).unwrap();
         let rows = crate::db::samples::list_for_item(&dst, "check-a").unwrap();
         assert_eq!(rows.len(), 2, "試し読みの行が復元されていない");
         assert_eq!(rows[0].id, "sp-1");
@@ -1443,7 +1740,7 @@ mod tests {
         let source = crate::db::books::list(&pool).unwrap();
         assert!(source.is_empty());
         crate::db::books::insert(&pool, &test_book("book-1")).unwrap();
-        let json = export_json(&pool, None, None).unwrap();
+        let json = export_json(&pool, None, None, false).unwrap();
 
         let root = PackRootKey::from_bytes([6u8; 32]);
         let envelope = SealedEnvelope::seal(&BACKUP_LABEL, json.as_bytes(), &root, OWNER_ID)
@@ -1515,7 +1812,7 @@ mod tests {
                 }
             ]
         });
-        import_json(&pool, &payload.to_string()).unwrap();
+        import_json(&pool, &payload.to_string(), None).unwrap();
         assert_eq!(
             crate::db::checklist::list_enabled_slugs(&pool).unwrap(),
             vec!["tbf20".to_string()]
@@ -1540,7 +1837,7 @@ mod tests {
                 }
             ]
         });
-        import_json(&pool, &payload.to_string()).unwrap();
+        import_json(&pool, &payload.to_string(), None).unwrap();
         assert!(crate::db::checklist::list_enabled_slugs(&pool).unwrap().is_empty());
     }
 }

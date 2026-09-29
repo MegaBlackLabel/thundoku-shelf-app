@@ -173,6 +173,20 @@ impl Serialize for HostScopedCookies {
     }
 }
 
+/// 収集元 `origin` に置かれた `cookie` を宛先 `host` へ載せてよいか。
+///
+/// 収集元が宛先そのものなら載せる。違っても、**Cookie 自身が `Domain` を持ち**それが宛先に
+/// 一致するなら載せる（`Domain=booth.pm` のセッションは `accounts.booth.pm` へも載る。実測:
+/// 購入ライブラリの `_plaza_session_*` がこの形で、完全一致では同期へ送れず失敗した）。
+/// `Domain` 無し（host-only）の Cookie は収集元のホスト以外へ出さない（RFC 6265 の扱い）。
+fn cookie_applies_to_host(origin: &str, cookie: &CookieEntry, host: &str) -> bool {
+    origin.eq_ignore_ascii_case(host)
+        || cookie
+            .domain
+            .as_deref()
+            .is_some_and(|domain| domain_matches(domain, host))
+}
+
 impl HostScopedCookies {
     /// 収集した形（ホスト → Cookie の並び）から作る。
     pub fn new(origins: BTreeMap<String, Vec<CookieEntry>>) -> Self {
@@ -241,10 +255,10 @@ impl HostScopedCookies {
         let mut matched: Vec<(&CookieEntry, usize)> = self
             .origins
             .iter()
-            .filter(|(origin, _)| origin.eq_ignore_ascii_case(host))
-            .flat_map(|(_, cookies)| cookies.iter())
-            .filter(|cookie| cookie.applies_to(host, path, https, now))
-            .map(|cookie| (cookie, cookie.path.as_deref().unwrap_or("/").len()))
+            .flat_map(|(origin, cookies)| cookies.iter().map(move |cookie| (origin, cookie)))
+            .filter(|(origin, cookie)| cookie_applies_to_host(origin, cookie, host))
+            .filter(|(_, cookie)| cookie.applies_to(host, path, https, now))
+            .map(|(_, cookie)| (cookie, cookie.path.as_deref().unwrap_or("/").len()))
             .collect();
         // 長い Path を先に、同じなら名前順（安定した並び）
         matched.sort_by(|a, b| {
@@ -345,6 +359,39 @@ mod tests {
         (name.to_string(), CookieEntry::new(value))
     }
 
+    /// 親ドメインで保存された Cookie（`Domain=booth.pm`）は配下（`accounts.booth.pm`）へ載る。
+    ///
+    /// 実測: WebView は購入ライブラリのセッション（`_plaza_session_*`）を `booth.pm` の束へ
+    /// 入れるため、これが無いと同期（宛先 `accounts.booth.pm`）へ送れず「ログインページを
+    /// 受信」で失敗した。`value()` は BOOTH では使わないので対象外。
+    #[test]
+    fn header_for_url_sends_parent_domain_cookies_to_subdomains() {
+        let cookies = HostScopedCookies::new(BTreeMap::from([(
+            "booth.pm".to_string(),
+            vec![
+                CookieEntry::with_attributes(
+                    "s3cret".to_string(),
+                    Some(".booth.pm".to_string()),
+                    Some("/".to_string()),
+                    true,
+                    None,
+                )
+                .named("_plaza_session"),
+            ],
+        )]));
+
+        assert_eq!(
+            cookies.header_for_url("https://accounts.booth.pm/library?page=1"),
+            "_plaza_session=s3cret"
+        );
+        // ラベル境界を越えない（`evilbooth.pm` や `booth.pm.evil.example.com` へは出さない）
+        assert_eq!(cookies.header_for_url("https://evilbooth.pm/"), "");
+        assert_eq!(
+            cookies.header_for_url("https://booth.pm.evil.example.com/"),
+            ""
+        );
+    }
+
     fn bag() -> HostScopedCookies {
         HostScopedCookies::from_named(BTreeMap::from([
             (
@@ -359,7 +406,8 @@ mod tests {
     }
 
     /// 宛先が収集元でなければ 1 つも送らない（CDN がこれに当たる）。
-    /// **完全一致**なので、収集元のサブドメインにも送らない。
+    /// **host-only（`Domain` 無し）**の Cookie は収集元のサブドメインにも送らない
+    /// （`Domain` 付きは配下へ送る。`header_for_url_honors_the_domain_attribute` 参照）。
     #[test]
     fn header_for_url_is_scoped_to_the_destination_host() {
         let cookies = bag();

@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use gpui_kit::AppContext as _;
 use gpui_kit::gpui::{App, Context, Entity, Window};
 use gpui_wry::{WebView, WebViewHandle};
+use thundoku_core::download_url::host_within;
 use thundoku_core::session_cookies::CookieEntry;
 
 /// ホバー中の背景色。
@@ -174,22 +175,136 @@ fn create_login_webview_reported<T: 'static>(
 
     #[cfg(not(windows))]
     {
-        // `Window` には同名の固有メソッド（gpui の `AnyWindowHandle` を返す）があるため、
-        // 生のハンドルを返すトレイトメソッドを明示的に選ぶ。
-        use raw_window_handle::HasWindowHandle;
-        let built = HasWindowHandle::window_handle(window)
-            .ok()
-            .and_then(|handle| build().build(&handle).ok());
-        match built {
-            Some(webview) => {
-                let entity = attach_webview(webview, initial_url, window, cx);
-                on_result(this, Some(entity), window, cx);
+        // Windows と同じく**タスクへ出す**。macOS の wry はメッセージループを回さないので
+        // 借用衝突は起きないが、**親の NSView がウィンドウに載っていない**状態で作ると、
+        // wry が `ns_view.window().unwrap()` で panic して**アプリごと abort する**
+        // （実測: ログインモーダルを開いた瞬間。lb-wry 0.53.3 の wkwebview/mod.rs:383）。
+        // タスクに出しても、モーダルの NSView が載るまでは nil のままなので、
+        // モーダルを開き直したときは 500ms では足りなかった（実測: 1 回目のログインは
+        // 載ったが、同期失敗で開き直した 2 回目は 10 回 × 50ms で打ち切られ、WebView が
+        // 無い黒い画面になった）。待機は非同期なので、伸ばしても UI は固まらない。
+        const MAX_ATTEMPTS: usize = 100;
+        const WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+        cx.spawn_in(window, async move |weak, cx| {
+            let mut attached = false;
+            let mut attempts = 0;
+            for attempt in 0..MAX_ATTEMPTS {
+                attempts = attempt + 1;
+                let in_window =
+                    match weak.update_in(cx, |_this, window, _cx| login_view_is_in_window(window)) {
+                        Ok(in_window) => in_window,
+                        Err(error) => {
+                            // entity が破棄された（ログイン完了や閉じる操作でモーダルが閉じた、
+                            // 再表示で新しい entity が作られた等）。待っても変わらないので静かに
+                            // 抜ける。正常系（閉じただけ）でもここに来るため ERROR にはしない。
+                            log::debug!("webview: 親 entity が破棄済みのため待機を終了: {error}");
+                            return;
+                        }
+                    };
+                if in_window {
+                    attached = true;
+                    break;
+                }
+                if attempt == 0 {
+                    log::warn!(
+                        "webview: 親ビューがまだウィンドウに載っていない。載るまで待つ（最大 {} ms）",
+                        MAX_ATTEMPTS as u64 * WAIT.as_millis() as u64
+                    );
+                }
+                cx.background_executor().timer(WAIT).await;
             }
-            None => {
-                log::error!("webview: build failed");
-                on_result(this, None, window, cx);
+            if !attached {
+                log::error!(
+                    "webview: 親ビューがウィンドウに載らず WebView を作れなかった（{MAX_ATTEMPTS} 回試行）"
+                );
+                let _ = weak.update_in(cx, |this, window, cx| on_result(this, None, window, cx));
+                return;
             }
+            log::info!("webview: 親ビューがウィンドウに載ったので作る（{attempts} 回目で載った）");
+            let _ = weak.update_in(cx, |this, window, cx| {
+                // ★build の直前にもう一度判定する。ループで true でもここの時点で false なら
+                // 「ガードと build が食い違っている」＝ lb-wry の `window().unwrap()` で落ちる。
+                // 判定と build が同じクロージャ内なので、ここが唯一の真実になる。
+                if !login_view_is_in_window(window) {
+                    log::error!(
+                        "webview: build 直前の判定が false（{attempts} 回目で載ったのに build できない）"
+                    );
+                    let _ =
+                        weak.update_in(cx, |this, window, cx| on_result(this, None, window, cx));
+                    return;
+                }
+                // `Window` には同名の固有メソッド（gpui の `AnyWindowHandle` を返す）が
+                // あるため、生のハンドルを返すトレイトメソッドを明示的に選ぶ。
+                use raw_window_handle::HasWindowHandle;
+                // ★`build` ではなく **`build_as_child`**。`build` は `is_child=false` で生成され、
+                // （lb-wry wkwebview/mod.rs:634-651）`ns_window.setContentView(parent_view)` で
+                // **ウィンドウの contentView を wry の親ビューへ差し替える**（gpui のビューが窓から
+                // 外れる）。`Drop` は `removeFromSuperview` だけで contentView を戻さないため、
+                // 一時 WebView（ログアウト時の保存データ消去）を捨てた後に**空の contentView が残り
+                // 画面が真っ黒になる**（実測）。`build_as_child` は `ns_view.addSubview` だけで
+                // contentView に触らない。
+                let built = HasWindowHandle::window_handle(window)
+                    .ok()
+                    .and_then(|handle| build().build_as_child(&handle).ok());
+                match built {
+                    Some(webview) => {
+                        let entity = attach_webview(webview, initial_url, window, cx);
+                        on_result(this, Some(entity), window, cx);
+                    }
+                    None => {
+                        log::error!("webview: build failed");
+                        on_result(this, None, window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+/// ログイン WebView を作る前に、親の NSView が**実際にウィンドウに属しているか**を確かめる。
+///
+/// `lb-wry` は `ns_view.window().unwrap()` を通るため、属していない（nil）まま渡すと
+/// アプリごと abort する（lb-wry 0.53.3 の wkwebview/mod.rs:383）。
+#[cfg(not(windows))]
+fn login_view_is_in_window(window: &mut Window) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return false;
+    };
+    match handle.as_raw() {
+        RawWindowHandle::AppKit(appkit) => {
+            // SAFETY: raw-window-handle の AppKit ハンドルが返す `ns_view` は有効な NSView。
+            // ここでは読み取り（`-window`）だけを行い、nil かどうかだけを見る。
+            unsafe { ns_view_has_window(appkit.ns_view.as_ptr()) }
         }
+        _ => false,
+    }
+}
+
+/// NSView がウィンドウに属しているか（`[view window] != nil`）。
+///
+/// **Cargo の依存は足さない**。`objc2` を足すと feature 統合で gpui 側の描画が壊れる
+/// （実測: メイン領域が真っ黒・要素は a11y に正しい座標で居るのに 1 ピクセルも描かれない）。
+/// `objc_msgSend` を直接呼ぶだけなら依存は不要。
+///
+/// # Safety
+/// `view` は有効な `NSView`（または nil）でなければならない。
+#[cfg(target_os = "macos")]
+unsafe fn ns_view_has_window(view: *mut std::ffi::c_void) -> bool {
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        fn objc_msgSend(obj: *mut std::ffi::c_void, sel: *mut std::ffi::c_void)
+            -> *mut std::ffi::c_void;
+    }
+    if view.is_null() {
+        return false;
+    }
+    // SAFETY: 呼び出し側の契約（有効な NSView）を満たしている。`window` は引数を取らない。
+    unsafe {
+        let sel = sel_registerName(c"window".as_ptr());
+        !objc_msgSend(view, sel).is_null()
     }
 }
 
@@ -261,7 +376,12 @@ fn attach_webview(
         view.load_url(initial_url);
         view.hide();
     });
-    log::debug!("webview: 添付完了（initial_url={initial_url}）");
+    let bounds = window.bounds();
+    log::debug!(
+        "webview: 添付完了（initial_url={initial_url}, window={}x{}）",
+        bounds.size.width.as_f32(),
+        bounds.size.height.as_f32()
+    );
     entity
 }
 
@@ -322,6 +442,14 @@ pub(crate) enum CheckStep {
     Stop,
     /// まだ収集しない（WebView 未生成 / URL が対象外）→ 次の tick へ。
     Wait,
+    /// **借用の外**で、この URL を WebView に開かせてから次の tick へ（収集はまだしない）。
+    ///
+    /// BOOTH のセッションは `booth.pm` で確立するが、購入ライブラリ
+    /// (`accounts.booth.pm/library`) はプラザ側の Cookie を要求する。ブラウザなら
+    /// ライブラリを開いた時点で SSO がそれを発行するため、WebView でも
+    /// **一度ライブラリを開いてから**集める必要がある（実測: booth.pm だけで集めると
+    /// `accounts.booth.pm` 向けが 0 件になり、同期が「ログインページを受信」で失敗した）。
+    Visit(CheckTick, &'static str),
     /// **借用の外**で Cookie を集めてから `finish_check` を呼ぶ。
     Collect(CheckTick),
 }
@@ -334,7 +462,7 @@ pub(crate) struct CheckTick {
 
 /// WebView から収集元ごとに Cookie を集める。**必ず gpui の借用の外から呼ぶ。**
 ///
-/// `cookies_for_url` は内部で `webview2_com::wait_with_pump` を呼び、**Windows のメッセージ
+/// `cookies()`（`cookies_for_url` も同じ）は内部で `webview2_com::wait_with_pump` を呼び、**Windows のメッセージ
 /// ループを回す**。その間に gpui は窓更新・前景タスクを走らせるため、借用を持ったまま呼ぶと
 /// `RefCell already borrowed` で落ちる（`AsyncApp::update_window` が `try_borrow_mut()` に
 /// 失敗する）。`WebViewHandle` をタスクへ渡し、**借用の外**で呼ぶことでこれを避ける。
@@ -344,27 +472,103 @@ pub(crate) fn collect_session_cookies(
     site: &str,
 ) -> CollectedCookies {
     let mut collected: CollectedCookies = BTreeMap::new();
-    for url in origins {
-        let cookies = webview.raw().cookies_for_url(url).unwrap_or_default();
-        log::debug!("{site} login: cookies_for_url({url}) -> {}", cookies.len());
-        let Ok(parsed) = thundoku_core::download_url::parse(url) else {
-            continue;
+    // 問い合わせ URL ごとに `cookies_for_url` を呼ぶと、**`Path` の合わない Cookie を取り落とす**。
+    // 実測: `https://accounts.booth.pm/library` では 0 件だったのに、`https://booth.pm/ja` では
+    // 購入ライブラリのセッション（`_plaza_session_*`）が 4 件返っていた。WebView が保持して
+    // いる**全 Cookie** を取り、宛先ごとの選別は `HostScopedCookies::header_for_url` の属性
+    // 判定へ任せる（`Path` / `Secure` / 期限をそこが見る）。
+    let all = webview.raw().cookies().unwrap_or_default();
+    log::debug!("{site} login: cookies() -> {} 件", all.len());
+    // `Domain` 無し（host-only）の Cookie は由来ホストを引けないので、起点 URL のホストへ置く。
+    // `Domain` 付きは自分の `Domain`（`booth.pm` / `accounts.booth.pm` 等）へ置く。宛先が
+    // サブドメインでも載るよう、照会側（`header_for_url`）が境界つきで一致を見る。
+    // 起点のホスト（収集した Cookie をどの起点へ寄せるか / 関係ないサイトの Cookie を落とすか）
+    let origin_hosts: Vec<String> = origins
+        .iter()
+        .filter_map(|url| thundoku_core::download_url::parse(url).ok())
+        .map(|parsed| parsed.host)
+        .collect();
+    let fallback_host = origins
+        .first()
+        .and_then(|url| thundoku_core::download_url::parse(url).ok())
+        .map(|parsed| parsed.host.to_string())
+        .unwrap_or_default();
+    for cookie in all {
+        let candidate = cookie_entry(&cookie);
+        // どの Cookie がどの属性で入っているかを残す（取り落としの調査のため）。
+        // **値は絶対に出さない**（セッション秘密。かつ長すぎて肝心の domain が切れる）。
+        log::debug!(
+            "{site} login: cookie name={:?} domain={:?} path={:?} secure={} expires={:?}",
+            candidate.name,
+            candidate.domain,
+            candidate.path,
+            candidate.secure,
+            candidate.expires
+        );
+        // ★キーは「収集元（origins）のホスト」にする。Cookie 自身の `Domain` をキーにすると、
+        //   `HostScopedCookies::value(host, name)`（完全一致の照会。`DlsiteSession` 等の
+        //   ログイン判定が使う）が引けなくなり、**ログイン済みなのに「未認証」と判定されて
+        //   モーダルが閉じない**（実測: DLsite で発生）。宛先がサブドメインでも載るかどうかは
+        //   `header_for_url` が Cookie の `Domain` 属性で判定するので、ここでは起点に寄せる。
+        // ★`Domain` が無い（host-only）ときだけ起点の最初へ置く。**どの起点にも属さない
+        //   サイトの Cookie は捨てる**（`cookies()` はデータストア全体を返すので、
+        //   DLsite のログイン収集に他サイトの Cookie が混ざる。同名 Cookie（`__cf_bm` 等）が
+        //   衝突して `cookies_count()` や `value(host, name)` を汚す）。
+        let host = match candidate.domain.as_deref() {
+            None => fallback_host.clone(),
+            Some(_) => match cookie_home_origin(&candidate, &origin_hosts) {
+                Some(origin) => origin.clone(),
+                None => continue,
+            },
         };
-        let entry = collected.entry(parsed.host.to_string()).or_default();
-        for cookie in cookies {
-            let candidate = cookie_entry(&cookie);
-            // 同名でも `Path` / `Domain` が違えば別の Cookie。同じ組み合わせだけ置き換える。
-            match entry.iter_mut().find(|existing| {
-                existing.name == candidate.name
-                    && existing.path == candidate.path
-                    && existing.domain == candidate.domain
-            }) {
-                Some(existing) => *existing = candidate,
-                None => entry.push(candidate),
-            }
+        let entry = collected.entry(host).or_default();
+        // 同名でも `Path` / `Domain` が違えば別の Cookie。同じ組み合わせだけ置き換える。
+        match entry.iter_mut().find(|existing| {
+            existing.name == candidate.name
+                && existing.path == candidate.path
+                && existing.domain == candidate.domain
+        }) {
+            Some(existing) => *existing = candidate,
+            None => entry.push(candidate),
         }
     }
+    // `cookies()` は**データストア全体**（この WebView が触れた全サイト）を返すため、起点
+    // サイトと無関係な Cookie まで保存すると `logged_in()` や件数が偽陽性になる。起点ホストと
+    // **親子関係にある**ドメインだけ残す（実測: 購入ライブラリの `_plaza_session_*` は
+    // `booth.pm` に host-only で入るので、`booth.pm` は残り、他サイトの分は落ちる）。
+    collected.retain(|host, _| host_is_related_to_any(host, &origin_hosts));
     collected
+}
+
+/// `cookies()` が返した Cookie を、どの収集元ホストへ寄せるかを決める。
+///
+/// **Cookie 自身の `Domain` をキーにしてはいけない**: `HostScopedCookies::value(host, name)`
+/// （完全一致の照会）が引けず、`DlsiteSession` などのログイン判定が「未認証」のままになって
+/// モーダルが閉じない（実測）。`Domain` 属性が起点に一致する**最初の起点**へ寄せる。
+/// どの起点にも一致しない Cookie（無関係なサイト）は `None`（後段の `retain` で落ちる）。
+fn cookie_home_origin<'a>(
+    cookie: &CookieEntry,
+    origin_hosts: &'a [String],
+) -> Option<&'a String> {
+    origin_hosts.iter().find(|origin| {
+        cookie.domain.as_deref().is_some_and(|domain| {
+            let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+            host_within(origin, &domain) || host_within(&domain, origin)
+        })
+    })
+}
+
+/// Cookie のドメインが、収集元ホストのいずれかと**親子関係**にあるか（どちらが親でもよい）。
+///
+/// `cookies()` は**データストア全体**（その WebView が触れた全サイトの Cookie）を返すため、
+/// 起点サイトと無関係な Cookie まで保存すると `logged_in()` や件数が偽陽性になる。実測では
+/// 購入ライブラリの `_plaza_session_*` が `booth.pm` に host-only で入るので、起点そのもの
+/// だけでなく**親**も残す必要がある（子の `accounts.booth.pm` も同様に残る）。
+/// ラベルの境界を見るので `evilbooth.pm` は残らない。
+fn host_is_related_to_any(host: &str, origin_hosts: &[String]) -> bool {
+    origin_hosts
+        .iter()
+        .any(|origin| host_within(host, origin) || host_within(origin, host))
 }
 
 /// WebView（wry）の Cookie を、属性つきの保存用 Cookie へ変換する。
@@ -395,6 +599,49 @@ pub(crate) fn cookie_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cookies()` が返す Cookie は**Cookie 自身の `Domain` ではなく起点ホストへ寄せる**。
+    ///
+    /// 完全一致の照会（`value(host, name)`）が引けなくなり、ログイン済みでも「未認証」と
+    /// 判定されてモーダルが閉じない（実測: DLsite のログインダイアログが消えなかった）。
+    #[test]
+    fn cookie_home_origin_prefers_the_matching_origin() {
+        let origins = ["www.dlsite.com".to_string(), "login.dlsite.com".to_string()];
+        let cookie = |domain: &str| {
+            CookieEntry::with_attributes(
+                "v".to_string(),
+                Some(domain.to_string()),
+                Some("/".to_string()),
+                true,
+                None,
+            )
+            .named("__DLsite_SID")
+        };
+
+        // host-only / 親ドメイン のどちらも最初の起点へ寄る
+        assert_eq!(cookie_home_origin(&cookie("www.dlsite.com"), &origins), Some(&origins[0]));
+        assert_eq!(cookie_home_origin(&cookie(".dlsite.com"), &origins), Some(&origins[0]));
+        // 起点でないサイトの Cookie は寄せない（後段の retain で落ちる）
+        assert_eq!(cookie_home_origin(&cookie("techbookfest.org"), &origins), None);
+    }
+
+    /// `cookies()` はデータストア全体を返すため、起点サイトと親子関係にあるドメインだけ残す。
+    ///
+    /// 実測: 購入ライブラリの `_plaza_session_*` は `booth.pm` に host-only で入るので、
+    /// 「起点そのもの」だけでは落ちてしまう（親も残す必要がある）。無関係なサイトは落とす。
+    #[test]
+    fn keeps_only_domains_related_to_the_origins() {
+        let origins = ["booth.pm".to_string(), "accounts.pixiv.net".to_string()];
+
+        // 起点そのもの / 起点の親 / 起点の子は残す
+        assert!(host_is_related_to_any("booth.pm", &origins));
+        assert!(host_is_related_to_any("accounts.booth.pm", &origins));
+        assert!(host_is_related_to_any("pixiv.net", &origins));
+        // 無関係なサイト・ラベル境界を偽装したものは落とす
+        assert!(!host_is_related_to_any("techbookfest.org", &origins));
+        assert!(!host_is_related_to_any("evilbooth.pm", &origins));
+        assert!(!host_is_related_to_any("booth.pm.evil.example.com", &origins));
+    }
 
     /// 閉じるボタンは**モーダルの右上・すぐ外側**（技術書典のログインモーダルと同じ位置）。
     ///
