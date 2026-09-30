@@ -108,6 +108,10 @@
    ※ `GoogleClient::authorize()` はブラウザを開いて最後まで実行する版で、アプリ経路は `begin_authorize`
    （URL を作る）→ ブラウザで開く → `wait_for_code`（ループバック受信）→ `complete_authorize`
    （トークン交換〜プロフィール）に分ける `crates/core/src/google.rs`。
+   **開く呼び出しはバックグラウンドで行う**: `ShellExecuteW` はメッセージポンプを回すことがあり、
+   モーダルの生成中（＝描画中）に呼ぶと保留中のタスクが再入して `RefCell already borrowed` で
+   アプリが落ちる（実測 2026-09-30。ログは `deferring re-entrant draw` ×6 の直後に panic）
+   `crates/app/src/views/google_login.rs`。
 7. `wait_for_code()` が別スレッドで `receive_callback` を実行する。**クライアントのロックは取らない**
    （待ちは最大 300 秒あり、保持すると UI 側の `google.lock()` が止まり、ログインモーダルの ✕ も
    効かなくなる）。ロックは `complete_authorize` のときだけ取る `crates/app/src/views/google_login.rs`, `crates/core/src/google.rs`。
@@ -347,7 +351,7 @@
 | 設定画面「今すぐ同期」 | `SettingsView::sync_drive_now` を実行（Google 未ログインならボタン disabled） | `crates/app/src/views/settings.rs:769-830`, `:1853-1863` |
 | Google ログイン直後 | `drive.last_sync_at` が未設定なら「Google Drive と同期しますか？」ダイアログ → 「同期する」で `drive.sync.enabled="true"` を保存し即同期 | `crates/app/src/workspace.rs:195-209`, `:1406-1451` |
 | チェックリストのポーリング | 変化があったときだけ `sync_drive_now` を呼ぶ（無変化ならノーコスト） | `crates/app/src/workspace.rs:294-296` |
-| ウィンドウ終了時 | バックアップ対象に変更があれば「アップロードして終了」を提示し、`db_path` 付きで同期してから終了 | `crates/app/src/workspace.rs:750-806`, `:1467-1472` |
+| ウィンドウ終了時 | バックアップ対象に変更があれば「アップロードして終了」を提示し、`db_path` 付きで同期してから終了。**失敗したら終了しない**（`log::error!` だけで捨てない）: 進行中の通知をエラー通知で置き換え、`exit_checked` を false に戻して次の終了でもう一度確認できるようにする。Google のトークン失効なら共通の後始末（`crate::app_state::handle_google_auth_expiry`。設定の同期と同じ）でトークンを捨てるが、**認証モーダルは開かない**（終了処理の描画中にモーダルを作ると `RefCell already borrowed` で落ちる。実測 2026-09-30）。案内の文言でアカウントメニューからのログインを促す | `crates/app/src/workspace.rs:750-806`, `:1467-1472`, `:1562-1619`; `crates/app/src/app_state.rs`（`handle_google_auth_expiry` / `open_google_login`） |
 | 起動時 | ログイン済み かつ `drive.sync.enabled` が `"true"`/`"1"` かつ `drive.sync.folder_id` があり、`inspect_drive_backup` が「Drive 側が最後のアップロードから動いた」と判定したときだけ復元確認ダイアログ（ローカル側だけが進んだ場合は出さない）。v3 の封筒は keyring の PRK で復号してから比較する | `crates/app/src/workspace.rs:582-673`, `:1359-1364` |
 | 暗号化バックアップだが鍵が無い | 起動時の `inspect_drive_backup` は内容を比較せず復元確認を出さない（`local_differs = false`）。復元を実行しても `SyncError::BackupKeyRequired` で失敗し**1 行も取り込まない**（`docs/spec/10-pack-keys.md` §11.4） | `crates/core/src/drive/sync.rs:538-569`, `:638-687` |
 | OFF スイッチ | 設定のトグルで `drive.sync.enabled` に `"true"`/`"false"` を保存（起動時読み込み時に `"true"` のみ有効） | `crates/app/src/views/settings.rs:754-766`, `:133` |

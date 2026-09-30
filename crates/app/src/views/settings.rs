@@ -137,10 +137,6 @@ pub(crate) const WHEEL_DIRECTION_UP: &str = "up-to-next";
 /// Drive 同期タスクの結果（失敗は利用者向けの文言と復元導線つき）。
 type SyncTaskResult = Result<sync::SyncOutcome, crate::pack_keys::SyncFailure>;
 
-/// Google の再ログインが必要なときの案内（生の `invalid_grant` JSON は出さない）。
-const GOOGLE_AUTH_EXPIRED_NOTICE: &str = "Google のログインが無効になりました（トークンが失効または取り消されています）。\
-     もう一度ログインしてください";
-
 /// ログアウト時に**永続値の削除に失敗した**ときの通知文。
 ///
 /// 「ログアウトしました」とだけ出すと、共有端末などで「消えた」と誤解させる
@@ -178,15 +174,6 @@ fn tbf_logout_message(
         crate::app_state::ToastKind::Info
     };
     (kind, message)
-}
-
-/// Google の認証が失効したことを示すメッセージか。
-///
-/// 同期のエラーは `String` に畳まれて渡ってくるため、core の `GoogleError` の文言で判定する
-/// （`RefreshTokenRevoked` / `NoRefreshToken` はどちらも再ログインが必要）。core 側の文言が
-/// 変わったらテストが落ちるようにしてある。
-fn is_google_auth_expired(message: &str) -> bool {
-    message.contains("re-authorize required")
 }
 
 /// バイト数を表示用の文字列にする（1MB 未満は KB。小さい pack を「0 MB」と出さない）。
@@ -1381,49 +1368,18 @@ impl SettingsView {
     ///
     /// 保存済みトークンを破棄し、再ログインの導線を自動で出す。画面に出す日本語の文言を返す
     /// （失効していなければ `None`）。`invalid_grant` の生 JSON は画面に出さない。
+    /// 後始末は終了時のアップロードと共通にする（`crate::app_state::handle_google_auth_expiry`）。
     fn handle_google_auth_expiry(
         &mut self,
         message: &str,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        // core の `RefreshTokenRevoked`（失効・取り消し）と `NoRefreshToken` は
-        // どちらも再ログインが必要。
-        if !is_google_auth_expired(message) {
+        if !crate::app_state::handle_google_auth_expiry(message, cx) {
             return None;
         }
-        log::warn!("google auth expired: {message}");
-        {
-            let state = AppState::global(cx);
-            if let Some(client) = state.google.lock().as_mut() {
-                client.logout();
-            }
-            crate::app_state::clear_google_profile(cx);
-            state
-                .google_logout_done
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            // 失効したトークンを keyring に残さない（削除は背景で、UI を固めない）。
-            // プロフィールの控えも消す（古い sub で所有者判定を続けない）。
-            let store = state.secrets.clone();
-            cx.background_spawn(async move {
-                let _ = store.delete(secrets::USER_GOOGLE);
-                let _ = thundoku_core::google::delete_saved_profile(&store);
-            })
-            .detach();
-        }
-        // 再ログインの導線を自動で出す。
-        //
-        // `dispatch_action` で認証モーダルを開くと、WebView 作成時にウィンドウの RefCell を
-        // 再入してアプリが固まる（設定画面のログインボタンと同じ理由）。本棚に切り替えて
-        // から `Workspace::open_auth` を呼ぶ経路にする。
-        cx.defer(move |cx| {
-            let ws_weak = AppState::global(cx).workspace.lock().clone();
-            if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
-                ws.update(cx, |ws, cx| {
-                    ws.open_auth(cx, AuthProvider::Google);
-                });
-            }
-        });
-        Some(GOOGLE_AUTH_EXPIRED_NOTICE.to_string())
+        // 設定画面からの同期は描画の外なので、そのまま再ログインの導線を出してよい。
+        crate::app_state::open_google_login(cx);
+        Some(crate::app_state::GOOGLE_AUTH_EXPIRED_NOTICE.to_string())
     }
 
     /// 実行中の Drive 同期の中止を要求する（次の進捗で転送を止める）。
@@ -4080,35 +4036,8 @@ mod tests {
         });
     }
 
-    /// Google のトークン失効（`invalid_grant`）を見逃さないこと。
-    ///
-    /// 同期のエラーは `String` に畳まれて渡ってくるため core の文言で判定している。
-    /// core 側の文言が変わったらこのテストが落ちる（＝気づける）ようにしておく。
-    #[test]
-    fn detects_google_token_expiry_from_core_messages() {
-        use thundoku_core::google::GoogleError;
-
-        assert!(is_google_auth_expired(
-            &GoogleError::RefreshTokenRevoked.to_string()
-        ));
-        assert!(is_google_auth_expired(
-            &GoogleError::NoRefreshToken.to_string()
-        ));
-        assert!(!is_google_auth_expired(
-            &GoogleError::NotAuthorized.to_string()
-        ));
-        assert!(!is_google_auth_expired("network error: timed out"));
-
-        // 案内は日本語で、生の応答（JSON）を含まない
-        assert!(
-            GOOGLE_AUTH_EXPIRED_NOTICE.contains("ログイン"),
-            "案内が日本語でない: {GOOGLE_AUTH_EXPIRED_NOTICE}"
-        );
-        assert!(
-            !GOOGLE_AUTH_EXPIRED_NOTICE.contains('{'),
-            "案内に生の応答が混ざっている: {GOOGLE_AUTH_EXPIRED_NOTICE}"
-        );
-    }
+    // Google のトークン失効の判定・後始末のテストは `crate::app_state::tests` にある
+    // （終了時のアップロードと共通の後始末を使う）。
 
     /// 非表示の本を 1 冊 seed する（設定画面の「非表示にした本」一覧に出る）。
     fn seed_hidden_item(cx: &mut TestAppContext, site_id: &str, database_id: &str) {

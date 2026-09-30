@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use gpui_kit::ReadGlobal as _;
-use gpui_kit::{App, Bounds, Global, Point, Size, Window, WindowBounds, px};
+use gpui_kit::{App, AppContext as _, Bounds, Global, Point, Size, Window, WindowBounds, px};
 use parking_lot::Mutex;
 use thundoku_core::booth::BoothSession;
 use thundoku_core::db;
@@ -670,6 +670,69 @@ pub fn clear_google_profile(cx: &App) {
     log::info!("google profile: 状態をクリア");
 }
 
+/// Google の認証が失効したことを示すメッセージか。
+///
+/// 同期のエラーは `String` に畳まれて渡ってくるため、core の `GoogleError` の文言で判定する
+/// （`RefreshTokenRevoked` / `NoRefreshToken` はどちらも再ログインが必要）。core 側の文言が
+/// 変わったらテストが落ちるようにしてある。
+pub fn is_google_auth_expired(message: &str) -> bool {
+    message.contains("re-authorize required")
+}
+
+/// Google の再ログインが必要なときの案内（生の `invalid_grant` JSON は出さない）。
+pub const GOOGLE_AUTH_EXPIRED_NOTICE: &str = "Google のログインが無効になりました（トークンが失効または取り消されています）。\
+     もう一度ログインしてください";
+
+/// Google の認証が失効していたときの後始末（失効していなければ `false`）。
+///
+/// 保存済みトークンを破棄する（失効したトークンを残すと次の同期も失敗し続ける）。
+/// **認証モーダルはここでは開かない**（呼び出し側の判断。描画や終了処理の途中で開くと
+/// 再入でアプリが落ちる場所があるため、開く側だけが [`open_google_login`] を呼ぶ）。
+/// 案内の文言は呼び出し側が出す。
+pub fn handle_google_auth_expiry(message: &str, cx: &mut App) -> bool {
+    if !is_google_auth_expired(message) {
+        return false;
+    }
+    log::warn!("google auth expired: {message}");
+    let state = AppState::global(cx);
+    if let Some(client) = state.google.lock().as_mut() {
+        client.logout();
+    }
+    clear_google_profile(cx);
+    state
+        .google_logout_done
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // 失効したトークンを keyring に残さない（削除は背景で、UI を固めない）。
+    // プロフィールの控えも消す（古い sub で所有者判定を続けない）。
+    let store = state.secrets.clone();
+    cx.background_spawn(async move {
+        let _ = store.delete(thundoku_core::secrets::USER_GOOGLE);
+        let _ = thundoku_core::google::delete_saved_profile(&store);
+    })
+    .detach();
+    true
+}
+
+/// 再ログインの導線（Google の認証モーダル）を開く。
+///
+/// `dispatch_action` で開くと、WebView 作成時にウィンドウの RefCell を再入してアプリが固まる
+/// （設定画面のログインボタンと同じ理由）。`defer` を挟み、本棚に切り替えてから
+/// `Workspace::open_auth` を呼ぶ経路にする。
+///
+/// **終了処理の途中（終了時のアップロードの失敗）からは呼ばない**: 描画が終わる前に
+/// モーダルを作ると `Workspace` の再入でアプリが落ちる（実測 2026-09-30）。あちらは通知だけで
+/// 案内し、利用者にアカウントメニューからログインしてもらう。
+pub fn open_google_login(cx: &mut App) {
+    cx.defer(move |cx| {
+        let ws_weak = AppState::global(cx).workspace.lock().clone();
+        if let Some(ws) = ws_weak.and_then(|w| w.upgrade()) {
+            ws.update(cx, |ws, cx| {
+                ws.open_auth(cx, crate::views::auth::AuthProvider::Google);
+            });
+        }
+    });
+}
+
 /// アプリ全体の通知を出す（Workspace が gpui-kit の Notification に流す。既定 5 秒で自動消滅）。
 /// トーストホスト（workspace）を notify して再レンダリングを促す。
 /// 通知の種別（gpui-kit の `NotificationType` に対応）。
@@ -1009,6 +1072,68 @@ mod tests {
         PROFILE_SLOT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Google のトークン失効（`invalid_grant`）を見逃さないこと。
+    ///
+    /// 同期のエラーは `String` に畳まれて渡ってくるため core の文言で判定している。
+    /// core 側の文言が変わったらこのテストが落ちる（＝気づける）ようにしておく。
+    #[test]
+    fn detects_google_token_expiry_from_core_messages() {
+        use thundoku_core::google::GoogleError;
+
+        assert!(is_google_auth_expired(
+            &GoogleError::RefreshTokenRevoked.to_string()
+        ));
+        assert!(is_google_auth_expired(
+            &GoogleError::NoRefreshToken.to_string()
+        ));
+        assert!(!is_google_auth_expired(
+            &GoogleError::NotAuthorized.to_string()
+        ));
+        assert!(!is_google_auth_expired("network error: timed out"));
+
+        // 案内は日本語で、生の応答（JSON）を含まない
+        assert!(
+            GOOGLE_AUTH_EXPIRED_NOTICE.contains("ログイン"),
+            "案内が日本語でない: {GOOGLE_AUTH_EXPIRED_NOTICE}"
+        );
+        assert!(
+            !GOOGLE_AUTH_EXPIRED_NOTICE.contains('{'),
+            "案内に生の応答が混ざっている: {GOOGLE_AUTH_EXPIRED_NOTICE}"
+        );
+    }
+
+    /// 失効したトークンは**捨てる**（残すと次の同期も失敗し続ける）。失効と関係ないエラーでは触らない。
+    #[gpui_kit::test]
+    async fn auth_expiry_clears_the_saved_credentials(cx: &mut gpui_kit::TestAppContext) {
+        let _guard = lock_profile_slot();
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+
+        let handled = cx.update(|cx| {
+            handle_google_auth_expiry(
+                &thundoku_core::google::GoogleError::RefreshTokenRevoked.to_string(),
+                cx,
+            )
+        });
+        assert!(handled, "失効として扱われていない");
+        cx.read(|cx| {
+            let state = AppState::global(cx);
+            assert!(
+                state
+                    .google_logout_done
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "失効したトークンを捨てる印が立っていない"
+            );
+            assert!(
+                state.google_profile.lock().is_none(),
+                "プロフィールの控えが残っている"
+            );
+        });
+
+        let handled = cx.update(|cx| handle_google_auth_expiry("network error: timed out", cx));
+        assert!(!handled, "失効でないエラーでトークンを捨てている");
     }
 
     /// 前回のログアウトで削除できなかった資格情報は、**削除に成功するまで復元しない**。

@@ -68,13 +68,28 @@ impl GoogleLoginView {
                         .next()
                         .unwrap_or("https://accounts.google.com/o/oauth2/v2/auth")
                 );
-                if let Err(error) = thundoku_core::google::open_browser(&pending.url) {
-                    // 自動で開けなくても、URL を出せば手で続行できる。
-                    log::warn!("google login: ブラウザを開けません: {error}");
-                    this.error = Some(
-                        "ブラウザを自動で開けませんでした。下の URL を開いてください。".to_string(),
-                    );
-                }
+                // ブラウザを開くのは**バックグラウンド**で行う。`ShellExecuteW` はメッセージ
+                // ポンプを回すことがあり、モーダルの生成中（＝描画中）に呼ぶと保留中のタスクが
+                // 再入して `RefCell already borrowed` でアプリが落ちる（実測 2026-09-30）。
+                let url = pending.url.clone();
+                cx.spawn(async move |this, cx| {
+                    let opened = cx
+                        .background_executor()
+                        .spawn(async move { thundoku_core::google::open_browser(&url) })
+                        .await;
+                    if let Err(error) = opened {
+                        // 自動で開けなくても、URL を出せば手で続行できる。
+                        log::warn!("google login: ブラウザを開けません: {error}");
+                        let _ = this.update(cx, |this, cx| {
+                            this.error = Some(
+                                "ブラウザを自動で開けませんでした。下の URL を開いてください。"
+                                    .to_string(),
+                            );
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
                 this.start_finish(pending, google, cx);
             }
             None => {

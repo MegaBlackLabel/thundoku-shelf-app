@@ -385,6 +385,9 @@ backup_hash_key   = HKDF-SHA256(ikm = PRK, salt = b"thundoku-backup:v1", info = 
   `content_hmac` / 差分判定が安定する（決定論的）。
   - 形式の明示: トップレベルに **`"user_data": "plaintext" | "sealed"`** を書く。
     取込側は **`plaintext` のときだけ**その端末の鍵で暗号化し直す（欠落時は `sealed` 扱い）。
+    暗号化し直すかの判定は**鍵で値を復号して行う**（`owner_sub` は prefix の無い生 base64 なので、
+    桁数が 4 の倍数の平文 sub を形状だけで「暗号文」と誤ると、平文のまま DB に入り復号失敗で
+    行が非表示になる）。
     表ではないので `canonicalize_json` の比較対象には入らない。
   - v2（PRK 不在で平文アップロード）は **`sealed`** のまま＝**暗号文を Drive に置く**
     （素のユーザーデータを上げない）。

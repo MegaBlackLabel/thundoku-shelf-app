@@ -74,6 +74,25 @@ fn exit_upload_progress_text(progress: &thundoku_core::drive::sync::SyncProgress
     crate::views::settings::sync_progress_compact(progress)
 }
 
+/// 終了時アップロードの失敗を利用者に見せる文言（純関数）。
+///
+/// 「アップロードして終了できなかった」ことと原因を出す。Google のトークン失効
+/// （`expired`）なら再ログインの案内を添える。
+///
+/// **ここから認証モーダルは開かない**: 終了処理の描画が終わる前にモーダルを作ると
+/// `RefCell already borrowed` でアプリが落ちる（実測 2026-09-30）。案内の文言で
+/// アカウントメニューからのログインを促す。
+fn exit_upload_failure_message(error: &str, expired: bool) -> String {
+    if expired {
+        format!(
+            "アップロードして終了できませんでした。{}",
+            crate::app_state::GOOGLE_AUTH_EXPIRED_NOTICE
+        )
+    } else {
+        format!("アップロードして終了できませんでした: {error}")
+    }
+}
+
 /// パスフレーズ未設定の警告の本文（ログイン直後に 1 回だけ出す）。
 ///
 /// 「いま危ない状態である」ことと、**パスフレーズがあれば端末を失っても復元できる**
@@ -1559,12 +1578,16 @@ impl Workspace {
                         .await;
                 }
             }
-            // アップロードは best-effort（失敗しても終了する）が、無言で捨てない:
-            // 「アップロードしたつもり」のまま終了すると、次回起動で毎回復元確認が
-            // 出る原因を後から追えない。
-            if let Err(error) = task.await {
-                log::error!("exit upload failed: {error}");
-            }
+            // アップロードが失敗したら**終了しない**。黙って終了すると「アップロードしたつもり」の
+            // まま次回起動を迎える（実測: リフレッシュトークンの失効で 1 件も送られないまま
+            // 終了し、利用者は気づけなかった）。
+            let failure = match task.await {
+                Ok(()) => None,
+                Err(error) => {
+                    log::error!("exit upload failed: {error}");
+                    Some(error)
+                }
+            };
             // 進捗の文言を片付ける（通知はもうすぐ消えるが、残しても意味がない）。
             handle.update(cx, |this, cx| {
                 this.exit_progress.update(cx, |progress, cx| {
@@ -1577,9 +1600,29 @@ impl Workspace {
                     .exit_uploading
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 sync_app_menus(cx);
+                let Some(error) = failure else {
+                    cx.quit();
+                    return;
+                };
+                // 次の終了でももう一度確認ダイアログを出せる状態に戻す（`exit_checked` を
+                // 立てたままだと、閉じ直しても確認なしで終了してしまう）。
+                AppState::global(cx)
+                    .exit_checked
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                // 失効ならトークンを捨てる（`handle_google_auth_expiry`。設定の同期と共通）。
+                // **認証モーダルはここでは開かない**: 終了処理の描画が終わる前にモーダルを作ると
+                // `RefCell already borrowed` でアプリが落ちる（実測 2026-09-30）。案内の文言で
+                // アカウントメニューからのログインを促す。
+                let expired = crate::app_state::handle_google_auth_expiry(&error, cx);
+                let message = exit_upload_failure_message(&error, expired);
+                // 進行中（消えない）通知を、失敗の通知で置き換える。
+                crate::app_state::set_toast_kind(
+                    cx,
+                    crate::app_state::ToastKind::Error,
+                    message,
+                );
                 cx.notify();
             });
-            cx.update(|cx| cx.quit());
         })
         .detach();
     }
@@ -3558,6 +3601,25 @@ mod tests {
         assert_eq!(text, "3.0 MB 送信");
         assert!(!text.contains('%'), "{text}");
     }
+
+    /// 終了時アップロードの失敗は「終了できなかった」＋原因を出す。
+    /// 失効なら再ログインの案内を添える（この経路はモーダルを開かないので、案内が唯一の導線）。
+    #[test]
+    fn exit_upload_failure_message_tells_the_user_what_happened() {
+        let expired = super::exit_upload_failure_message(
+            &thundoku_core::google::GoogleError::RefreshTokenRevoked.to_string(),
+            true,
+        );
+        assert!(
+            expired.contains("アップロードして終了できませんでした"),
+            "{expired}"
+        );
+        assert!(expired.contains("もう一度ログインしてください"), "{expired}");
+
+        let other = super::exit_upload_failure_message("Drive 同期が未設定です", false);
+        assert!(other.contains("Drive 同期が未設定です"), "{other}");
+        assert!(!other.contains("ログイン"), "{other}");
+    }
     use super::*;
     use crate::app_state::AppState;
     use crate::app_state::ToastKind;
@@ -4113,6 +4175,55 @@ mod tests {
         });
         draw_frames(visual);
         assert_eq!(notification_count(visual), 2, "2 件目の通知が出ていない");
+    }
+
+    /// 終了時アップロードが失敗したら**アプリを終了しない**。
+    ///
+    /// best-effort のまま黙って終了すると「アップロードしたつもり」のまま次回起動を迎える
+    /// （実測: リフレッシュトークンの失効で 1 件も送られないまま終了し、利用者は気づけなかった）。
+    /// 失敗は見せて、次の終了でもう一度確認できる状態（`exit_checked` を戻す）にする。
+    ///
+    /// 通知は窓を描かずに状態（`toast_*`）で見る: 描画すると通知ホストが
+    /// `clear_toast` で状態を消してしまう（通知そのものへの変換は
+    /// `toast_is_delivered_as_a_notification` が固定する）。
+    #[gpui_kit::test]
+    async fn exit_upload_failure_keeps_the_app_open_and_shows_the_error(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        // テスト環境は `drive.sync.folder_id` が無いので、終了時アップロードは必ず失敗する
+        cx.update(|cx| {
+            ws.update(cx, |this, cx| this.confirm_exit_upload(cx));
+        });
+        for _ in 0..40 {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+
+        cx.read(|cx| {
+            let this = ws.read(cx);
+            assert!(!this.exit_uploading, "アップロード中の表示が残っている");
+            let state = AppState::global(cx);
+            assert!(
+                !state.exit_checked.load(std::sync::atomic::Ordering::SeqCst),
+                "次の終了でもう一度確認できる状態に戻していない"
+            );
+            assert_eq!(
+                *state.toast_kind.lock(),
+                ToastKind::Error,
+                "失敗がエラーとして通知されていない"
+            );
+            assert!(
+                !*state.toast_progress.lock(),
+                "進行中の通知のまま残っている（消えない通知で覆い隠している）"
+            );
+            let message = state.toast_message.lock().clone().unwrap_or_default();
+            assert!(
+                message.contains("アップロードして終了できませんでした"),
+                "失敗したことが分かる文言が出ていない: {message}"
+            );
+        });
     }
 
     /// 進行中の通知には Spinner が出る（終了時のアップロード・取り込み中）。

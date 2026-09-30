@@ -363,11 +363,12 @@ pub fn user_data_is_plaintext(payload: &serde_json::Value) -> bool {
 /// そのままでは他端末で復号できず、取り込んでも値が空になる。バックアップでは**平文で運び**、
 /// 取り込む端末の鍵で暗号化し直す。機密は外側の `SealedEnvelope`（PRK）が担保する。
 ///
-/// 値ベースで判定する（`is_encrypted`）ので、列リストの取りこぼしで復号不能データを作らない。
+/// 開閉は**値ごとに鍵で判定する**（`owner_sub` は `owner::decrypt` が通れば暗号文、それ以外の
+/// 列は `enc:v1:` の有無）ので、列リストの取りこぼしで復号不能データを作らない。
 /// - `owner_sub` は AAD 無し・prefix 無しの生 base64（`owner::encrypt` / `decrypt`）
 /// - それ以外の `enc:v1:` は行キーから作った AAD で `column_crypto` を通す
 ///   （`page_notes` は PK ではなく**自然キー** `book_id/content_id/page`。
-///    `id` を使うと読み出し側と食い違って**付箋が空になる**）
+///   `id` を使うと読み出し側と食い違って**付箋が空になる**）
 fn user_data_row_key(table: &str, row: &Map<String, Value>) -> Option<String> {
     let text = |column: &str| row.get(column).and_then(Value::as_str).map(str::to_owned);
     match table {
@@ -388,11 +389,14 @@ fn user_data_row_key(table: &str, row: &Map<String, Value>) -> Option<String> {
     }
 }
 
-/// 行に「平文のユーザーデータ」が含まれるか（＝端末鍵で暗号化し直す必要があるか）。
+/// 行にユーザーデータ列の値が入っているか（＝端末鍵が要る行か）。
 ///
-/// `owner_sub` は prefix が無い生 base64 なので、**復号を試して失敗したら平文**と判定する。
-/// それ以外は `enc:v1:` の有無で分かる。
-fn has_plaintext_user_data(table: &str, rows: &[Value]) -> bool {
+/// `owner_sub` は prefix が無い生 base64 なので、**鍵無しでは暗号文と平文を区別できない**。
+/// 形状（長さと base64 妥当性）で判定すると、桁数が 4 の倍数の平文 sub を暗号文と誤判定し、
+/// 平文のまま DB に入れてしまう（復号失敗で行が非表示になる）。ここでは「値があるか」だけを
+/// 見て鍵を用意し、暗号化し直すかどうかは鍵を持つ [`seal_user_data_row`] が値ごとに決める
+/// （復号できる＝暗号文は触らない）。
+fn has_user_data_value(table: &str, rows: &[Value]) -> bool {
     let columns = user_data_columns(table);
     if columns.is_empty() {
         return false;
@@ -402,28 +406,12 @@ fn has_plaintext_user_data(table: &str, rows: &[Value]) -> bool {
             return false;
         };
         columns.iter().any(|column| {
-            let Some(text) = object.get(*column).and_then(Value::as_str) else {
-                return false;
-            };
-            if *column == "owner_sub" {
-                // 生 base64 は復号できる（＝暗号文）。鍵を持たずに形状だけで判定する。
-                return !base64_looks_encrypted(text);
-            }
-            // 列暗号は prefix で分かる。空文字（移行前の平文）は触らない。
-            !text.is_empty() && !crate::db::column_crypto::is_encrypted(text)
+            object
+                .get(*column)
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
         })
     })
-}
-
-/// `owner::encrypt` の出力（`B64(IV(12) || ct || tag)`）として妥当そうか。
-///
-/// 鍵を持たずに判定するための形状チェック（長さと base64 妥当性のみ）。
-fn base64_looks_encrypted(text: &str) -> bool {
-    use base64::Engine as _;
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(text) else {
-        return false;
-    };
-    bytes.len() > 12
 }
 
 /// バックアップで平文に開く「端末鍵で暗号化される列」。
@@ -627,10 +615,11 @@ pub fn import_json(
                 }
             }
             // バックアップでは端末ローカル鍵の暗号列が**平文で運ばれている**（v3 封筒）。
-            // この端末の鍵で暗号化し直してから入れる。既に暗号文の値（v2 バックアップ）は
-            // 触らないので後方互換。鍵が要るのは実際に平文が含まれるときだけにする
-            // （鍵リングに触れないテストを壊さないため）。
-            let sealed_rows: Option<Vec<Value>> = if seal_plaintext && has_plaintext_user_data(table, rows) {
+            // この端末の鍵で暗号化し直してから入れる。既に暗号文の値（v2 バックアップ / 他端末の
+            // 暗号文）は値ごとの `seal_user_data_row` が復号を試して触らないので後方互換。
+            // 鍵が要るのは**値が入っているとき**だけにする（暗号文 / 平文の区別は鍵を持ってから
+            // 値を復号して行う。鍵リングに触れないテストを壊さないため）。
+            let sealed_rows: Option<Vec<Value>> = if seal_plaintext && has_user_data_value(table, rows) {
                 let key = match user_key {
                     Some(key) => *key,
                     None => crate::db::column_crypto::db_key()?,
@@ -1449,6 +1438,51 @@ mod tests {
         let sealed = export_json(&src, None, Some(&src_filter), false).unwrap();
         assert!(!sealed.contains("\"owner_sub\":\"A\""), "v2 は平文で載せない");
         assert!(sealed.contains("\"user_data\":\"sealed\""));
+    }
+
+    /// `owner_sub` は prefix の無い生 base64 なので、**鍵無しの形状では暗号文と平文を
+    /// 区別できない**。桁数が 4 の倍数の平文 sub（base64 として妥当な長さ）を暗号文と
+    /// 誤判定すると、平文のまま DB に入り、復号失敗でその本・行が非表示になる。
+    /// 平文で運ばれた `owner_sub` は、値の形によらず取込先の鍵で暗号化し直すこと。
+    #[test]
+    fn export_import_reencrypts_plaintext_owner_sub_of_any_length() {
+        let src_key = [7u8; 32];
+        let dst_key = [6u8; 32];
+        // 21 桁（base64 としては不正な長さ）と 24 桁（妥当な長さ = 形状判定が誤る本命）
+        for sub in ["112233445566778899001", "112233445566778899001122"] {
+            let src = crate::db::test_pool();
+            let owner = crate::owner::encrypt(&src_key, sub);
+            crate::db::block_on(async {
+                sqlx::query("INSERT INTO favorite_tags (tag_name, owner_sub) VALUES ('t', ?1)")
+                    .bind(&owner)
+                    .execute(&src)
+                    .await
+                    .unwrap();
+            });
+            let filter = OwnerFilter {
+                key: &src_key,
+                sub: Some(sub),
+            };
+            let plain = export_json(&src, None, Some(&filter), true).unwrap();
+            assert!(
+                plain.contains(&format!("\"owner_sub\":\"{sub}\"")),
+                "v3 は owner_sub を平文で運ぶ: {plain}"
+            );
+
+            let dst = crate::db::test_pool();
+            import_json(&dst, &plain, Some(&dst_key)).unwrap();
+            let stored: String = crate::db::block_on(
+                sqlx::query_scalar("SELECT owner_sub FROM favorite_tags WHERE tag_name = 't'")
+                    .fetch_one(&dst),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::owner::decrypt(&dst_key, &stored).as_deref(),
+                Some(sub),
+                "sub len {} は取込先の鍵で暗号化し直されるはず（stored={stored}）",
+                sub.len()
+            );
+        }
     }
 
     fn seed_check_item(pool: &SqlitePool, item_id: &str, owner: Option<&str>) {
