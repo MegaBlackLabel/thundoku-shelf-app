@@ -2183,8 +2183,14 @@ impl ImageViewer {
                     .default_value(self.current_page as f32)
             });
             self._page_slider_subscription = Some(cx.observe(&slider, |this, slider, cx| {
-                let value = slider.read(cx).value();
-                let page = value.start().round() as usize;
+                let raw = slider.read(cx).value().start().round() as usize;
+                let count = this.loader.page_count().max(1);
+                // 右綴じ（右→左）は右端が 1 ページ目なので値を反転して読む。
+                let page = if this.page_turn_right_to_left {
+                    (count - 1).saturating_sub(raw)
+                } else {
+                    raw
+                };
                 if page != this.current_page {
                     this.set_page(cx, page);
                 }
@@ -2192,8 +2198,13 @@ impl ImageViewer {
             self.page_slider = Some(slider);
         } else if let Some(slider) = &self.page_slider {
             // 現在ページをスライダーに反映（スライダー操作とのループは set_page の
-            // 同一ページガードで防ぐ）
-            let current = self.current_page as f32;
+            // 同一ページガードで防ぐ）。右綴じはページ順を反転して値に写す。
+            let count = self.loader.page_count().max(1);
+            let current = if self.page_turn_right_to_left {
+                (count - 1).saturating_sub(self.current_page)
+            } else {
+                self.current_page
+            } as f32;
             let value = slider.read(cx).value();
             if (value.start() - current).abs() > 0.5 {
                 slider.update(cx, |state, cx| {
@@ -3486,7 +3497,13 @@ impl Render for ImageViewer {
                                     this.child(prev_button())
                                 }
                             })
-                            .child(Slider::new(&page_slider).horizontal().w(px(200.0)))
+                            // 右綴じは右→左に動くので、塗りも右端（読む始点）基準に反転する。
+                            .child(
+                                Slider::new(&page_slider)
+                                    .horizontal()
+                                    .when(page_turn_right_to_left, |this| this.reverse())
+                                    .w(px(200.0)),
+                            )
                             .when(mode != ViewMode::Scroll, |this| {
                                 if mirror_nav {
                                     this.child(prev_button())
@@ -4661,6 +4678,67 @@ mod tests {
                 "本に紐づかない表示からグローバル設定を書き換えている"
             );
         });
+    }
+
+    /// ページスライダーは綴じ方向に追従する。左綴じは左端が 1 ページ目（左→右）、
+    /// 右綴じは右端が 1 ページ目（右→左）で、ページを進めるとつまみが逆方向へ動く。
+    #[gpui_kit::test]
+    async fn page_slider_direction_follows_the_binding(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 5);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(800.0),
+                height: gpui_kit::px(600.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        // 初期描画で page_slider が生成され、現在ページが同期される
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let slider_value = |cx: &mut TestAppContext| {
+            view.read_with(cx, |v, cx| {
+                v.page_slider
+                    .as_ref()
+                    .expect("page slider")
+                    .read(cx)
+                    .value()
+                    .start()
+            })
+        };
+
+        // 左綴じ（既定）: 値 = ページ（左端が 0 ページ目、右へ動くと進む）
+        cx.update(|cx| view.update(cx, |this, cx| this.set_binding(cx, false)));
+        cx.update(|cx| view.update(cx, |this, cx| this.set_page(cx, 3)));
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(slider_value(cx), 3.0, "左綴じは左→右（値=ページ）");
+
+        // 右綴じ: 右端が 0 ページ目になる（値 = count-1-page）
+        cx.update(|cx| view.update(cx, |this, cx| this.set_binding(cx, true)));
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            slider_value(cx),
+            1.0,
+            "右綴じはページ 3 → 値 1（右端が 1 ページ目）"
+        );
+
+        // 右綴じでスライダーを左へ（値 1 → 0）動かすと「次へ」進む
+        visual.update(|window, cx| {
+            let slider = view.read(cx).page_slider.clone().expect("page slider");
+            slider.update(cx, |state, cx| state.set_value(0.0, window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            4,
+            "右綴じでスライダーを左端へ動かすと最終ページへ進む"
+        );
     }
 
     #[gpui_kit::test]
