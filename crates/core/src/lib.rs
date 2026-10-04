@@ -1,5 +1,6 @@
 //! thundoku-core: storage, DB, external API clients and sync engines.
 pub mod booth;
+pub mod clipboard;
 pub mod db;
 pub mod dlsite;
 pub mod download_url;

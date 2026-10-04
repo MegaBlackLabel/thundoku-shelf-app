@@ -59,4 +59,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     # `ShellExecuteW` の `nshowcmd`（`SHOW_WINDOW_CMD` / `SW_SHOWNORMAL`）用。
     "Win32_UI_WindowsAndMessaging",
+    # クリップボードへ画像ファイルを置く（`clipboard::copy_files` の `CF_HDROP`）。
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
 ] }
