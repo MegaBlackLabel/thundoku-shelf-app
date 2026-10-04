@@ -142,6 +142,22 @@ fn main() {
                 if let Some(bounds) = saved_bounds {
                     options.window_bounds = Some(bounds);
                 }
+                // 本の上のツールバー（メニュー）が隠れる幅まで狭められないようにする。
+                // ディスプレイがその幅より狭いときは画面幅で止める（画面外へはみ出すと
+                // 何も操作できなくなるため）。高さは制限しない。
+                let min_width = cx.update(|cx| {
+                    let needed = thundoku_shelf::views::bookshelf::MIN_WINDOW_WIDTH;
+                    cx.displays()
+                        .first()
+                        .map(|display| {
+                            gpui_kit::px(display.visible_bounds().size.width.as_f32().min(needed))
+                        })
+                        .unwrap_or(gpui_kit::px(needed))
+                });
+                options.window_min_size = Some(gpui_kit::Size {
+                    width: min_width,
+                    height: gpui_kit::px(0.0),
+                });
                 cx.open_window(options, |window, cx| {
                     // ウィンドウを閉じる時に現在の配置・サイズを保存する。
                     // 終了時確認ダイアログを一度だけ出す（request_exit_upload_check）。
