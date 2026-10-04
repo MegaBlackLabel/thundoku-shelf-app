@@ -746,6 +746,8 @@ mod tests {
     struct Recorder {
         /// 開いた URL。
         opened: parking_lot::Mutex<Vec<String>>,
+        /// ブラウザーを開けなかったことにする（失敗経路のテスト用）。
+        fail: bool,
     }
 
     impl Recorder {
@@ -754,7 +756,11 @@ mod tests {
             ReportIo {
                 open_browser: Arc::new(move |url: &str| {
                     opened.opened.lock().push(url.to_string());
-                    Ok(())
+                    if opened.fail {
+                        Err("ShellExecuteW failed (-1)".to_string())
+                    } else {
+                        Ok(())
+                    }
                 }),
             }
         }
@@ -792,6 +798,17 @@ mod tests {
             view.update(cx, |this, cx| {
                 let input = this.title_input.clone().expect("タイトルの入力が無い");
                 input.update(cx, |state, cx| state.set_value(title.clone(), window, cx));
+            });
+        });
+    }
+
+    /// 本文を入力する（`TextareaState` は render で作られるのでウィンドウ越しに入れる）。
+    fn set_body(visual: &mut gpui_kit::VisualTestContext, view: &Entity<ReportView>, body: &str) {
+        let body = body.to_string();
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                let input = this.body_input.clone().expect("本文の入力が無い");
+                input.update(cx, |state, cx| state.set_value(body.clone(), window, cx));
             });
         });
     }
@@ -1055,5 +1072,62 @@ mod tests {
         let (kind, message) = toast(cx);
         assert_eq!(kind, crate::app_state::ToastKind::Info);
         assert!(message.unwrap_or_default().contains("開きました"));
+    }
+
+    /// ブラウザーを開けなかったら、画面に理由と次の操作を出すこと（失敗経路）。
+    #[gpui_kit::test]
+    async fn failing_to_open_the_browser_reports_the_reason(cx: &mut TestAppContext) {
+        let recorder = Arc::new(Recorder {
+            fail: true,
+            ..Default::default()
+        });
+        let (view, visual) = open_report(cx, recorder.io());
+        set_title(visual, &view, "開けなかったとき");
+
+        view.update(cx, |this, cx| this.submit(cx));
+        visual.run_until_parked();
+
+        assert_eq!(recorder.opened.lock().len(), 1, "開こうとしていない");
+        let error = view
+            .read_with(cx, |this, _| this.error.clone())
+            .unwrap_or_default();
+        assert!(
+            error.contains("ShellExecuteW failed"),
+            "原因が出ていない: {error}"
+        );
+        assert!(
+            error.contains("既定のブラウザーの設定を確認してください"),
+            "次の操作が出ていない: {error}"
+        );
+        // 失敗を成功として見せない（通知は出さない）。
+        let (_, message) = toast(cx);
+        assert!(message.is_none(), "成功の通知が出ている: {message:?}");
+    }
+
+    /// 本文が長すぎてクリップボードへ渡っているときは、本文を失っていないことも伝えること。
+    #[gpui_kit::test]
+    async fn failing_to_open_the_browser_notes_the_copied_body(cx: &mut TestAppContext) {
+        let recorder = Arc::new(Recorder {
+            fail: true,
+            ..Default::default()
+        });
+        let (view, visual) = open_report(cx, recorder.io());
+        set_title(visual, &view, "長い本文と開けないブラウザー");
+        set_body(visual, &view, &"あ".repeat(9_000));
+
+        view.update(cx, |this, cx| this.submit(cx));
+        visual.run_until_parked();
+
+        let error = view
+            .read_with(cx, |this, _| this.error.clone())
+            .unwrap_or_default();
+        assert!(
+            error.contains("本文はコピー済みです"),
+            "コピー済みを伝えていない: {error}"
+        );
+        assert!(
+            error.contains("ShellExecuteW failed"),
+            "原因が出ていない: {error}"
+        );
     }
 }
