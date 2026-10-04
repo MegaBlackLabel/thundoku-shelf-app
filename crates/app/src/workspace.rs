@@ -1341,8 +1341,61 @@ impl Workspace {
         AppState::global(cx)
             .exit_checked
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self.exit_backup_prompt_needed(cx) {
+            return true;
+        }
         self.request_exit_upload_check(cx);
         false
+    }
+
+    /// 終了時に「アップロードして終了」を出すか（＝まだ上げていない変更があるか）。
+    ///
+    /// - Drive 同期が使えないとき（未ログイン・無効・同期フォルダ未設定）は出さない:
+    ///   「アップロードして終了」は成功しようがなく、訊かれるだけになる（#6）。
+    /// - 変更が無いときも出さない（毎回同じ確認を出さない）。
+    /// - 判定できないとき（DB の読み出しに失敗した等）は**出す**側に倒す
+    ///   （控えを失うより、一度多く訊く方が安全）。
+    fn exit_backup_prompt_needed(&self, cx: &App) -> bool {
+        let state = AppState::global(cx);
+        let Some(sub) = state
+            .google_profile
+            .lock()
+            .as_ref()
+            .map(|profile| profile.sub.clone())
+            .filter(|sub| !sub.trim().is_empty())
+        else {
+            return false;
+        };
+        let enabled = db::settings::get(&state.db_pool, "drive.sync.enabled")
+            .ok()
+            .flatten()
+            .is_some_and(|v| v == "true" || v == "1");
+        let folder_id = db::settings::get(&state.db_pool, "drive.sync.folder_id")
+            .ok()
+            .flatten();
+        if !enabled || folder_id.is_none() {
+            return false;
+        }
+        let Ok(owner_key) = state.secrets.db_key() else {
+            return false;
+        };
+        // PRK は解決済みのものだけ使う（終了時に Drive を取りに行かない）。
+        let root = state.pack_root_key();
+        let sync_books = thundoku_core::drive::sync::books_backup_enabled(&state.db_pool);
+        match thundoku_core::drive::sync::pending_backup_changes(
+            &state.db_pool,
+            &state.packs_dir,
+            Some(&sub),
+            Some(&owner_key),
+            root.as_ref(),
+            sync_books,
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                log::warn!("exit backup check failed: {error}");
+                true
+            }
+        }
     }
 
     /// ウィンドウを閉じる時に、バックアップ対象に変更があるかを確認する。
@@ -1374,6 +1427,14 @@ impl Workspace {
                 crate::app_state::ToastKind::Info,
                 format!("{}が終わるまで閉じられません", kind.label()),
             );
+            return;
+        }
+        AppState::global(cx)
+            .exit_checked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // 上げる変更が無い（または Drive 同期が使えない）ときは確認を出さずに終了する。
+        if !self.exit_backup_prompt_needed(cx) {
+            cx.quit();
             return;
         }
         self.request_exit_upload_check(cx);
@@ -3862,6 +3923,9 @@ mod tests {
     #[gpui_kit::test]
     async fn quit_app_action_opens_exit_prompt(cx: &mut TestAppContext) {
         let ws = setup(cx);
+        let sub = "sub-quit-pending";
+        set_drive_ready(cx, sub);
+        seed_pending_pack(cx, sub, "quit-pending-pack");
         assert!(
             !ws.read_with(cx, |w, _| w.exit_upload_prompt),
             "初期状態では確認ダイアログは出ていない"
@@ -3872,6 +3936,24 @@ mod tests {
         assert!(
             ws.read_with(cx, |w, _| w.exit_upload_prompt),
             "終了でアップロード確認が表示されること"
+        );
+    }
+
+    /// 上げる変更が無ければ、メニューの「終了」で確認を出さずに終了すること。
+    #[gpui_kit::test]
+    async fn quit_app_action_closes_without_the_exit_prompt_when_nothing_changed(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        let sub = "sub-quit-clean";
+        set_drive_ready(cx, sub);
+        mark_backup_synced(cx, sub);
+        cx.update(|cx| {
+            cx.dispatch_action(&crate::actions::QuitApp);
+        });
+        assert!(
+            !ws.read_with(cx, |w, _| w.exit_upload_prompt),
+            "何も変えていないのに終了確認を出す"
         );
     }
 
@@ -3964,15 +4046,57 @@ mod tests {
         });
     }
 
-    /// モーダルが無ければ、これまでどおり終了確認が出る（閉じる要求は拒否）。
+    /// モーダルが無くても、Drive 同期が使えないときは確認を出さずに閉じること。
+    ///
+    /// アカウント連携が未実施だと「アップロードして終了」は必ず失敗する
+    /// （`drive.sync.folder_id` が無い）。毎回訊かれるだけの確認は出さない。
     #[gpui_kit::test]
-    async fn close_request_opens_the_exit_prompt_when_no_modal_is_open(cx: &mut TestAppContext) {
+    async fn close_request_closes_without_the_upload_prompt_when_drive_sync_is_unavailable(
+        cx: &mut TestAppContext,
+    ) {
         let ws = setup(cx);
+        let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
+        assert!(allowed, "上げる先が無いときは確認を出さずに閉じる");
+        assert!(
+            !ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
+            "Drive 同期が使えないのに終了確認を出す"
+        );
+    }
+
+    /// Drive 同期が使えても、上げる変更が無ければ確認を出さずに閉じること。
+    #[gpui_kit::test]
+    async fn close_request_closes_without_the_upload_prompt_when_nothing_changed(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        let sub = "sub-exit-clean";
+        set_drive_ready(cx, sub);
+        // 最後に上げた内容と一致させる（＝ローカルは何も変わっていない）
+        mark_backup_synced(cx, sub);
+
+        let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
+        assert!(allowed, "何も変えていないときは確認を出さずに閉じる");
+        assert!(
+            !ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
+            "上げる変更が無いのに終了確認を出す"
+        );
+    }
+
+    /// 未アップロードの変更があるときは、これまでどおり終了確認を出す（閉じる要求は拒否）。
+    #[gpui_kit::test]
+    async fn close_request_opens_the_exit_prompt_when_a_backup_is_pending(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        let sub = "sub-exit-pending";
+        set_drive_ready(cx, sub);
+        seed_pending_pack(cx, sub, "exit-pending-pack");
+
         let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
         assert!(!allowed, "確認を出すときは閉じない");
         assert!(
             ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
-            "モーダルが無いときは終了確認を出す"
+            "未アップロードの本があるときは終了確認を出す"
         );
     }
 
@@ -5315,6 +5439,64 @@ mod tests {
         }
     }
 
+    /// Google ログイン済み + Drive 同期有効 + 同期フォルダ設定済みにする（終了確認の前提）。
+    fn set_drive_ready(cx: &mut TestAppContext, sub: &str) {
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            *state.google_profile.lock() = Some(google_profile(sub));
+            let _ = db::settings::set(&state.db_pool, "drive.sync.enabled", "true");
+            let _ = db::settings::set(&state.db_pool, "drive.sync.folder_id", "folder-1");
+        });
+    }
+
+    /// まだ上げていない本（所有つき・pack 本体あり・同期の記帳なし）を 1 冊入れる。
+    fn seed_pending_pack(cx: &mut TestAppContext, sub: &str, pack_id: &str) {
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let key = state.secrets.db_key().expect("暗号鍵");
+            books::insert(&state.db_pool, &test_book(pack_id)).unwrap();
+            books::set_owner_sub(
+                &state.db_pool,
+                pack_id,
+                Some(thundoku_core::owner::encrypt(&key, sub)),
+            )
+            .unwrap();
+            std::fs::create_dir_all(&state.packs_dir).unwrap();
+            std::fs::write(
+                state.packs_dir.join(format!("{pack_id}.opfspack")),
+                b"PACK",
+            )
+            .unwrap();
+        });
+    }
+
+    /// ローカルのバックアップ内容を「最後に上げた内容」として基準値に書き込む
+    /// （＝上げる変更が無い状態にする）。テストの端末には PRK が無いので平文（v2）の流儀。
+    fn mark_backup_synced(cx: &mut TestAppContext, sub: &str) {
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let key = state.secrets.db_key().expect("暗号鍵");
+            let ids = books::owned_book_ids(&state.db_pool, &key, Some(sub)).unwrap();
+            let owner = thundoku_core::db::backup::OwnerFilter {
+                key: &key,
+                sub: Some(sub),
+            };
+            let json = thundoku_core::db::backup::export_json(
+                &state.db_pool,
+                Some(&ids),
+                Some(&owner),
+                false,
+            )
+            .unwrap();
+            let baseline = thundoku_core::db::backup::canonical_md5_str(&json, None).unwrap();
+            let _ = db::settings::set(
+                &state.db_pool,
+                thundoku_core::drive::sync::BACKUP_BASELINE_KEY,
+                &baseline,
+            );
+        });
+    }
+
     /// Google の sub が未取得のときは、復元の差分比較に使える集合が無いこと。
     ///
     /// 差分比較は「Drive のバックアップ（所有者で絞られている）」と「ローカルの同じ範囲」を
@@ -5376,6 +5558,9 @@ mod tests {
     #[gpui_kit::test]
     async fn window_close_is_blocked_while_uploading(cx: &mut TestAppContext) {
         let ws = setup(cx);
+        let sub = "sub-close-uploading";
+        set_drive_ready(cx, sub);
+        seed_pending_pack(cx, sub, "close-uploading-pack");
 
         // 1 回目の「閉じる」→ アップロード確認を出す（この時点では閉じない）
         let allowed = cx.update(|cx| ws.update(cx, |w, cx| w.handle_window_close_request(cx)));

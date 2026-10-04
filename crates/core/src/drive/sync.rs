@@ -1113,6 +1113,100 @@ pub fn inspect_drive_backup(
     }))
 }
 
+/// ローカルのバックアップ内容が、最後にアップロードした内容から変わっているか。
+///
+/// 比較は同期エンジンと同じ流儀（v3 = 封筒の `content_hmac`、v2 = 正規形 md5）で、
+/// 基準値 [`BACKUP_BASELINE_KEY`] と突き合わせる。**ネットワークは使わない**。
+fn local_backup_changed(
+    pool: &SqlitePool,
+    identity_sub: &str,
+    owner_key: &[u8; 32],
+    pack_root_key: Option<&PackRootKey>,
+) -> Result<bool, SyncError> {
+    let book_ids = books::owned_book_ids(pool, owner_key, Some(identity_sub))?;
+    let owner = crate::db::backup::OwnerFilter {
+        key: owner_key,
+        sub: Some(identity_sub),
+    };
+    // 同期と同じ条件で書き出す（PRK があるときだけ平文で運ぶ）。PRK が無いのに
+    // 基準値が v3 のものなら token が食い違い「変更あり」に倒れる＝確認は出る。
+    let plaintext_user_data = pack_root_key.is_some();
+    let json =
+        crate::db::backup::export_json(pool, Some(&book_ids), Some(&owner), plaintext_user_data)?;
+    let token = match pack_root_key {
+        Some(root) => opfspack::SealedEnvelope::seal(
+            &opfspack::BACKUP_LABEL,
+            json.as_bytes(),
+            root,
+            &opfspack::derive_owner_id(identity_sub),
+        )
+        .content_hmac_hex(),
+        None => crate::db::backup::canonical_md5_str(&json, None)?,
+    };
+    let baseline = crate::db::settings::get(pool, BACKUP_BASELINE_KEY)?;
+    Ok(baseline.as_deref() != Some(token.as_str()))
+}
+
+/// まだ上げていない pack があるか（同期の記帳と mtime だけで判定。ネットワーク不使用）。
+fn has_pending_pack_upload(
+    pool: &SqlitePool,
+    packs_dir: &Path,
+    identity_sub: &str,
+    owner_key: &[u8; 32],
+) -> Result<bool, SyncError> {
+    let upload_ids = books::owned_book_ids(pool, owner_key, Some(identity_sub))?;
+    let backup_excluded = books::backup_excluded_ids(pool).unwrap_or_default();
+    for book in books::list(pool)? {
+        if !upload_ids.contains(&book.id) || backup_excluded.contains(&book.id) {
+            continue;
+        }
+        let pack_id = book.pack_id.clone().unwrap_or_else(|| book.id.clone());
+        if pack_id.is_empty() {
+            continue;
+        }
+        let local_path = crate::pack_path::pack_path(packs_dir, &pack_id)
+            .map_err(|e| SyncError::InvalidPack(format!("{pack_id}: {e}")))?;
+        if !local_path.exists() {
+            continue;
+        }
+        match sync_state::get(pool, &pack_id)? {
+            // 記帳が無い＝一度も上げていない
+            None => return Ok(true),
+            Some(state) => {
+                // Drive 側のファイルの有無は見られない（ネットワーク無し）。削除は
+                // 伝播しない（消えていれば同期も上げない）ので、ここで true に倒れても
+                // 「確認を出すだけ」で控えを失う側にはならない。
+                if local_newer_than(&local_path, &state.last_synced_at) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// 終了時に「アップロードして終了」を出すべきか（まだ上げていない変更があるか）。
+///
+/// 判定にネットワークは使わない（Drive を見ない）。所有者（ログイン中の Google
+/// アカウントと暗号鍵）が分からないときは `false` を返す: 同期エンジンもその状態では
+/// 何も上げないので、確認を出しても「アップロードに失敗する」だけになる。
+pub fn pending_backup_changes(
+    pool: &SqlitePool,
+    packs_dir: &Path,
+    identity_sub: Option<&str>,
+    owner_key: Option<&[u8; 32]>,
+    pack_root_key: Option<&PackRootKey>,
+    sync_books: bool,
+) -> Result<bool, SyncError> {
+    let (Some(sub), Some(key)) = (identity_sub, owner_key) else {
+        return Ok(false);
+    };
+    if sync_books && has_pending_pack_upload(pool, packs_dir, sub, key)? {
+        return Ok(true);
+    }
+    local_backup_changed(pool, sub, key, pack_root_key)
+}
+
 /// Drive 同期の状態（drive_sync_state の行と drive.* 設定）をクリアする。
 /// 次回同期時に全ファイルが再アップロード/再ダウンロードの対象になる。
 pub fn clear_sync_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {

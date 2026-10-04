@@ -2407,3 +2407,142 @@ fn a_broken_thumbnail_store_does_not_fail_the_sync() {
         "失敗の印を残して設定画面に出せるようにする"
     );
 }
+
+// ---- 終了時のアップロード確認（未アップロードの変更があるか）-----------------
+
+/// 終了時に確認を出すかの判定（所有者・PRK・書籍バックアップの設定を渡す省略形）。
+fn pending_backup_changes(
+    env: &TestEnv,
+    sub: Option<&str>,
+    owner_key: Option<&[u8; 32]>,
+    root: Option<&PackRootKey>,
+    sync_books: bool,
+) -> bool {
+    thundoku_core::drive::sync::pending_backup_changes(
+        &env.pool,
+        &env.packs(),
+        sub,
+        owner_key,
+        root,
+        sync_books,
+    )
+    .unwrap()
+}
+
+/// 所有者が分からないとき（未ログイン）は確認を出さない（同期も何も上げない）。
+#[test]
+fn pending_backup_changes_is_false_without_an_owner() {
+    let env = TestEnv::new("pending-no-owner");
+    assert!(
+        !pending_backup_changes(&env, None, None, None, true),
+        "所有者不明で「変更あり」にすると、上げられないのに確認を出すことになる"
+    );
+}
+
+/// 同期直後は「未アップロードの変更なし」（終了時に確認を出さない）。
+#[test]
+fn pending_backup_changes_is_false_right_after_a_sync() {
+    let env = TestEnv::new("pending-none");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-pending-none";
+    let owner_key = [61u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    std::fs::write(env.packs().join("b1.opfspack"), b"PACK").unwrap();
+    let db_path = env.packs().join("thundoku-shelf.db");
+
+    let outcome =
+        sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+    assert!(
+        outcome.database_backed_up,
+        "前提: DB バックアップが上がること"
+    );
+    assert_eq!(outcome.uploaded, vec!["b1"], "前提: pack も上がること");
+
+    assert!(
+        !pending_backup_changes(&env, Some(sub), Some(&owner_key), Some(&root), true),
+        "同期直後に確認を出すと、何も変えていない利用者に毎回訊くことになる"
+    );
+}
+
+/// 同期のあとに取り込んだ本（pack も DB も新しい）は「変更あり」。
+#[test]
+fn pending_backup_changes_is_true_for_a_new_book() {
+    let env = TestEnv::new("pending-new-book");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-pending-new-book";
+    let owner_key = [62u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    std::fs::write(env.packs().join("b1.opfspack"), b"PACK").unwrap();
+    let db_path = env.packs().join("thundoku-shelf.db");
+    sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+
+    insert_owned_book(&env.pool, "b2", "新しい本", sub, &owner_key);
+    std::fs::write(env.packs().join("b2.opfspack"), b"PACK2").unwrap();
+
+    assert!(
+        pending_backup_changes(&env, Some(sub), Some(&owner_key), Some(&root), true),
+        "新しい本を上げそこねて終了する"
+    );
+}
+
+/// DB のユーザーデータ（お気に入り）を変えたら「変更あり」。
+#[test]
+fn pending_backup_changes_is_true_when_user_data_changed() {
+    let env = TestEnv::new("pending-user-data");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-pending-user-data";
+    let owner_key = [63u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    std::fs::write(env.packs().join("b1.opfspack"), b"PACK").unwrap();
+    let db_path = env.packs().join("thundoku-shelf.db");
+    sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+
+    db::books::set_favorite(&env.pool, "b1", true).unwrap();
+
+    assert!(
+        pending_backup_changes(&env, Some(sub), Some(&owner_key), Some(&root), true),
+        "お気に入りを上げそこねて終了する"
+    );
+}
+
+/// pack が最後の同期より新しいときも「変更あり」。書籍バックアップ OFF なら見ない
+/// （同期も pack を上げないため）。
+#[test]
+fn pending_backup_changes_notices_a_pack_newer_than_the_last_sync() {
+    let env = TestEnv::new("pending-pack-newer");
+    let mut drive = FakeDrive::new();
+    let sub = "sub-pending-pack-newer";
+    let owner_key = [64u8; 32];
+    let root = PackRootKey::generate();
+    save_root_key(sub, &root);
+    insert_owned_book(&env.pool, "b1", "自分の本", sub, &owner_key);
+    std::fs::write(env.packs().join("b1.opfspack"), b"PACK").unwrap();
+    let db_path = env.packs().join("thundoku-shelf.db");
+    sync_with_backup(&env, &mut drive, sub, Some(&root), &owner_key, &db_path).unwrap();
+
+    // 同期の記帳を過去に倒す（mtime の比較だけで判定できる決定的な状態にする）
+    let state = db::sync_state::get(&env.pool, "b1").unwrap().unwrap();
+    db::sync_state::upsert(
+        &env.pool,
+        &db::sync_state::DriveSyncState {
+            last_synced_at: "2000-01-01 00:00:00".into(),
+            ..state
+        },
+    )
+    .unwrap();
+
+    assert!(
+        pending_backup_changes(&env, Some(sub), Some(&owner_key), Some(&root), true),
+        "更新された pack を上げそこねて終了する"
+    );
+    assert!(
+        !pending_backup_changes(&env, Some(sub), Some(&owner_key), Some(&root), false),
+        "書籍バックアップ OFF の pack は上げない（確認も出さない）"
+    );
+}
