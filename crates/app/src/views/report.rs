@@ -17,6 +17,14 @@
 //! テンプレート取得の HTTP は UI スレッドでは実行しない。`background_executor` に投げ、
 //! 完了は `cx.spawn` で受ける。入力欄は `Window` が要るため render の冒頭で遅延生成する
 //! （`new` は `cx.new(ReportView::new)` から呼ばれるので `Window` を持てない）。
+//!
+//! **ブラウザーを開く処理は update の外（背景スレッド）で行う**。Windows の `ShellExecuteW`
+//! はシェルがメッセージループを回すため、App 借用中（update の中）に呼ぶと gpui の window
+//! proc が再入して `RefCell already borrowed` になる（実測 2026-10-04: 「Issue を作成」の
+//! 1 クリックで 3 件。Google ログインのモーダルで落ちたのと同じ原因）。結果は後続の update
+//! で反映する。
+
+use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -146,6 +154,41 @@ fn error_message(error: &GithubError) -> String {
     }
 }
 
+/// 既定のブラウザーで URL を開く処理。
+type OpenBrowser = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// 送信で外へ出る処理。テストは記録するだけの実装を差し込む。
+///
+/// Windows ではシェルを触る（`ShellExecuteW` はメッセージループを回す）。
+/// **update の中で呼ばない**（[`ReportView::submit`] を参照）。
+#[derive(Clone)]
+struct ReportIo {
+    /// 既定のブラウザーで URL を開く。
+    open_browser: OpenBrowser,
+}
+
+impl Default for ReportIo {
+    fn default() -> Self {
+        Self {
+            open_browser: Arc::new(|url| {
+                thundoku_core::google::open_browser(url).map_err(|error| error.to_string())
+            }),
+        }
+    }
+}
+
+/// ブラウザーを開けなかったときの画面のエラー（コピー済みなら本文は失われていない）。
+fn open_failure_message(copied_body: bool, error: &str) -> String {
+    if copied_body {
+        format!(
+            "ブラウザーを開けませんでした（本文はコピー済みです。\
+             ブラウザーで GitHub を開いて貼り付けてください）: {error}"
+        )
+    } else {
+        format!("ブラウザーを開けませんでした（既定のブラウザーの設定を確認してください）: {error}")
+    }
+}
+
 pub struct ReportView {
     /// タイトル入力（render で遅延生成）。
     title_input: Option<Entity<InputState>>,
@@ -161,12 +204,19 @@ pub struct ReportView {
     templates_fetched: bool,
     /// テンプレートを取得できなかった理由（自由入力で投稿はできる）。
     templates_error: Option<String>,
+    /// 送信で外へ出る処理（テストは差し替える）。
+    io: ReportIo,
     /// 画面に赤字で出すエラー（タイトル未入力・ブラウザーを開けない）。
     error: Option<String>,
 }
 
 impl ReportView {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self::with_io(cx, ReportIo::default())
+    }
+
+    /// 外へ出る処理を差し替えて作る（テストは記録装置を渡す）。
+    fn with_io(_cx: &mut Context<Self>, io: ReportIo) -> Self {
         Self {
             title_input: None,
             body_input: None,
@@ -175,6 +225,7 @@ impl ReportView {
             templates_loading: false,
             templates_fetched: false,
             templates_error: None,
+            io,
             error: None,
         }
     }
@@ -275,7 +326,10 @@ impl ReportView {
     ///
     /// ブラウザーを開く処理は Google ログインと同じ実装（`google::open_browser`）を使う。
     /// Windows では `ShellExecuteW` で URL をそのままシェルへ渡す（コマンドライン経由だと
-    /// `&` で URL が切れる）。
+    /// `&` で URL が切れる）。**その呼び出しは update の外で行う**: `ShellExecuteW` はシェルが
+    /// メッセージループを回すため、App 借用中に呼ぶと gpui の window proc が再入して
+    /// `RefCell already borrowed`（最悪 panic = アプリ終了）になる（実測 2026-10-04。
+    /// Google ログインのモーダルで落ちたのと同じ原因）。
     fn submit(&mut self, cx: &mut Context<Self>) {
         let Some(title_input) = self.title_input.clone() else {
             return;
@@ -295,13 +349,34 @@ impl ReportView {
         if let Some(body) = &link.copy_body {
             cx.write_to_clipboard(ClipboardItem::new_string(body.clone()));
         }
-        match thundoku_core::google::open_browser(&link.url) {
+        let url = link.url.clone();
+        let copied_body = link.copy_body.is_some();
+        let io = self.io.clone();
+        cx.spawn(async move |this, cx| {
+            // シェルは UI スレッドの外で扱う（update の借用と衝突させない）。
+            let opened = cx
+                .background_executor()
+                .spawn(async move { (io.open_browser)(&url) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.finish_submit(opened, copied_body, cx));
+        })
+        .detach();
+    }
+
+    /// 送信の後処理（トースト / エラー）。update の外から呼ばれる。
+    fn finish_submit(
+        &mut self,
+        opened: Result<(), String>,
+        copied_body: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match opened {
             Ok(()) => {
                 self.error = None;
                 set_toast_kind(
                     cx,
                     ToastKind::Info,
-                    if link.copy_body.is_some() {
+                    if copied_body {
                         "本文をコピーしました。GitHub の画面に貼り付けてください"
                     } else {
                         "既定のブラウザーで Issue の作成画面を開きました"
@@ -310,15 +385,7 @@ impl ReportView {
             }
             Err(error) => {
                 log::warn!("report: ブラウザーを開けませんでした: {error}");
-                // コピー済みなら本文は失われていない（貼り付ける先だけ利用者が開く）。
-                self.error = Some(if link.copy_body.is_some() {
-                    "ブラウザーを開けませんでした（本文はコピー済みです。\
-                     ブラウザーで GitHub を開いて貼り付けてください）"
-                        .to_string()
-                } else {
-                    "ブラウザーを開けませんでした（既定のブラウザーの設定を確認してください）"
-                        .to_string()
-                });
+                self.error = Some(open_failure_message(copied_body, &error));
             }
         }
         cx.notify();
@@ -674,6 +741,86 @@ mod tests {
 
     use super::*;
 
+    /// 送信で外へ出た処理を記録する（実物のブラウザーは開かない）。
+    #[derive(Default)]
+    struct Recorder {
+        /// 開いた URL。
+        opened: parking_lot::Mutex<Vec<String>>,
+        /// ブラウザーを開けなかったことにする（失敗経路のテスト用）。
+        fail: bool,
+    }
+
+    impl Recorder {
+        fn io(self: &Arc<Self>) -> ReportIo {
+            let opened = self.clone();
+            ReportIo {
+                open_browser: Arc::new(move |url: &str| {
+                    opened.opened.lock().push(url.to_string());
+                    if opened.fail {
+                        Err("ShellExecuteW failed (-1)".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }),
+            }
+        }
+    }
+
+    /// レポート画面をウィンドウに載せる（入力欄は render で作られる）。
+    fn open_report(
+        cx: &mut TestAppContext,
+        io: ReportIo,
+    ) -> (Entity<ReportView>, &'static mut gpui_kit::VisualTestContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_test);
+        let view = cx.new(|cx| ReportView::with_io(cx, io));
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1280.0),
+                height: gpui_kit::px(1100.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        for _ in 0..4 {
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+        }
+        (view, visual)
+    }
+
+    /// タイトルを入力する（`InputState` は render で作られるのでウィンドウ越しに入れる）。
+    fn set_title(visual: &mut gpui_kit::VisualTestContext, view: &Entity<ReportView>, title: &str) {
+        let title = title.to_string();
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                let input = this.title_input.clone().expect("タイトルの入力が無い");
+                input.update(cx, |state, cx| state.set_value(title.clone(), window, cx));
+            });
+        });
+    }
+
+    /// 本文を入力する（`TextareaState` は render で作られるのでウィンドウ越しに入れる）。
+    fn set_body(visual: &mut gpui_kit::VisualTestContext, view: &Entity<ReportView>, body: &str) {
+        let body = body.to_string();
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                let input = this.body_input.clone().expect("本文の入力が無い");
+                input.update(cx, |state, cx| state.set_value(body.clone(), window, cx));
+            });
+        });
+    }
+
+    /// トースト（送信の結果）を読む。
+    fn toast(cx: &mut TestAppContext) -> (crate::app_state::ToastKind, Option<String>) {
+        cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            (*state.toast_kind.lock(), state.toast_message.lock().clone())
+        })
+    }
+
     fn field(
         kind: TemplateFieldKind,
         label: Option<&str>,
@@ -895,5 +1042,92 @@ mod tests {
         view.update(cx, |this, cx| this.submit(cx));
         let error = view.read_with(cx, |this, _| this.error.clone());
         assert_eq!(error.as_deref(), Some("タイトルを入力してください"));
+    }
+
+    /// 送信はブラウザーを update の中で呼ばず、タスク（実機では背景スレッド）で開くこと。
+    ///
+    /// Windows の `ShellExecuteW` はシェルがメッセージループを回す。App 借用中（update の中）に
+    /// 呼ぶと gpui の window proc が再入して `RefCell already borrowed`（最悪 panic = アプリ終了）
+    /// になる（実測 2026-10-04: 「Issue を作成」の 1 クリックで 3 件）。実物のブラウザーは開かない。
+    #[gpui_kit::test]
+    async fn submit_opens_the_browser_outside_the_update(cx: &mut TestAppContext) {
+        let recorder = Arc::new(Recorder::default());
+        let (view, visual) = open_report(cx, recorder.io());
+        set_title(visual, &view, "一覧のスクロールが引っかかる");
+
+        view.update(cx, |this, cx| this.submit(cx));
+        assert!(
+            recorder.opened.lock().is_empty(),
+            "update の中でブラウザーを開いている（ShellExecuteW が gpui を再入させる）"
+        );
+
+        visual.run_until_parked();
+        let opened = recorder.opened.lock().clone();
+        assert_eq!(opened.len(), 1, "ブラウザーを 1 回開いていない");
+        assert!(
+            opened[0].contains("/issues/new?title="),
+            "URL が違う: {}",
+            opened[0]
+        );
+        let (kind, message) = toast(cx);
+        assert_eq!(kind, crate::app_state::ToastKind::Info);
+        assert!(message.unwrap_or_default().contains("開きました"));
+    }
+
+    /// ブラウザーを開けなかったら、画面に理由と次の操作を出すこと（失敗経路）。
+    #[gpui_kit::test]
+    async fn failing_to_open_the_browser_reports_the_reason(cx: &mut TestAppContext) {
+        let recorder = Arc::new(Recorder {
+            fail: true,
+            ..Default::default()
+        });
+        let (view, visual) = open_report(cx, recorder.io());
+        set_title(visual, &view, "開けなかったとき");
+
+        view.update(cx, |this, cx| this.submit(cx));
+        visual.run_until_parked();
+
+        assert_eq!(recorder.opened.lock().len(), 1, "開こうとしていない");
+        let error = view
+            .read_with(cx, |this, _| this.error.clone())
+            .unwrap_or_default();
+        assert!(
+            error.contains("ShellExecuteW failed"),
+            "原因が出ていない: {error}"
+        );
+        assert!(
+            error.contains("既定のブラウザーの設定を確認してください"),
+            "次の操作が出ていない: {error}"
+        );
+        // 失敗を成功として見せない（通知は出さない）。
+        let (_, message) = toast(cx);
+        assert!(message.is_none(), "成功の通知が出ている: {message:?}");
+    }
+
+    /// 本文が長すぎてクリップボードへ渡っているときは、本文を失っていないことも伝えること。
+    #[gpui_kit::test]
+    async fn failing_to_open_the_browser_notes_the_copied_body(cx: &mut TestAppContext) {
+        let recorder = Arc::new(Recorder {
+            fail: true,
+            ..Default::default()
+        });
+        let (view, visual) = open_report(cx, recorder.io());
+        set_title(visual, &view, "長い本文と開けないブラウザー");
+        set_body(visual, &view, &"あ".repeat(9_000));
+
+        view.update(cx, |this, cx| this.submit(cx));
+        visual.run_until_parked();
+
+        let error = view
+            .read_with(cx, |this, _| this.error.clone())
+            .unwrap_or_default();
+        assert!(
+            error.contains("本文はコピー済みです"),
+            "コピー済みを伝えていない: {error}"
+        );
+        assert!(
+            error.contains("ShellExecuteW failed"),
+            "原因が出ていない: {error}"
+        );
     }
 }
