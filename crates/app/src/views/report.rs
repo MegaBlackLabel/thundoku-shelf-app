@@ -83,6 +83,13 @@ const ATTACHMENT_THUMB_WIDTH: u32 = 128;
 /// レポート画面のキーコンテキスト。`Ctrl+V` のインターセプタが「この画面か」を見るのに使う。
 const REPORT_KEY_CONTEXT: &str = "Report";
 
+/// 貼り付けのショートカット表示（macOS は `Cmd+V`）。
+const PASTE_LABEL: &str = if cfg!(target_os = "macos") {
+    "Cmd+V"
+} else {
+    "Ctrl+V"
+};
+
 /// 説明文を引用（blockquote）にして本文の下書きに載せる。
 fn quote(text: &str) -> String {
     text.lines()
@@ -409,7 +416,11 @@ impl ReportView {
         let weak = cx.entity().downgrade();
         let _paste_interceptor =
             cx.intercept_keystrokes(move |event: &gpui_kit::KeystrokeEvent, _window, cx| {
-                if event.keystroke.key != "v" || !event.keystroke.modifiers.control {
+                // 貼り付けのキーは OS で違う（macOS は `cmd-v`、それ以外は `ctrl-v`。
+                // 本文欄のバインドも同じ切り替えになっている）。
+                let paste_modifier = event.keystroke.modifiers.control
+                    || (cfg!(target_os = "macos") && event.keystroke.modifiers.platform);
+                if event.keystroke.key != "v" || !paste_modifier {
                     return;
                 }
                 let on_report_screen = event.context_stack.iter().any(|context| {
@@ -915,11 +926,9 @@ impl ReportView {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .child(
-                        div().text_xs().text_color(muted_fg).child(
-                            "画像はここへドラッグ&ドロップ、または Ctrl+V（PNG / JPEG / WebP）",
-                        ),
-                    )
+                    .child(div().text_xs().text_color(muted_fg).child(format!(
+                        "画像はここへドラッグ&ドロップ、または {PASTE_LABEL}（PNG / JPEG / WebP）"
+                    )))
                     .child(
                         Button::new("report-attach-clipboard")
                             .outline()
@@ -1990,6 +1999,13 @@ mod tests {
         assert_eq!(paths[0], first);
     }
 
+    /// 貼り付けのキー（macOS は `cmd-v`、それ以外は `ctrl-v`。本文欄のバインドと同じ切り替え）。
+    const PASTE_KEYSTROKE: &str = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    };
+
     /// 本文欄にフォーカスする（`Ctrl+V` の貼り付け先）。
     fn focus_body(visual: &mut gpui_kit::VisualTestContext, view: &Entity<ReportView>) {
         visual.update(|window, cx| {
@@ -2012,7 +2028,7 @@ mod tests {
             )],
         });
         focus_body(visual, &view);
-        visual.simulate_keystrokes("ctrl-v");
+        visual.simulate_keystrokes(PASTE_KEYSTROKE);
         visual.run_until_parked();
 
         let (attachments, error) = view.read_with(cx, |this, _| {
@@ -2030,7 +2046,7 @@ mod tests {
             "ただのテキスト".to_string(),
         ));
         focus_body(visual, &view);
-        visual.simulate_keystrokes("ctrl-v");
+        visual.simulate_keystrokes(PASTE_KEYSTROKE);
         visual.run_until_parked();
 
         let (attachments, body) = view.read_with(cx, |this, cx| {
