@@ -12,7 +12,8 @@
 //! 壊さない（理由だけを出して再取得できる）。
 //! 本文が長すぎて URL に載らないときは、本文をクリップボードへコピーしてから素の作成画面を
 //! 開く（判定は core の `issue_link`）。
-//! 画像はこのアプリからアップロードしない（選択 UI も持たない）。GitHub の画面で添付してもらう。
+//! 画像はこのアプリからアップロードしない（選択 UI も持たない）。本文欄の下に「GitHub の
+//! Issue 画面でアップロードする」旨を出して、利用者が GitHub の画面で添付する。
 //!
 //! テンプレート取得の HTTP は UI スレッドでは実行しない。`background_executor` に投げ、
 //! 完了は `cx.spawn` で受ける。入力欄は `Window` が要るため render の冒頭で遅延生成する
@@ -49,7 +50,7 @@ pub(crate) const TARGET_REPO: &str = "MegaBlackLabel/thundoku-shelf-app";
 const BODY_HEIGHT: f32 = 280.0;
 
 /// 画像の添付方法（アプリからは上げないことを画面に明記する）。
-const IMAGE_NOTE: &str = "画像は GitHub の画面で添付してください（このアプリからはアップロードしません）";
+const IMAGE_NOTE: &str = "画像のアップロードは GitHub の Issue 画面で行ってください（このアプリからはアップロードしません）";
 
 /// 説明文を引用（blockquote）にして本文の下書きに載せる。
 fn quote(text: &str) -> String {
