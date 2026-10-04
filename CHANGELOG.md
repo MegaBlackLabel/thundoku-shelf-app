@@ -42,6 +42,17 @@
 
 ### Fixed
 
+- **アカウント連携していないのに終了時に「保存確認」ダイアログが出ていた**: 終了時の
+  アップロード確認が**無条件**に出ていたため、Google 未ログイン（Drive 同期の宛先が無い）でも
+  「バックアップ対象に変更があります。Google Drive にアップロードして終了しますか？」と訊かれ、
+  「アップロードして終了」を選んでも失敗するだけだった。**Drive 同期が使えて（ログイン済み・
+  `drive.sync.enabled` 有効・`drive.sync.folder_id` あり）、まだ上げていない変更があるときだけ**
+  確認を出すようにした（変更なし・同期が使えないときは確認なしで閉じる）。判定は core の
+  `drive::sync::pending_backup_changes` に置き、同期と同じ流儀（pack = `drive_sync_state` の
+  記帳と pack の更新時刻 / DB = 基準値 `drive.backup.md5` と今の内容の突き合わせ）で
+  **ネットワークを使わない**。判定できないときは確認を出す側に倒す（控えを失うより一度多く訊く）
+  #6
+  `crates/core/src/drive/sync.rs`、`crates/app/src/workspace.rs`、`docs/features.md`
 - **レポート画面の「Issue を作成」でアプリが落ちることがあった**: Google ログインのモーダルと
   同じ原因で、`ShellExecuteW` を update の中で呼んでいた（シェルのメッセージポンプで保留中の
   タスクが再入し `RefCell already borrowed`。実測 2026-10-04: 「Issue を作成」の 1 クリックで
