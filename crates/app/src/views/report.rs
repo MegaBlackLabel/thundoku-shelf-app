@@ -78,25 +78,35 @@ fn quote(text: &str) -> String {
 ///
 /// - `markdown` の項目は `value`（説明文）をそのまま 1 節として出す
 /// - それ以外は `## {label}` の見出し + `placeholder`（無ければ `value`）
+/// - **アプリのバージョンを書く欄**（[`TemplateField::asks_for_app_version`]）は `app_version` を
+///   値として入れる（利用者がバージョンを調べに「このアプリについて」へ行かなくて済むように）
+/// - バージョンを書く欄が無いテンプレートでは、末尾に `アプリのバージョン: x.y.z` を 1 行足す
+///   （どのテンプレートでもレポートにバージョンが残るように）
 /// - `description` は見出しの下に引用として出す。issue form では入力欄の補足として
 ///   表示される文で、「秘密情報を確認してから貼る」のような注意書きがここに書かれる。
 ///   アプリのフォームは field 単位の入力欄を作らないので、本文に載せて見えるようにする
 /// - 節は空行 1 つで区切る（末尾に余分な空行は残さない）
 /// - label も value も placeholder も無い項目はスキップする
-fn compose_body(fields: &[TemplateField]) -> String {
+fn compose_body(fields: &[TemplateField], app_version: &str) -> String {
     let mut sections: Vec<String> = Vec::new();
+    let mut wrote_version = false;
     for field in fields {
+        let version_field = field.asks_for_app_version();
         let label = field
             .label
             .as_deref()
             .map(str::trim)
             .filter(|label| !label.is_empty());
-        let text = field
-            .placeholder
-            .as_deref()
-            .or(field.value.as_deref())
-            .map(str::trim)
-            .filter(|text| !text.is_empty());
+        let text = if version_field {
+            Some(app_version)
+        } else {
+            field
+                .placeholder
+                .as_deref()
+                .or(field.value.as_deref())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        };
         let description = field
             .description
             .as_deref()
@@ -122,8 +132,12 @@ fn compose_body(fields: &[TemplateField]) -> String {
             },
         };
         if let Some(section) = section {
+            wrote_version |= version_field;
             sections.push(section);
         }
+    }
+    if !wrote_version {
+        sections.push(format!("アプリのバージョン: {app_version}"));
     }
     sections.join("\n\n").trim_end().to_string()
 }
@@ -310,7 +324,8 @@ impl ReportView {
         self.selected_template = Some(template.file_name.clone());
         self.error = None;
         let title = template.title.clone().unwrap_or_default();
-        let body = compose_body(&template.fields);
+        // バージョンを書く欄には**このアプリのバージョン**を入れる（issue #4）。
+        let body = compose_body(&template.fields, env!("CARGO_PKG_VERSION"));
         if let Some(input) = self.title_input.clone() {
             input.update(cx, |state, cx| state.set_value(title, window, cx));
         }
@@ -822,6 +837,9 @@ mod tests {
         })
     }
 
+    /// 下書きへ入る「このアプリのバージョン」の代わり（テストは固定値で確かめる）。
+    const TEST_VERSION: &str = "0.0.0-test";
+
     fn field(
         kind: TemplateFieldKind,
         label: Option<&str>,
@@ -829,6 +847,7 @@ mod tests {
         value: Option<&str>,
     ) -> TemplateField {
         TemplateField {
+            id: None,
             kind,
             label: label.map(str::to_string),
             description: None,
@@ -839,6 +858,7 @@ mod tests {
     }
 
     /// 見出し（`## label` + placeholder）と説明文（markdown）が節として並ぶこと。
+    /// アプリのバージョンを書く欄は、テンプレートの既定値ではなく**このアプリのもの**で埋まる。
     #[test]
     fn compose_body_expands_markdown_and_fields() {
         let fields = [
@@ -862,10 +882,10 @@ mod tests {
             ),
         ];
         assert_eq!(
-            compose_body(&fields),
+            compose_body(&fields, TEST_VERSION),
             "報告ありがとうございます。\n\n\
              ## 概要\n何が起きましたか？\n\n\
-             ## アプリのバージョン\n0.0.2"
+             ## アプリのバージョン\n0.0.0-test"
         );
     }
 
@@ -883,22 +903,23 @@ mod tests {
             Some("秘密情報が含まれていないか確認してから貼ってください。".to_string());
 
         assert_eq!(
-            compose_body(&[logs]),
+            compose_body(&[logs], TEST_VERSION),
             "## ログ\n\
              > 秘密情報が含まれていないか確認してから貼ってください。\n\
-             <details>...</details>"
+             <details>...</details>\n\n\
+             アプリのバージョン: 0.0.0-test"
         );
     }
 
-    /// 本文が空でも、見出しと説明は出すこと（利用者がそこへ書く）。
+    /// 本文が空でも、見出しと説明は出すこと（利用者がそこへ書く）。バージョン欄は自動で埋まる。
     #[test]
     fn compose_body_keeps_the_description_without_a_placeholder() {
         let mut version = field(TemplateFieldKind::Input, Some("バージョン"), None, None);
         version.description = Some("設定画面の下部で確認できます。".to_string());
 
         assert_eq!(
-            compose_body(&[version]),
-            "## バージョン\n> 設定画面の下部で確認できます。"
+            compose_body(&[version], TEST_VERSION),
+            "## バージョン\n> 設定画面の下部で確認できます。\n0.0.0-test"
         );
     }
 
@@ -915,10 +936,11 @@ mod tests {
             ),
             field(TemplateFieldKind::Textarea, Some("補足"), None, None),
         ];
-        let body = compose_body(&fields);
+        let body = compose_body(&fields, TEST_VERSION);
         assert_eq!(
             body,
-            "## 再現手順\n1. 本棚を開く\n2. スクロールする\n\n## 補足"
+            "## 再現手順\n1. 本棚を開く\n2. スクロールする\n\n## 補足\n\n\
+             アプリのバージョン: 0.0.0-test"
         );
         assert!(!body.ends_with('\n'), "末尾に空行が残っている: {body:?}");
     }
@@ -937,7 +959,96 @@ mod tests {
                 None,
             ),
         ];
-        assert_eq!(compose_body(&fields), "## OS\nWindows");
+        assert_eq!(
+            compose_body(&fields, TEST_VERSION),
+            "## OS\nWindows\n\nアプリのバージョン: 0.0.0-test"
+        );
+    }
+
+    /// バージョンを書く欄が無いテンプレートでは、末尾に 1 行だけ足すこと
+    /// （どのテンプレートでもレポートにバージョンが残るように）。
+    #[test]
+    fn compose_body_appends_the_version_when_the_template_has_no_version_field() {
+        let fields = [
+            field(TemplateFieldKind::Textarea, Some("概要"), Some("何？"), None),
+            field(
+                TemplateFieldKind::Textarea,
+                Some("解決したい課題"),
+                Some("何に困っている？"),
+                None,
+            ),
+        ];
+        let body = compose_body(&fields, TEST_VERSION);
+        assert!(body.ends_with("アプリのバージョン: 0.0.0-test"), "{body}");
+        assert_eq!(body.matches("アプリのバージョン").count(), 1, "{body}");
+    }
+
+    /// `id` だけでバージョン欄と分かるテンプレートでも自動で埋まること
+    /// （見出しに「バージョン」を含まなくても効く）。
+    #[test]
+    fn compose_body_fills_the_version_field_matched_by_id() {
+        let mut version = field(TemplateFieldKind::Input, Some("その他"), Some("0.0.0"), None);
+        version.id = Some("version".to_string());
+
+        assert_eq!(
+            compose_body(&[version], TEST_VERSION),
+            "## その他\n0.0.0-test"
+        );
+    }
+
+    /// テンプレートを選ぶと、下書きのバージョン欄に**このアプリのバージョン**が入ること（issue #4）。
+    #[gpui_kit::test]
+    async fn selecting_a_template_fills_the_draft_with_the_app_version(cx: &mut TestAppContext) {
+        let (view, visual) = open_report(cx, ReportIo::default());
+        // テンプレート取得はテストでは走らないので、bug.yml と同じ形を自分で入れる。
+        view.update(cx, |this, _| {
+            let mut version = field(
+                TemplateFieldKind::Input,
+                Some("アプリのバージョン"),
+                None,
+                None,
+            );
+            version.id = Some("version".to_string());
+            this.templates = vec![IssueTemplate {
+                file_name: "bug.yml".to_string(),
+                name: "不具合報告".to_string(),
+                description: None,
+                title: Some("[Bug] ".to_string()),
+                fields: vec![
+                    field(
+                        TemplateFieldKind::Textarea,
+                        Some("概要"),
+                        Some("何が起きた？"),
+                        None,
+                    ),
+                    version,
+                ],
+            }];
+        });
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| this.select_template("bug.yml", window, cx));
+        });
+
+        let title = view.read_with(cx, |this, cx| {
+            this.title_input
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default()
+        });
+        let body = view.read_with(cx, |this, cx| {
+            this.body_input
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default()
+        });
+        assert_eq!(title, "[Bug] ");
+        assert!(
+            body.contains(&format!(
+                "## アプリのバージョン\n{}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "アプリのバージョンが入っていない: {body}"
+        );
     }
 
     /// 種別ごとに違う日本語になること（原因の取り違えを防ぐ）。

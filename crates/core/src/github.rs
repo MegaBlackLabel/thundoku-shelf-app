@@ -125,6 +125,8 @@ impl TemplateFieldKind {
 /// issue form の 1 項目。レポート画面の下書きのもとになる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateField {
+    /// `id`（`version` / `os` のような識別子。持たないテンプレートもある）。
+    pub id: Option<String>,
     pub kind: TemplateFieldKind,
     /// `attributes.label`（`markdown` は持たない）。
     pub label: Option<String>,
@@ -133,6 +135,21 @@ pub struct TemplateField {
     /// `markdown` の本文、または既定値。
     pub value: Option<String>,
     pub required: bool,
+}
+
+impl TemplateField {
+    /// **アプリのバージョンを書く欄**か。
+    ///
+    /// レポート画面はここへ実行中のバージョンを自動で入れる（利用者がバージョンを調べに
+    /// 「このアプリについて」へ行かなくて済むように）。判定は `id: version`（このリポジトリの
+    /// テンプレートの約束）か、見出しに「バージョン」を含むこと（`id` を変えても効くように）。
+    pub fn asks_for_app_version(&self) -> bool {
+        self.id.as_deref() == Some("version")
+            || self
+                .label
+                .as_deref()
+                .is_some_and(|label| label.contains("バージョン"))
+    }
 }
 
 /// リポジトリの issue form。
@@ -259,6 +276,7 @@ fn parse_issue_form(file_name: &str, text: &str) -> Result<Option<IssueTemplate>
                     .and_then(yaml_text)
             };
             fields.push(TemplateField {
+                id: yaml_field(item, "id").and_then(yaml_text),
                 kind,
                 label: attribute("label"),
                 description: attribute("description"),
@@ -528,6 +546,26 @@ body:
         assert_eq!(link.copy_body.as_deref(), Some(too_long.as_str()));
     }
 
+    /// アプリのバージョンを書く欄の判定（`id: version` と、見出しの「バージョン」）が効くこと。
+    #[test]
+    fn app_version_field_is_recognised_by_id_or_label() {
+        let input = |id: Option<&str>, label: &str| TemplateField {
+            id: id.map(str::to_string),
+            kind: TemplateFieldKind::Input,
+            label: Some(label.to_string()),
+            description: None,
+            placeholder: None,
+            value: None,
+            required: false,
+        };
+
+        assert!(input(Some("version"), "その他").asks_for_app_version());
+        assert!(input(None, "アプリのバージョン").asks_for_app_version());
+        // 別の欄をバージョン欄と取り違えない。
+        assert!(!input(Some("os"), "OS").asks_for_app_version());
+        assert!(!input(None, "概要").asks_for_app_version());
+    }
+
     /// テンプレート取得が**匿名**で、一覧は API・本文は CDN から取ること。
     #[test]
     fn template_listing_is_anonymous_and_parses_forms() {
@@ -550,6 +588,7 @@ body:
         assert_eq!(template.fields.len(), 2);
         assert_eq!(template.fields[0].kind, TemplateFieldKind::Markdown);
         assert_eq!(template.fields[1].kind, TemplateFieldKind::Textarea);
+        assert_eq!(template.fields[1].id.as_deref(), Some("summary"));
         assert_eq!(template.fields[1].label.as_deref(), Some("概要"));
         assert_eq!(template.fields[1].placeholder.as_deref(), Some("何が起きた？"));
         assert!(template.fields[1].required);
