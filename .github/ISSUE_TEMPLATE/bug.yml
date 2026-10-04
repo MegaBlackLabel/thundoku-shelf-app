@@ -74,10 +74,3 @@ body:
         </details>
     validations:
       required: false
-  - type: textarea
-    id: notes
-    attributes:
-      label: 補足（スクリーンショットなど）
-      description: 画像はここにドラッグ&ドロップできます。
-    validations:
-      required: false

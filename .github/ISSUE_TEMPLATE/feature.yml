@@ -32,10 +32,3 @@ body:
       description: 他に考えた方法や、既に試した回避策があれば。
     validations:
       required: false
-  - type: textarea
-    id: notes
-    attributes:
-      label: 補足（スクリーンショットなど）
-      description: 画像はここにドラッグ&ドロップできます。
-    validations:
-      required: false
