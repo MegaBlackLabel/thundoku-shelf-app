@@ -336,6 +336,27 @@ const COVER_BADGE_SIZE: f32 = 24.0;
 /// バッジの中に描くアイコンの一辺。文字グリフ（♥ ♡ ✓ ↓）は細くて潰れるのでアイコンを描く。
 const COVER_BADGE_ICON: f32 = 14.0;
 
+/// 検索欄の幅（広いとき）。placeholder「検索（タイトル・サークル・著者）」が切れない幅。
+pub(crate) const SEARCH_WIDTH: f32 = 320.0;
+/// 検索欄の幅の下限。ここまで縮めると虫めがねアイコンだけが残る
+/// （これ以上は切り取る中身が無くなるので、窓の幅の下限で防ぐ）。
+pub(crate) const SEARCH_MIN_WIDTH: f32 = 32.0;
+/// 検索欄の入力の高さ（`gpui-kit` の既定サイズの Input と同じ。箱を切り取るときに要る）。
+const INPUT_HEIGHT: f32 = 32.0;
+
+/// ウィンドウ幅の下限（本の上のツールバーが隠れない幅）。
+///
+/// 中身は フィルタチップ（全項目 / 未読 / 読んでいる途中 / 既読 / お気に入り / イベント /
+/// お気に入りタグ）+ 検索欄（`SEARCH_MIN_WIDTH` まで縮む）+ 右の操作（並び替え /
+/// 表示切替 / タグ取得 / 表示中のタグ取得 / 同期）。いちばん幅を食うのは
+/// **サイドバーを開いた状態**（本棚に割り当てられる幅が 184px 減る）。
+/// 実測でツールバーの右端は 1588px で止まった（検索欄 `SEARCH_MIN_WIDTH` のとき）ので、
+/// フォント差の余裕を足して 1620px にする。
+///
+/// 中身を増やす・ラベルを長くすると足りなくなるので、
+/// `workspace::tests::toolbar_stays_visible_at_the_minimum_window_width` が番人。
+pub const MIN_WINDOW_WIDTH: f32 = 1620.0;
+
 /// 表紙バッジの配色（塗り / アイコン / 輪郭）。
 ///
 /// 表紙は任意の画像なので、**テーマではなく「どんな表紙の上でも読めるか」**で決める:
@@ -8527,19 +8548,36 @@ impl Render for BookshelfView {
                                     ),
                             )
                             .child(
-                                // Web と同じ: 検索ボックス左に Search アイコン。
-                                // absolute で重ねると Input の背景に隠れて見えず、
-                                // placeholder が 28px 右に寄って見えるため、
-                                // Input の prefix（インフロー）でインプット内に配置する
-                                Input::new(&search_state)
-                                    .cursor_text()
-                                    // placeholder「検索（タイトル・サークル・著者）」と打ち込み文字が
-                                    // 切れない幅を確保する
-                                    .w(px(320.0))
-                                    .prefix(
-                                        Icon::new(IconName::Search)
-                                            .size(px(14.0))
-                                            .text_color(cx.theme().muted_foreground),
+                                // 検索欄。幅が足りないときは**箱だけ**縮めて、中身を切り取る
+                                // （右側の操作が見切れないように）。Input の幅を flex で決めると
+                                // この環境でレイアウトが収束しなくなるため、中身は固定幅のまま
+                                // absolute で置く（高さは既定サイズの Input に合わせる）。
+                                div()
+                                    .debug_selector(|| "bookshelf-search".into())
+                                    .relative()
+                                    .h(px(INPUT_HEIGHT))
+                                    .flex_1()
+                                    .min_w(px(SEARCH_MIN_WIDTH))
+                                    .max_w(px(SEARCH_WIDTH))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .left_0()
+                                            .child(
+                                                Input::new(&search_state)
+                                                    .cursor_text()
+                                                    .w(px(SEARCH_WIDTH))
+                                                    .h(px(INPUT_HEIGHT))
+                                                    .prefix(
+                                                        Icon::new(IconName::Search)
+                                                            .size(px(14.0))
+                                                            .text_color(
+                                                                cx.theme().muted_foreground,
+                                                            ),
+                                                    ),
+                                            ),
                                     ),
                             ),
                     )
@@ -10484,7 +10522,59 @@ mod tests {
         );
     }
 
-    /// ソートボタンは表示切替の左隣に置く。イベントフィルタは技術書典のときだけ出す。
+    /// 幅が足りないときは検索欄が縮んで、右端の操作（同期）まで見切れずに届くこと。
+    ///
+    /// 窓そのものは `MIN_WINDOW_WIDTH` で止まるので、ここで見ているのは「足りないぶんを
+    /// 検索欄が吸収する」側の振る舞い。固定 320px に戻すと右側の操作が画面外に出る
+    /// （issue #5 の再発）。下限（`SEARCH_MIN_WIDTH`）まで縮めても足りない幅は
+    /// 窓の下限で防ぐ。
+    #[gpui_kit::test]
+    async fn search_box_shrinks_and_keeps_the_toolbar_inside(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(cx, "db-1", "本", "サークル", None);
+
+        for width in [1100.0f32, 1000.0] {
+            let view = cx.new(BookshelfView::new);
+            let window = cx.open_window(
+                gpui_kit::Size {
+                    width: gpui_kit::px(width),
+                    height: gpui_kit::px(700.0),
+                },
+                |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+            );
+            let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+            draw_frames(visual);
+
+            for selector in [
+                "bookshelf-sort",
+                "bookshelf-view-toggle",
+                "bookshelf-tag-fetch",
+                "bookshelf-visible-tags",
+                "bookshelf-sync",
+            ] {
+                let bounds = visual
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} が出ていない"));
+                let right = bounds.origin.x.as_f32() + bounds.size.width.as_f32();
+                assert!(
+                    right <= width,
+                    "{selector} が画面外に出ている（width={width} right={right}）"
+                );
+            }
+
+            // 検索欄は固定幅ではなく、足りないぶんを縮めている（下限は確保する）。
+            let search = visual
+                .debug_bounds("bookshelf-search")
+                .expect("検索欄が出ていない");
+            let search_width = search.size.width.as_f32();
+            assert!(
+                (SEARCH_MIN_WIDTH..SEARCH_WIDTH).contains(&search_width),
+                "検索欄が縮んでいない（width={width}）: width={search_width}"
+            );
+        }
+    }
+
     #[gpui_kit::test]
     async fn sort_button_sits_left_of_view_toggle_and_event_hides_outside_tbf(
         cx: &mut TestAppContext,

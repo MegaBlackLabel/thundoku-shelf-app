@@ -3987,6 +3987,63 @@ mod tests {
         assert_ne!(initial, after, "sidebar toggle must flip the open state");
     }
 
+    /// ウィンドウの下限（`MIN_WINDOW_WIDTH`）まで狭めても、本の上のメニューが隠れないこと。
+    ///
+    /// ウィンドウは `MIN_WINDOW_WIDTH` より狭くできない（`main.rs` が
+    /// `window_min_size` で止める）。ここでは**その幅で全部の操作が画面内に残る**ことを見る。
+    /// サイドバーを開くと本棚に割り当てられる幅がいちばん減るので、両方の状態で確かめる。
+    /// 検索欄は足りないぶんを `SEARCH_MIN_WIDTH` まで縮めて吸収する。
+    #[gpui_kit::test]
+    async fn toolbar_stays_visible_at_the_minimum_window_width(cx: &mut TestAppContext) {
+        use crate::views::bookshelf::{MIN_WINDOW_WIDTH, SEARCH_MIN_WIDTH, SEARCH_WIDTH};
+
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        for sidebar_open in [false, true] {
+            ws.update(cx, |w, cx| {
+                if w.sidebar_open != sidebar_open {
+                    w.toggle_sidebar(cx);
+                }
+            });
+            let window = cx.open_window(
+                gpui_kit::Size {
+                    width: gpui_kit::px(MIN_WINDOW_WIDTH),
+                    height: gpui_kit::px(800.0),
+                },
+                |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+            );
+            let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+            draw_frames(visual);
+
+            // 右側の操作が見切れない（画面外だと押せない）。
+            for selector in [
+                "bookshelf-sort",
+                "bookshelf-view-toggle",
+                "bookshelf-tag-fetch",
+                "bookshelf-visible-tags",
+                "bookshelf-sync",
+            ] {
+                let bounds = visual.debug_bounds(selector).unwrap_or_else(|| {
+                    panic!("{selector} が出ていない（sidebar_open={sidebar_open}）")
+                });
+                let right = bounds.origin.x.as_f32() + bounds.size.width.as_f32();
+                assert!(
+                    right <= MIN_WINDOW_WIDTH,
+                    "{selector} が画面外に出ている（sidebar_open={sidebar_open} right={right}）"
+                );
+            }
+
+            // 検索欄は下限を割らず、広いときの幅も超えない。
+            let search = visual
+                .debug_bounds("bookshelf-search")
+                .expect("検索欄が出ていない");
+            let search_width = search.size.width.as_f32();
+            assert!(
+                (SEARCH_MIN_WIDTH..=SEARCH_WIDTH).contains(&search_width),
+                "検索欄の幅が範囲外（sidebar_open={sidebar_open} width={search_width}）"
+            );
+        }
+    }
+
     /// ウィンドウ上部のタイトルバーにアプリ名が出て、信号機に重ならないこと。
     ///
     /// `TitleBar::window_options()` は透過タイトルバー + `app_owns_titlebar_drag` を
