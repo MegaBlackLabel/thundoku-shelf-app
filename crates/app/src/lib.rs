@@ -42,6 +42,9 @@ mod icon_assets_tests {
             "icons/circle-user-round.svg",
             "icons/log-in.svg",
             "icons/log-out.svg",
+            // サイドバーの開閉（#7。デスクトップ版だけで使う lucide アイコン）
+            "icons/panel-left-open.svg",
+            "icons/panel-right-open.svg",
             // gpui-component 標準アイコン（AppAssets 経由で解決される）
             "icons/settings.svg",
             "icons/search.svg",

@@ -12,6 +12,9 @@
 //! Copyright (c) Lucide Icons and Contributors）から取得したもの。ISC は
 //! 再配布時に著作権表示の保持を求めるため、この注記を残すこと
 //! （`assets/icons/*.svg` の生成元は lucide の各アイコン）。
+//!
+//! デスクトップ版だけで使うもの（`panel-left-open` / `panel-right-open` =
+//! サイドバーの開閉ボタン）も同じ場所に置く。
 
 use std::borrow::Cow;
 
@@ -77,6 +80,10 @@ pub enum AppIcon {
     HeartFilled,
     /// 本の鍵（lucide KeyRound。パスフレーズの設定）
     KeyRound,
+    /// サイドバーを開く（lucide PanelLeftOpen。閉じているときの開閉ボタン）
+    PanelLeftOpen,
+    /// サイドバーを閉じる（lucide PanelRightOpen。開いているときの開閉ボタン）
+    PanelRightOpen,
 }
 
 impl IconNamed for AppIcon {
@@ -110,6 +117,8 @@ impl IconNamed for AppIcon {
             Self::Heart => "icons/heart.svg".into(),
             Self::HeartFilled => "icons/heart-filled.svg".into(),
             Self::KeyRound => "icons/key-round.svg".into(),
+            Self::PanelLeftOpen => "icons/panel-left-open.svg".into(),
+            Self::PanelRightOpen => "icons/panel-right-open.svg".into(),
         }
     }
 }
@@ -161,6 +170,10 @@ fn custom_icon(path: &str) -> Option<&'static [u8]> {
         "icons/heart.svg" => Some(include_bytes!("../assets/icons/heart.svg")),
         "icons/heart-filled.svg" => Some(include_bytes!("../assets/icons/heart-filled.svg")),
         "icons/key-round.svg" => Some(include_bytes!("../assets/icons/key-round.svg")),
+        "icons/panel-left-open.svg" => Some(include_bytes!("../assets/icons/panel-left-open.svg")),
+        "icons/panel-right-open.svg" => {
+            Some(include_bytes!("../assets/icons/panel-right-open.svg"))
+        }
         _ => None,
     }
 }
@@ -202,6 +215,8 @@ mod tests {
             AppIcon::Heart,
             AppIcon::HeartFilled,
             AppIcon::KeyRound,
+            AppIcon::PanelLeftOpen,
+            AppIcon::PanelRightOpen,
         ];
         for icon in icons {
             let path = icon.path();
