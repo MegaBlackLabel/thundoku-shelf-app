@@ -45,58 +45,11 @@ fn main() {
         }
     };
 
-    // Windows（Wine/CrossOver）ではコンソール出力が抑制されるためファイルにも出す
-    #[cfg(windows)]
-    {
-        // C:\ 直下は一般ユーザーが書き込めず `expect` でパニックし、
-        // 起動直後にクラッシュする（Windows で起動しない原因）。
-        // 書き込み可能な既知ディレクトリ（%TEMP%\thundoku-shelf）にログを出す。
-        let log_dir = std::env::temp_dir().join("thundoku-shelf");
-        let _ = std::fs::create_dir_all(&log_dir);
-        let log_path = log_dir.join("thundoku.log");
-        let hook_log = log_path.clone();
-        std::panic::set_hook(Box::new(move |info| {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&hook_log)
-            {
-                let _ = writeln!(f, "PANIC: {info}");
-                // スタックは `RUST_BACKTRACE=1` のときだけ残す（release は
-                // `strip = true` で関数名が出ないため、常用では情報が増えない）。
-                // 調査時は `CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1`
-                // でビルドしてから再現させる。
-                let _ = writeln!(f, "BACKTRACE:\n{}", std::backtrace::Backtrace::capture());
-            }
-        }));
-        // ログファイルが開けなくてもアプリは起動を続ける（best-effort）。
-        //
-        // 追記（append）で開く: `File::create` は既存ログを切り詰めるため、
-        // 2 個目の起動が 1 個目（起動中）のログを消してしまう。また非 append の
-        // ハンドルは自分のオフセットに書き込むので、追記された行を後から
-        // 上書きしてしまう。追記なら両プロセスの行が残る。
-        // 増え続けないよう、大きくなったら起動時に捨てる。
-        const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
-        if let Ok(meta) = std::fs::metadata(&log_path)
-            && meta.len() > MAX_LOG_BYTES
-        {
-            let _ = std::fs::File::create(&log_path);
-        }
-        if let Ok(f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-                .target(env_logger::Target::Pipe(Box::new(f)))
-                .init();
-        } else {
-            env_logger::init();
-        }
-    }
-    #[cfg(not(windows))]
-    env_logger::init();
+    // ログは**データディレクトリ配下**（`<data_dir>/logs/thundoku.log`）に出す。
+    // レポート画面が同じ場所を表示し、「ログの格納先を開く」で開く（issue #8）。
+    // 初期化は単一インスタンスの判定より**後**（ログ初期化が大きすぎるファイルを
+    // 切り詰めるため、2 個目の起動が起動中インスタンスのログを壊すのを防ぐ）。
+    thundoku_shelf::logging::init(&thundoku_shelf::app_state::resolve_data_dir());
 
     // 調査用の UA 差し替え（`thundoku_core::ua`）が効いている状態で起動したかを残す。
     // ストアの同期が失敗したとき、「差し替えた状態で走らせたのか」をログだけで確定できる
@@ -199,30 +152,18 @@ fn instance_lock_path() -> Option<std::path::PathBuf> {
 
 /// 2 重起動を検知したことをログに残す。
 ///
-/// Windows はコンソールを持たない（`windows_subsystem = "windows"`）ため stderr は
-/// 見えない。起動中インスタンスが使っているログを切り詰めないよう、追記で書く。
+/// 起動中インスタンスが使っているログを切り詰めないよう、**追記**で書く
+/// （`logging::init` はここでは呼ばない: 2 個目はロガーを初期化せずに終了する）。
+/// ファイルに書けなければ標準エラーへ出す（開発時に見えるように）。
 fn note_second_launch(lock_path: &std::path::Path) {
-    #[cfg(windows)]
-    {
-        use std::io::Write as _;
-        let log_path = std::env::temp_dir()
-            .join("thundoku-shelf")
-            .join("thundoku.log");
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            let _ = writeln!(
-                file,
-                "既に別のインスタンスが起動しているため終了します（lock: {}）",
-                lock_path.display()
-            );
-        }
-    }
-    #[cfg(not(windows))]
-    eprintln!(
+    let log_path =
+        thundoku_shelf::logging::log_file(&thundoku_shelf::app_state::resolve_data_dir());
+    let message = format!(
         "既に別のインスタンスが起動しているため終了します（lock: {}）",
         lock_path.display()
     );
+    // 追記できないときは標準エラーへ出す（開発時に見えるように）
+    if !thundoku_shelf::logging::append_line(&log_path, &message) {
+        eprintln!("{message}");
+    }
 }

@@ -6,6 +6,17 @@
 
 ### Added
 
+- **ログをデータディレクトリに出すようにした（レポート画面から格納先を開ける）**: これまで
+  ログファイルは Windows だけ `%TEMP%\thundoku-shelf\thundoku.log` に出ていて（macOS /
+  Linux は標準エラーだけ = GUI 起動では実質どこにも残らない）、**場所も分からなかった**。
+  出力先を **`<データディレクトリ>/logs/thundoku.log`（全 OS 共通）**に変え、レポート画面の
+  一番下に「ログ」カードを追加して**格納先を表示 + 「ログの格納先を開く」ボタン**で
+  エクスプローラー / Finder を開けるようにした（#8）。既定フィルタは `debug`（`RUST_LOG` 優先）、
+  起動時に 4 MiB を超えていたら捨て、panic も同じファイルに `PANIC:` として残す。
+  標準エラーにも出す（ターミナルから起動したときはその場でも読める）。
+  `crates/app/src/logging.rs`（新規）、`crates/app/src/main.rs`、`crates/app/src/app_state.rs`、
+  `crates/app/src/views/report.rs`、`crates/core/src/shell.rs`（新規。`google::open_browser` の
+  ShellExecuteW / open / xdg-open を共通化）、`docs/features.md`、`docs/spec/08-notifications-and-nonfunctional.md`
 - **設定の「同期」でも Drive のバックアップ（お気に入り・付箋・履歴）を取り込む**: 従来の
   取り込みは**起動時の復元確認ダイアログだけ**で、設定の同期は本のファイル（パック）しか
   取り込んでいなかった。`should_offer_restore`（Drive が動いた かつ ローカルと違う）を
