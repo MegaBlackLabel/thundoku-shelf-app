@@ -408,53 +408,10 @@ fn percent_encode(value: &str) -> String {
 /// `?client_id=…` まで）。必須パラメータが落ちると Google は 400 `invalid_request` を返す。
 /// `explorer <URL>` も不可（URL を渡すとエクスプローラーが開くだけで既定ブラウザが
 /// 開かない。実測 2026-09-23）。`ShellExecuteW` は URL をそのままシェルへ渡す。
+///
+/// 実装は [`crate::shell::open_in_shell`]（フォルダを開くのと同じ経路）。
 pub fn open_browser(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows_sys::Win32::UI::Shell::ShellExecuteW;
-        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-        let operation = wide("open");
-        let target = wide(url);
-        // SAFETY: 3 つの文字列はこの関数の間だけ生きる NUL 終端 UTF-16 で、
-        // ポインタ引数は ShellExecuteW が呼び出し中しか読まない。
-        let result = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                operation.as_ptr(),
-                target.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                SW_SHOWNORMAL,
-            )
-        };
-        // ShellExecute の戻り値は「32 以下なら失敗」と決まっている。
-        if (result as isize) <= 32 {
-            return Err(std::io::Error::other(format!(
-                "ShellExecuteW failed ({})",
-                result as isize
-            )));
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let program = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        std::process::Command::new(program)
-            .arg(url)
-            .spawn()
-            .map(|_| ())
-    }
-}
-
-/// NUL 終端の UTF-16（Windows の `*W` API 用）。
-#[cfg(target_os = "windows")]
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
+    crate::shell::open_in_shell(url)
 }
 
 fn percent_decode(input: &str) -> String {

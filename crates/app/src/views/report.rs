@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use gpui_kit::ReadGlobal as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
@@ -46,6 +47,7 @@ use thundoku_core::github::{
 use thundoku_core::github::GithubClient;
 
 use crate::app_state::{ToastKind, set_toast_kind};
+use crate::logging::LOG_FILE_NAME;
 
 /// 投稿先リポジトリの owner（**固定**）。
 const TARGET_REPO_OWNER: &str = "MegaBlackLabel";
@@ -172,14 +174,19 @@ fn error_message(error: &GithubError) -> String {
 /// 既定のブラウザーで URL を開く処理。
 type OpenBrowser = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// フォルダ（ログの格納先）をファイルマネージャーで開く処理。
+type OpenFolder = Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>;
+
 /// 送信で外へ出る処理。テストは記録するだけの実装を差し込む。
 ///
 /// Windows ではシェルを触る（`ShellExecuteW` はメッセージループを回す）。
-/// **update の中で呼ばない**（[`ReportView::submit`] を参照）。
+/// **update の中で呼ばない**（[`ReportView::submit`] / [`ReportView::open_log_folder`] を参照）。
 #[derive(Clone)]
 struct ReportIo {
     /// 既定のブラウザーで URL を開く。
     open_browser: OpenBrowser,
+    /// ログの格納先をファイルマネージャー（エクスプローラー / Finder）で開く。
+    open_folder: OpenFolder,
 }
 
 impl Default for ReportIo {
@@ -187,6 +194,9 @@ impl Default for ReportIo {
         Self {
             open_browser: Arc::new(|url| {
                 thundoku_core::google::open_browser(url).map_err(|error| error.to_string())
+            }),
+            open_folder: Arc::new(|path| {
+                thundoku_core::shell::open_path(path).map_err(|error| error.to_string())
             }),
         }
     }
@@ -221,6 +231,8 @@ pub struct ReportView {
     templates_error: Option<String>,
     /// 送信で外へ出る処理（テストは差し替える）。
     io: ReportIo,
+    /// ログの格納先（`<データディレクトリ>/logs`。画面に出して「開く」で開く）。
+    log_dir: std::path::PathBuf,
     /// 画面に赤字で出すエラー（タイトル未入力・ブラウザーを開けない）。
     error: Option<String>,
 }
@@ -231,7 +243,7 @@ impl ReportView {
     }
 
     /// 外へ出る処理を差し替えて作る（テストは記録装置を渡す）。
-    fn with_io(_cx: &mut Context<Self>, io: ReportIo) -> Self {
+    fn with_io(cx: &mut Context<Self>, io: ReportIo) -> Self {
         Self {
             title_input: None,
             body_input: None,
@@ -240,6 +252,8 @@ impl ReportView {
             templates_loading: false,
             templates_fetched: false,
             templates_error: None,
+            // ログの格納先はデータディレクトリ配下（`logging` が唯一の決定箇所）
+            log_dir: crate::logging::log_dir(&crate::app_state::AppState::global(cx).data_dir),
             io,
             error: None,
         }
@@ -407,6 +421,39 @@ impl ReportView {
         cx.notify();
     }
 
+    /// 「ログの格納先を開く」: ログのフォルダをファイルマネージャー
+    /// （エクスプローラー / Finder）で開く。
+    ///
+    /// 開く処理はブラウザーと同じく**update の外**で行う（Windows の `ShellExecuteW` は
+    /// シェルがメッセージループを回すため、App 借用中に呼ぶと gpui の window proc が
+    /// 再入して `RefCell already borrowed` で落ちる）。
+    pub fn open_log_folder(&mut self, cx: &mut Context<Self>) {
+        let dir = self.log_dir.clone();
+        let io = self.io.clone();
+        cx.spawn(async move |this, cx| {
+            let opened = cx
+                .background_executor()
+                .spawn(async move { (io.open_folder)(&dir) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.finish_open_log_folder(opened, cx));
+        })
+        .detach();
+    }
+
+    /// ログの格納先を開いた後の後処理（失敗は画面に出す）。update の外から呼ばれる。
+    fn finish_open_log_folder(&mut self, opened: Result<(), String>, cx: &mut Context<Self>) {
+        match opened {
+            Ok(()) => self.error = None,
+            Err(error) => {
+                log::warn!("report: ログの格納先を開けませんでした: {error}");
+                self.error = Some(format!(
+                    "ログの格納先を開けませんでした（画面に出ているパスを確認してください）: {error}"
+                ));
+            }
+        }
+        cx.notify();
+    }
+
     /// カード風の枠（アイコン + タイトル + 説明 + 中身）。設定画面と揃える。
     fn card(
         cx: &Context<Self>,
@@ -527,6 +574,11 @@ impl Render for ReportView {
         let selected = self.selected_template.clone();
         let muted_fg = cx.theme().muted_foreground;
         let handle = cx.entity();
+        // ログカードの説明（ファイル名とローテーションの方針は定数から作る）
+        let log_note = format!(
+            "{LOG_FILE_NAME} に追記されます（{} MiB を超えたら起動時に捨てます）。",
+            crate::logging::MAX_LOG_BYTES / (1024 * 1024)
+        );
         let title_input = self
             .title_input
             .clone()
@@ -744,6 +796,44 @@ impl Render for ReportView {
                                             }),
                                     ),
                             ),
+                    ))
+                    // ログ（不具合の調査に使う置き場所。フォルダを開けるようにする）
+                    .child(Self::card(
+                        cx,
+                        "ログ",
+                        Some("不具合の調査に使うログの置き場所です"),
+                        Icon::new(crate::icons::AppIcon::HardDrive)
+                            .size(px(16.0))
+                            .text_color(muted_fg),
+                        div()
+                            .p_5()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .debug_selector(|| "report-log-path".to_string())
+                                    .text_sm()
+                                    .child(self.log_dir.display().to_string()),
+                            )
+                            .child(div().text_xs().text_color(muted_fg).child(log_note))
+                            .child(
+                                div().flex().flex_row().justify_end().child(
+                                    Button::new("report-log-open")
+                                        .outline()
+                                        .cursor_pointer()
+                                        .label("ログの格納先を開く")
+                                        .debug_selector(|| "report-log-open".to_string())
+                                        .on_click({
+                                            let handle = handle.clone();
+                                            move |_, _window, cx| {
+                                                handle.update(cx, |this, cx| {
+                                                    this.open_log_folder(cx);
+                                                });
+                                            }
+                                        }),
+                                ),
+                            ),
                     )),
             )
     }
@@ -762,17 +852,28 @@ mod tests {
     struct Recorder {
         /// 開いた URL。
         opened: parking_lot::Mutex<Vec<String>>,
-        /// ブラウザーを開けなかったことにする（失敗経路のテスト用）。
+        /// 開いたフォルダ（ログの格納先など）。
+        opened_folders: parking_lot::Mutex<Vec<std::path::PathBuf>>,
+        /// ブラウザー / フォルダを開けなかったことにする（失敗経路のテスト用）。
         fail: bool,
     }
 
     impl Recorder {
         fn io(self: &Arc<Self>) -> ReportIo {
-            let opened = self.clone();
+            let browser = self.clone();
+            let folder = self.clone();
             ReportIo {
                 open_browser: Arc::new(move |url: &str| {
-                    opened.opened.lock().push(url.to_string());
-                    if opened.fail {
+                    browser.opened.lock().push(url.to_string());
+                    if browser.fail {
+                        Err("ShellExecuteW failed (-1)".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }),
+                open_folder: Arc::new(move |path: &std::path::Path| {
+                    folder.opened_folders.lock().push(path.to_path_buf());
+                    if folder.fail {
                         Err("ShellExecuteW failed (-1)".to_string())
                     } else {
                         Ok(())
@@ -1154,6 +1255,70 @@ mod tests {
         view.update(cx, |this, cx| this.submit(cx));
         let error = view.read_with(cx, |this, _| this.error.clone());
         assert_eq!(error.as_deref(), Some("タイトルを入力してください"));
+    }
+
+    /// ログの格納先が画面に出て、「開く」でそのフォルダを開くこと（issue #8）。
+    ///
+    /// 開く処理はブラウザーと同じく update の外（背景）で行う（`ShellExecuteW` が
+    /// gpui を再入させるため）。
+    #[gpui_kit::test]
+    async fn report_shows_and_opens_the_log_folder(cx: &mut TestAppContext) {
+        let recorder = Arc::new(Recorder::default());
+        let (view, visual) = open_report(cx, recorder.io());
+        let data_dir = cx.read(|cx| crate::app_state::AppState::global(cx).data_dir.clone());
+        let log_dir = crate::logging::log_dir(&data_dir);
+
+        assert_eq!(
+            view.read_with(cx, |this, _| this.log_dir.clone()),
+            log_dir,
+            "ログの格納先が違う（ログの出力先と画面の表示がずれている）"
+        );
+        assert!(
+            visual.debug_bounds("report-log-path").is_some(),
+            "ログの格納先が画面に出ていない"
+        );
+        assert!(
+            visual.debug_bounds("report-log-open").is_some(),
+            "「ログの格納先を開く」ボタンが出ていない"
+        );
+
+        view.update(cx, |this, cx| this.open_log_folder(cx));
+        assert!(
+            recorder.opened_folders.lock().is_empty(),
+            "update の中でフォルダを開いている（ShellExecuteW が gpui を再入させる）"
+        );
+        visual.run_until_parked();
+        assert_eq!(
+            recorder.opened_folders.lock().clone(),
+            vec![log_dir],
+            "ログの格納先を開いていない"
+        );
+    }
+
+    /// ログの格納先を開けなかったら、画面に理由を出すこと（失敗経路）。
+    #[gpui_kit::test]
+    async fn failing_to_open_the_log_folder_reports_the_reason(cx: &mut TestAppContext) {
+        let recorder = Arc::new(Recorder {
+            fail: true,
+            ..Default::default()
+        });
+        let (view, visual) = open_report(cx, recorder.io());
+
+        view.update(cx, |this, cx| this.open_log_folder(cx));
+        visual.run_until_parked();
+
+        assert_eq!(
+            recorder.opened_folders.lock().len(),
+            1,
+            "開こうとしていない"
+        );
+        let error = view
+            .read_with(cx, |this, _| this.error.clone())
+            .unwrap_or_default();
+        assert!(
+            error.contains("ログの格納先を開けませんでした"),
+            "原因が出ていない: {error}"
+        );
     }
 
     /// 送信はブラウザーを update の中で呼ばず、タスク（実機では背景スレッド）で開くこと。

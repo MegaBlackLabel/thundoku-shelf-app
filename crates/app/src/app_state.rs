@@ -260,6 +260,18 @@ pub fn save_data_path(path: &std::path::Path) {
     );
 }
 
+/// データディレクトリを解決する（保存先の設定 → OS の `data_dir`/thundoku-shelf）。
+///
+/// **`main.rs` は AppState の初期化より先にこれを使う**（ログの出力先を決めるため。
+/// `AppState::init` も同じ値を使うので、保存先の解決はここ 1 箇所）。
+pub fn resolve_data_dir() -> PathBuf {
+    loaded_data_path().unwrap_or_else(|| {
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("thundoku-shelf")
+    })
+}
+
 /// 保存済みの Google プロフィール（`sub` 等）を keyring から復元する（起動時に呼ぶ）。
 ///
 /// プロフィールはネットワーク（`userinfo`）でしか取れないが、`sub` は所有者
@@ -281,12 +293,7 @@ impl AppState {
     pub fn init(cx: &mut App) {
         // 保存先が変更されている場合はそのパスを使う（設定ファイルは
         // データディレクトリとは独立した場所に保存し、必ず読めるようにする）。
-        let data_dir = loaded_data_path().unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("thundoku-shelf")
-        });
-        Self::init_with_data_dir(cx, data_dir);
+        Self::init_with_data_dir(cx, resolve_data_dir());
     }
 
     /// Initialize with a specific data directory (keyring-backed secrets).

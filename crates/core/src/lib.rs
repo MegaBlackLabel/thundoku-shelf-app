@@ -15,6 +15,7 @@ pub mod pack_path;
 pub mod secrets;
 pub mod session_cookies;
 pub mod session_store;
+pub mod shell;
 pub mod single_instance;
 pub mod store_size;
 pub mod tags;

@@ -173,14 +173,19 @@
 
 | 項目 | 値 | アンカー |
 |---|---|---|
-| ロガー | `env_logger` + `log`（`RUST_LOG` で制御可） | `crates/app/src/main.rs:86-92`, `docs/features.md:74` |
-| Windows の出力先 | `%TEMP%\thundoku-shelf\thundoku.log`（stderr は非表示のためファイルにも出す） | `crates/app/src/main.rs:48-60` |
-| 既定フィルタ（Windows） | `default_filter_or("debug")` | `crates/app/src/main.rs:86-88` |
-| ログのローテーション | 起動時に 4 MiB（`MAX_LOG_BYTES = 4 * 1024 * 1024`）を超えていたら `File::create` で捨てる | `crates/app/src/main.rs:75-80` |
-| 書き込みモード | 追記（`append(true)`）。`File::create` だと 2 個目の起動が起動中インスタンスのログを消し、非 append ハンドルは自分のオフセットに書いて後続行を上書きするため | `crates/app/src/main.rs:81-85` |
-| panic 時 | `std::panic::set_hook` で `PANIC: {info}` を同じログに追記 | `crates/app/src/main.rs:62-70` |
-| 非 Windows | `env_logger::init()`（標準エラー） | `crates/app/src/main.rs:92` |
-| 2 個目の起動 | `note_second_launch` がロックパス付きで追記（ウィンドウは開かない） | `crates/app/src/main.rs:180-190`, `:33` |
+| ロガー | `env_logger` + `log`（`RUST_LOG` で制御可） | `crates/app/src/logging.rs`, `docs/features.md:75` |
+| 出力先 | **`<データディレクトリ>/logs/thundoku.log`**（全 OS 共通。データディレクトリは保存先の設定で変わる）。Windows は `%APPDATA%\thundoku-shelf\logs\thundoku.log` | `crates/app/src/logging.rs`（`log_dir` / `log_file`）, `crates/app/src/main.rs:48-52` |
+| 出力先の表示と導線 | レポート画面の「ログ」カードが同じパスを表示し、「ログの格納先を開く」でファイルマネージャー（エクスプローラー / Finder）を開く（issue #8） | `crates/app/src/views/report.rs`（`open_log_folder` / `report-log-path` / `report-log-open`）, `crates/core/src/shell.rs`（`open_path`） |
+| 既定フィルタ | `default_filter_or("debug")`（全 OS。`RUST_LOG` があればそちらが優先） | `crates/app/src/logging.rs`（`DEFAULT_FILTER`） |
+| 書き込み先 | **ファイル + 標準エラー**（GUI 起動では標準エラーが見えないためファイルにも出し、ターミナル起動ではその場でも読める） | `crates/app/src/logging.rs`（`TeeWriter`） |
+| ログのローテーション | 起動時に 4 MiB（`MAX_LOG_BYTES = 4 * 1024 * 1024`）を超えていたら捨てる | `crates/app/src/logging.rs`（`open_log_file`） |
+| 書き込みモード | 追記（`append(true)`）。`File::create` だと 2 個目の起動が起動中インスタンスのログを消し、非 append ハンドルは自分のオフセットに書いて後続行を上書きするため | `crates/app/src/logging.rs`（`open_log_file`） |
+| panic 時 | `std::panic::set_hook` で `PANIC: {info}`（`RUST_BACKTRACE=1` のときはスタックも）を同じログに追記 | `crates/app/src/logging.rs`（`set_panic_hook` / `append_line`） |
+| 2 個目の起動 | `note_second_launch` が同じログに追記（書けなければ標準エラー。ウィンドウは開かない） | `crates/app/src/main.rs`（`note_second_launch`） |
+| 依存（OSS）のログ | 依存も `log` 経由で**同じログに入る**（実測: `sqlx::query` のクエリログ・`usvg::text` のフォント警告・`ureq` / `rustls` / `keyring`）。独自のログファイルを書く依存は無い（`tracing` は gpui-kit 経由で依存に入るが、購読者（`tracing-subscriber`）を付けていないので `tracing` 系のイベントは出ない） | `Cargo.lock`, `crates/app/src/logging.rs` |
+| 既定のログ量 | `debug` なので依存の DEBUG も入る（実測: 起動 12 秒で約 200 KB。`usvg::text` が最多）。増え続けないよう起動時に 4 MiB で捨てる。静かにしたいときは `RUST_LOG=info` 等で絞る | `crates/app/src/logging.rs`（`DEFAULT_FILTER` / `MAX_LOG_BYTES`） |
+| 保存先の変更との関係 | データ保存先の変更では `logs/` を移動しない（移動対象は DB / packs / thumbnails / downloads）。**次回起動から新しい保存先の `logs/` に書く**（古いログは古い保存先に残る） | `crates/app/src/views/settings.rs`（`confirm_data_dir_change`） |
+| ローカルデータ削除との関係 | 「ローカルデータをすべて削除」は DB の行と `packs` / `thumbnails` / `downloads` だけを消す（**ログは消さない**。開いているログを消そうとして失敗することも無い） | `crates/app/src/views/settings.rs`（`delete_all_data`） |
 
 ### 6.2 記録されるログの種類（用途別）
 
