@@ -4505,13 +4505,14 @@ mod tests {
         );
     }
 
-    /// サイドバーの先頭（ロゴ行）が上端に張り付いていること。
+    /// サイドバーの先頭（開閉ボタンの行）が上端に張り付いていること。
     ///
     /// タイトルバーが信号機のぶんを確保しているので、サイドバー側にも同じ余白を置くと
-    /// 二重に下がる（macOS は 30 px が二重になっていた）。
-    #[cfg(target_os = "macos")]
+    /// 二重に下がる（macOS は 30 px が二重になっていた）。#7 で開閉ボタンの行を一番上に
+    /// 足したので、先頭はこの行（ロゴ行はその下）。判定は同じウィンドウ内の相対位置なので
+    /// プラットフォームに依らない（macOS だけに掛けていたのを外した）。
     #[gpui_kit::test]
-    async fn sidebar_header_sits_at_the_top(cx: &mut TestAppContext) {
+    async fn sidebar_toggle_row_sits_at_the_top(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
             ws.update(cx, |w, cx| {
@@ -4531,13 +4532,22 @@ mod tests {
         let sidebar = visual
             .debug_bounds("sidebar")
             .expect("サイドバーが出ていない");
+        let toggle_row = visual
+            .debug_bounds("sidebar-toggle-row")
+            .expect("サイドバーの開閉ボタンの行が出ていない");
+        assert_eq!(
+            toggle_row.origin.y, sidebar.origin.y,
+            "サイドバーの先頭（開閉ボタンの行）が上端から下がっている（開閉ボタンの行 {:?} / サイドバー上端 {:?}）",
+            toggle_row.origin.y, sidebar.origin.y
+        );
         let header = visual
             .debug_bounds("sidebar-header")
             .expect("サイドバーのロゴ行が出ていない");
-        assert_eq!(
-            header.origin.y, sidebar.origin.y,
-            "サイドバーのロゴ行が上端から下がっている（ロゴ行 {:?} / サイドバー上端 {:?}）",
-            header.origin.y, sidebar.origin.y
+        assert!(
+            header.origin.y >= toggle_row.origin.y + toggle_row.size.height,
+            "ロゴ行が開閉ボタンの行に重なっている（ロゴ行 {:?} / 開閉ボタンの行の下端 {:?}）",
+            header.origin.y,
+            toggle_row.origin.y + toggle_row.size.height
         );
     }
 
