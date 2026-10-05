@@ -285,6 +285,19 @@ struct SidebarRowStyle {
     background: Option<gpui_kit::Hsla>,
 }
 
+/// サイドバーの開閉ボタンのアイコン（#7）。
+///
+/// **押すとパネルが動く向き**を示す: 閉じているときは「開く」（`panel-left-open`）、
+/// 開いているときは「閉じる」（`panel-right-open`）。ラベルを出さないボタンなので、
+/// アイコンの向きだけで何が起きるか分かるようにする。
+fn sidebar_toggle_icon(open: bool) -> AppIcon {
+    if open {
+        AppIcon::PanelRightOpen
+    } else {
+        AppIcon::PanelLeftOpen
+    }
+}
+
 /// サイドバーの行の見た目を決める（選択中 / 非選択）。
 ///
 /// 選択中は**塗りつぶし**（`primary` の下地 + `primary_foreground` のアイコン / ラベル）
@@ -689,23 +702,31 @@ impl Workspace {
         cx.notify();
     }
 
-    /// サイドバー開閉トグル（ツールバー・ショートカット）。
+    /// サイドバー開閉トグル（「表示」メニューの `ToggleSidebar`）。
+    ///
+    /// 開閉は明示的な操作だけにする（#7）: 開閉ボタン / このメニュー / 本棚行の
+    /// ダブルクリック（開く）。**メニューからの切替は自動クローズを予約しない**
+    /// （開いたままにできる）。予約済みのタイマーは無効化する（開き直した直後に
+    /// 古いタイマーで閉じないため）。
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        // ショートカットでの開閉はマウスオーバー判定に使うウィンドウを取れないため、
-        // 自動クローズは掛けず、手動で閉じる。
         self.sidebar_open = !self.sidebar_open;
+        self.cancel_sidebar_auto_close();
         cx.notify();
     }
 
-    /// サイドバー操作後の接続。ホバーが外れてしばらくすると、
-    /// アイコンのみの閉じた状態に戻す（タイマー方式）。
+    /// サイドバーを開いて、自動クローズ（マウスが離れてから 3 秒）を予約する。
     pub fn interact_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_open = true;
         self.schedule_sidebar_auto_close(window, cx);
         cx.notify();
     }
 
-    /// サイドバーを閉じるタイマー（マウスが離れてから数秒後に閉じる）。
+    /// 自動クローズの予約を無効化する（世代を進めるだけ。タイマー側は世代が一致しないと
+    /// 閉じないので、予約し直さない限り閉じない）。
+    fn cancel_sidebar_auto_close(&mut self) {
+        self.sidebar_close_generation += 1;
+    }
+
     /// サイドバーを閉じるタイマー（マウスがサイドバー上にいなければ 3 秒後に閉じる）。
     /// タイマー発火時にマウス位置をポーリングし、サイドバー領域（ウィンドウ左端 256px）に
     /// マウスが居る場合はタイマーを仕切り直す（GPUI の on_mouse_exit は
@@ -2796,18 +2817,6 @@ impl Workspace {
             .flex_col()
             .relative()
             .overflow_hidden()
-            .on_click({
-                let handle = handle.clone();
-                move |_event, window, cx| {
-                    handle.update(cx, |this, cx| {
-                        if !this.sidebar_open {
-                            this.sidebar_open = true;
-                        }
-                        this.schedule_sidebar_auto_close(window, cx);
-                        cx.notify();
-                    });
-                }
-            })
             .with_animation(
                 SharedString::from(format!(
                     "sidebar-width-{}",
@@ -2830,6 +2839,24 @@ impl Workspace {
                         this.w(px(width))
                     }
                 },
+            )
+            // 開閉ボタン（サイドバーの一番上。#7）
+            //
+            // 開閉の導線はこのボタンだけにする（以前は「サイドバーのどこかをクリック」で
+            // 開き、マウスが離れると 3 秒で閉じていた = 分かりにくかった）。
+            // 閉じているときはアイコン列の中央、開いているときは右端（＝畳む側）に置く。
+            .child(
+                div()
+                    .id("sidebar-toggle-row")
+                    .debug_selector(|| "sidebar-toggle-row".into())
+                    .flex()
+                    .items_center()
+                    .w_full()
+                    .h(px(36.0))
+                    .when(!open, |this| this.justify_center())
+                    // 開いたときは行の右端（コンテナの横パディング 18px）に揃える
+                    .when(open, |this| this.justify_end().px(px(18.0)))
+                    .child(self.sidebar_toggle_button(open, handle.clone(), cx)),
             )
             // ヘッダー（ロゴ行）
             .child(
@@ -2887,7 +2914,8 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .p_2()
+                    .px(px(18.0))
+                    .py_2()
                     .gap_1()
                     .child(
                         self.nav_row(
@@ -2985,7 +3013,8 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .p_2()
+                    .px(px(18.0))
+                    .py_2()
                     .gap_1()
                     .mt_auto()
                     .pb(px(16.0))
@@ -3063,6 +3092,53 @@ impl Workspace {
         } else {
             count.to_string()
         }
+    }
+
+    /// サイドバーの開閉ボタン（一番上）。アイコンは「押すと動く向き」を示す（#7）。
+    fn sidebar_toggle_button(
+        &self,
+        open: bool,
+        handle: Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .id("sidebar-toggle")
+            .debug_selector(|| "sidebar-toggle".into())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(36.0))
+            .h(px(36.0))
+            .rounded_xl()
+            .cursor_pointer()
+            // ナビ行と同じホバーの下地（押せることを見せる）
+            .hover(|style| style.bg(theme.muted))
+            .on_click({
+                let handle = handle.clone();
+                move |_, window, cx| {
+                    handle.update(cx, |this, cx| {
+                        if this.sidebar_open {
+                            // 閉じる: 予約済みの自動クローズも無効化する
+                            this.sidebar_open = false;
+                            this.cancel_sidebar_auto_close();
+                            cx.notify();
+                        } else {
+                            // 開く: マウスが離れたら 3 秒で戻る（自動クローズ）を予約する
+                            this.interact_sidebar(window, cx);
+                        }
+                    });
+                }
+            })
+            .child(
+                div()
+                    .debug_selector(|| "sidebar-toggle-glyph".into())
+                    .child(
+                        Icon::new(sidebar_toggle_icon(open))
+                            .size(px(24.0))
+                            .text_color(theme.muted_foreground),
+                    ),
+            )
     }
 
     /// サイドバーのロゴ（ブックマーク + 未読バッジ）。
@@ -3180,7 +3256,7 @@ impl Workspace {
             // アイコンは行の色を継承する（`Icon` 側で色を指定しない）
             .text_color(row.icon_color)
             .when_some(row.background, |this, bg| this.bg(bg))
-            .when(open, |this| this.ml(px(18.0)).px(px(6.0)))
+            .when(open, |this| this.px(px(6.0)))
             .when(open, |this| this.w_full())
             .when(!open, |this| this.w(px(36.0)).h(px(36.0)).justify_center())
             .hover(|style| style.bg(theme.muted))
@@ -3191,6 +3267,9 @@ impl Workspace {
                     cx.stop_propagation();
                     handle.update(cx, |this, cx| {
                         let is_bookshelf = target == NavTarget::Bookshelf;
+                        // 本棚行のダブルクリックで開く（#7 で残した導線）。開いているときは
+                        // サイト別サブメニューの開閉にする。自動クローズ（マウスが離れて 3 秒）
+                        // を予約するので、開いたあと触らなければアイコンだけの幅に戻る。
                         if is_bookshelf && event.click_count() >= 2 {
                             if !this.sidebar_open {
                                 this.sidebar_open = true;
@@ -3281,7 +3360,7 @@ impl Workspace {
             // アイコンは行の色を継承する（`Icon` 側で色を指定しない）
             .text_color(row.icon_color)
             .when_some(row.background, |this, bg| this.bg(bg))
-            .when(open, |this| this.ml(px(18.0)).px(px(6.0)))
+            .when(open, |this| this.px(px(6.0)))
             .when(open, |this| this.w_full())
             .when(!open, |this| this.w(px(36.0)).h(px(36.0)).justify_center())
             .hover(|style| style.bg(theme.muted))
@@ -3343,15 +3422,17 @@ impl Workspace {
             .id("bookshelf-submenu-wrap")
             .debug_selector(|| "bookshelf-submenu".into())
             .overflow_hidden()
-            // ナビの中央寄せ（items_center）の影響を受けず、左寄せで表示する
+            // ナビの中央寄せ（items_center）の影響を受けず、左寄せで表示する。
+            // インデントは `ml` ではなく横パディングで取る（`w_full` + `ml` は
+            // 行が右へはみ出して右端に接する）。左右を揃えて 8px 下げる。
             .w_full()
+            .px_2()
             .child(
                 div()
                     .id(format!(
                         "bookshelf-submenu-{}",
                         if open { "open" } else { "closed" }
                     ))
-                    .ml_2()
                     .mt_1()
                     .flex()
                     .flex_col()
@@ -4109,6 +4190,195 @@ mod tests {
         });
         let after = ws.read_with(cx, |w, _| w.sidebar_open);
         assert_ne!(initial, after, "sidebar toggle must flip the open state");
+    }
+
+    /// 開閉ボタンのアイコンは「押すとパネルが動く向き」を示すこと（#7）。
+    ///
+    /// 閉じているとき = パネルを開く（`panel-left-open`）/ 開いているとき = パネルを閉じる
+    /// （`panel-right-open`）。
+    #[test]
+    fn sidebar_toggle_icon_shows_where_the_button_moves_the_panel() {
+        assert_eq!(
+            sidebar_toggle_icon(false),
+            AppIcon::PanelLeftOpen,
+            "閉じているときは「開く」アイコンでない"
+        );
+        assert_eq!(
+            sidebar_toggle_icon(true),
+            AppIcon::PanelRightOpen,
+            "開いているときは「閉じる」アイコンでない"
+        );
+    }
+
+    /// サイドバーの左上の開閉ボタンで開閉できること（#7）。
+    ///
+    /// 以前は「サイドバーのどこかをクリックすると開く / マウスが離れて 3 秒で閉じる」で、
+    /// 開閉の仕方が分かりにくかった。開閉はこのボタン（と本棚行のダブルクリック = 開く）
+    /// だけにする。
+    #[gpui_kit::test]
+    async fn sidebar_toggle_button_opens_and_closes_the_sidebar(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        assert!(
+            !ws.read_with(cx, |w, _| w.sidebar_open),
+            "前提: 閉じた状態から始まる"
+        );
+
+        click_sidebar_toggle(visual);
+        assert!(
+            ws.read_with(cx, |w, _| w.sidebar_open),
+            "開閉ボタンを押しても開かない"
+        );
+        click_sidebar_toggle(visual);
+        assert!(
+            !ws.read_with(cx, |w, _| w.sidebar_open),
+            "開閉ボタンを押しても閉じない"
+        );
+    }
+
+    /// サイドバーの余白（アイコンでも開閉ボタンでもない場所）をクリックしても開かないこと（#7）。
+    ///
+    /// 「左ペインのどこかをクリックすると開く」のが分かりにくかった（issue #7）。
+    #[gpui_kit::test]
+    async fn sidebar_background_click_does_not_open_it(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        let header = visual
+            .debug_bounds("sidebar-header")
+            .expect("サイドバーのロゴ行が出ていない");
+        // ロゴ行の左端（ロゴの外＝余白）をクリックする
+        let point = gpui_kit::point(header.origin.x + gpui_kit::px(4.0), header.center().y);
+        visual.simulate_click(point, gpui_kit::Modifiers::default());
+        draw_frames(visual);
+
+        assert!(
+            !ws.read_with(cx, |w, _| w.sidebar_open),
+            "サイドバーの余白クリックで開いてしまう"
+        );
+    }
+
+    /// サイドバーの開閉ボタン（左上）をクリックして描き直す。
+    fn click_sidebar_toggle(visual: &mut gpui_kit::VisualTestContext) {
+        let button = visual
+            .debug_bounds("sidebar-toggle")
+            .expect("サイドバーの開閉ボタンが出ていない");
+        visual.simulate_click(button.center(), gpui_kit::Modifiers::default());
+        draw_frames(visual);
+    }
+
+    /// マウス移動を送る（論理ピクセル）。
+    fn send_mouse_move(visual: &mut gpui_kit::VisualTestContext, x: f32, y: f32) {
+        visual.simulate_event(gpui_kit::MouseMoveEvent {
+            position: gpui_kit::Point::new(gpui_kit::px(x), gpui_kit::px(y)),
+            modifiers: Default::default(),
+            pressed_button: None,
+        });
+    }
+
+    /// 開いたあと、マウスがサイドバーから離れて 3 秒でアイコンだけの幅に戻ること（#7）。
+    ///
+    /// 開閉ボタンで開くと自動クローズが予約され、マウスがサイドバー（ウィンドウ左端
+    /// 256 px）の上に居る間は仕切り直す。
+    #[gpui_kit::test]
+    async fn sidebar_closes_after_the_mouse_leaves_for_three_seconds(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        click_sidebar_toggle(visual);
+        assert!(
+            ws.read_with(cx, |w, _| w.sidebar_open),
+            "前提: 開閉ボタンで開いている"
+        );
+
+        // サイドバーの上にマウスがある間は閉じない（タイマーを仕切り直す）
+        send_mouse_move(visual, 30.0, 300.0);
+        cx.executor().advance_clock(Duration::from_secs(4));
+        cx.run_until_parked();
+        draw_frames(visual);
+        assert!(
+            ws.read_with(cx, |w, _| w.sidebar_open),
+            "マウスがサイドバーの上にあるのに閉じた"
+        );
+
+        // 離れて 3 秒経つと閉じる
+        send_mouse_move(visual, 800.0, 400.0);
+        cx.executor().advance_clock(Duration::from_secs(4));
+        cx.run_until_parked();
+        draw_frames(visual);
+        assert!(
+            !ws.read_with(cx, |w, _| w.sidebar_open),
+            "マウスが離れて 3 秒経っても閉じない"
+        );
+    }
+
+    /// サイドバーを開いたとき、行の左右の余白が等しいこと（#7）。
+    ///
+    /// 開状態の行は `ml(18px)` のぶん右へ寄る。幅を `w_full()` のままにすると
+    /// 右側の余白だけが詰まり、ラベルやシェブロンが右端に接して見える。
+    #[gpui_kit::test]
+    async fn sidebar_rows_keep_the_same_margin_on_both_sides_when_open(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        ws.update(cx, |w, cx| {
+            w.sidebar_open = true;
+            cx.notify();
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1400.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        let sidebar = visual
+            .debug_bounds("sidebar")
+            .expect("サイドバーが出ていない");
+        let left_edge = sidebar.origin.x.as_f32();
+        let right_edge = left_edge + sidebar.size.width.as_f32();
+        for selector in [
+            "sidebar-nav-bookshelf",
+            "sidebar-nav-favorites",
+            "sidebar-nav-settings",
+            "sidebar-nav-account",
+            "bookshelf-submenu",
+        ] {
+            let row = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} が出ていない"));
+            let left = row.origin.x.as_f32() - left_edge;
+            let right = right_edge - (row.origin.x.as_f32() + row.size.width.as_f32());
+            assert!(
+                (left - right).abs() < 0.5,
+                "{selector}: 左右の余白が違う（左 {left} / 右 {right}）"
+            );
+        }
     }
 
     /// ウィンドウの下限（`MIN_WINDOW_WIDTH`）まで狭めても、本の上のメニューが隠れないこと。
