@@ -1,7 +1,7 @@
 //! 本棚ビュー: ローカル本のグリッド + 検索/タグ/既読フィルタ + 技術書典同期と
 //! ダウンロード導線 + インポート。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -9918,11 +9918,67 @@ pub(crate) fn no_image_cover() -> Option<Arc<RenderImage>> {
     rasterize_svg(svg)
 }
 
+/// 汎用 `sans-serif` に割り当てるファミリの候補（先頭優先）。
+///
+/// `fontdb` の既定は `sans-serif` = "Arial" 固定なので、Arial が無い環境（Linux 等）では
+/// `sans-serif` が解決できず文字が描画されない。日本語タイトルを描くため CJK 対応を優先する。
+const SANS_SERIF_FAMILIES: &[&str] = &[
+    "Yu Gothic UI",
+    "Meiryo",
+    "Hiragino Sans",
+    "Hiragino Kaku Gothic ProN",
+    "Noto Sans CJK JP",
+    "Noto Sans JP",
+    "IPAGothic",
+    "Source Han Sans JP",
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Arial",
+    "Helvetica",
+];
+
+/// SVG のラスタライズに使う `usvg::Options`（プロセスで 1 回だけ初期化）。
+///
+/// `usvg::Options::default()` のフォントDBは**空**で、システムフォントは自動では
+/// 読み込まれない。そのまま `<text font-family='sans-serif'>` を渡すと usvg が
+/// `No match for '...' font-family.` を警告し、**文字を 1 文字も描画しない**
+/// （＝プレースホルダが無地になる）。ここで一度だけシステムフォントを読み込み、
+/// `sans-serif` を実在するファミリに向け直す（読み込みは重いので `LazyLock` で 1 回）。
+fn svg_options() -> &'static usvg::Options<'static> {
+    static OPTIONS: LazyLock<usvg::Options<'static>> = LazyLock::new(|| {
+        let mut options = usvg::Options::default();
+        options.fontdb_mut().load_system_fonts();
+        if let Some(family) = sans_serif_family(&options.fontdb) {
+            options.fontdb_mut().set_sans_serif_family(family.clone());
+            options.font_family = family;
+        }
+        options
+    });
+    &OPTIONS
+}
+
+/// 読み込み済みフォントから `sans-serif` に割り当てるファミリを選ぶ。
+/// 候補が 1 つも無い環境でも文字が消えないよう、読み込めた先頭のファミリへ落とす。
+fn sans_serif_family(db: &usvg::fontdb::Database) -> Option<String> {
+    let loaded: HashSet<&str> = db
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
+        .collect();
+    SANS_SERIF_FAMILIES
+        .iter()
+        .find(|candidate| loaded.contains(*candidate))
+        .map(|candidate| (*candidate).to_string())
+        .or_else(|| {
+            db.faces()
+                .find_map(|face| face.families.first().map(|(name, _)| name.clone()))
+        })
+}
+
 /// SVG 文字列を `RenderImage` に rasterize する（GPUI は BGRA を期待する）。
 /// **`image` クレートは SVG を復号できない**ため、表紙のプレースホルダはこちらを通す
 /// （以前は `decode_bytes_to_render_image` に SVG を渡していて常に `None` になっていた）。
 pub(crate) fn rasterize_svg(svg: &str) -> Option<Arc<RenderImage>> {
-    let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).ok()?;
+    let tree = usvg::Tree::from_str(svg, svg_options()).ok()?;
     let size = tree.size().to_int_size();
     let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height())?;
     resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
@@ -9979,8 +10035,7 @@ pub(crate) fn progress_ring_image(fraction: f32) -> Arc<RenderImage> {
          stroke-dasharray='{circumference}' stroke-dashoffset='{offset}' transform='rotate(-90 36 36)'/>\
          </svg>"
     );
-    let opt = usvg::Options::default();
-    let tree = usvg::Tree::from_str(&svg, &opt).expect("valid progress svg");
+    let tree = usvg::Tree::from_str(&svg, svg_options()).expect("valid progress svg");
     let mut pixmap = tiny_skia::Pixmap::new(size, size).expect("progress pixmap");
     resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
     let mut data = pixmap.data().to_vec();
@@ -10717,6 +10772,26 @@ mod tests {
         assert_eq!(
             (no_image.size(0).width.0, no_image.size(0).height.0),
             (240, 320)
+        );
+    }
+
+    /// プレースホルダの `<text>` が実際にグリフとして描画されること。
+    /// `usvg::Options::default()` のフォントDBは空で `font-family='sans-serif'` を
+    /// 解決できず、usvg は警告を出したうえで**文字を描画しない**（＝無地の枠になる）。
+    #[test]
+    fn rasterize_svg_draws_text_glyphs() {
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='32'>\
+                   <rect width='64' height='32' fill='white'/>\
+                   <text x='4' y='24' font-family='sans-serif' font-size='20' fill='black'>A</text>\
+                   </svg>";
+        let image = rasterize_svg(svg).expect("SVG がラスタライズされない");
+        let bytes = image.as_bytes(0).expect("フレームが無い");
+        let has_glyph_pixel = bytes
+            .chunks_exact(4)
+            .any(|pixel| pixel[..3].iter().all(|channel| *channel < 100));
+        assert!(
+            has_glyph_pixel,
+            "テキストのグリフが 1 ピクセルも描画されていない（フォントDBが空のまま）"
         );
     }
 

@@ -64,6 +64,18 @@
 
 ### Fixed
 
+- **表紙プレースホルダの文字が描画されず、`usvg::text` の警告が大量に出ていた**: SVG の
+  ラスタライズで `usvg::Options::default()` を使っていたが、そのフォントDBは**空**で
+  （システムフォントは自動では読み込まれない）、`<text font-family='sans-serif'>` を解決できない。
+  usvg は `No match for 'sans-serif' font-family.` を**テキストノードごとに**警告し、警告だけでなく
+  **文字を 1 文字も描画しない**（＝ NoImage / タイトルが無地の枠になる）。起動時に一度だけ
+  システムフォントを読み込み（`svg_options()` / `LazyLock`）、`sans-serif` を実在するファミリへ
+  向け直した（fontdb の既定は "Arial" 固定で、Arial が無い環境では解決できない）。あわせて
+  `usvg` の `text` / `system-fonts` / `memmap-fonts` を明示した（`resvg` の既定 features 頼みをやめる）。
+  テスト `rasterize_svg_draws_text_glyphs` がグリフの描画を検証する
+  `crates/app/src/views/bookshelf.rs`、`crates/app/Cargo.toml`、`docs/spec/07-decisions.md`、
+  `docs/spec/08-notifications-and-nonfunctional.md`
+
 - **サイドバーを開くとナビの行が右端に接していた**: 開状態の行は `ml(18px)` で右へ寄せて
   いたのに幅が `w_full()`（＝親の幅）だったため、行が右へ 18px はみ出し、サイドバーの右端で
   切れていた（実測: 行が x=17〜257 で、サイドバーの右端 256 を越えて右の余白が −1px）。

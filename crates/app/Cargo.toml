@@ -41,7 +41,15 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
 resvg = "0.44"
-usvg = { version = "0.44", default-features = false }
+# `text` / `system-fonts` を明示する: SVG の `<text>`（表紙プレースホルダ）を描くには
+# フォントDBへのシステムフォント読込が要る（`usvg::Options::default()` のフォントDBは空）。
+# `resvg` の既定 feature でも有効になるが、ここに書いておかないと resvg 側の変更で静かに壊れる。
+# `memmap-fonts` はフォント本体をメモリへ読み込まず mmap で参照する（常駐メモリを抑える）。
+usvg = { version = "0.44", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "memmap-fonts",
+] }
  tiny-skia = "0.11"
 
 [target.'cfg(windows)'.dependencies]

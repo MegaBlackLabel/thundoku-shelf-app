@@ -182,8 +182,8 @@
 | 書き込みモード | 追記（`append(true)`）。`File::create` だと 2 個目の起動が起動中インスタンスのログを消し、非 append ハンドルは自分のオフセットに書いて後続行を上書きするため | `crates/app/src/logging.rs`（`open_log_file`） |
 | panic 時 | `std::panic::set_hook` で `PANIC: {info}`（`RUST_BACKTRACE=1` のときはスタックも）を同じログに追記 | `crates/app/src/logging.rs`（`set_panic_hook` / `append_line`） |
 | 2 個目の起動 | `note_second_launch` が同じログに追記（書けなければ標準エラー。ウィンドウは開かない） | `crates/app/src/main.rs`（`note_second_launch`） |
-| 依存（OSS）のログ | 依存も `log` 経由で**同じログに入る**（実測: `sqlx::query` のクエリログ・`usvg::text` のフォント警告・`ureq` / `rustls` / `keyring`）。独自のログファイルを書く依存は無い（`tracing` は gpui-kit 経由で依存に入るが、購読者（`tracing-subscriber`）を付けていないので `tracing` 系のイベントは出ない） | `Cargo.lock`, `crates/app/src/logging.rs` |
-| 既定のログ量 | `debug` なので依存の DEBUG も入る（実測: 起動 12 秒で約 200 KB。`usvg::text` が最多）。増え続けないよう起動時に 4 MiB で捨てる。静かにしたいときは `RUST_LOG=info` 等で絞る | `crates/app/src/logging.rs`（`DEFAULT_FILTER` / `MAX_LOG_BYTES`） |
+| 依存（OSS）のログ | 依存も `log` 経由で**同じログに入る**（実測: `sqlx::query` のクエリログ・`ureq` / `rustls` / `keyring`）。独自のログファイルを書く依存は無い（`tracing` は gpui-kit 経由で依存に入るが、購読者（`tracing-subscriber`）を付けていないので `tracing` 系のイベントは出ない） | `Cargo.lock`, `crates/app/src/logging.rs` |
+| 既定のログ量 | `debug` なので依存の DEBUG も入る（実測: 起動 12 秒で約 200 KB。フォント警告を直す前は `usvg::text` が最多だった。警告は解消済みなので今はこれより少ない）。増え続けないよう起動時に 4 MiB で捨てる。静かにしたいときは `RUST_LOG=info` 等で絞る | `crates/app/src/logging.rs`（`DEFAULT_FILTER` / `MAX_LOG_BYTES`）, `crates/app/src/views/bookshelf.rs`（`svg_options`） |
 | 保存先の変更との関係 | データ保存先の変更では `logs/` を移動しない（移動対象は DB / packs / thumbnails / downloads）。**次回起動から新しい保存先の `logs/` に書く**（古いログは古い保存先に残る） | `crates/app/src/views/settings.rs`（`confirm_data_dir_change`） |
 | ローカルデータ削除との関係 | 「ローカルデータをすべて削除」は DB の行と `packs` / `thumbnails` / `downloads` だけを消す（**ログは消さない**。開いているログを消そうとして失敗することも無い） | `crates/app/src/views/settings.rs`（`delete_all_data`） |
 
