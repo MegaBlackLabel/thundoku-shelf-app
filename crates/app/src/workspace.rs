@@ -440,13 +440,18 @@ impl Workspace {
         crate::theme::apply_dark_surfaces(cx);
         crate::theme::apply_light_surfaces(cx);
         this.restore_theme_mode(cx);
-        // 保存済みプロフィールが無い場合（アップグレード直後）はここで取得しておく。
-        // 所有者（sub）が分からないと、終了時のバックアップがスキップされ、復元確認も
-        // 出せない（[`backup_owner_ids`] を参照）。
-        this.restore_google_profile(cx);
-        this.check_startup_backup(cx);
+        // サンプル（デモ）モードはネットワークに出ない: プロフィールは起動時に
+        // 仕込んであるので取りに行かず、Drive のバックアップ確認と技術書典の
+        // チェックリスト定期取得も始めない（[`crate::demo`]）。
+        if !AppState::global(cx).demo {
+            // 保存済みプロフィールが無い場合（アップグレード直後）はここで取得しておく。
+            // 所有者（sub）が分からないと、終了時のバックアップがスキップされ、復元確認も
+            // 出せない（[`backup_owner_ids`] を参照）。
+            this.restore_google_profile(cx);
+            this.check_startup_backup(cx);
+            this.start_checklist_poller(cx);
+        }
         this.start_login_done_watcher(cx);
-        this.start_checklist_poller(cx);
         this
     }
 
@@ -504,7 +509,8 @@ impl Workspace {
                         this.auth_loading = false;
                         this.active = NavTarget::Settings;
                         this.sidebar_open = true;
-                        if last_sync.is_none() {
+                        // サンプル（デモ）モードは Drive を使わないので確認を出さない。
+                        if last_sync.is_none() && !AppState::global(cx).demo {
                             this.show_drive_prompt = true;
                         }
                         // ログイン状態が変わったので本棚を再フィルタ（owner モデル）。
@@ -1034,6 +1040,12 @@ impl Workspace {
     /// pack の鍵（v3 の PRK）を解決すべきか（未ログイン・解決済みなら不要）。
     fn needs_pack_key_unlock(&self, cx: &App) -> bool {
         let state = AppState::global(cx);
+        // サンプル（デモ）モードは pack を持たない（ページは `DemoPageLoader` が生成する）ので
+        // 鍵の解錠を試みない。試すと必ず失敗し、**本を開くたびにエラーの通知**が出る
+        // （実測: `pack key unlock failed: not authorized`）。
+        if state.demo {
+            return false;
+        }
         if state.pack_root_key().is_some() {
             return false;
         }
@@ -1053,6 +1065,11 @@ impl Workspace {
     /// 解決できなかった場合はトーストで理由を知らせる（`Unavailable` = 復元の案内は
     /// core の文言に入っている）。
     fn start_login_key_flow(&mut self, cx: &mut Context<Self>) {
+        // サンプル（デモ）モードでは鍵 bundle を取りに Drive へ出ない
+        // （そもそもログインしないが、経路そのものを塞いでおく）。
+        if AppState::global(cx).demo {
+            return;
+        }
         let task = crate::pack_keys::unlock_task(cx, "ログイン");
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -1377,6 +1394,11 @@ impl Workspace {
     /// - 判定できないとき（DB の読み出しに失敗した等）は**出す**側に倒す
     ///   （控えを失うより、一度多く訊く方が安全）。
     fn exit_backup_prompt_needed(&self, cx: &App) -> bool {
+        // サンプル（デモ）モードは Drive へアップロードしない（同期が無いので、
+        // 確認を出しても「アップロードして終了」が失敗するだけになる）。
+        if AppState::global(cx).demo {
+            return false;
+        }
         let state = AppState::global(cx);
         let Some(sub) = state
             .google_profile
@@ -1421,6 +1443,11 @@ impl Workspace {
 
     /// ウィンドウを閉じる時に、バックアップ対象に変更があるかを確認する。
     pub fn request_exit_upload_check(&mut self, cx: &mut Context<Self>) {
+        // サンプル（デモ）モードはアップロードしないので確認を出さない
+        // （呼び出し側は「閉じてよい」と判断済み: `exit_checked` が立っている）。
+        if AppState::global(cx).demo {
+            return;
+        }
         self.exit_upload_prompt = true;
         cx.notify();
     }
@@ -1468,6 +1495,12 @@ impl Workspace {
         cx: &mut Context<Self>,
         provider: crate::views::auth::AuthProvider,
     ) {
+        // サンプル（デモ）モードはログイン用の WebView を開かない（本物のログインページを
+        // 読みに行き、BOOTH は非シークレットの WebView で実プロファイルにも触れる）。
+        // 対象は Google / 技術書典 / BOOTH / FANZA / DLsite のすべて。
+        if AppState::global(cx).demo {
+            return;
+        }
         // SettingsView を非表示にしてからダイアログを表示する（WebView 作成時の RefCell 競合回避）。
         // 本棚ではなく専用のダミー画面を表示する。
         self.auth_loading = true;
@@ -1509,8 +1542,9 @@ impl Workspace {
                 .ok()
                 .flatten()
                 .is_some_and(|v| v == "true" || v == "1");
-            handle.update(cx, |this, _cx| {
-                if !enabled {
+            handle.update(cx, |this, cx| {
+                // サンプル（デモ）モードは Drive を使わないので確認を出さない。
+                if !enabled && !AppState::global(cx).demo {
                     this.show_drive_prompt = true;
                 }
             });
@@ -1744,6 +1778,9 @@ impl Workspace {
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
         let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
+        // サンプル（デモ）モードはログイン導線を無効にする（`open_auth` / `OpenAuthProvider`
+        // でも止めるが、押せない見た目にしておく）。
+        let demo = AppState::global(cx).demo;
 
         let google_email = AppState::global(cx)
             .google_profile
@@ -1793,7 +1830,7 @@ impl Workspace {
                         }),
                 )
                 .child(if logged_in {
-                    // Web 版: 右寄せでチェック丸（緑）+ ログアウトアイコン
+                    // ログイン中: 右寄せでチェック丸（緑）+ ログアウトアイコン
                     div()
                         .flex()
                         .items_center()
@@ -1832,6 +1869,20 @@ impl Workspace {
                                 ),
                         )
                         .into_any_element()
+                } else if demo {
+                    // サンプル（デモ）モード: ログインの導線を押せない見た目にする
+                    // （本物のログインページを読みに行かない）
+                    Box::new(
+                        div()
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .bg(theme.muted)
+                            .text_color(theme.muted_foreground)
+                            .text_xs()
+                            .child("ログイン"),
+                    )
+                    .into_any_element()
                 } else {
                     Box::new(
                         div()
@@ -1993,6 +2044,10 @@ impl Workspace {
             cx.notify();
         });
         reg!(crate::actions::OpenAuth, |this, cx| {
+            // サンプル（デモ）モードはログイン用の WebView を開かない（`open_auth` と同じ）。
+            if AppState::global(cx).demo {
+                return;
+            }
             this.show_auth = true;
             if this.auth_dialog.is_none() {
                 this.auth_dialog = Some(cx.new(AuthDialog::new));
@@ -2009,6 +2064,10 @@ impl Workspace {
             |action: &crate::actions::OpenAuthProvider,
              this: &mut Workspace,
              cx: &mut Context<Workspace>| {
+                // サンプル（デモ）モードはログイン用の WebView を開かない（`open_auth` と同じ）。
+                if AppState::global(cx).demo {
+                    return;
+                }
                 let provider = action.provider;
                 this.show_auth = true;
                 let dialog = this
@@ -2041,6 +2100,10 @@ impl Workspace {
         );
         reg!(crate::actions::SyncDrive, |this, cx| this.sync_drive(cx));
         reg!(crate::actions::PromptDriveEnable, |this, cx| {
+            // サンプル（デモ）モードは Drive を使わないので確認を出さない。
+            if AppState::global(cx).demo {
+                return;
+            }
             // Drive 同期が未設定ならば確認ダイアログを表示する
             let enabled = db::settings::get(&AppState::global(cx).db_pool, "drive.sync.enabled")
                 .ok()
@@ -2058,6 +2121,9 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let handle = cx.entity();
+        // サンプル（デモ）モードでは、実在の本を出していないことを画面で明示する
+        // （バッジ。どの画面でも見えるよう最前面に重ねる）。
+        let demo = AppState::global(cx).demo;
 
         // モーダルの登録簿を更新し、**優先度が最も高い 1 つだけ**を描く。
         // 負けた側は状態を保持したまま描かれないので、勝者が閉じれば自然に出る
@@ -2629,6 +2695,26 @@ impl Render for Workspace {
                         ),
                 );
                 fade_dialog(window, cx, true, content).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            // サンプルモードの表示（デモのときだけ）。他要素の後ろ（最後の子）に足して
+            // 最前面に出す: リーダーやモーダルを開いても、実在の本ではないことが見える。
+            .child(if demo {
+                gpui_kit::div()
+                    .debug_selector(|| "demo-badge".into())
+                    .absolute()
+                    // タイトルバー（windows は自前バー）に重ねないよう、その下へ置く。
+                    .top(gpui_kit::px(TITLE_BAR_HEIGHT + 8.0))
+                    .right(gpui_kit::px(12.0))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.muted)
+                    .text_color(theme.muted_foreground)
+                    .text_sm()
+                    .child("サンプルモード")
+                    .into_any_element()
             } else {
                 div().into_any_element()
             })
@@ -3771,6 +3857,42 @@ mod tests {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         cx.new(Workspace::new)
+    }
+
+    /// サンプル（デモ）モードの土台。
+    ///
+    /// `init_demo` はメモリ内 DB + 一時ディレクトリで起動し、固定のサンプル
+    /// （技術書典の架空の 50 冊）を投入する。本物のデータディレクトリと keyring には
+    /// 触らない（[`crate::demo`]）。
+    fn setup_demo(cx: &mut TestAppContext) -> gpui_kit::Entity<Workspace> {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        cx.new(Workspace::new)
+    }
+
+    /// サンプル（デモ）モードはログイン用の WebView を開かない。
+    ///
+    /// 本物の Google / BOOTH / FANZA / DLsite のログインページを読みに行かないため、
+    /// ログイン導線（設定のボタンとサイドバーの行）のどちらからも認証モーダルを開かない。
+    #[gpui_kit::test]
+    async fn demo_mode_does_not_open_the_login_webview(cx: &mut TestAppContext) {
+        let ws = setup_demo(cx);
+        ws.update(cx, |ws, cx| {
+            ws.open_auth(cx, crate::views::auth::AuthProvider::Booth)
+        });
+        assert!(
+            !ws.read_with(cx, |ws, _| ws.show_auth),
+            "サンプルモードでボタンから認証モーダルが開いている"
+        );
+        cx.update(|cx| {
+            cx.dispatch_action(&crate::actions::OpenAuthProvider {
+                provider: crate::views::auth::AuthProvider::Dlsite,
+            });
+        });
+        assert!(
+            !ws.read_with(cx, |ws, _| ws.show_auth),
+            "サンプルモードでアクション経由の認証モーダルが開いている"
+        );
     }
 
     /// メニューから名前で項目を引く（`app_menus` の可否を検証する）。
@@ -5829,6 +5951,150 @@ mod tests {
                 "現在のアカウントに帰属する本だけを対象にする"
             );
         });
+    }
+
+    /// サンプル（デモ）モードのときだけ「サンプルモード」バッジを出すこと。
+    ///
+    /// 提出用に実在の本を出さない状態で全画面を見せるので、どの画面を見ていても
+    /// サンプルであることが分かるようにしておく（本物のデータと見分けが付かないと、
+    /// 利用者が実データを消したと思い込む）。
+    #[gpui_kit::test]
+    async fn demo_badge_is_rendered_in_demo_mode(cx: &mut TestAppContext) {
+        let ws = setup_demo(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1500.0),
+                height: gpui_kit::px(950.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        assert!(
+            visual.debug_bounds("demo-badge").is_some(),
+            "サンプルモードのバッジが描画されていない"
+        );
+    }
+
+    /// サンプル（デモ）モードで本を開くとき、pack の鍵の解錠（必ず失敗する）を試みないこと。
+    ///
+    /// デモの本は pack を持たず、ページは `DemoPageLoader` が作る。鍵を解こうとすると必ず
+    /// 失敗して**本を開くたびにエラーの通知**が出る（実測: `pack key unlock failed: not authorized`）。
+    #[gpui_kit::test]
+    async fn demo_opens_a_book_without_unlocking_the_pack_key(cx: &mut TestAppContext) {
+        let ws = setup_demo(cx);
+        cx.update(|cx| {
+            assert!(
+                !ws.read_with(cx, |this, cx| this.needs_pack_key_unlock(cx)),
+                "デモなのに pack の鍵を解こうとしている"
+            );
+        });
+        cx.update(|cx| ws.update(cx, |this, cx| this.open_reader(cx, "demo-01".to_string())));
+        assert!(
+            ws.read_with(cx, |this, _| this.reader.is_some()),
+            "デモの本が開かない"
+        );
+        let (kind, message) = cx.update(|cx| {
+            let state = crate::app_state::AppState::global(cx);
+            (*state.toast_kind.lock(), state.toast_message.lock().clone())
+        });
+        assert_ne!(
+            kind,
+            crate::app_state::ToastKind::Error,
+            "エラーの通知が出ている: {message:?}"
+        );
+    }
+
+    /// 通常起動ではバッジを出さないこと（本物のデータをサンプルと誤解させない）。
+    #[gpui_kit::test]
+    async fn demo_badge_is_absent_in_normal_mode(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1500.0),
+                height: gpui_kit::px(950.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        assert!(
+            visual.debug_bounds("demo-badge").is_none(),
+            "通常起動でサンプルモードのバッジが出ている"
+        );
+    }
+
+    /// サンプル（デモ）モードでは Drive の有効化の確認を出さないこと。
+    ///
+    /// デモは Drive を使わない（ネットワークに出ない）ので、訊かれても答えようがない。
+    #[gpui_kit::test]
+    async fn demo_does_not_prompt_to_enable_drive(cx: &mut TestAppContext) {
+        let ws = setup_demo(cx);
+        cx.update(|cx| ws.update(cx, |w, cx| w.login_done(cx)));
+        cx.run_until_parked();
+        assert!(
+            !ws.read_with(cx, |w, _| w.show_drive_prompt),
+            "サンプルモードで Drive の有効化を訊いている"
+        );
+    }
+
+    /// 通常起動では、Drive が無効ならログイン後に有効化の確認を出すこと
+    /// （上のサンプルモードの対照。ここが真にならないと、上のテストが素通りする）。
+    #[gpui_kit::test]
+    async fn login_done_prompts_to_enable_drive_when_disabled(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        cx.update(|cx| ws.update(cx, |w, cx| w.login_done(cx)));
+        cx.run_until_parked();
+        assert!(
+            ws.read_with(cx, |w, _| w.show_drive_prompt),
+            "Drive が無効なのに有効化の確認を出していない"
+        );
+    }
+
+    /// サンプル（デモ）モードでは、起動時の Drive 復元確認を立てないこと。
+    ///
+    /// プロフィールは仕込んであるので所有者の判定は通るが、Drive を見に行く経路
+    /// （`check_startup_backup`）自体を起動しない（`Workspace::new`）。
+    #[gpui_kit::test]
+    async fn demo_does_not_offer_drive_restore_at_startup(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        // Drive 同期が設定済みの状態で起動する（ガードが無ければ復元確認まで進む条件）
+        set_drive_ready(cx, "demo-owner");
+        let ws = cx.new(Workspace::new);
+        cx.run_until_parked();
+        assert!(
+            !ws.read_with(cx, |w, _| w.restore_prompt_active()),
+            "サンプルモードで Drive の復元確認を立てている"
+        );
+        assert!(
+            !ws.read_with(cx, |w, _| w.show_drive_prompt),
+            "サンプルモードで Drive の有効化の確認を立てている"
+        );
+    }
+
+    /// サンプル（デモ）モードでは、終了時のアップロード確認を出さずそのまま閉じて
+    /// よいこと（未アップロードの変更があっても Drive へ出ない）。
+    ///
+    /// 通常起動で同じ前提を揃えると確認が出ることは
+    /// `close_request_opens_the_exit_prompt_when_a_backup_is_pending` が押さえている。
+    #[gpui_kit::test]
+    async fn demo_does_not_ask_to_upload_on_exit(cx: &mut TestAppContext) {
+        let ws = setup_demo(cx);
+        // 通常起動なら確認が出る条件（Drive 有効 + 同期フォルダ + 未アップロードの本）
+        set_drive_ready(cx, "demo-owner");
+        seed_pending_pack(cx, "demo-owner", "demo-exit-pack");
+
+        let allowed = cx.update(|cx| ws.update(cx, |w, cx| w.handle_window_close_request(cx)));
+        assert!(allowed, "サンプルモードでは確認なしで閉じてよい");
+        assert!(
+            !ws.read_with(cx, |w, _| w.exit_upload_prompt),
+            "サンプルモードで終了時のアップロード確認を出している"
+        );
+        assert!(
+            !ws.read_with(cx, |w, _| w.exit_uploading),
+            "サンプルモードでアップロードを始めている"
+        );
     }
 
     /// アップロード中は、閉じるボタンでウィンドウを閉じられないこと。

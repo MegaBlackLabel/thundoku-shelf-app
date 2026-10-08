@@ -103,6 +103,50 @@ Google OAuth のループバックポート（`127.0.0.1:38387`）の取り合�
   （＝サイトに 1 つでもログイン済みなら従来どおり本棚）。判定はサイト別のログインフラグ
   （起動時のセッション復元直後の値）で行う（`any_site_logged_in`）
 
+## サンプル（デモ）モード
+
+実在の本を出さずに全画面を見せるための**サンプル（デモ）モード**を持つ。提出・デモ用で、
+**通常のデータディレクトリには一切書かず、ネットワークにも出ない**ことを最優先にしている。
+
+- **有効化**: 起動引数 `--demo` または環境変数 `THUNDOKU_DEMO=1`（判定は純関数
+  `crate::demo::enabled(&args, env)`。`main.rs` が起動時に一度だけ評価し、真なら
+  `AppState::init_demo(cx)`、偽なら従来の `AppState::init(cx)`）。
+  **単一インスタンスのロックパスは demo で別名**にし、本物の起動中インスタンスと衝突させない
+  （demo と通常起動を同時に走らせられる）
+- **データ分離**: メモリ内 DB（`:memory:`）+ 一時ディレクトリ
+  （`temp_dir()/thundoku-shelf-demo`）+ メモリ内 keyring。`init_test` と本体を共有する
+  `init_in_memory(cx, data_dir, demo)` で**本物の `resolve_data_dir()` の下には書かない**。
+  `AppState::demo` にフラグを持つ
+- **ログイン済みに見せる**: demo では Google（ダミーの `GoogleProfile`）と技術書典（ダミー
+  `TbfSession`）がログイン済みの状態にする。プロフィール復元 / 起動時バックアップ確認 /
+  チェックリストポーリング / ログイン鍵フローは**起動しない**
+- **固定データ**: 技術書典の架空 50 冊（タイトル / サークル / 作者 / タグ / ページ数 /
+  読書状態）を `demo::seed` で投入する。進捗・閲覧履歴・付箋・お気に入り・チェックリストも
+  日付を固定した再現可能なデータを入れる。うち 10 冊ほどは**お気に入り**にしてあり、
+  `bookshelf::set_favorite` / `books::set_favorite` で本棚とローカル本の両方に印を付ける
+  （seed は upsert と `set_favorite` だけを使うので、2 回呼んでもお気に入りは消えない）。
+  表紙は SVG を `rasterize_svg` でラスタライズし、既存の表紙キャッシュ経路
+  （`thumbnails/{site_id}_{database_id}_448.png`）へ書き出すので、**UI に demo 分岐を
+  足さず既存の表紙読み込みがそのまま拾う**
+- **ビューアー**: `DemoPageLoader`（`PageLoader` 実装）が「サンプル / {タイトル} / p.{n}」を
+  描いた SVG をページ画像にして返す（本物の `db::documents::images_for_book` は読まない）
+- **未ダウンロードとダミーのダウンロード**: 50 冊のうち 12 冊（`DemoBook::downloaded = false`、
+  demo-13 / 15 / 18 / 22 / 24 / 27 / 31 / 33 / 39 / 41 / 45 / 50）は本棚と表紙 PNG だけを持ち
+  （ローカル本が無い = カードが未ダウンロード表示）、カードからダウンロードすると
+  `start_download` のワーカーが**最初に demo 分岐**（`demo_download`）へ入って本物の
+  ネットワーク経路（鍵の解決 / サイト別の取得 / インポート）を一切通らず、5 段階の進捗
+  （200ms 刻み）の後に `demo::promote_to_downloaded` が**本物の取り込みと同じ形**
+  （`books` 行 + タグ + 所有者 + お気に入り）で仕上げる（中止は既存の
+  `ImportFailure::DownloadCancelled`）
+- **ネットワーク停止**: `AppState::global(cx).demo` を見て、ストア同期 / 表紙のリモート取得 /
+  タグ取得 / お気に入りの自動ダウンロード / Google Drive の復元・保存確認 / 終了時
+  アップロードを止める。危険操作（`logout_tbf` / `logout_google` / `sync_drive_now` /
+  `delete_all_data`）も早期 return にする
+- **バッジ**: `Workspace::render` の root に、demo のときだけ右上へ絶対配置の
+  「サンプルモード」チップを足す（`debug_selector` は `demo-badge`）
+- **初期表示**: 保存済みのウィンドウ bounds が無ければ 1600x1000 で開く（保存値があるときは
+  それを使う）
+
 ---
 
 ## 主な画面

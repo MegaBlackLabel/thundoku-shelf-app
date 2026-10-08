@@ -21,16 +21,25 @@ fn main() {
         std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
     }
 
+    // サンプル（デモ）モード（`--demo` / `THUNDOKU_DEMO=1`）。メモリ内 DB と一時
+    // ディレクトリだけで動き、ネットワークへは出ない。単一インスタンスのロック
+    // （下）とデータの保存先（`AppState::init_demo`）を本物の起動と混ぜないよう、
+    // **何よりも先に**決める。
+    let demo = thundoku_shelf::demo::enabled(
+        &std::env::args().collect::<Vec<_>>(),
+        std::env::var("THUNDOKU_DEMO").ok().as_deref(),
+    );
+
     // 2 重起動を防ぐ（macOS / Windows / Linux 共通。実体は OS のファイルロック）。
     // ログの初期化より先に判定する: 下のログ初期化は File::create で切り詰めるため、
     // 2 個目のプロセスが起動中インスタンスのログを壊してしまう。ロックは main の
     // 間ずっと保持する（プロセスが終了すれば OS が解放する）。
-    let _instance_guard: Option<InstanceGuard> = match instance_lock_path() {
+    let _instance_guard: Option<InstanceGuard> = match instance_lock_path(demo) {
         Some(lock_path) => match InstanceGuard::acquire(&lock_path) {
             Ok(guard) => Some(guard),
             Err(InstanceError::AlreadyRunning(_)) => {
                 // 既に起動している。2 個目は何もせず静かに終了する。
-                note_second_launch(&lock_path);
+                note_second_launch(&lock_path, demo);
                 return;
             }
             // ロックファイルが開けないだけで起動を止めるのは避ける
@@ -49,7 +58,7 @@ fn main() {
     // レポート画面が同じ場所を表示し、「ログの格納先を開く」で開く（issue #8）。
     // 初期化は単一インスタンスの判定より**後**（ログ初期化が大きすぎるファイルを
     // 切り詰めるため、2 個目の起動が起動中インスタンスのログを壊すのを防ぐ）。
-    thundoku_shelf::logging::init(&thundoku_shelf::app_state::resolve_data_dir());
+    thundoku_shelf::logging::init(&log_data_dir(demo));
 
     // 調査用の UA 差し替え（`thundoku_core::ua`）が効いている状態で起動したかを残す。
     // ストアの同期が失敗したとき、「差し替えた状態で走らせたのか」をログだけで確定できる
@@ -82,7 +91,13 @@ fn main() {
                     .with_damping(0.9);
             cx.activate(true);
 
-            AppState::init(cx);
+            // サンプル（デモ）モードはメモリ内 DB + 一時ディレクトリで起動する
+            // （本物のデータディレクトリと keyring には触らない）。
+            if demo {
+                AppState::init_demo(cx);
+            } else {
+                AppState::init(cx);
+            }
             // 起動時の状態をメニューに反映する（技術書典にログイン済みなら
             // 「チェックリスト」を有効にする）。
             thundoku_shelf::workspace::sync_app_menus(cx);
@@ -92,8 +107,24 @@ fn main() {
                 let saved_bounds =
                     cx.update(|cx| thundoku_shelf::app_state::load_window_bounds(cx));
                 let mut options = TitleBar::window_options();
-                if let Some(bounds) = saved_bounds {
-                    options.window_bounds = Some(bounds);
+                match saved_bounds {
+                    Some(bounds) => options.window_bounds = Some(bounds),
+                    // サンプル（デモ）モードは撮影用に広めの既定サイズで開く
+                    // （保存済みがあればそちらを優先する）。
+                    None if demo => {
+                        let bounds = cx.update(|cx| {
+                            gpui_kit::WindowBounds::Windowed(gpui_kit::Bounds::centered(
+                                None,
+                                gpui_kit::Size {
+                                    width: gpui_kit::px(1600.0),
+                                    height: gpui_kit::px(1000.0),
+                                },
+                                cx,
+                            ))
+                        });
+                        options.window_bounds = Some(bounds);
+                    }
+                    None => {}
                 }
                 // 本の上のツールバー（メニュー）が隠れる幅まで狭められないようにする。
                 // ディスプレイがその幅より狭いときは画面幅で止める（画面外へはみ出すと
@@ -146,8 +177,30 @@ fn main() {
 ///
 /// データ保存先（変更可能）ではなく config ディレクトリに置く。保存先を変更しても
 /// 「同時に動くアプリは 1 つ」を保つため。
-fn instance_lock_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("thundoku-shelf").join("instance.lock"))
+///
+/// サンプル（デモ）モードはファイル名を分ける: 本物の起動中インスタンスと同じ
+/// ロックを使うと、デモを見ようとしただけで「既に起動している」と判定されて
+/// 何も出ずに終了してしまう（データも別なので、同時に動いて問題ない）。
+fn instance_lock_path(demo: bool) -> Option<std::path::PathBuf> {
+    let name = if demo {
+        "instance-demo.lock"
+    } else {
+        "instance.lock"
+    };
+    dirs::config_dir().map(|dir| dir.join("thundoku-shelf").join(name))
+}
+
+/// ログの出力先になるデータディレクトリ。
+///
+/// サンプル（デモ）モードは一時領域（[`thundoku_shelf::demo::data_dir`]）に出す:
+/// 本物のデータディレクトリに書くと、サンプルを見ただけで実ログを切り詰めてしまう
+/// （`logging::init` は大きすぎるファイルを `File::create` で作り直す）。
+fn log_data_dir(demo: bool) -> std::path::PathBuf {
+    if demo {
+        thundoku_shelf::demo::data_dir()
+    } else {
+        thundoku_shelf::app_state::resolve_data_dir()
+    }
 }
 
 /// 2 重起動を検知したことをログに残す。
@@ -155,9 +208,8 @@ fn instance_lock_path() -> Option<std::path::PathBuf> {
 /// 起動中インスタンスが使っているログを切り詰めないよう、**追記**で書く
 /// （`logging::init` はここでは呼ばない: 2 個目はロガーを初期化せずに終了する）。
 /// ファイルに書けなければ標準エラーへ出す（開発時に見えるように）。
-fn note_second_launch(lock_path: &std::path::Path) {
-    let log_path =
-        thundoku_shelf::logging::log_file(&thundoku_shelf::app_state::resolve_data_dir());
+fn note_second_launch(lock_path: &std::path::Path, demo: bool) {
+    let log_path = thundoku_shelf::logging::log_file(&log_data_dir(demo));
     let message = format!(
         "既に別のインスタンスが起動しているため終了します（lock: {}）",
         lock_path.display()
@@ -165,5 +217,35 @@ fn note_second_launch(lock_path: &std::path::Path) {
     // 追記できないときは標準エラーへ出す（開発時に見えるように）
     if !thundoku_shelf::logging::append_line(&log_path, &message) {
         eprintln!("{message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `use super::*` は使わない: `main.rs` は `gpui_kit::*` を glob 輸入していて、
+    // その中の `test` マクロが std の `#[test]` を覆い隠す（展開が再帰してコンパイルできない）。
+    // 対象は 2 つだけなので、`super::` で明示して呼ぶ。
+
+    /// サンプル（デモ）モードのログとロックは本物の起動と分ける。
+    ///
+    /// ここを間違えると、デモを見ただけで本物のログが切り詰められたり
+    /// 「既に起動している」と判定されたりする（`main.rs` の起動判定はテストが無いため、
+    /// この分岐だけは直接検証しておく）。
+    #[test]
+    fn demo_logs_and_locks_do_not_collide_with_the_real_run() {
+        assert!(
+            super::log_data_dir(true).starts_with(thundoku_shelf::demo::data_dir()),
+            "サンプルのログが一時領域の外に出ている"
+        );
+        assert_ne!(
+            super::log_data_dir(true),
+            super::log_data_dir(false),
+            "サンプルのログが本物のデータディレクトリに混ざっている"
+        );
+        assert_ne!(
+            super::instance_lock_path(true),
+            super::instance_lock_path(false),
+            "サンプルのロックが本物の起動と共有されている"
+        );
     }
 }

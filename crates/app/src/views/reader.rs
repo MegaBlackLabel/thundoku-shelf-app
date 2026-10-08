@@ -18,7 +18,7 @@ use thundoku_core::db;
 
 use crate::app_state::AppState;
 use crate::components::image_viewer::{
-    Base64PageLoader, ContentEntry, FormatEntry, ImageViewer, PackPageLoader,
+    Base64PageLoader, ContentEntry, FormatEntry, ImageViewer, PackPageLoader, PageLoader,
 };
 
 pub struct ReaderView {
@@ -176,6 +176,14 @@ impl ReaderView {
         let packs_dir = state.packs_dir.clone();
         // v3: pack の復号鍵は解決済みのルート鍵（PRK）から冊ごとに導出する
         let pack_root_key = state.pack_root_key();
+        // サンプルモードの本（`books.id` = "demo-01".."demo-50"）は pack を持たないため、
+        // 生成したサンプルページを返すローダーに差し替える。対象外（`new` が None）なら
+        // これまでどおり pack から読む。
+        let demo_loader = if state.demo {
+            crate::demo::DemoPageLoader::new(&book_id)
+        } else {
+            None
+        };
 
         let (title, images, progress, site_id, selection) = {
             let book = db::books::get(&db, &book_id).ok().flatten();
@@ -184,11 +192,16 @@ impl ReaderView {
                 .map(|book| book.title.clone())
                 .unwrap_or_else(|| book_id.clone());
             let site_id = book.as_ref().and_then(|book| book.site_id.clone());
-            let images = db::documents::images_for_book(&db, &book_id)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|image| image.image_type == "page")
-                .collect::<Vec<_>>();
+            // サンプルモードは DB のページ画像を持たない（持っていても使わない）ので読まない。
+            let images = if demo_loader.is_some() {
+                Vec::new()
+            } else {
+                db::documents::images_for_book(&db, &book_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|image| image.image_type == "page")
+                    .collect::<Vec<_>>()
+            };
             let progress = db::progress::get(&db, &book_id).ok().flatten();
             // 既定表示コンテンツとその先頭レンディション（旧データは None = 未指定）
             let selection = db::contents::primary_for_book(&db, &book_id)
@@ -205,13 +218,17 @@ impl ReaderView {
         };
 
         let contents = load_content_entries(&db, &book_id);
-        let loader = Arc::new(PackPageLoader {
-            images,
-            packs_dir,
-            db,
-            pack_root_key,
-            pack_reader: std::sync::OnceLock::new(),
-        });
+        // サンプルモードはサンプルページのローダー、通常は pack のページを使う。
+        let loader: Arc<dyn PageLoader> = match demo_loader {
+            Some(loader) => Arc::new(loader),
+            None => Arc::new(PackPageLoader {
+                images,
+                packs_dir,
+                db,
+                pack_root_key,
+                pack_reader: std::sync::OnceLock::new(),
+            }),
+        };
         let initial_page = progress
             .as_ref()
             // 保存は 1-indexed（Web と同じ）。表示 index は 0 始まりなので -1 する。
@@ -2038,6 +2055,29 @@ mod tests {
         assert!(
             pages.contains(&4),
             "right-hand page of second spread recorded"
+        );
+    }
+
+    /// サンプルモードの本は pack ではなく生成したサンプルページで開く
+    /// （`books.id` = `demo::book` のキー。ページ数が固定ページ数になる）。
+    #[gpui_kit::test]
+    async fn demo_book_opens_with_generated_pages(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(crate::app_state::AppState::init_demo);
+        let (id, page_count) = crate::demo::BOOKS
+            .first()
+            .map(|book| (book.database_id, book.page_count as usize))
+            .expect("サンプル本が定義されていない");
+        assert!(
+            crate::demo::book(id).is_some(),
+            "サンプル本のキーが引けない"
+        );
+
+        let reader = cx.new(|cx| ReaderView::for_book(cx, id.to_string()));
+        let count = reader.read_with(cx, |this, cx| this.viewer.read(cx).loader.page_count());
+        assert_eq!(
+            count, page_count,
+            "サンプルモードで生成ページのローダーが使われていない"
         );
     }
 }

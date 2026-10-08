@@ -756,6 +756,10 @@ impl SettingsView {
 
     /// パスフレーズを忘れた / 別端末で復元したいときの解錠を促す（鍵が無いときの導線）。
     fn unlock_pack_key(&mut self, cx: &mut Context<Self>) {
+        // サンプル（デモ）モードは pack を持たないので復元する鍵も無い（試すと必ず失敗する）。
+        if AppState::global(cx).demo {
+            return;
+        }
         let handle = cx.entity();
         let task = crate::pack_keys::unlock_task(cx, "本の鍵の復元");
         cx.spawn(async move |_window, cx| {
@@ -1159,6 +1163,11 @@ impl SettingsView {
     ///   `clear_all_browsing_data` で消す。WebView の生成は非同期（Windows）なので、
     ///   結果は揃った時点で 1 回だけ知らせる。
     pub fn logout_tbf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // サンプルモードはログイン済みの状態を固定で見せる（サーバーへのログアウト要求も
+        // ローカル資格情報の削除も WebView の保存データ消去も行わない）。
+        if AppState::global(cx).demo {
+            return;
+        }
         let t = std::time::Instant::now();
         let server_ok = {
             let state = AppState::global(cx);
@@ -1199,6 +1208,11 @@ impl SettingsView {
     }
 
     pub fn logout_google(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // サンプルモードはログイン済みの状態を固定で見せる（keyring の削除も
+        // ログアウトの印も残さない）。
+        if AppState::global(cx).demo {
+            return;
+        }
         let t = std::time::Instant::now();
         // ローカルの利用状態は即時に落とす（メモリ上のトークンは破棄する）。
         // 永続値（keyring）の削除は結果を待ってから知らせる（SEC-09）。
@@ -1401,6 +1415,11 @@ impl SettingsView {
     /// 「同期」ボタンのように利用者が起点のときだけ true にし、自動同期（チェックリスト
     /// 変更・ログイン直後）からは false にして、同意なしの巻き戻しを起こさない。
     pub fn sync_drive_now(&mut self, allow_restore: bool, cx: &mut Context<Self>) {
+        // サンプルモードはネットワークへ出ない（Drive の同期も取り込みもしない）。
+        // busy を立てないので、押してもスピナーは出ない。
+        if AppState::global(cx).demo {
+            return;
+        }
         self.busy = true;
         self.error = None;
         self.sync_progress = None;
@@ -1686,6 +1705,12 @@ impl SettingsView {
 
     /// フォルダ選択ダイアログで新しいデータ保存先を選ぶ。
     pub fn pick_data_dir(&mut self, cx: &mut Context<Self>) {
+        // サンプル（デモ）モードは保存先を変更しない。変更すると本物の設定ファイル
+        // （`<config>/thundoku-shelf/settings.json`）を書き換えて、次回の通常起動が
+        // 空のフォルダを指し、本物の本棚が消えたように見えてしまう。
+        if AppState::global(cx).demo {
+            return;
+        }
         let current = AppState::global(cx).data_dir.clone();
         if let Some(path) = rfd::FileDialog::new()
             .set_title("データ保存先を選択")
@@ -1704,6 +1729,14 @@ impl SettingsView {
 
     /// 移動確認で「OK」: 既存ファイルを新しい保存先に移動し、保存先を更新する。
     pub fn confirm_data_dir_change(&mut self, cx: &mut Context<Self>) {
+        // サンプル（デモ）モードは保存先を変更しない（`pick_data_dir` と同じ理由）。
+        // サンプルのデータを動かしたうえに本物の設定ファイルを書き換えない。
+        if AppState::global(cx).demo {
+            self.pending_data_dir = None;
+            self.confirm_data_dir = false;
+            cx.notify();
+            return;
+        }
         let Some(new_dir) = self.pending_data_dir.take() else {
             return;
         };
@@ -1810,6 +1843,11 @@ impl SettingsView {
     }
 
     pub fn delete_all_data(&mut self, cx: &mut Context<Self>) {
+        // サンプルモードのデータは起動のたびに seed したものなので、消すと画面が
+        // 空になる。全削除は実行しない（確認ダイアログのボタンも無効にしてある）。
+        if AppState::global(cx).demo {
+            return;
+        }
         {
             let state = AppState::global(cx);
             let db = &state.db_pool;
@@ -2179,6 +2217,7 @@ impl SettingsView {
         booth_logged_in: bool,
         fanza_logged_in: bool,
         dlsite_logged_in: bool,
+        demo: bool,
     ) -> gpui_kit::AnyElement {
         let handle = cx.weak_entity();
         let muted_fg = cx.theme().muted_foreground;
@@ -2224,6 +2263,7 @@ impl SettingsView {
                             Button::new("logout-google")
                                 .cursor_pointer()
                                 .label("ログアウト")
+                                .disabled(demo)
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
@@ -2281,6 +2321,7 @@ impl SettingsView {
                             Button::new("logout-tbf")
                                 .cursor_pointer()
                                 .label("ログアウト")
+                                .disabled(demo)
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
@@ -2349,6 +2390,7 @@ impl SettingsView {
                             Button::new("login-booth")
                                 .cursor_pointer()
                                 .label("ログイン")
+                                .disabled(demo)
                                 .cursor_pointer()
                                 .on_click(|_, _window, cx| {
                                     // アプリ内 WebView で pixiv ログイン（BOOTH）へ直接進む
@@ -2404,6 +2446,7 @@ impl SettingsView {
                             Button::new("login-fanza")
                                 .cursor_pointer()
                                 .label("ログイン")
+                                .disabled(demo)
                                 .cursor_pointer()
                                 .on_click(|_, _window, cx| {
                                     // アプリ内 WebView で FANZA のログインへ直接進む
@@ -2459,6 +2502,7 @@ impl SettingsView {
                             Button::new("login-dlsite")
                                 .cursor_pointer()
                                 .label("ログイン")
+                                .disabled(demo)
                                 .cursor_pointer()
                                 .on_click(|_, _window, cx| {
                                     // アプリ内 WebView で DLsite のログインへ直接進む
@@ -2550,6 +2594,8 @@ impl Render for SettingsView {
         let error = self.error.clone();
         // 同期の進捗（`sync_drive_now` がチャネル経由で更新する。ここでは DB を引かない）
         let sync_progress = self.sync_progress.clone();
+        // サンプルモードではログアウト・同期・全削除のボタンを無効にする
+        let demo = AppState::global(cx).demo;
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let google_profile = AppState::global(cx).google_profile.lock().clone();
         let google_logged_in = *AppState::global(cx).google_logged_in.lock();
@@ -2666,7 +2712,7 @@ impl Render for SettingsView {
                                 .cursor_pointer()
                                 .label("ローカルデータを削除")
                                 .danger()
-                                .disabled(busy)
+                                .disabled(busy || demo)
                                 .cursor_pointer()
                                 .on_click({
                                     let handle = handle.clone();
@@ -2827,7 +2873,7 @@ impl Render for SettingsView {
                                         "今すぐ同期"
                                     })
                                     .loading(busy)
-                                    .disabled(!google_logged_in || busy)
+                                    .disabled(!google_logged_in || busy || demo)
                                     .cursor_pointer()
                                     .on_click({
                                         let handle = handle.clone();
@@ -2842,6 +2888,8 @@ impl Render for SettingsView {
                                     .cursor_pointer()
                                     .icon(Icon::new(AppIcon::HardDrive).size(px(14.0)))
                                     .label("保存先変更")
+                                    // サンプル（デモ）モードは本物の設定ファイルを書き換えない
+                                    .disabled(demo)
                                     .cursor_pointer()
                                     .on_click({
                                         let handle = handle.clone();
@@ -3377,6 +3425,7 @@ impl Render for SettingsView {
                                     .cursor_pointer()
                                     .label("データ初期化")
                                     .outline()
+                                    .disabled(demo)
                                     .cursor_pointer()
                                     .on_click({
                                         let handle = handle.clone();
@@ -3399,6 +3448,7 @@ impl Render for SettingsView {
             booth_logged_in,
             fanza_logged_in,
             dlsite_logged_in,
+            demo,
         );
         div()
             .size_full()
@@ -3696,6 +3746,7 @@ impl Render for SettingsView {
                                     .child(
                                         Button::new("delete-confirm").cursor_pointer()
                                             .danger()
+                                            .disabled(demo)
                                             .label("削除").cursor_pointer().on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
@@ -3738,7 +3789,7 @@ impl Render for SettingsView {
                                     .child(
                                         Button::new("datadir-confirm").cursor_pointer()
                                             .primary()
-                                            .label("移動して変更").cursor_pointer().on_click({
+                                            .label("移動して変更").disabled(demo).cursor_pointer().on_click({
                                             let handle = handle.clone();
                                             move |_, _window, cx| {
                                                 handle.update(cx, |this, cx| {
@@ -4713,6 +4764,92 @@ mod tests {
         assert!(
             cancel.load(std::sync::atomic::Ordering::SeqCst),
             "中止が実行中の転送に伝わらない"
+        );
+    }
+
+    /// サンプルモードでは危険操作（ログアウト・データ全削除）を実行しない。
+    ///
+    /// サンプルは「ログイン済みで本が入っている」状態を見せるためのものなので、
+    /// 操作しても何も変わらない（早期 return。ボタン自体も無効にしてある）。
+    #[gpui_kit::test]
+    async fn demo_mode_blocks_destructive_actions(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        let view = cx.new(SettingsView::new);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1000.0),
+                height: gpui_kit::px(700.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+
+        let books_before = cx.read(|cx| {
+            db::books::list(&AppState::global(cx).db_pool)
+                .unwrap()
+                .len()
+        });
+        assert!(books_before > 0, "サンプルデータが入っていない");
+        let google_before = cx.read(|cx| *AppState::global(cx).google_logged_in.lock());
+
+        // Google ログアウト: ログイン済みのまま（プロフィールも消えない）
+        visual.update(|window, cx| {
+            view.update(cx, |this, cx| this.logout_google(window, cx));
+        });
+        cx.read(|cx| {
+            let state = AppState::global(cx);
+            assert_eq!(
+                *state.google_logged_in.lock(),
+                google_before,
+                "サンプルモードで Google のログイン状態が変わっている"
+            );
+            assert!(
+                state.google_profile.lock().is_some(),
+                "サンプルモードでプロフィールが消えている"
+            );
+        });
+
+        // ローカルデータの全削除: 本が残る（削除フラグも立たない）
+        cx.update(|cx| view.update(cx, |this, cx| this.delete_all_data(cx)));
+        cx.read(|cx| {
+            let state = AppState::global(cx);
+            assert_eq!(
+                db::books::list(&state.db_pool).unwrap().len(),
+                books_before,
+                "サンプルモードでデータが削除されている"
+            );
+            assert!(
+                !state
+                    .local_data_deleted
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "サンプルモードで削除フラグが立っている"
+            );
+        });
+    }
+
+    /// サンプルモードではデータ保存先を変更しない（本物の設定ファイルを書き換えない）。
+    ///
+    /// 変更すると、次回の通常起動が空のフォルダを指して本物の本棚が消えたように見える。
+    #[gpui_kit::test]
+    async fn demo_mode_does_not_change_the_data_directory(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        let view = cx.new(SettingsView::new);
+        let new_dir = std::env::temp_dir().join("thundoku-shelf-demo-move-test");
+        let _ = std::fs::remove_dir_all(&new_dir);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_data_dir = Some(new_dir.clone());
+                this.confirm_data_dir = true;
+                this.confirm_data_dir_change(cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            !new_dir.exists(),
+            "サンプルモードでデータ保存先が移動されている: {}",
+            new_dir.display()
         );
     }
 }
