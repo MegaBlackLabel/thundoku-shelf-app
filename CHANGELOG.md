@@ -19,7 +19,8 @@
   表紙とページ画像は起動時に SVG から生成し、画面右上に「サンプルモード」バッジ
   （`demo-badge`）を出す。`crates/app/src/demo.rs`（新規）、
   `crates/app/src/{main.rs,workspace.rs,app_state.rs}`、
-  `crates/app/src/views/{reader.rs,bookshelf.rs,settings.rs}`、`README.md`、
+  `crates/app/src/views/{reader.rs,bookshelf.rs,settings.rs,checklist.rs}`、
+  `crates/core/src/db/mod.rs`、`README.md`、
   `docs/features.md`、`docs/spec/07-decisions.md`
 - **ログをデータディレクトリに出すようにした（レポート画面から格納先を開ける）**: これまで
   ログファイルは Windows だけ `%TEMP%\thundoku-shelf\thundoku.log` に出ていて（macOS /

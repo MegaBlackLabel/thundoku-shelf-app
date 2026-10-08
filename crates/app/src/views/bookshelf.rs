@@ -1588,7 +1588,9 @@ fn demo_download(
     Ok(ImportOutcome {
         // 本物の取り込みは pack からタイトルを読むが、サンプルは本棚の値を使う。
         title: title.to_string(),
-        warnings: vec!["サンプルモード: ダミーのダウンロード".to_string()],
+        // warnings は空にする: 完了の定型文（`download_messages`）は warnings があると
+        // 「一部を読み飛ばし」を付けるため、実際には何も読み飛ばさないサンプルでは誤解させる。
+        warnings: Vec::new(),
     })
 }
 
@@ -18192,10 +18194,11 @@ mod tests {
             Err(_) => panic!("ダミーのダウンロードが失敗した"),
         };
         assert_eq!(outcome.title, sample.title, "タイトルが違う");
-        assert_eq!(outcome.warnings.len(), 1, "ダミーの案内が付いていない");
+        // ダミーの案内は warnings に載せない: 完了の定型文が「一部を読み飛ばし」になり、
+        // 実際には何も読み飛ばしていないのに誤解させる（`download_messages` 参照）。
         assert!(
-            outcome.warnings[0].contains("サンプルモード"),
-            "ダミーの案内が違う: {:?}",
+            outcome.warnings.is_empty(),
+            "サンプルの完了に読み飛ばしの案内が付いている: {:?}",
             outcome.warnings
         );
         let fractions: Vec<f32> = progress_rx
@@ -18307,6 +18310,12 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("ダウンロードしました")),
             "完了の通知が出ていない: {message:?}"
+        );
+        assert!(
+            !message
+                .as_deref()
+                .is_some_and(|message| message.contains("読み飛ばし")),
+            "サンプルなのに「一部を読み飛ばし」の通知が出ている: {message:?}"
         );
         // 再読み込みでカードがローカル本を持つ（「未ダウンロード」のままにならない）
         let card_has_local = view.read_with(cx, |this, _| {
