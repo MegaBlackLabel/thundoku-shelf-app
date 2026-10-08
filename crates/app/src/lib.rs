@@ -4,6 +4,7 @@
 pub mod actions;
 pub mod app_state;
 pub mod components;
+pub mod demo;
 pub mod icons;
 pub mod logging;
 pub mod pack_keys;

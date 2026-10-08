@@ -455,6 +455,11 @@ impl ChecklistView {
 
     /// 選択中イベントのチェックリストを同期する。
     pub fn sync(&mut self, cx: &mut Context<Self>) {
+        // サンプル（デモ）モードはネットワークへ出ない（ダミーのセッションで
+        // 本物の技術書典を叩かない。叩いても「セッション切れ」の通知が出るだけ）。
+        if AppState::global(cx).demo {
+            return;
+        }
         let logged_in = *AppState::global(cx).tbf_logged_in.lock();
         if !logged_in {
             self.toast = Some("ログインしてから同期してください".into());
@@ -517,6 +522,10 @@ impl ChecklistView {
 
     /// お気に入り（checkedProductInfos）をチェックリストへ取り込む。
     pub fn import_favorites(&mut self, cx: &mut Context<Self>) {
+        // サンプル（デモ）モードはネットワークへ出ない（`sync` と同じ理由）。
+        if AppState::global(cx).demo {
+            return;
+        }
         let logged_in = *AppState::global(cx).tbf_logged_in.lock();
         if !logged_in {
             self.toast = Some("ログインしてから実行してください".into());
@@ -1038,6 +1047,9 @@ impl ChecklistView {
         let toast = self.toast.clone();
         let last_sync = self.last_sync.clone();
         let selected_slug = self.selected_slug.clone().unwrap_or_default();
+        // サンプル（デモ）モードはネットワークへ出ないので、同期のボタンも無効にする
+        // （押しても何も起きないより、押せないほうが分かりやすい）。
+        let demo = AppState::global(cx).demo;
         let handle = cx.entity();
         let events = self.events.clone();
         let items = self.items.clone();
@@ -1393,7 +1405,7 @@ impl ChecklistView {
                                 Button::new("checklist-sync").cursor_pointer()
                                     .icon(AppIcon::RefreshCw)
                                     .label("同期")
-                                    .disabled(busy).cursor_pointer().on_click({
+                                    .disabled(busy || demo).cursor_pointer().on_click({
                                 let handle = handle.clone();
                                 move |_, _window, cx| {
                                     handle.update(cx, |this, cx| this.sync(cx));
@@ -2415,5 +2427,40 @@ mod tests {
         cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, "tbf20")));
         cx.run_until_parked();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// サンプル（デモ）モードはチェックリストの同期でネットワークへ出ない。
+    ///
+    /// サンプルはダミーのセッションだけを持ち、本物の技術書典へリクエストを投げない
+    /// （投げても「セッション切れ」の通知が出るだけで、実在のアカウントには何も起きない）。
+    #[gpui_kit::test]
+    async fn demo_mode_sync_does_not_hit_the_network(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        let calls = Arc::new(AtomicUsize::new(0));
+        // 実クライアントの代わりに、呼ばれたら数えるモックを差し込む
+        cx.update(|cx| *AppState::global(cx).tbf.lock() = mock_tbf_client(1, calls.clone()));
+        let slug = cx
+            .read(|cx| {
+                checklist_db::list_events(&AppState::global(cx).db_pool)
+                    .unwrap()
+                    .first()
+                    .and_then(|event| event.slug.clone())
+            })
+            .expect("サンプルのイベントが無い");
+        let view = cx.new(ChecklistView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.select_event(cx, &slug)));
+        cx.run_until_parked();
+        cx.update(|cx| view.update(cx, |this, cx| this.sync(cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "サンプルモードでチェックリストの同期がネットワークへ出ている"
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.toast.is_none()),
+            "サンプルモードで同期の通知が出ている"
+        );
     }
 }

@@ -56,6 +56,12 @@ pub struct SyncCursors {
 
 pub struct AppState {
     pub data_dir: PathBuf,
+    /// サンプル（デモ）モードか（`--demo` / `THUNDOKU_DEMO=1`。[`crate::demo::enabled`]）。
+    ///
+    /// 真のときは**メモリ DB + 一時ディレクトリ + メモリ keyring** で動き、本物のデータ
+    /// ディレクトリには触らない。ネットワーク（同期・表紙取得・タグ取得）と危険操作
+    /// （ログアウト・全削除）も各所でこれを見て止める。
+    pub demo: bool,
     pub packs_dir: PathBuf,
     pub downloads_dir: PathBuf,
     /// sqlx の接続プール（migrations 適用済み）
@@ -288,6 +294,32 @@ fn restore_google_profile(secrets: &SecretStore) -> Option<thundoku_core::google
     profile
 }
 
+/// メモリ内 SQLite のプール（`init_test` とサンプルモードの共通部分）。
+///
+/// `:memory:` の SQLite は**接続ごとに別のデータベース**なので、プールが接続を作り直すと
+/// テーブルの無い空の DB に繋がる。sqlx の既定は接続の寿命 30 分・アイドル 10 分で、
+/// **48 分開いたデモでダウンロードが失敗**した（実測:
+/// `error returned from database: (code: 1) no such table: books`）。1 本を張りっぱなしに
+/// して作り直させない。
+fn in_memory_pool() -> thundoku_core::db::SqlitePool {
+    let pool = thundoku_core::db::block_on(async {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(":memory:")
+            .foreign_keys(true)
+            .create_if_missing(true);
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .connect_with(options)
+            .await
+    })
+    .expect("in-memory sqlx pool");
+    thundoku_core::db::migrate(&pool).expect("migrate");
+    pool
+}
+
 impl AppState {
     /// Initialize from the real data directory and the OS keyring.
     pub fn init(cx: &mut App) {
@@ -457,6 +489,9 @@ impl AppState {
 
         cx.set_global(Self {
             data_dir,
+            // 本物の起動はサンプルモードではない（`main.rs` が `--demo` / env を見て
+            // `init_demo` を選ぶ）。
+            demo: false,
             packs_dir,
             downloads_dir,
             db_pool,
@@ -503,34 +538,79 @@ impl AppState {
 
     /// Test-only initialization: in-memory DB, no keyring.
     pub fn init_test(cx: &mut App) {
-        // テストは BookshelfView::new → 所有者フィルタ → db_key() の経路で
+        Self::init_in_memory(cx, std::env::temp_dir().join("thundoku-shelf-test"), false);
+    }
+
+    /// サンプル（デモ）モードで起動する: メモリ DB + 一時ディレクトリ + メモリ keyring。
+    ///
+    /// **本物のデータディレクトリ（[`resolve_data_dir`]）は読まない・書かない**。
+    /// 画面には固定のサンプルだけが出る（[`crate::demo`]）。
+    pub fn init_demo(cx: &mut App) {
+        Self::init_in_memory(cx, crate::demo::data_dir(), true);
+    }
+
+    /// メモリ上だけで起動する（テストとサンプルモードの共通部分）。
+    ///
+    /// `data_dir` は呼び出し側が一時領域を渡す。`demo` はサンプルモード
+    /// （[`crate::demo`]）で、ログイン済みの画面と固定データを用意する。
+    fn init_in_memory(cx: &mut App, data_dir: PathBuf, demo: bool) {
+        // テストとサンプルは BookshelfView::new → 所有者フィルタ → db_key() の経路で
         // keychain に到達するため、メモリバックエンドにして触らないようにする
         // （開発機の許可ダイアログ／CI でのアイテム作成を避ける）。
         SecretStore::use_memory_backend();
         // sqlx のメモリ DB プール（1 接続固定で同一メモリを共有）＋マイグレーション適用
-        let db_pool = thundoku_core::db::block_on(async {
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(":memory:")
-                .foreign_keys(true)
-                .create_if_missing(true);
-            sqlx::sqlite::SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect_with(options)
-                .await
-        })
-        .expect("in-memory sqlx pool");
-        thundoku_core::db::migrate(&db_pool).expect("migrate");
+        let db_pool = in_memory_pool();
         let client_id = default_client_id();
         let secrets = SecretStore::new();
         // 本番と同じ復元経路を通す（keyring の代わりにメモリバックエンド）
-        let session_vault =
-            SessionVault::new(&secrets, &std::env::temp_dir().join("thundoku-shelf-test")).ok();
+        let session_vault = SessionVault::new(&secrets, &data_dir).ok();
+        let packs_dir = data_dir.join("packs");
+        let downloads_dir = data_dir.join("downloads");
+        let mut tbf = TbfClient::new();
+        let (google_profile, google_logged_in, tbf_logged_in) = if demo {
+            // サンプルは「ログイン済みで本が入っている」画面を見せる。ネットワークへは
+            // 出ない（各所が `state.demo` を見て同期・取得を止める）。技術書典の
+            // セッションはダミー（Cookie が 1 つあれば `is_logged_in()` が真）。
+            tbf.restore_session(TbfSession::from_cookies(vec![(
+                "session".to_string(),
+                "demo-session".to_string(),
+            )]));
+            (
+                Some(GoogleProfile {
+                    sub: crate::demo::DEMO_OWNER_SUB.to_string(),
+                    email: "demo@example.com".to_string(),
+                    name: "サンプル ユーザー".to_string(),
+                    picture: None,
+                }),
+                true,
+                true,
+            )
+        } else {
+            (None, false, false)
+        };
+        if demo {
+            // 表紙を書くので、一時ディレクトリ側だけは作る（本物のデータディレクトリは触らない）。
+            for dir in [&packs_dir, &downloads_dir, &data_dir.join("thumbnails")] {
+                if let Err(error) = std::fs::create_dir_all(dir) {
+                    log::warn!(
+                        "サンプルモードのディレクトリを作れない {}: {error}",
+                        dir.display()
+                    );
+                }
+            }
+            // 固定データ（表紙 PNG を含む）を 1 回だけ投入する。失敗しても起動は続ける
+            // （画面は空になるが、サンプルの表示でアプリを落とさない）。
+            if let Err(error) = crate::demo::seed(&db_pool, &data_dir.join("thumbnails")) {
+                log::error!("サンプルデータを投入できない: {error}");
+            }
+        }
         cx.set_global(Self {
-            data_dir: std::env::temp_dir().join("thundoku-shelf-test"),
-            packs_dir: std::env::temp_dir().join("thundoku-shelf-test/packs"),
-            downloads_dir: std::env::temp_dir().join("thundoku-shelf-test/downloads"),
+            data_dir,
+            demo,
+            packs_dir,
+            downloads_dir,
             db_pool,
-            tbf: Arc::new(Mutex::new(TbfClient::new())),
+            tbf: Arc::new(Mutex::new(tbf)),
             google: Arc::new(Mutex::new(if client_id.is_empty() {
                 None
             } else {
@@ -543,12 +623,12 @@ impl AppState {
             // メモリバックエンドの keyring はプロセス内で共有されるため、テストでは
             // 保存済みプロフィールを復元しない（復元すると所有者フィルタが全テストに
             // 波及する）。復元経路は init_with_data_dir（本番）で検証する。
-            google_profile: Arc::new(Mutex::new(None)),
+            google_profile: Arc::new(Mutex::new(google_profile)),
             pack_root_key: Arc::new(Mutex::new(None)),
             pack_key_prompt: Arc::new(crate::pack_keys::PackKeyPrompt::default()),
-            google_logged_in: Arc::new(Mutex::new(false)),
+            google_logged_in: Arc::new(Mutex::new(google_logged_in)),
             google_login_error: Arc::new(Mutex::new(None)),
-            tbf_logged_in: Arc::new(Mutex::new(false)),
+            tbf_logged_in: Arc::new(Mutex::new(tbf_logged_in)),
             booth_session: Arc::new(Mutex::new(None)),
             booth_logged_in: Arc::new(Mutex::new(false)),
             session_vault,
@@ -1447,6 +1527,112 @@ mod tests {
             let _ = thundoku_core::google::delete_saved_profile(&AppState::global(cx).secrets);
         });
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// メモリ DB の接続を作り直さないこと（`:memory:` は**接続ごとに別の DB**）。
+    ///
+    /// sqlx の既定は接続の寿命 30 分・アイドル 10 分。接続が入れ替わるとテーブルの無い
+    /// 空の DB に繋がり「no such table: books」になる（実測: デモを 48 分開いてから
+    /// ダウンロードすると失敗した）。プールの設定で 1 本を張りっぱなしにして防ぐ。
+    #[test]
+    fn in_memory_pool_keeps_one_connection_forever() {
+        let pool = in_memory_pool();
+        let options = pool.options();
+        assert_eq!(
+            options.get_min_connections(),
+            1,
+            "接続を維持する設定になっていない"
+        );
+        assert_eq!(
+            options.get_max_lifetime(),
+            None,
+            "接続が寿命で作り直される設定になっている"
+        );
+        assert_eq!(
+            options.get_idle_timeout(),
+            None,
+            "接続がアイドルで捨てられる設定になっている"
+        );
+        // マイグレーション済み（テーブルがある）
+        assert!(
+            thundoku_core::db::books::list(&pool).is_ok(),
+            "テーブルが無い（マイグレーションされていない）"
+        );
+    }
+
+    /// サンプル（デモ）モードの起動: ログイン済みの画面と固定データが用意される。
+    ///
+    /// `init_demo` はメモリ DB + 一時ディレクトリ + メモリ keyring だけを使う
+    /// （本物のデータディレクトリを触らない）。本棚は Google の `sub` で絞り込むため、
+    /// プロフィール（`demo-owner`）と本の所有者（`owner_sub`）が揃っている必要がある。
+    #[gpui_kit::test]
+    async fn init_demo_starts_in_sample_mode_with_seeded_data(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            assert!(state.demo, "demo フラグが立っていない");
+            assert!(
+                state.data_dir.starts_with(std::env::temp_dir()),
+                "本物のデータディレクトリを使っている: {}",
+                state.data_dir.display()
+            );
+            assert!(
+                *state.google_logged_in.lock(),
+                "サンプルなのに Google が未ログイン"
+            );
+            assert!(
+                *state.tbf_logged_in.lock(),
+                "サンプルなのに技術書典が未ログイン"
+            );
+            assert_eq!(
+                state
+                    .google_profile
+                    .lock()
+                    .as_ref()
+                    .map(|profile| profile.sub.clone()),
+                Some(crate::demo::DEMO_OWNER_SUB.to_string()),
+                "サンプルのプロフィールになっていない"
+            );
+            assert!(
+                state.tbf.lock().is_authenticated(),
+                "技術書典のクライアントへセッションを復元していない"
+            );
+            // 本棚は全冊入り、ローカル本（ダウンロード済み）は未ダウンロードの 12 冊を除く。
+            // 未ダウンロードの本は本棚と表紙だけを持つ（ダミーのダウンロードで取り込める）。
+            assert_eq!(
+                db::bookshelf::list(&state.db_pool, thundoku_core::tbf::SITE_ID_TECHBOOKFEST)
+                    .unwrap()
+                    .len(),
+                crate::demo::BOOKS.len(),
+                "固定データ（seed）が入っていない"
+            );
+            let undownloaded = crate::demo::BOOKS
+                .iter()
+                .filter(|book| !book.downloaded)
+                .count();
+            assert_eq!(
+                db::books::list(&state.db_pool).unwrap().len(),
+                crate::demo::BOOKS.len() - undownloaded,
+                "固定データ（seed）のうちダウンロード済みの冊数が違う"
+            );
+            assert_eq!(undownloaded, 12, "未ダウンロードの冊数が変わっている");
+        });
+    }
+
+    /// テスト用の起動（`init_test`）はサンプルモードではない（従来の前提を変えない）。
+    #[gpui_kit::test]
+    async fn init_test_is_not_sample_mode(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            assert!(!state.demo, "テスト起動がサンプルモードになっている");
+            assert!(!*state.google_logged_in.lock());
+            assert!(!*state.tbf_logged_in.lock());
+            assert!(state.google_profile.lock().is_none());
+            assert!(db::books::list(&state.db_pool).unwrap().is_empty());
+        });
     }
 
     /// 保護期限は 5 秒（自動消滅と同じ）。

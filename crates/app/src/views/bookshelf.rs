@@ -1552,6 +1552,46 @@ impl From<String> for ImportFailure {
     }
 }
 
+/// サンプルモードのダミーダウンロード（**ネットワークへ出ない**）。
+///
+/// `start_download` のワーカーが、サンプルモード（`AppState::demo`）のときだけ本物の取り込みの
+/// 代わりに呼ぶ。進捗（0 → 1）を段階的に送り、最後に [`crate::demo::promote_to_downloaded`] で
+/// サンプルの本をローカル本にする。成功・失敗の形は本物の取り込みと同じ
+/// （[`ImportOutcome`] / [`ImportFailure`]）にして、UI 側の完了処理（進捗の解除・通知・
+/// 完了待ちのビューアー）をそのまま通す（専用の通知経路を作らない）。
+fn demo_download(
+    db: &db::SqlitePool,
+    product_id: &str,
+    title: &str,
+    cancel: &AtomicBool,
+    progress: &std::sync::mpsc::Sender<(String, DownloadState)>,
+) -> Result<ImportOutcome, ImportFailure> {
+    /// 進捗の段階数と 1 段あたりの待ち時間（「少し待って終わる」見た目を作るだけ）。
+    const STEPS: u32 = 5;
+    const STEP: std::time::Duration = std::time::Duration::from_millis(200);
+    for step in 1..=STEPS {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ImportFailure::DownloadCancelled);
+        }
+        let _ = progress.send((
+            product_id.to_string(),
+            DownloadState::Downloading(step as f32 / STEPS as f32),
+        ));
+        std::thread::sleep(STEP);
+    }
+    // 最後の段階を送った後にも中止を見る（進捗 1.0 の後に中止された場合）
+    if cancel.load(Ordering::SeqCst) {
+        return Err(ImportFailure::DownloadCancelled);
+    }
+    crate::demo::promote_to_downloaded(db, product_id)
+        .map_err(|error| ImportFailure::Message(error.to_string()))?;
+    Ok(ImportOutcome {
+        // 本物の取り込みは pack からタイトルを読むが、サンプルは本棚の値を使う。
+        title: title.to_string(),
+        warnings: vec!["サンプルモード: ダミーのダウンロード".to_string()],
+    })
+}
+
 /// 取り込みエラーを UI 用の失敗種別に変換する（`NotAReadableWork` だけ特別扱い）。
 fn import_failure(error: thundoku_core::import::ImportError) -> ImportFailure {
     match error {
@@ -1908,6 +1948,11 @@ impl BookshelfView {
     /// shelf_cards は既に構築済みで、表示は filtered（仮想化リストが見る）が
     /// フィルタするため reload（DB 再読込 + カバー再ロード）は行わない（即時反映・軽量）。
     pub fn set_site_filter(&mut self, cx: &mut Context<Self>, site: Option<&str>) {
+        // サンプルモードは技術書典のサンプルしか無いため、他サイト（や「すべての本」）へ
+        // 切り替えると空の本棚になる。フィルタは技術書典に固定して切り替えさせない。
+        if Self::app_state(cx).demo && site != Some(tbf::SITE_ID_TECHBOOKFEST) {
+            return;
+        }
         // 展開中・同期中に切り替えると busy 表示や処理がバッティングするため無視する
         if self.fetching_covers || self.sync_busy > 0 {
             return;
@@ -1940,6 +1985,11 @@ impl BookshelfView {
 
     /// 保存済みのサイトフィルタを復元する（"all" は None）。
     fn read_site_filter(cx: &Context<Self>) -> Option<String> {
+        // サンプルモードの本棚は技術書典のサンプルしか持たないため、保存値に
+        // 他のサイトが入っていても**読まない**（読むと起動直後が空の本棚になる）。
+        if Self::app_state(cx).demo {
+            return Some(tbf::SITE_ID_TECHBOOKFEST.to_string());
+        }
         db::settings::get(&Self::app_state(cx).db_pool, "bookshelf.site_filter")
             .ok()
             .flatten()
@@ -2617,6 +2667,11 @@ impl BookshelfView {
     /// thumbnail (TBF session), save it to `thumbnails/{site}_{db}.{ext}`
     /// and apply it to the card as each image finishes (1 枚ずつ追加表示).
     fn fetch_remote_covers(&mut self, cx: &mut Context<Self>) {
+        // サンプルモードの表紙は seed がローカルに書いたものだけを使う。
+        // 取得対象判定より前に抜けて、ネットワークへ一切出ないようにする。
+        if Self::app_state(cx).demo {
+            return;
+        }
         let pending: Vec<(String, String, String)> = self
             .shelf_cards
             .iter()
@@ -3351,6 +3406,10 @@ impl BookshelfView {
     /// 同期ボタン: 技術書典の本棚同期に加えて、Google にログイン済みなら
     /// Drive 同期も実施する（Web 版の「同期」ボタン + Drive 同期の統合）。
     pub fn sync_all(&mut self, cx: &mut Context<Self>) {
+        // サンプルモードはネットワークへ出ない（同期も busy 表示もトーストも出さない）
+        if Self::app_state(cx).demo {
+            return;
+        }
         // 同期中に再実行されないようにする（ボタンは busy 中も押せる見た目のため）
         if self.sync_busy > 0 {
             return;
@@ -3413,6 +3472,10 @@ impl BookshelfView {
     /// 同期ボタン（`sync_all`）の両方から呼ばれる。未知の id では何もしない。
     /// 未ログインならそのサイトの `sync_*` がログイン導線を出す。
     pub fn sync_site(&mut self, site: &str, cx: &mut Context<Self>) {
+        // サンプルモードはネットワークへ出ない（ログイン導線のトーストも出さない）
+        if Self::app_state(cx).demo {
+            return;
+        }
         match site {
             "techbookfest" => self.sync_tbf(cx),
             "booth" => self.sync_booth(cx),
@@ -3769,6 +3832,10 @@ impl BookshelfView {
     /// （アカウントのログイン状態にも影響が出る）。同期が成功したときに少量ずつ進め、
     /// 取得済みの作品は次回の対象から外して何回かの同期で埋めていく。
     fn fetch_missing_fanza_tags(&mut self, cx: &mut Context<Self>) {
+        // サンプルモードはタグを外へ取りに行かない（リクエストも通知も出さない）
+        if Self::app_state(cx).demo {
+            return;
+        }
         // ヘッダーの「タグ取得」トグル（`tag.fetch.enabled`）が OFF なら取りに行かない。
         // サイトへタグを取りに行く操作なので、自動生成タグと同じスイッチで止められるようにする。
         if !self.tag_fetch_enabled {
@@ -3850,6 +3917,10 @@ impl BookshelfView {
     /// （FANZA は 1 件 = 1 リクエストなので bot 判定を避けて少しずつ、
     /// DLsite は `product/info/ajax` が 20 件一括）。
     pub fn fetch_visible_tags(&mut self, cx: &mut Context<Self>) {
+        // サンプルモードはタグを外へ取りに行かない（リクエストも通知も出さない）
+        if Self::app_state(cx).demo {
+            return;
+        }
         if !self.tag_fetch_enabled {
             crate::app_state::set_toast_kind(
                 cx,
@@ -4307,8 +4378,17 @@ impl BookshelfView {
         // 専用スレッドで実行して結果をチャネルで受け取る。
         let (result_tx, result_rx) =
             std::sync::mpsc::channel::<Result<ImportOutcome, ImportFailure>>();
+        // サンプルモードは実在の本を取りに行かない（ダミーの進捗と取り込みだけを行う）。
+        // 判定はここ（spawn の前）で取り、ワーカーには真偽値だけを渡す（背景スレッドから
+        // `AppState` を触らない）。false のときの経路は従来どおり。
+        let demo = Self::app_state(cx).demo;
         std::thread::spawn(move || {
             let result = (|| -> Result<ImportOutcome, ImportFailure> {
+                // サンプルモードは **ネットワークを一切触らない**。本物の取り込み経路
+                // （鍵の解決 → サイト別のダウンロード → インポート）には入らない。
+                if demo {
+                    return demo_download(&db, &product_id, &title, &cancel, &progress_tx);
+                }
                 // pack の鍵（v3 の PRK）は**最初に**決める（fail-closed）。
                 // ログイン済みなのに鍵が取れない場合はここで失敗させ、平文 pack を
                 // 作らない（数分のダウンロードを無駄にしない意味でも先に判定する）。
@@ -4910,6 +4990,10 @@ impl BookshelfView {
     /// 同時実行数は `MAX_AUTO_DOWNLOADS` に絞り、残りは待ち行列に積んで
     /// 1 件終わるごとに次を開始する。
     fn auto_download_favorites(&mut self, cx: &mut Context<Self>) {
+        // サンプルモードは実在の本を取りに行かない（お気に入りの自動ダウンロードも止める）
+        if Self::app_state(cx).demo {
+            return;
+        }
         let favorites: Vec<bookshelf::BookshelfItem> = {
             let state = Self::app_state(cx);
             let db = &state.db_pool;
@@ -18037,5 +18121,199 @@ mod tests {
         );
         // 1 件も取れなければ出さない（失敗の通知はここでは出さない）
         assert_eq!(visible_tag_fetch_notice(0, 3, 3), None);
+    }
+
+    /// サンプルモードはネットワークへ出ない（同期しても busy も通知も出さない）。
+    #[gpui_kit::test]
+    async fn demo_mode_sync_all_does_nothing(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        let view = cx.new(BookshelfView::new);
+        let before = cx.update(|cx| AppState::global(cx).toast_message.lock().clone());
+        cx.update(|cx| view.update(cx, |this, cx| this.sync_all(cx)));
+        let (busy, after) = cx.update(|cx| {
+            (
+                view.read(cx).sync_busy,
+                AppState::global(cx).toast_message.lock().clone(),
+            )
+        });
+        assert_eq!(busy, 0, "サンプルモードで同期が始まっている");
+        assert_eq!(after, before, "サンプルモードで同期の通知が出ている");
+    }
+
+    /// サンプルモードの本棚は技術書典に固定される（保存値に他サイトが残っていても）。
+    #[gpui_kit::test]
+    async fn demo_mode_pins_the_site_filter_to_techbookfest(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        // 前回終了時の他サイトの選択が残っていても読み飛ばす
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            db::settings::set(db, "bookshelf.site_filter", "booth").unwrap();
+        });
+        let view = cx.new(BookshelfView::new);
+        assert_eq!(
+            view.read_with(cx, |this, _| this.site_filter()),
+            Some("techbookfest".to_string()),
+            "保存値ではなく技術書典に固定されていない"
+        );
+        // サイドバーから他サイトを選んでも固定のまま（サンプルは技術書典だけ）
+        cx.update(|cx| view.update(cx, |this, cx| this.set_site_filter(cx, Some("fanza"))));
+        assert_eq!(
+            view.read_with(cx, |this, _| this.site_filter()),
+            Some("techbookfest".to_string()),
+            "サンプルモードで他サイトへ切り替わっている"
+        );
+    }
+
+    /// サンプルのダミーダウンロード: 進捗を段階的に送り、最後にローカル本を作る。
+    ///
+    /// 中止が立っていたら何も書かずに中止を返す（ネットワークへは出ない = セッションも
+    /// pack の鍵も使わない）。
+    #[test]
+    fn demo_download_reports_progress_and_promotes_the_book() {
+        let pool = thundoku_core::db::test_pool();
+        let dir = std::env::temp_dir().join(format!(
+            "thundoku-shelf-demo-download-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::demo::seed(&pool, &dir).expect("サンプルを投入できる");
+        let sample = crate::demo::book("demo-13").expect("サンプルを引ける");
+        assert!(!sample.downloaded, "demo-13 は未ダウンロードのはず");
+
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(String, DownloadState)>();
+        let cancel = AtomicBool::new(false);
+        let outcome = match demo_download(&pool, "demo-13", sample.title, &cancel, &progress_tx) {
+            Ok(outcome) => outcome,
+            Err(ImportFailure::Message(message)) => {
+                panic!("ダミーのダウンロードが失敗した: {message}")
+            }
+            Err(_) => panic!("ダミーのダウンロードが失敗した"),
+        };
+        assert_eq!(outcome.title, sample.title, "タイトルが違う");
+        assert_eq!(outcome.warnings.len(), 1, "ダミーの案内が付いていない");
+        assert!(
+            outcome.warnings[0].contains("サンプルモード"),
+            "ダミーの案内が違う: {:?}",
+            outcome.warnings
+        );
+        let fractions: Vec<f32> = progress_rx
+            .try_iter()
+            .map(|(id, state)| {
+                assert_eq!(id, "demo-13", "進捗の id が違う");
+                match state {
+                    DownloadState::Downloading(fraction) => fraction,
+                    other => panic!("進捗の状態が違う: {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(fractions, vec![0.2, 0.4, 0.6, 0.8, 1.0], "進捗の段階が違う");
+        assert!(
+            books::get(&pool, "demo-13").unwrap().is_some(),
+            "ローカル本ができていない"
+        );
+
+        // 中止が立っていたら途中で止め、ローカル本は作らない
+        let cancel = AtomicBool::new(true);
+        let result = demo_download(&pool, "demo-15", "サンプル", &cancel, &progress_tx);
+        assert!(
+            matches!(result, Err(ImportFailure::DownloadCancelled)),
+            "中止になっていない"
+        );
+        assert!(
+            books::get(&pool, "demo-15").unwrap().is_none(),
+            "中止したのにローカル本ができている"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// サンプルモードのダウンロードはダミーで完了する（ネットワークへ出ない）:
+    /// ローカル本ができ、進捗が消え、エラーの通知は出ない。
+    #[gpui_kit::test]
+    async fn demo_mode_download_completes_the_sample_book(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_demo);
+        let view = cx.new(BookshelfView::new);
+        let database_id = "demo-13";
+        let db = cx.update(|cx| AppState::global(cx).db_pool.clone());
+        assert!(
+            books::get(&db, database_id).unwrap().is_none(),
+            "最初からダウンロード済みになっている"
+        );
+
+        let item = view.read_with(cx, |this, _| {
+            this.shelf_cards
+                .iter()
+                .find(|card| card.shelf.database_id == database_id)
+                .map(|card| card.shelf.clone())
+                .expect("サンプルのカードがある")
+        });
+        cx.update(|cx| view.update(cx, |this, cx| this.download_item(cx, item)));
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.contains_key(database_id)),
+            "サンプルのダウンロードが始まっていない"
+        );
+
+        // ワーカーは実時間で 200ms × 5 段階進む（テストの時計は仮想時計なので、完了は
+        // DB を見て待つ）。終わると進捗チャネルが閉じ、UI 側の反映が走る。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while books::get(&db, database_id).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ダミーのダウンロードが終わらない"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+        // 進捗の解除は結果チャネルを処理する UI 側のタスクで起きる。DB が書けた時点では
+        // まだ残っていることがある（スイート全体で走らせるとワーカーが遅れて競合する）。
+        // UI の状態が落ち着くまで、ハーネスを回しながら待つ。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while view.read_with(cx, |this, _| !this.download_states.is_empty()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ダウンロードの進捗が消えない"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            // UI 側のポーリングは 16ms の**仮想タイマー**で回る（ワーカーだけが実時間）。
+            // 時計を進めないとタイマーが発火せず、進捗の解除が永久に来ない
+            // （`run_until_parked` だけでは未来のタイマーは走らない）。
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+        }
+
+        assert!(
+            books::get(&db, database_id).unwrap().is_some(),
+            "ローカル本ができていない"
+        );
+        assert!(
+            view.read_with(cx, |this, _| this.download_states.is_empty()),
+            "ダウンロードの進捗が残っている"
+        );
+        let (kind, message) = cx.update(|cx| {
+            let state = AppState::global(cx);
+            (*state.toast_kind.lock(), state.toast_message.lock().clone())
+        });
+        assert_ne!(
+            kind,
+            ToastKind::Error,
+            "エラーの通知が出ている: {message:?}"
+        );
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.contains("ダウンロードしました")),
+            "完了の通知が出ていない: {message:?}"
+        );
+        // 再読み込みでカードがローカル本を持つ（「未ダウンロード」のままにならない）
+        let card_has_local = view.read_with(cx, |this, _| {
+            this.shelf_cards
+                .iter()
+                .any(|card| card.shelf.database_id == database_id && card.local.is_some())
+        });
+        assert!(card_has_local, "カードにローカル本が反映されていない");
     }
 }

@@ -639,6 +639,12 @@ pub fn test_pool() -> SqlitePool {
             .create_if_missing(true);
         sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
+            // `:memory:` は接続ごとに別 DB。既定の寿命（30 分）・アイドル（10 分）で接続が
+            // 入れ替わるとテーブルの無い空の DB に繋がるので、1 本を張りっぱなしにする
+            // （アプリ側の `app_state::in_memory_pool` と同じ理由）。
+            .min_connections(1)
+            .max_lifetime(None)
+            .idle_timeout(None)
             .connect_with(options)
             .await
     })
