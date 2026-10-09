@@ -1373,6 +1373,8 @@ pub(crate) struct PendingFileChoice {
     pub(crate) item: bookshelf::BookshelfItem,
     /// 選ばせる候補（文書順。2 件以上）
     pub(crate) options: Vec<thundoku_core::booth::DownloadOption>,
+    /// 選択中の候補（矢印 / j k で動かし、Enter かクリックで確定する。初期値は先頭）
+    pub(crate) selected: usize,
 }
 
 /// 確認モーダルに出す 1 コンテンツ分の要約。
@@ -1391,9 +1393,6 @@ pub(crate) struct ImportChoice {
 /// スクロールさせ、フッターのボタンが画面外に出ないようにする。
 const IMPORT_CHOICES_MAX_H: f32 = 360.0;
 
-/// 他の本を取り込み中に開こうとしたときの案内。
-const DOWNLOADING_NOTICE: &str = "ダウンロード中です。終わってから開いてください";
-
 /// 未ログインで取り込み（ダウンロード）を要求されたときの案内。
 ///
 /// pack の鍵（v3 の PRK）は Google アカウントごとに作るため、未ログインでは
@@ -1411,6 +1410,25 @@ const FAVORITES_NOTE: &str =
 /// 同期できるサイトの id（本棚の絞り込み・サイドバーのサイト行と同じ表記）。
 /// 「すべての本」での同期（`sync_all`）と、ログイン直後の自動同期が同じ一覧を使う。
 const SYNC_SITE_IDS: [&str; 4] = ["techbookfest", "booth", "fanza", "dlsite"];
+
+/// 「すべての本」で同期するサイト（**ログイン済みだけ**）。
+///
+/// 未ログインのサイトは同期できず、各 `sync_*` がログイン導線（ダイアログ）を出す
+/// だけなので対象から外す。個別サイトを選んでいるときは、そのサイトが未ログインでも
+/// 従来どおりログイン導線を出す（`sync_all` の `Some(site)` 分岐）。
+fn logged_in_sync_sites(cx: &App) -> Vec<&'static str> {
+    let state = AppState::global(cx);
+    SYNC_SITE_IDS
+        .into_iter()
+        .filter(|site| match *site {
+            "techbookfest" => *state.tbf_logged_in.lock(),
+            "booth" => *state.booth_logged_in.lock(),
+            "fanza" => *state.fanza_logged_in.lock(),
+            "dlsite" => *state.dlsite_logged_in.lock(),
+            _ => false,
+        })
+        .collect()
+}
 
 /// タグを後から取りに行けるサイトの id（作品ページ / 作品メタにタグがあるストア）。
 ///
@@ -2016,8 +2034,121 @@ impl BookshelfView {
         }
     }
 
+    /// 複数ダウンロードのファイル選択ダイアログが今まさに表示中か。
+    ///
+    /// render の可視判定と同じ条件（`DownloadConfirm` の枠のうち、2 GiB 超の確認と
+    /// 未ダウンロードの確認が無いときに最後に出る 1 つ）。
+    fn file_choice_visible(&self, cx: &App) -> bool {
+        self.pending_file_choice.is_some()
+            && self.pending_large_download.is_none()
+            && self.pending_download_confirm.is_none()
+            && crate::app_state::active_modal(cx)
+                == Some(crate::app_state::ModalKind::DownloadConfirm)
+    }
+
+    /// ファイル選択の選択位置を動かす（`up` は -1 / `down` は +1）。
+    /// 端では止まる（先頭より上・末尾より下へは行かない）。
+    fn move_file_choice_selection(&mut self, up: bool) {
+        let Some(pending) = self.pending_file_choice.as_mut() else {
+            return;
+        };
+        let last = pending.options.len().saturating_sub(1);
+        let next = if up {
+            pending.selected.saturating_sub(1)
+        } else {
+            (pending.selected + 1).min(last)
+        };
+        if next != pending.selected {
+            pending.selected = next;
+        }
+    }
+
+    /// 取り込み内容の確認モーダルが今表示中か（render の可視判定と同じ条件）。
+    fn import_confirmation_visible(&self, cx: &App) -> bool {
+        self.pending_import.is_some()
+            && crate::app_state::active_modal(cx) == Some(crate::app_state::ModalKind::Import)
+    }
+
+    /// 取り込み確認の選択位置を動かす（`up` は -1 / `down` は +1）。端では止まる。
+    fn move_pending_import_selection(&mut self, up: bool, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_import.as_mut() {
+            let last = pending.choices.len().saturating_sub(1);
+            let next = if up {
+                pending.selected.saturating_sub(1)
+            } else {
+                (pending.selected + 1).min(last)
+            };
+            pending.selected = next;
+        }
+        cx.notify();
+    }
+
+    /// ワークスペースからキーボードフォーカスを戻す（サイドバーから表示中の本棚へ）。
+    pub(crate) fn focus_view(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+    }
+
     /// キーボード操作: Enter で開く、矢印 / hjkl で選択移動、ESC で絞り込み解除
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 取り込み内容の確認モーダルが出ている間は、矢印 / j k / Enter を
+        // その選択操作に使う（背後の本棚へ漏らさない）。
+        if self.import_confirmation_visible(cx) {
+            match event.keystroke.key.as_str() {
+                "up" | "k" => {
+                    self.move_pending_import_selection(true, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "down" | "j" => {
+                    self.move_pending_import_selection(false, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" => {
+                    self.confirm_pending_import(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // これ以外のキーも背後の本棚へ漏らさない（左/右や h/l が背後の選択を
+                // 動かし、Escape が背後の絞り込みを消していた）。モーダルが入力を独占する。
+                _ => {
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+        }
+        // ファイル選択ダイアログが出ている間は、矢印 / j k / Enter を
+        // ダイアログの選択操作に使う（背後の本棚へ漏らさない）。
+        if self.file_choice_visible(cx) {
+            match event.keystroke.key.as_str() {
+                "up" | "k" => {
+                    self.move_file_choice_selection(true);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "down" | "j" => {
+                    self.move_file_choice_selection(false);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "enter" => {
+                    if let Some(pending) = &self.pending_file_choice {
+                        let index = pending.selected;
+                        self.choose_file_choice(cx, index);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                // これ以外のキーも背後の本棚へ漏らさない（左/右や h/l が背後の選択を
+                // 動かし、Escape が背後の絞り込みを消していた）。モーダルが入力を独占する。
+                _ => {
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+        }
         match event.keystroke.key.as_str() {
             "enter" => self.activate_selected(cx),
             "right" | "l" => self.shift_selection(1, 0, window, cx),
@@ -3424,7 +3555,9 @@ impl BookshelfView {
                 self.sync_site(site, cx)
             }
             _ => {
-                for site in SYNC_SITE_IDS {
+                // 未ログインのサイトは同期できない（ログイン導線が並ぶだけ）ので、
+                // ログイン済みのサイトだけを対象にする。
+                for site in logged_in_sync_sites(cx) {
                     self.sync_site(site, cx);
                 }
             }
@@ -4328,7 +4461,11 @@ impl BookshelfView {
         if !auto && !file_choice_confirmed {
             let options = item.download_choices();
             if options.len() > 1 {
-                self.pending_file_choice = Some(PendingFileChoice { item, options });
+                self.pending_file_choice = Some(PendingFileChoice {
+                    item,
+                    options,
+                    selected: 0,
+                });
                 cx.notify();
                 return true;
             }
@@ -5342,14 +5479,15 @@ impl BookshelfView {
 
     /// worker から取り込み確認の依頼が来たとき（モーダルを出す）。
     ///
-    /// ビューアーが開いているとモーダルがその下に隠れて操作できないため、閉じる。
+    /// ビューアーが開いていても**閉じない**（読書の状態を保つ）。モーダルはビューアーの
+    /// オーバーレイの下に描かれるため、表示中はワークスペース側でビューアーを描かない
+    /// ようにして、このモーダルを見せる（`Workspace::render`）。
     pub(crate) fn request_pending_import(
         &mut self,
         request: PendingImport,
         cx: &mut Context<Self>,
     ) {
         self.pending_import = Some(request);
-        cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseReader));
         cx.notify();
     }
 
@@ -5987,13 +6125,10 @@ impl BookshelfView {
             cx.notify();
             return;
         }
-        // 他の本を取り込み中はビューアーを開かない（取り込みと競合する）。
-        // 対象が未ダウンロードなら、そのまま取り込みの確認へ進む。
-        if book_id.is_some() && self.has_running_downloads() {
-            crate::app_state::set_toast_kind(cx, ToastKind::Info, DOWNLOADING_NOTICE);
-            cx.notify();
-            return;
-        }
+        // 他の本を取り込み中でも、**ダウンロード済みの本は開ける**。
+        // 取り込みの書き込みとビューアーの読み込みは DB（WAL）と別ファイルで競合せず、
+        // 待たせると読書ができない（実測で不便だった）。未ダウンロードならこの先の
+        // 取り込み確認へ進む。
         if let Some(book_id) = book_id {
             self.open_book(cx, &book_id);
         } else if !self.require_import_login(cx, true) {
@@ -6070,6 +6205,10 @@ impl BookshelfView {
     /// やり直す（worker は今までどおりこの 2 列だけを見て取得する）。
     /// 選択は記憶しない（再取得のたびに選ぶ）。
     pub(crate) fn choose_file_choice(&mut self, cx: &mut Context<Self>, index: usize) {
+        // マウスのクリックもキーボードの選択と同じ状態にする（確定した行を揃える）
+        if let Some(pending) = self.pending_file_choice.as_mut() {
+            pending.selected = index;
+        }
         let Some(pending) = self.pending_file_choice.take() else {
             return;
         };
@@ -9247,12 +9386,13 @@ impl Render for BookshelfView {
                     let content_handle = handle.clone();
                     let title = pending.item.title.clone();
                     let options = pending.options.clone();
+                    let selected = pending.selected;
                     Dialog::new(cx)
                         .bg(cx.theme().colors.popover)
                         .title(div().child("ダウンロードするファイルを選んでください"))
                         // バツは置かない（キャンセル / ファイルのどちらかで必ず答える）
                         .close_button(false)
-                        .content(move |content, window, _cx| {
+                        .content(move |content, window, cx| {
                             // 取り込み確認と同じ流儀: 選択肢が多いときはリストだけを
                             // スクロールさせ、フッターのボタンを画面内に残す。
                             let max_height = FILE_CHOICE_MAX_H
@@ -9269,24 +9409,32 @@ impl Render for BookshelfView {
                             for (index, option) in options.iter().enumerate() {
                                 let handle = content_handle.clone();
                                 let label = file_choice_label(option, index);
+                                let is_selected = index == selected;
+                                let mut row = div()
+                                    .id(SharedString::from(format!("file-choice-{index}")))
+                                    .debug_selector(move || format!("file-choice-{index}"))
+                                    .min_h(px(FILE_CHOICE_ROW_H))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer();
+                                // 選択中の行は背景で示す（キーボードの選択とマウスの
+                                // クリックは同じ `selected` を見る）
+                                if is_selected {
+                                    row = row.bg(cx.theme().muted);
+                                }
                                 items = items.child(
-                                    div()
-                                        .id(SharedString::from(format!("file-choice-{index}")))
-                                        .debug_selector(move || format!("file-choice-{index}"))
-                                        .min_h(px(FILE_CHOICE_ROW_H))
-                                        .flex_shrink_0()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_2()
-                                        .py_1()
-                                        .cursor_pointer()
-                                        .on_click(move |_, _window, cx| {
-                                            handle.update(cx, |this, cx| {
-                                                this.choose_file_choice(cx, index);
-                                            });
-                                        })
-                                        .child(div().text_sm().child(label)),
+                                    row.on_click(move |_, _window, cx| {
+                                        handle.update(cx, |this, cx| {
+                                            this.choose_file_choice(cx, index);
+                                        });
+                                    })
+                                    .child(div().text_sm().child(label)),
                                 );
                             }
                             content
@@ -12262,6 +12410,71 @@ mod tests {
         assert_eq!(answer.recv().unwrap(), None);
     }
 
+    /// 取り込み確認モーダルは矢印 / j k で選択肢を切り替え、Enter で確定できる。
+    /// 表示中は背後の本棚へキーを漏らさない。
+    #[gpui_kit::test]
+    async fn import_confirmation_modal_is_keyboard_operable(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        let (reply, answer) = std::sync::mpsc::channel();
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_import = Some(PendingImport {
+                    database_id: "db-1".into(),
+                    title: "総集編".into(),
+                    choices: vec![
+                        ImportChoice {
+                            display_name: "本編".into(),
+                            kind: "画像".into(),
+                            detail: "画像 48ファイル".into(),
+                        },
+                        ImportChoice {
+                            display_name: "別冊".into(),
+                            kind: "PDF".into(),
+                            detail: "PDF 1ファイル".into(),
+                        },
+                    ],
+                    selected: 0,
+                    reply,
+                });
+                cx.notify();
+            });
+        });
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+
+        // ↓ で 2 件目へ
+        press_key(&mut *visual, "down");
+        assert_eq!(
+            view.read_with(cx, |this, _| this.pending_import.as_ref().unwrap().selected),
+            1,
+            "↓ で選択が動いていない"
+        );
+        // j でも下へ（末尾で止まる）
+        press_key(&mut *visual, "j");
+        assert_eq!(
+            view.read_with(cx, |this, _| this.pending_import.as_ref().unwrap().selected),
+            1,
+            "末尾で止まっていない"
+        );
+        // k で 1 件目へ
+        press_key(&mut *visual, "k");
+        assert_eq!(
+            view.read_with(cx, |this, _| this.pending_import.as_ref().unwrap().selected),
+            0,
+            "k で選択が動いていない"
+        );
+        // Enter で確定（worker に選択が返る）
+        press_key(&mut *visual, "enter");
+        assert_eq!(answer.recv().unwrap(), Some(0));
+        assert!(
+            view.read_with(cx, |this, _| this.pending_import.is_none()),
+            "Enter で確定していない"
+        );
+    }
+
     /// 表紙を枠に比率を保って収めた描画サイズを返す（カード / リスト共通）。
     /// 横長は幅いっぱい、縦長は高さいっぱいになり、どちらも枠からはみ出さない。
     #[test]
@@ -13483,6 +13696,201 @@ mod tests {
         assert!(
             downloading || notified,
             "選んだのにダウンロードが始まっていない（開始状態も通知も無い）"
+        );
+    }
+
+    /// ファイル選択ダイアログはキーボードでも操作できる（↓ で次の候補、Enter で確定）。
+    /// 背後の本棚にはキーを漏らさない（本棚の選択が勝手に動かない）。
+    #[gpui_kit::test]
+    async fn file_choice_keyboard_moves_selection_and_confirms_with_enter(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        login_google_for_import(cx);
+        seed_booth_item_with_options(
+            cx,
+            "100",
+            "2 ファイルの本",
+            &[
+                thundoku_core::booth::DownloadOption {
+                    name: Some("book.pdf".into()),
+                    url: "https://booth.pm/downloadables/111".into(),
+                },
+                thundoku_core::booth::DownloadOption {
+                    name: Some("images.zip".into()),
+                    url: "https://booth.pm/downloadables/222".into(),
+                },
+            ],
+        );
+        // 背後の本棚に 2 件目を置く（矢印が漏れると本棚の選択が動いてしまう）
+        seed_shelf_item_for_site(cx, "techbookfest", "db-2", "背後の本", "サークルB");
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let item = this
+                    .shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "100")
+                    .map(|card| card.shelf.clone())
+                    .expect("100 のカード");
+                this.download_item(cx, item);
+            });
+        });
+        assert!(
+            view.read_with(cx, |this, _| this.pending_file_choice.is_some()),
+            "候補 2 件なのにファイル選択が出ていない"
+        );
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+
+        // ↓ はダイアログの選択を 2 件目へ動かす（背後の本棚の選択は動かさない）
+        let shelf_selected_before = view.read_with(cx, |this, _| this.selected_index);
+        press_key(&mut *visual, "down");
+        press_key(&mut *visual, "j");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_file_choice
+                .as_ref()
+                .map(|pending| pending.selected)),
+            Some(1),
+            "ファイル選択の ↓ / j で 2 件目が選ばれていない"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this.selected_index),
+            shelf_selected_before,
+            "ファイル選択中の ↓ / j が背後の本棚へ漏れている"
+        );
+
+        // 左/右・h/l・Escape など他のキーも背後の本棚へ漏らさない
+        // （モーダルが入力を独占する）。
+        for key in ["left", "right", "h", "l", "escape"] {
+            press_key(&mut *visual, key);
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |this, _| this.selected_index),
+            shelf_selected_before,
+            "ファイル選択中の左/右・h/l が背後の本棚へ漏れている"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_file_choice
+                .as_ref()
+                .map(|pending| pending.selected)),
+            Some(1),
+            "他のキーでファイル選択の選択が変わっている"
+        );
+
+        // Enter は選択中のファイルで確定する（ダイアログが閉じてダウンロードが始まる）
+        press_key(&mut *visual, "enter");
+        cx.run_until_parked();
+
+        let downloading = view.read_with(cx, |this, _| this.download_states.contains_key("100"));
+        let notified = cx.update(|cx| AppState::global(cx).toast_message.lock().is_some());
+        assert!(
+            view.read_with(cx, |this, _| this.pending_file_choice.is_none()),
+            "Enter で確定したのにファイル選択が閉じていない"
+        );
+        assert!(
+            downloading || notified,
+            "Enter で確定したのにダウンロードが始まっていない（開始状態も通知も無い）"
+        );
+    }
+
+    /// ファイル選択のキー操作は端で止まる（2 件で ↑ / k を押し続けても先頭、↓ / j を
+    /// 押し続けても末尾）。先頭のまま Enter しても 0 件目をそのまま確定する
+    /// （選ばずに閉じたり、裏の本を開いたりしない）。
+    #[gpui_kit::test]
+    async fn file_choice_keyboard_clamps_selection_at_the_ends(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        login_google_for_import(cx);
+        seed_booth_item_with_options(
+            cx,
+            "100",
+            "2 ファイルの本",
+            &[
+                thundoku_core::booth::DownloadOption {
+                    name: Some("book.pdf".into()),
+                    url: "https://booth.pm/downloadables/111".into(),
+                },
+                thundoku_core::booth::DownloadOption {
+                    name: Some("images.zip".into()),
+                    url: "https://booth.pm/downloadables/222".into(),
+                },
+            ],
+        );
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let item = this
+                    .shelf_cards
+                    .iter()
+                    .find(|card| card.shelf.database_id == "100")
+                    .map(|card| card.shelf.clone())
+                    .expect("100 のカード");
+                this.download_item(cx, item);
+            });
+        });
+
+        let window = open_shelf(cx, &view);
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(&mut *visual);
+
+        // 先頭で ↑ / k を押しても先頭のまま
+        press_key(&mut *visual, "k");
+        press_key(&mut *visual, "up");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_file_choice
+                .as_ref()
+                .map(|pending| pending.selected)),
+            Some(0),
+            "先頭で ↑ / k を押したら先頭より上へ動いた"
+        );
+
+        // 末尾で ↓ / j を押しても末尾のまま（候補は 2 件）
+        press_key(&mut *visual, "j");
+        press_key(&mut *visual, "down");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_file_choice
+                .as_ref()
+                .map(|pending| pending.selected)),
+            Some(1),
+            "末尾で ↓ / j を押したら末尾より下へ動いた"
+        );
+
+        // 先頭へ戻して確定（先頭の Enter でも 0 件目がそのまま選ばれる）
+        press_key(&mut *visual, "k");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_file_choice
+                .as_ref()
+                .map(|pending| pending.selected)),
+            Some(0),
+            "k で先頭へ戻っていない"
+        );
+
+        press_key(&mut *visual, "enter");
+        cx.run_until_parked();
+
+        let downloading = view.read_with(cx, |this, _| this.download_states.contains_key("100"));
+        let notified = cx.update(|cx| AppState::global(cx).toast_message.lock().is_some());
+        assert!(
+            view.read_with(cx, |this, _| this.pending_file_choice.is_none()),
+            "先頭で Enter したのにファイル選択が閉じていない"
+        );
+        assert!(
+            downloading || notified,
+            "先頭で Enter したのにダウンロードが始まっていない（開始状態も通知も無い）"
         );
     }
 
@@ -17473,12 +17881,14 @@ mod tests {
         );
     }
 
-    /// 他の本を取り込み中は、ダウンロード済みの本をクリックしてもビューアーを開かないこと。
+    /// 他の本を取り込み中でも、**ダウンロード済みの本は開ける**。
     ///
-    /// 開いてしまうと取り込みと競合する（ビューアーの読み込み・ページ画像の生成と、
-    /// 取り込みの書き込みが重なる）。
+    /// 取り込みの書き込みとビューアーの読み込みは競合しない（DB は WAL、ページ画像は
+    /// 別ファイル）。待たせると読書ができないため、開けるようにしてある。
     #[gpui_kit::test]
-    async fn another_download_blocks_opening_the_viewer(cx: &mut TestAppContext) {
+    async fn another_download_does_not_block_opening_a_downloaded_book(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "local-1", "ローカル本", "サークル");
@@ -17517,15 +17927,8 @@ mod tests {
                 });
             }
         }
-        // 対照: 取り込みが無ければ開く
-        click_local_card(visual);
-        assert!(
-            opened.load(std::sync::atomic::Ordering::SeqCst),
-            "前提: 通常はクリックでビューアーが開くこと"
-        );
-        opened.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // 別の本を取り込み中
+        // 別の本を取り込み中でも、ダウンロード済みの本はクリックで開ける
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 this.download_states
@@ -17535,20 +17938,12 @@ mod tests {
         });
         click_local_card(visual);
         assert!(
-            !opened.load(std::sync::atomic::Ordering::SeqCst),
-            "取り込み中に別の本のビューアーが開いている"
-        );
-
-        // 理由を通知で伝える
-        let message = cx.update(|cx| AppState::global(cx).toast_message.lock().clone());
-        assert!(
-            message
-                .as_deref()
-                .is_some_and(|m| m.contains("ダウンロード中")),
-            "取り込み中で開けないことを伝えていない: {message:?}"
+            opened.load(std::sync::atomic::Ordering::SeqCst),
+            "取り込み中にダウンロード済みの本が開けない"
         );
 
         // キーボードからの起動（Enter）も同じ
+        opened.store(false, std::sync::atomic::Ordering::SeqCst);
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 this.selected_index = this.filtered.iter().position(|&card_idx| {
@@ -17558,21 +17953,8 @@ mod tests {
             });
         });
         assert!(
-            !opened.load(std::sync::atomic::Ordering::SeqCst),
-            "取り込み中に Enter でビューアーが開いている"
-        );
-
-        // 取り込みが終われば開ける
-        cx.update(|cx| {
-            view.update(cx, |this, cx| {
-                this.download_states.clear();
-                cx.notify();
-            });
-        });
-        click_local_card(visual);
-        assert!(
             opened.load(std::sync::atomic::Ordering::SeqCst),
-            "取り込みが終わったら開けること"
+            "取り込み中に Enter でダウンロード済みの本が開けない"
         );
     }
 
@@ -18141,6 +18523,33 @@ mod tests {
         });
         assert_eq!(busy, 0, "サンプルモードで同期が始まっている");
         assert_eq!(after, before, "サンプルモードで同期の通知が出ている");
+    }
+
+    /// 「すべての本」で同期を押したときは、**ログイン済みのサイトだけ**を対象にする
+    /// （未ログインのサイトのログイン導線をまとめて出さない）。
+    #[gpui_kit::test]
+    async fn sync_all_targets_only_logged_in_sites(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        // FANZA だけログイン済み
+        cx.update(|cx| {
+            *AppState::global(cx).fanza_logged_in.lock() = true;
+        });
+        let sites = cx.update(|cx| logged_in_sync_sites(cx));
+        assert_eq!(
+            sites,
+            vec!["fanza"],
+            "未ログインのサイトまで同期対象になっている"
+        );
+    }
+
+    /// どのサイトにもログインしていなければ、同期対象は空（ログイン導線も出さない）。
+    #[gpui_kit::test]
+    async fn sync_all_without_login_targets_nothing(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let sites = cx.update(|cx| logged_in_sync_sites(cx));
+        assert!(sites.is_empty(), "未ログインなのに同期対象がある");
     }
 
     /// サンプルモードの本棚は技術書典に固定される（保存値に他サイトが残っていても）。

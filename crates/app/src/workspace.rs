@@ -60,6 +60,20 @@ pub enum NavTarget {
     About,
 }
 
+/// サイドバーのキーボード選択カーソル（↑↓ / j / k で動かす）が乗る項目。
+///
+/// 本棚のサイト別サブメニューは `NavTarget` ではない（同じ本棚画面の絞り込み）ので、
+/// カーソルはこの型で表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarCursor {
+    /// トップレベルのナビ行。
+    Nav(NavTarget),
+    /// 本棚サブメニューの「すべての本」。
+    AllBooks,
+    /// 本棚サブメニューのサイト行（サイト id）。
+    Site(&'static str),
+}
+
 /// 「アップロードして終了」の実行中に出す通知。
 ///
 /// 確認ダイアログは押した時点で閉じるため、これが進行中の唯一の手がかりになる。
@@ -189,6 +203,13 @@ pub struct Workspace {
     pub sidebar_open: bool,
     /// 自動クローズタイマーの世代（stale タイマー対策）。
     sidebar_close_generation: u64,
+    /// キーボード操作（Tab）でサイドバーへ入ったときのフォーカス。
+    sidebar_focus: gpui_kit::FocusHandle,
+    /// キーボードの選択カーソル（↑↓ / j / k で動かす）。`None` はまだ動かしていない。
+    sidebar_cursor: Option<SidebarCursor>,
+    /// メイン領域（`div#view-container`）のフォーカス。本棚などのフォーカス可能な
+    /// ビューを持たない画面（設定 / チェックリスト / レポート / 説明）へ戻すときの受け皿。
+    view_focus: gpui_kit::FocusHandle,
     pub bookshelf_submenu_open: bool,
     /// 未読バッジ表示用の件数。
     unread_count: usize,
@@ -323,16 +344,33 @@ fn sidebar_row_style(theme: &gpui_kit::component::Theme, selected: bool) -> Side
     }
 }
 
+/// いま表示している画面の行（塗りつぶしで示す）。
+fn sidebar_row_active(active: NavTarget, target: NavTarget) -> bool {
+    active == target
+}
+
+/// キーボードの選択カーソルが乗っている行（枠で示す）。
+///
+/// カーソルは Enter を押すまで表示中の画面を変えないので、塗りつぶし（表示中の画面）
+/// とは別に **枠** で「次に開く行」を示す。
+fn sidebar_row_keyboard_selected(cursor: Option<SidebarCursor>, target: NavTarget) -> bool {
+    cursor == Some(SidebarCursor::Nav(target))
+}
+
+/// キーボードの選択カーソルを示す枠の色。
+///
+/// 塗りつぶし（表示中の画面）と**重ならないときだけ**描く（`nav_row` / `bottom_item` 側で
+/// 抑制する）。塗りつぶしと同じ色だと枠が見えず、暗くすると沈むので `primary` をそのまま使う。
+fn sidebar_row_cursor_border(theme: &gpui_kit::component::Theme) -> gpui_kit::Hsla {
+    theme.primary
+}
+
 /// サイドバーの行のアイコン色（選択状態に応じる）。
 ///
 /// `Icon` は親の文字色を継承せず自前の既定色で描かれるので、行に `text_color` を
 /// 置くだけでは選択色にならない。アイコンを作る側でこれを使う。
-fn sidebar_icon_color(
-    theme: &gpui_kit::component::Theme,
-    target: NavTarget,
-    active: NavTarget,
-) -> gpui_kit::Hsla {
-    sidebar_row_style(theme, active == target).icon_color
+fn sidebar_icon_color(theme: &gpui_kit::component::Theme, selected: bool) -> gpui_kit::Hsla {
+    sidebar_row_style(theme, selected).icon_color
 }
 
 /// サイドバーのロゴ（説明画面への入口）のタイル地色。
@@ -403,6 +441,11 @@ impl Workspace {
             active,
             sidebar_open: false,
             sidebar_close_generation: 0,
+            // ハンドル自身をタブストップにする（`div` 側の `.tab_stop` は、
+            // 外から渡したハンドルを追跡する場合は効かない）。
+            sidebar_focus: cx.focus_handle().tab_stop(true),
+            sidebar_cursor: None,
+            view_focus: cx.focus_handle(),
             bookshelf_submenu_open: false,
             unread_count: 0,
             toast_host_generation: 0,
@@ -1388,7 +1431,7 @@ impl Workspace {
 
     /// 終了時に「アップロードして終了」を出すか（＝まだ上げていない変更があるか）。
     ///
-    /// - Drive 同期が使えないとき（未ログイン・無効・同期フォルダ未設定）は出さない:
+    /// - Drive 同期が使えないとき（未ログイン・明示的に無効・同期フォルダ未設定）は出さない:
     ///   「アップロードして終了」は成功しようがなく、訊かれるだけになる（#6）。
     /// - 変更が無いときも出さない（毎回同じ確認を出さない）。
     /// - 判定できないとき（DB の読み出しに失敗した等）は**出す**側に倒す
@@ -1409,14 +1452,18 @@ impl Workspace {
         else {
             return false;
         };
-        let enabled = db::settings::get(&state.db_pool, "drive.sync.enabled")
+        // `drive.sync.enabled` は UI トグルで、同期エンジン（`sync_with_progress`）は
+        // 読まない。行が無い状態（「同期情報をクリア」後の手動同期は folder_id だけを
+        // 作り直す）でも folder とログインが揃っていればアップロードは成功するため、
+        // **明示的に OFF のときだけ**確認を抑止する（行が無い＝有効として扱う）。
+        let disabled = db::settings::get(&state.db_pool, "drive.sync.enabled")
             .ok()
             .flatten()
-            .is_some_and(|v| v == "true" || v == "1");
+            .is_some_and(|v| v == "false" || v == "0");
         let folder_id = db::settings::get(&state.db_pool, "drive.sync.folder_id")
             .ok()
             .flatten();
-        if !enabled || folder_id.is_none() {
+        if disabled || folder_id.is_none() {
             return false;
         }
         let Ok(owner_key) = state.secrets.db_key() else {
@@ -2130,6 +2177,18 @@ impl Render for Workspace {
         // （実機で「終了確認」と「同期の続き通知」が同時に出ていたのを防ぐ）。
         self.sync_modals(cx);
         let modal = crate::app_state::active_modal(cx);
+        // ビュー（本棚）の中に描かれるダイアログが出ている間は、ビューアーのオーバーレイを
+        // 描かない（オーバーレイが上に重なるとダイアログが隠れて操作できない）。
+        // ワークスペース側のモーダル（終了確認など）はオーバーレイより後に描かれるので
+        // 対象外（ビューアーを消す必要がない）。
+        let reader_hidden_for_dialog = matches!(
+            modal,
+            Some(
+                crate::app_state::ModalKind::Import
+                    | crate::app_state::ModalKind::DownloadConfirm
+                    | crate::app_state::ModalKind::DownloadCancel
+            )
+        );
 
         // メッセージは gpui-kit の Notification（右上のトースト）で出す。
         // 自前のバーは廃止した（自動で消える・種別ごとに色が付く・履歴が残る）。
@@ -2207,6 +2266,9 @@ impl Render for Workspace {
         } else {
             self.active_view(cx).into_any_element()
         };
+        // ルートのキー処理（F6 でサイドバーへフォーカス）で使う自分のハンドル。
+        // `self.sidebar(cx)` の可変借用より先に取る（あとから `cx` を取ると借用が衝突する）。
+        let key_handle = cx.entity();
         let sidebar = self.sidebar(cx);
         div()
               .id("app-sidebar")
@@ -2218,9 +2280,32 @@ impl Render for Workspace {
              .relative()
               .bg(theme.background)
             .on_key_down({
-                move |event, window, _cx| {
+                let handle = key_handle;
+                move |event, window, cx| {
                     match event.keystroke.key.as_str() {
                         "f11" => toggle_maximize(window),
+                        // サイドバーへ直接フォーカスを入れる（Ctrl+0）。Tab はタイトル
+                        // バーなどのタブストップに先に入って狙った枠へ行けないため。
+                        "0" if event.keystroke.modifiers.control => {
+                            cx.stop_propagation();
+                            handle.update(cx, |this, cx| this.focus_sidebar(window, cx));
+                        }
+                        // F6 はペイン切替（サイドバー ↔ メイン領域）。
+                        "f6" => {
+                            cx.stop_propagation();
+                            handle.update(cx, |this, cx| this.toggle_sidebar_focus(window, cx));
+                        }
+                        // Ctrl+1 はメイン領域へフォーカスを戻す（VS Code の
+                        // 「エディターグループ 1 にフォーカス」相当）。
+                        "1" if event.keystroke.modifiers.control => {
+                            cx.stop_propagation();
+                            handle.update(cx, |this, cx| this.focus_active_view(window, cx));
+                        }
+                        // サイドバーの開閉トグル（Ctrl+B）。
+                        "b" if event.keystroke.modifiers.control => {
+                            cx.stop_propagation();
+                            handle.update(cx, |this, cx| this.toggle_sidebar(cx));
+                        }
                         "escape" => restore_window(window),
                         _ => {}
                     }
@@ -2245,6 +2330,9 @@ impl Render for Workspace {
                         div()
                             .id("view-container")
                             .debug_selector(|| "view-container".into())
+                            // サイドバーからフォーカスを戻す受け皿（フォーカス可能な
+                            // ビューを持たない画面用。タブ順には入れない）
+                            .track_focus(&self.view_focus)
                             .flex_1()
                             .h_full()
                             .overflow_hidden()
@@ -2259,26 +2347,34 @@ impl Render for Workspace {
             // フィット計算（window.bounds().size - WIN_TITLE_BAR_HEIGHT）と実際の表示領域が
             // 一致し、見開き画像が右・下にはみ出さない。
             .child(if let Some(reader) = &self.reader {
-                let view: AnyView = AnyView::from(reader.clone());
-                div()
-                    .id("reader-overlay")
-                    .debug_selector(|| "reader-overlay".into())
-                    .absolute()
-                    // ウィンドウのタイトルバー（閉じる/最小化/最大化）は
-                    // リーダー表示中も使えるように残す（top = タイトルバー高さ）。
-                    .top(px(TITLE_BAR_HEIGHT))
-                    .right_0()
-                    .bottom_0()
-                    .left_0()
-                    .bg(theme.background)
-                    // リーダー内のクリックを下の層（本棚）へ伝えない。
-                    // これが無いと、リーダーの余白をクリックしたときに
-                    // 下にある本棚のカードが反応して本が開き直る。
-                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(view)
-                    .into_any_element()
+                // 取り込み / ダウンロードのダイアログは、ビュー（本棚）の中に描かれる
+                // ため、ビューアーのオーバーレイが上に重なると隠れて操作できない。
+                // 表示中はビューアーを描かない（ビューアーは**状態を保ったまま**で、
+                // ダイアログが閉じれば戻る）。
+                if reader_hidden_for_dialog {
+                    div().into_any_element()
+                } else {
+                    let view: AnyView = AnyView::from(reader.clone());
+                    div()
+                        .id("reader-overlay")
+                        .debug_selector(|| "reader-overlay".into())
+                        .absolute()
+                        // ウィンドウのタイトルバー（閉じる/最小化/最大化）は
+                        // リーダー表示中も使えるように残す（top = タイトルバー高さ）。
+                        .top(px(TITLE_BAR_HEIGHT))
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(theme.background)
+                        // リーダー内のクリックを下の層（本棚）へ伝えない。
+                        // これが無いと、リーダーの余白をクリックしたときに
+                        // 下にある本棚のカードが反応して本が開き直る。
+                        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(view)
+                        .into_any_element()
+                }
             } else {
                 div().into_any_element()
             })
@@ -2862,6 +2958,11 @@ impl Workspace {
         let theme = cx.theme().clone();
         let handle = cx.entity();
         let active = self.active;
+        // 行の見た目は 2 種類で示す: 「いま表示している画面」の塗りつぶしと、
+        // 「キーボードの選択カーソル」の枠（本棚の選択枠と同じ流儀）。
+        let cursor = self.sidebar_cursor;
+        let selected = move |target: NavTarget| sidebar_row_active(active, target);
+        let keyboard = move |target: NavTarget| sidebar_row_keyboard_selected(cursor, target);
         let unread_count = self.unread_count;
         // 未読数は**本棚のときだけ**出す（履歴 / 付箋 / 設定などでは本棚の話ではないため）。
         // サイドバーを開いたときの「未読数 N 件」と、閉じたときのロゴのバッジで同じ扱いにする。
@@ -2875,11 +2976,12 @@ impl Workspace {
             "sidebar-nav-report",
             Icon::new(AppIcon::Megaphone)
                 .size(px(24.0))
-                .text_color(sidebar_icon_color(&theme, NavTarget::Report, active))
+                .text_color(sidebar_icon_color(&theme, selected(NavTarget::Report)))
                 .into_any_element(),
             "レポート",
             open,
-            active == NavTarget::Report,
+            selected(NavTarget::Report),
+            keyboard(NavTarget::Report),
             |this, cx| {
                 this.switch_to(NavTarget::Report, cx);
             },
@@ -2898,6 +3000,16 @@ impl Workspace {
         div()
             .id("sidebar")
             .debug_selector(|| "sidebar".into())
+            // Tab でサイドバーにフォーカスを入れる（コンテナー自身がタブストップ）。
+            // 矢印 / j / k / Enter の操作はフォーカスが入ってから届く。
+            .track_focus(&self.sidebar_focus)
+            .tab_stop(true)
+            .on_key_down({
+                let handle = handle.clone();
+                move |event, window, cx| {
+                    handle.update(cx, |this, cx| this.handle_sidebar_key(event, window, cx));
+                }
+            })
             .h_full()
             .flex()
             .flex_col()
@@ -3010,13 +3122,13 @@ impl Workspace {
                                 .size(px(24.0))
                                 .text_color(sidebar_icon_color(
                                     &theme,
-                                    NavTarget::Bookshelf,
-                                    active,
+                                    selected(NavTarget::Bookshelf),
                                 ))
                                 .into_any_element(),
                             "本棚",
                             open,
-                            active,
+                            selected(NavTarget::Bookshelf),
+                            keyboard(NavTarget::Bookshelf),
                             handle.clone(),
                             cx,
                         ),
@@ -3031,13 +3143,13 @@ impl Workspace {
                                 .size(px(24.0))
                                 .text_color(sidebar_icon_color(
                                     &theme,
-                                    NavTarget::Favorites,
-                                    active,
+                                    selected(NavTarget::Favorites),
                                 ))
                                 .into_any_element(),
                             "お気に入り",
                             open,
-                            active,
+                            selected(NavTarget::Favorites),
+                            keyboard(NavTarget::Favorites),
                             handle.clone(),
                             cx,
                         ),
@@ -3047,11 +3159,15 @@ impl Workspace {
                             NavTarget::History,
                             Icon::new(AppIcon::History)
                                 .size(px(24.0))
-                                .text_color(sidebar_icon_color(&theme, NavTarget::History, active))
+                                .text_color(sidebar_icon_color(
+                                    &theme,
+                                    selected(NavTarget::History),
+                                ))
                                 .into_any_element(),
                             "閲覧履歴",
                             open,
-                            active,
+                            selected(NavTarget::History),
+                            keyboard(NavTarget::History),
                             handle.clone(),
                             cx,
                         ),
@@ -3061,11 +3177,12 @@ impl Workspace {
                             NavTarget::Notes,
                             Icon::new(AppIcon::StickyNote)
                                 .size(px(24.0))
-                                .text_color(sidebar_icon_color(&theme, NavTarget::Notes, active))
+                                .text_color(sidebar_icon_color(&theme, selected(NavTarget::Notes)))
                                 .into_any_element(),
                             "付箋",
                             open,
-                            active,
+                            selected(NavTarget::Notes),
+                            keyboard(NavTarget::Notes),
                             handle.clone(),
                             cx,
                         ),
@@ -3080,13 +3197,13 @@ impl Workspace {
                                     .size(px(24.0))
                                     .text_color(sidebar_icon_color(
                                         &theme,
-                                        NavTarget::Checklist,
-                                        active,
+                                        selected(NavTarget::Checklist),
                                     ))
                                     .into_any_element(),
                                 "チェックリスト",
                                 open,
-                                active,
+                                selected(NavTarget::Checklist),
+                                keyboard(NavTarget::Checklist),
                                 handle.clone(),
                                 cx,
                             ),
@@ -3110,11 +3227,15 @@ impl Workspace {
                             "sidebar-nav-settings",
                             Icon::new(IconName::Settings)
                                 .size(px(24.0))
-                                .text_color(sidebar_icon_color(&theme, NavTarget::Settings, active))
+                                .text_color(sidebar_icon_color(
+                                    &theme,
+                                    selected(NavTarget::Settings),
+                                ))
                                 .into_any_element(),
                             "設定",
                             open,
-                            active == NavTarget::Settings,
+                            selected(NavTarget::Settings),
+                            keyboard(NavTarget::Settings),
                             |this, cx| {
                                 this.switch_to(NavTarget::Settings, cx);
                             },
@@ -3140,6 +3261,8 @@ impl Workspace {
                             open,
                             // テーマは画面ではなく切替操作なので選択状態を持たない
                             false,
+                            // キーボードの対象外（カーソルは乗らない）
+                            false,
                             |this, cx| {
                                 this.cycle_theme(cx);
                             },
@@ -3157,6 +3280,8 @@ impl Workspace {
                             open,
                             // アカウントはパネルを開く操作なので選択状態を持たない
                             false,
+                            // キーボードの対象外（カーソルは乗らない）
+                            false,
                             |this, cx| {
                                 this.open_auth_panel(cx);
                             },
@@ -3165,6 +3290,209 @@ impl Workspace {
                         ),
                     ),
             )
+    }
+
+    /// キーボード操作（↑↓ / j / k）でカーソルを動かせるサイドバーの行を、見た目の順に返す。
+    ///
+    /// 本棚のサイト別サブメニューは**開いているときだけ**入れる（矢印でその中まで入れる）。
+    /// テーマ（切替操作）とアカウント（パネルを開くだけ）は `NavTarget` ではない操作なので
+    /// **意図的にマウス専用**とする。チェックリストは技術書典ログイン時のみ表示するので、
+    /// 未ログインでは対象に入れない。
+    fn sidebar_keyboard_targets(&self, cx: &App) -> Vec<SidebarCursor> {
+        let state = AppState::global(cx);
+        let tbf_logged_in = *state.tbf_logged_in.lock();
+        let mut targets = vec![SidebarCursor::Nav(NavTarget::Bookshelf)];
+        // サブメニューはサイドバーを開いていて、かつサブメニューが開いているときだけ見える
+        if self.sidebar_open && self.bookshelf_submenu_open {
+            targets.push(SidebarCursor::AllBooks);
+            if tbf_logged_in {
+                targets.push(SidebarCursor::Site("techbookfest"));
+            }
+            if *state.booth_logged_in.lock() {
+                targets.push(SidebarCursor::Site("booth"));
+            }
+            if *state.fanza_logged_in.lock() {
+                targets.push(SidebarCursor::Site("fanza"));
+            }
+            if *state.dlsite_logged_in.lock() {
+                targets.push(SidebarCursor::Site("dlsite"));
+            }
+        }
+        targets.push(SidebarCursor::Nav(NavTarget::Favorites));
+        targets.push(SidebarCursor::Nav(NavTarget::History));
+        targets.push(SidebarCursor::Nav(NavTarget::Notes));
+        if tbf_logged_in {
+            targets.push(SidebarCursor::Nav(NavTarget::Checklist));
+        }
+        targets.push(SidebarCursor::Nav(NavTarget::Report));
+        targets.push(SidebarCursor::Nav(NavTarget::Settings));
+        targets
+    }
+
+    /// キーボードの選択カーソルを `delta` 行ぶん動かす（上下端では止まる）。
+    ///
+    /// まだカーソルが無い（または対象外の行にいた）ときは、いま表示している画面の行から
+    /// 始める（その画面が対象外なら先頭の行）。
+    fn sidebar_move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let targets = self.sidebar_keyboard_targets(cx);
+        if targets.is_empty() {
+            return;
+        }
+        let active = SidebarCursor::Nav(self.active);
+        let current = self
+            .sidebar_cursor
+            .filter(|cursor| targets.contains(cursor))
+            .or_else(|| targets.contains(&active).then_some(active))
+            .unwrap_or(targets[0]);
+        let index = targets
+            .iter()
+            .position(|target| *target == current)
+            .unwrap_or(0) as isize;
+        let next = (index + delta).clamp(0, targets.len() as isize - 1) as usize;
+        self.sidebar_cursor = Some(targets[next]);
+        cx.notify();
+    }
+
+    /// キーボードの選択カーソルがある行を開く（Enter）。
+    ///
+    /// 本棚の行は**サブメニュー（サイト一覧）を開く**（マウスのダブルクリックと同じ導線）。
+    /// サイト行はクリックと同じ経路で絞り込みを変える。
+    ///
+    /// 戻り値は「フォーカスをサイドバーに残すか」。サブメニューを開いたときは `true`
+    /// （そのまま ↓ でサブメニューへ入れるように、フォーカスを残す）。画面が切り替わった
+    /// ときは `false`（呼び出し側が表示中の画面へフォーカスを戻す）。
+    fn sidebar_activate_cursor(&mut self, cx: &mut Context<Self>) -> bool {
+        let targets = self.sidebar_keyboard_targets(cx);
+        let Some(cursor) = self
+            .sidebar_cursor
+            .filter(|cursor| targets.contains(cursor))
+        else {
+            return false;
+        };
+        match cursor {
+            SidebarCursor::Nav(NavTarget::Bookshelf) => {
+                self.sidebar_open = true;
+                self.bookshelf_submenu_open = true;
+                self.switch_to(NavTarget::Bookshelf, cx);
+                true
+            }
+            SidebarCursor::Nav(target) => {
+                self.switch_to(target, cx);
+                false
+            }
+            // サイト行はクリックと同じ経路（`set_site_filter` → 本棚へ切替）
+            SidebarCursor::AllBooks => {
+                self.select_bookshelf_site(None, cx);
+                false
+            }
+            SidebarCursor::Site(site) => {
+                self.select_bookshelf_site(Some(site), cx);
+                false
+            }
+        }
+    }
+
+    /// 本棚のサイト絞り込みを切り替える（サイドバーのサイト行のクリック / Enter 共通）。
+    fn select_bookshelf_site(&mut self, site: Option<&str>, cx: &mut Context<Self>) {
+        self.bookshelf
+            .update(cx, |b, cx| b.set_site_filter(cx, site));
+        self.switch_to(NavTarget::Bookshelf, cx);
+        self.refresh_unread_count(cx);
+    }
+
+    /// サイドバーのキーボード操作（↑↓ / j / k でカーソル、Enter で決定、Esc で戻る）。
+    ///
+    /// 操作した時点で自動クローズ（マウスが離れて 3 秒）の予約を無効化する:
+    /// キーボードで選んでいる最中に閉じると操作が続けられないため。
+    fn handle_sidebar_key(
+        &mut self,
+        event: &gpui_kit::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "down" | "j" => {
+                self.sidebar_move_cursor(1, cx);
+                self.cancel_sidebar_auto_close();
+                cx.stop_propagation();
+            }
+            "up" | "k" => {
+                self.sidebar_move_cursor(-1, cx);
+                self.cancel_sidebar_auto_close();
+                cx.stop_propagation();
+            }
+            "enter" => {
+                // サブメニューを開いたときはフォーカスを残す（↓ でその中へ入れるように）
+                let stays = self.sidebar_activate_cursor(cx);
+                self.cancel_sidebar_auto_close();
+                if !stays {
+                    // 選んだ画面へフォーカスを戻す（サイドバーに残ったままだと
+                    // 続けて操作できない）
+                    self.focus_active_view(window, cx);
+                }
+                cx.stop_propagation();
+            }
+            // Esc はサイドバーから表示中の画面へ戻る（一般的な「パネルを抜ける」キー）。
+            // 元に戻す（最大化の解除）など親の Esc 処理は、サイドバーに
+            // フォーカスが無いときに働く。
+            "escape" => {
+                self.cancel_sidebar_auto_close();
+                self.focus_active_view(window, cx);
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
+    }
+
+    /// サイドバーへ直接キーボードフォーカスを入れる（`F6` / `Ctrl+0`）。
+    ///
+    /// Tab はタイトルバーなどのタブストップに先に入って狙った枠へ行きにくいため、
+    /// サイドバー専用の入口を用意する。入れたら ↑↓ / <kbd>j</kbd><kbd>k</kbd> でカーソルを
+    /// 動かし、Enter で切り替えられる。ハイライトが出るよう、カーソルが無ければ今の画面
+    /// （対象外なら先頭）から用意する。
+    fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_sidebar_auto_close();
+        window.focus(&self.sidebar_focus, cx);
+        // `0` 移動 = カーソルの用意だけ（`sidebar_move_cursor` が notify する）
+        self.sidebar_move_cursor(0, cx);
+    }
+
+    /// `F6` のペイン切替: サイドバーに居ればメイン領域へ、そうでなければサイドバーへ。
+    fn toggle_sidebar_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_focus.is_focused(window) {
+            self.focus_active_view(window, cx);
+        } else {
+            self.focus_sidebar(window, cx);
+        }
+    }
+
+    /// 表示中の画面（メイン領域）へキーボードフォーカスを戻す。
+    ///
+    /// 本棚 / 履歴 / 付箋 / ビューアーは自前のフォーカスを持っているのでそこへ戻す。
+    /// 持たない画面（設定 / チェックリスト / レポート / 説明）はメイン領域の枠へ戻す
+    /// （サイドバーのキー操作から抜けるのが目的なので、戻し先はここで足りる）。
+    pub(crate) fn focus_active_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reader) = self.reader.clone() {
+            reader.update(cx, |view, cx| view.focus_view(window, cx));
+            return;
+        }
+        match self.active {
+            NavTarget::Bookshelf | NavTarget::Favorites => {
+                self.bookshelf
+                    .update(cx, |view, cx| view.focus_view(window, cx));
+            }
+            NavTarget::History => {
+                self.history
+                    .update(cx, |view, cx| view.focus_view(window, cx));
+            }
+            NavTarget::Notes => {
+                self.notes
+                    .update(cx, |view, cx| view.focus_view(window, cx));
+            }
+            NavTarget::Checklist | NavTarget::Settings | NavTarget::Report | NavTarget::About => {
+                window.focus(&self.view_focus, cx);
+            }
+        }
     }
 
     /// 未読数バッジに出すラベル。3 桁で頭打ちにする。
@@ -3307,6 +3635,9 @@ impl Workspace {
     }
 
     /// メインのナビ行（アイコン + ラベル）。サブメニュートグルは本棚のときのみ。
+    ///
+    /// `selected` は「表示中の画面」か（塗りつぶし）。`keyboard` はキーボードの
+    /// 選択カーソルが乗っているか（枠）。
     #[allow(clippy::too_many_arguments)]
     fn nav_row(
         &mut self,
@@ -3314,7 +3645,8 @@ impl Workspace {
         icon: gpui_kit::AnyElement,
         label: &str,
         open: bool,
-        active: NavTarget,
+        selected: bool,
+        keyboard: bool,
         handle: Entity<Workspace>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -3328,8 +3660,7 @@ impl Workspace {
             NavTarget::Checklist => "sidebar-nav-checklist",
             _ => "sidebar-nav-other",
         };
-        let is_active = active == target;
-        let row = sidebar_row_style(&theme, is_active);
+        let row = sidebar_row_style(&theme, selected);
         let site_menu = target == NavTarget::Bookshelf;
         div()
             .id(id)
@@ -3342,6 +3673,14 @@ impl Workspace {
             // アイコンは行の色を継承する（`Icon` 側で色を指定しない）
             .text_color(row.icon_color)
             .when_some(row.background, |this, bg| this.bg(bg))
+            // キーボードの選択カーソルは枠で示す（本棚の選択枠と同じ流儀）。
+            // 常に枠を確保して、カーソルが動いても行の高さ・幅がずれないようにする。
+            .border_1()
+            .border_color(if keyboard && !selected {
+                sidebar_row_cursor_border(&theme)
+            } else {
+                gpui_kit::transparent_black()
+            })
             .when(open, |this| this.px(px(6.0)))
             .when(open, |this| this.w_full())
             .when(!open, |this| this.w(px(36.0)).h(px(36.0)).justify_center())
@@ -3428,6 +3767,7 @@ impl Workspace {
         label: &str,
         open: bool,
         selected: bool,
+        keyboard: bool,
         on_click: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
         handle: Entity<Workspace>,
         cx: &mut Context<Self>,
@@ -3446,6 +3786,14 @@ impl Workspace {
             // アイコンは行の色を継承する（`Icon` 側で色を指定しない）
             .text_color(row.icon_color)
             .when_some(row.background, |this, bg| this.bg(bg))
+            // キーボードの選択カーソルは枠で示す（本棚の選択枠と同じ流儀）。
+            // 常に枠を確保して、カーソルが動いても行の高さ・幅がずれないようにする。
+            .border_1()
+            .border_color(if keyboard && !selected {
+                sidebar_row_cursor_border(&theme)
+            } else {
+                gpui_kit::transparent_black()
+            })
             .when(open, |this| this.px(px(6.0)))
             .when(open, |this| this.w_full())
             .when(!open, |this| this.w(px(36.0)).h(px(36.0)).justify_center())
@@ -3492,6 +3840,10 @@ impl Workspace {
         let theme = cx.theme().clone();
         let handle = cx.entity();
         let site_filter = self.bookshelf.update(cx, |b, _| b.site_filter());
+        // キーボードの選択カーソル（枠）が乗っているか
+        let cursor = self.sidebar_cursor;
+        let keyboard_all = cursor == Some(SidebarCursor::AllBooks);
+        let keyboard_site = move |site: &'static str| cursor == Some(SidebarCursor::Site(site));
         let tbf_logged_in = *AppState::global(cx).tbf_logged_in.lock();
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
@@ -3533,6 +3885,12 @@ impl Workspace {
                             .px_2()
                             .py_1p5()
                             .text_xs()
+                            .border_1()
+                            .border_color(if keyboard_all {
+                                sidebar_row_cursor_border(&theme)
+                            } else {
+                                gpui_kit::transparent_black()
+                            })
                             .when(site_filter.is_none(), |this| {
                                 this.bg(theme.secondary)
                                     .text_color(theme.primary)
@@ -3566,6 +3924,12 @@ impl Workspace {
                                 .px_2()
                                 .py_1p5()
                                 .text_xs()
+                                .border_1()
+                                .border_color(if keyboard_site("techbookfest") {
+                                    sidebar_row_cursor_border(&theme)
+                                } else {
+                                    gpui_kit::transparent_black()
+                                })
                                 .when(site_filter.as_deref() == Some("techbookfest"), |this| {
                                     this.bg(theme.secondary)
                                         .text_color(theme.primary)
@@ -3600,6 +3964,12 @@ impl Workspace {
                                 .px_2()
                                 .py_1p5()
                                 .text_xs()
+                                .border_1()
+                                .border_color(if keyboard_site("booth") {
+                                    sidebar_row_cursor_border(&theme)
+                                } else {
+                                    gpui_kit::transparent_black()
+                                })
                                 .when(site_filter.as_deref() == Some("booth"), |this| {
                                     this.bg(theme.secondary)
                                         .text_color(theme.primary)
@@ -3634,6 +4004,12 @@ impl Workspace {
                                 .px_2()
                                 .py_1p5()
                                 .text_xs()
+                                .border_1()
+                                .border_color(if keyboard_site("fanza") {
+                                    sidebar_row_cursor_border(&theme)
+                                } else {
+                                    gpui_kit::transparent_black()
+                                })
                                 .when(site_filter.as_deref() == Some("fanza"), |this| {
                                     this.bg(theme.secondary)
                                         .text_color(theme.primary)
@@ -3669,6 +4045,12 @@ impl Workspace {
                                 .px_2()
                                 .py_1p5()
                                 .text_xs()
+                                .border_1()
+                                .border_color(if keyboard_site("dlsite") {
+                                    sidebar_row_cursor_border(&theme)
+                                } else {
+                                    gpui_kit::transparent_black()
+                                })
                                 .when(site_filter.as_deref() == Some("dlsite"), |this| {
                                     this.bg(theme.secondary)
                                         .text_color(theme.primary)
@@ -4303,6 +4685,56 @@ mod tests {
         );
     }
 
+    /// `drive.sync.enabled` の行が無くても、同期フォルダとログインが揃っていれば
+    /// 終了確認を出す（#6 の回帰: 行が無いと確認が抑止され、終了時にアップされない）。
+    ///
+    /// 同期エンジン（`sync_with_progress`）はこのフラグを読まないので、行が無い状態でも
+    /// アップロードは成功する。「同期情報をクリア」後の手動同期は `folder_id` を作り直すが
+    /// `enabled` は立てないため、この状態が実際に起きる。
+    #[gpui_kit::test]
+    async fn close_request_opens_the_exit_prompt_when_the_enabled_flag_is_missing(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        let sub = "sub-exit-no-flag";
+        set_drive_ready(cx, sub);
+        // 「同期情報をクリア」後の手動同期を再現する（folder_id は有るが enabled が無い）
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let _ = db::settings::delete(&state.db_pool, "drive.sync.enabled");
+        });
+        seed_pending_pack(cx, sub, "exit-no-flag-pack");
+
+        let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
+        assert!(!allowed, "確認を出すときは閉じない");
+        assert!(
+            ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
+            "enabled の行が無いだけで終了アップロードの確認を抑止している"
+        );
+    }
+
+    /// 明示的に OFF（`drive.sync.enabled = false`）のときは、これまでどおり確認を出さない。
+    #[gpui_kit::test]
+    async fn close_request_closes_without_the_upload_prompt_when_drive_sync_is_turned_off(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        let sub = "sub-exit-disabled";
+        set_drive_ready(cx, sub);
+        cx.update(|cx| {
+            let state = AppState::global(cx);
+            let _ = db::settings::set(&state.db_pool, "drive.sync.enabled", "false");
+        });
+        seed_pending_pack(cx, sub, "exit-disabled-pack");
+
+        let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
+        assert!(allowed, "Drive 同期 OFF のときは確認を出さずに閉じる");
+        assert!(
+            !ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
+            "Drive 同期を OFF にしているのに終了確認を出す"
+        );
+    }
+
     #[gpui_kit::test]
     async fn sidebar_toggle_flips_open_state(cx: &mut TestAppContext) {
         let ws = setup(cx);
@@ -4393,6 +4825,508 @@ mod tests {
         assert!(
             !ws.read_with(cx, |w, _| w.sidebar_open),
             "サイドバーの余白クリックで開いてしまう"
+        );
+    }
+
+    /// サイドバーにキーボードフォーカスを入れる。
+    ///
+    /// 実際は Tab で入る（`tab_moves_focus_into_the_sidebar`）。キー操作だけを見たい
+    /// テストではここで直接入れる（フォーカスが入っていないと、サイドバーの
+    /// `on_key_down` にイベントが届かない）。
+    fn focus_sidebar(ws: &gpui_kit::Entity<Workspace>, visual: &mut gpui_kit::VisualTestContext) {
+        visual.update(|window, cx| {
+            let handle = ws.read(cx).sidebar_focus.clone();
+            window.focus(&handle, cx);
+        });
+    }
+
+    /// キーを 1 つ押す（`"down"` / `"j"` のように名前で指定する）。
+    fn press_key(visual: &mut gpui_kit::VisualTestContext, key: &str) {
+        visual.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: gpui_kit::Keystroke::parse(key).expect("キー名が不正"),
+            is_held: false,
+            prefer_character_input: false,
+        });
+    }
+
+    /// サイドバーのキーボード操作: ↓ / j でカーソルが下へ、↑ / k で上へ動き、
+    /// Enter でその行の画面に切り替わる。
+    #[gpui_kit::test]
+    async fn sidebar_keyboard_down_then_enter_switches_the_view(cx: &mut TestAppContext) {
+        let ws = setup(cx);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        focus_sidebar(&ws, visual);
+
+        // 全サイト未ログイン: チェックリストは出ない（レポート / 設定は常に出す）。
+        assert_eq!(
+            ws.read_with(cx, |w, cx| w.sidebar_keyboard_targets(cx)),
+            vec![
+                SidebarCursor::Nav(NavTarget::Bookshelf),
+                SidebarCursor::Nav(NavTarget::Favorites),
+                SidebarCursor::Nav(NavTarget::History),
+                SidebarCursor::Nav(NavTarget::Notes),
+                SidebarCursor::Nav(NavTarget::Report),
+                SidebarCursor::Nav(NavTarget::Settings),
+            ],
+            "キーボードで動かせる行の並びが表示と違う"
+        );
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::About,
+            "前提: 説明画面から始まる"
+        );
+
+        // Enter を押すまでカーソルだけが動く（表示中の画面は変わらない）。
+        press_key(visual, "down");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.sidebar_cursor),
+            Some(SidebarCursor::Nav(NavTarget::Favorites)),
+            "↓ でカーソルが 2 番目の行（お気に入り）へ動いていない"
+        );
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::About,
+            "Enter を押す前に画面が切り替わっている"
+        );
+
+        // Enter でカーソルの行（2 番目 = お気に入り）へ切り替わる。
+        press_key(visual, "enter");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Favorites,
+            "↓ + Enter で 2 番目の行（お気に入り）に切り替わっていない"
+        );
+
+        // 切り替えで本棚ビューが初めて描かれ、そちらへフォーカスが移る
+        // （`BookshelfView` の初回フォーカス）。続けて操作するには入り直す。
+        focus_sidebar(&ws, visual);
+
+        // k（↑）でお気に入り → 本棚。上端で up を押しても動かない（クランプ）。
+        press_key(visual, "k");
+        press_key(visual, "up");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.sidebar_cursor),
+            Some(SidebarCursor::Nav(NavTarget::Bookshelf)),
+            "k（↑）で 1 番目の行（本棚）へ戻らない / 上端を越えて動いた"
+        );
+
+        // j（↓）x5 で本棚 → 設定、さらに down を押しても下端で止まる（クランプ）。
+        for _ in 0..5 {
+            press_key(visual, "j");
+        }
+        press_key(visual, "down");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.sidebar_cursor),
+            Some(SidebarCursor::Nav(NavTarget::Settings)),
+            "j（↓）で末尾の行（設定）まで動かない / 下端を越えて動いた"
+        );
+
+        // Enter で末尾の行（設定）へ切り替わる。
+        press_key(visual, "enter");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Settings,
+            "j（↓）x5 + Enter で末尾の行（設定）に切り替わっていない"
+        );
+    }
+
+    /// キーボードの選択カーソルは、表示中の画面とは別に「選択中」の見た目になる。
+    #[gpui_kit::test]
+    async fn sidebar_keyboard_cursor_is_highlighted(cx: &mut TestAppContext) {
+        // 本棚から始まる（技術書典ログイン済み）ので、カーソルと表示中が別の行になる。
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        focus_sidebar(&ws, visual);
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Bookshelf,
+            "前提: 本棚から始まる"
+        );
+
+        press_key(visual, "down");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.sidebar_cursor),
+            Some(SidebarCursor::Nav(NavTarget::Favorites)),
+            "↓ でカーソルが 2 番目の行（お気に入り）へ動いていない"
+        );
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Bookshelf,
+            "カーソルを動かしただけで画面が切り替わっている"
+        );
+
+        // 見た目の規則: 塗りつぶし = 表示中の画面 / 枠 = キーボードの選択カーソル。
+        let (active, cursor) = ws.read_with(cx, |w, _| (w.active, w.sidebar_cursor));
+        assert!(
+            sidebar_row_keyboard_selected(cursor, NavTarget::Favorites),
+            "カーソルの行が枠で示されない"
+        );
+        assert!(
+            !sidebar_row_keyboard_selected(cursor, NavTarget::Bookshelf),
+            "カーソルが乗っていない行に枠が付く"
+        );
+        assert!(
+            sidebar_row_active(active, NavTarget::Bookshelf),
+            "表示中の画面の行が塗りつぶされない"
+        );
+        assert!(
+            !sidebar_row_active(active, NavTarget::Favorites),
+            "表示中でない画面の行が塗りつぶされる"
+        );
+    }
+
+    /// Tab でキーボードフォーカスがサイドバーへ入る。
+    ///
+    /// Tab は gpui-kit の（「Root」コンテキストの）バインディングなので、**アプリ内の
+    /// どこかにフォーカスが入っている**必要がある（フォーカスが無いとキーコンテキストが
+    /// 解決されず、Tab は何もしない）。本棚ビューは初回描画で自分へフォーカスを入れるので、
+    /// 本棚から始めて Tab を押し続け、サイドバーのタブストップへ入るところを見る。
+    /// タブストップの数は画面の内容で変わるため「一周ぶん（十分な回数）押して入れば良い」
+    /// とする（現在は 13 個で一周する）。
+    #[gpui_kit::test]
+    async fn tab_moves_focus_into_the_sidebar(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        assert!(
+            visual.update(|window, cx| window.focused(cx)).is_some(),
+            "前提: 本棚ビューが初回描画で自分へフォーカスを入れている"
+        );
+
+        let mut reached = false;
+        for _ in 0..40 {
+            visual.simulate_keystrokes("tab");
+            if visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "Tab を押してもサイドバーにフォーカスが入らない");
+
+        // フォーカスが入ったので、そのままキーボードで選べる。
+        press_key(visual, "down");
+        press_key(visual, "enter");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Favorites,
+            "Tab → ↓ → Enter でお気に入りへ切り替わっていない"
+        );
+    }
+
+    /// `F6` でサイドバーへ直接フォーカスを入れる。
+    ///
+    /// Tab はタイトルバーなどのタブストップに先に入ってしまい狙った枠へ行きにくいので、
+    /// サイドバー専用の入口を用意する（Windows のペイン移動と同じ F6）。
+    #[gpui_kit::test]
+    async fn f6_focuses_the_sidebar(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        assert!(
+            visual.update(|window, cx| window.focused(cx)).is_some(),
+            "前提: どこかにフォーカスが入っている"
+        );
+        assert!(
+            !visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "前提: 最初はサイドバーにフォーカスは無い"
+        );
+
+        press_key(visual, "f6");
+        assert!(
+            visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "F6 でサイドバーにフォーカスが入らない"
+        );
+        assert!(
+            ws.read_with(cx, |w, _| w.sidebar_cursor.is_some()),
+            "F6 でカーソルが用意されない（ハイライトが出ない）"
+        );
+
+        // 入ったらそのままキーボードで選べる
+        press_key(visual, "down");
+        press_key(visual, "enter");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Favorites,
+            "F6 → ↓ → Enter でお気に入りへ切り替わっていない"
+        );
+    }
+
+    /// `Ctrl+B` でサイドバーの開閉を切り替える。
+    #[gpui_kit::test]
+    async fn ctrl_b_toggles_the_sidebar(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+
+        let initial = ws.read_with(cx, |w, _| w.sidebar_open);
+        press_key(visual, "ctrl-b");
+        assert_ne!(
+            ws.read_with(cx, |w, _| w.sidebar_open),
+            initial,
+            "Ctrl+B でサイドバーの開閉が切り替わらない"
+        );
+        press_key(visual, "ctrl-b");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.sidebar_open),
+            initial,
+            "Ctrl+B を 2 回押しても元に戻らない"
+        );
+    }
+
+    /// `Ctrl+0` でサイドバーへフォーカスを入れる（F6 と同じ）。
+    #[gpui_kit::test]
+    async fn ctrl_0_focuses_the_sidebar(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        assert!(
+            visual.update(|window, cx| window.focused(cx)).is_some(),
+            "前提: どこかにフォーカスが入っている"
+        );
+        assert!(
+            !visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "前提: 最初はサイドバーにフォーカスは無い"
+        );
+
+        press_key(visual, "ctrl-0");
+        assert!(
+            visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "Ctrl+0 でサイドバーにフォーカスが入らない"
+        );
+    }
+
+    /// 本棚の行で Enter を押すと、サイト別サブメニューが開く（マウスのダブルクリックと同じ）。
+    #[gpui_kit::test]
+    async fn enter_on_the_bookshelf_row_opens_the_site_submenu(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        // F6 でサイドバーへ入る（カーソルも用意される）
+        press_key(visual, "f6");
+        // カーソルは表示中の画面（本棚）から始まる
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.sidebar_cursor),
+            Some(SidebarCursor::Nav(NavTarget::Bookshelf)),
+            "カーソルが本棚の行から始まっていない"
+        );
+        assert!(
+            !ws.read_with(cx, |w, _| w.bookshelf_submenu_open),
+            "前提: サブメニューは閉じている"
+        );
+
+        press_key(visual, "enter");
+        assert!(
+            ws.read_with(cx, |w, _| w.bookshelf_submenu_open),
+            "本棚の行で Enter してもサブメニューが開かない"
+        );
+        assert!(
+            ws.read_with(cx, |w, _| w.sidebar_open),
+            "サブメニューを開くときサイドバーも開いていない"
+        );
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Bookshelf,
+            "本棚の行で Enter しても本棚へ切り替わっていない"
+        );
+    }
+
+    /// サブメニューが開いていれば、↓ でその中（サイト行）まで入れて Enter で絞り込める。
+    #[gpui_kit::test]
+    async fn sidebar_cursor_enters_the_open_site_submenu(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        // F6 でサイドバーへ入り、本棚の行で Enter → サブメニューが開く
+        press_key(visual, "f6");
+        press_key(visual, "enter");
+        assert!(
+            ws.read_with(cx, |w, _| w.bookshelf_submenu_open),
+            "前提: サブメニューが開いていない"
+        );
+
+        // ↓ で「すべての本」、さらに ↓ で「技術書典」へ入る（枠が付く）
+        press_key(visual, "down");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.sidebar_cursor),
+            Some(SidebarCursor::AllBooks),
+            "↓ でサブメニューの先頭（すべての本）へ入れない"
+        );
+        press_key(visual, "down");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.sidebar_cursor),
+            Some(SidebarCursor::Site("techbookfest")),
+            "↓ でサイト行（技術書典）へ入れない"
+        );
+
+        // Enter でクリックと同じ経路（絞り込みが変わる）
+        press_key(visual, "enter");
+        assert_eq!(
+            ws.read_with(cx, |w, cx| w.bookshelf.read(cx).site_filter()),
+            Some("techbookfest".to_string()),
+            "サイト行で Enter しても絞り込みが変わらない"
+        );
+    }
+
+    /// サイドバーへ入るための小さなヘルパ（サイトありログイン + 本棚 + ウィンドウ）。
+    fn sidebar_focus_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui_kit::Entity<Workspace>,
+        &'static mut gpui_kit::VisualTestContext,
+    ) {
+        let ws = setup_with_logins(cx, &["tbf"], false);
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        draw_frames(visual);
+        (ws, visual)
+    }
+
+    /// Enter で選んだ行へ切り替わり、**表示中の画面へフォーカスが戻る**。
+    #[gpui_kit::test]
+    async fn enter_returns_focus_to_the_view(cx: &mut TestAppContext) {
+        let (ws, visual) = sidebar_focus_window(cx);
+        press_key(visual, "f6");
+        assert!(
+            visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "前提: F6 でサイドバーにフォーカスが入る"
+        );
+
+        press_key(visual, "down");
+        press_key(visual, "enter");
+        assert_eq!(
+            ws.read_with(cx, |w, _| w.active),
+            NavTarget::Favorites,
+            "Enter で行が切り替わっていない"
+        );
+        assert!(
+            !visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "Enter 後もサイドバーにフォーカスが残っている"
+        );
+        assert!(
+            visual.update(|window, cx| window.focused(cx)).is_some(),
+            "Enter 後にフォーカスがどこにも入っていない"
+        );
+    }
+
+    /// Esc でサイドバーから表示中の画面へフォーカスが戻る。
+    #[gpui_kit::test]
+    async fn escape_returns_focus_to_the_view(cx: &mut TestAppContext) {
+        let (ws, visual) = sidebar_focus_window(cx);
+        press_key(visual, "f6");
+        assert!(
+            visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "前提: F6 でサイドバーにフォーカスが入る"
+        );
+
+        press_key(visual, "escape");
+        assert!(
+            !visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "Esc 後もサイドバーにフォーカスが残っている"
+        );
+        assert!(
+            visual.update(|window, cx| window.focused(cx)).is_some(),
+            "Esc 後にフォーカスがどこにも入っていない"
+        );
+    }
+
+    /// Ctrl+1 でもメイン領域へフォーカスが戻る（VS Code のエディターグループ相当）。
+    #[gpui_kit::test]
+    async fn ctrl_1_returns_focus_to_the_view(cx: &mut TestAppContext) {
+        let (ws, visual) = sidebar_focus_window(cx);
+        press_key(visual, "f6");
+        assert!(
+            visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "前提: F6 でサイドバーにフォーカスが入る"
+        );
+
+        press_key(visual, "ctrl-1");
+        assert!(
+            !visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "Ctrl+1 後もサイドバーにフォーカスが残っている"
+        );
+    }
+
+    /// F6 はペイン切替（サイドバー ↔ メイン領域）。2 回押すと元へ戻る。
+    #[gpui_kit::test]
+    async fn f6_toggles_focus_between_sidebar_and_view(cx: &mut TestAppContext) {
+        let (ws, visual) = sidebar_focus_window(cx);
+        press_key(visual, "f6");
+        assert!(
+            visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "F6 でサイドバーにフォーカスが入らない"
+        );
+        press_key(visual, "f6");
+        assert!(
+            !visual.update(|window, cx| ws.read(cx).sidebar_focus.is_focused(window)),
+            "F6 をもう一度押してもメイン領域へ戻らない"
+        );
+        assert!(
+            visual.update(|window, cx| window.focused(cx)).is_some(),
+            "F6 後にフォーカスがどこにも入っていない"
         );
     }
 
@@ -6204,11 +7138,12 @@ mod tests {
         );
     }
 
-    /// 取り込み確認モーダルが来たら、開いていたビューアーを閉じること。
+    /// 取り込み確認モーダルが来ても、開いていたビューアーは**閉じない**（状態を保つ）。
     ///
-    /// モーダルはビューアーの下の層に描かれるため、重なったままだと操作できない。
+    /// モーダルはビューアーの下の層に描かれるので、表示中はビューアーを描かないことで
+    /// 見せる（`Workspace::render` の `reader_hidden_for_dialog`）。読書位置を失わない。
     #[gpui_kit::test]
-    async fn import_dialog_closes_the_viewer(cx: &mut TestAppContext) {
+    async fn import_dialog_keeps_the_viewer_open(cx: &mut TestAppContext) {
         let ws = setup(cx);
         cx.update(|cx| {
             cx.dispatch_action(&crate::actions::OpenReader {
@@ -6238,8 +7173,8 @@ mod tests {
         });
 
         assert!(
-            ws.read_with(cx, |w, _| w.reader.is_none()),
-            "取り込み確認が出たらビューアーは閉じること"
+            ws.read_with(cx, |w, _| w.reader.is_some()),
+            "取り込み確認でビューアーを閉じている"
         );
     }
 

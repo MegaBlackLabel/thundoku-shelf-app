@@ -219,6 +219,16 @@ pub fn parse_product_page(html: &str) -> FanzaProductPage {
     FanzaProductPage { genre_tags, author }
 }
 
+/// 作品ページの骨格（作品情報テーブル / ジャンル一覧）を含むか。
+///
+/// age 確認・bot チャレンジ・レイアウト変更などで**別の HTML** が 200 で返ると、
+/// タグも作者も空のまま「取得済み」になり、その作品のタグが二度と取れなくなる。
+/// 骨格が無いページは取得失敗として扱い（`product_page` が `Err` を返す）、
+/// 呼び出し側に取得済みの印を立てさせない。
+fn looks_like_product_page(html: &str) -> bool {
+    html.contains("informationList") || html.contains("genreTag")
+}
+
 /// FANZA 同人クライアント（`tbf::transport` を再利用、`Transport` でモック可能）。
 pub struct FanzaClient {
     transport: Box<dyn Transport>,
@@ -370,6 +380,10 @@ impl FanzaClient {
         let resp = self.transport.send(spec).map_err(FanzaError::Transport)?;
         self.check_status(resp.status)?;
         let html = String::from_utf8_lossy(&resp.body).to_string();
+        if !looks_like_product_page(&html) {
+            // age 確認・bot ページ等を成功として返すと、空タグで「取得済み」にしてしまう
+            return Err(FanzaError::Parse("作品ページではない HTML を受信".into()));
+        }
         Ok(parse_product_page(&html))
     }
 
@@ -1235,6 +1249,43 @@ mod tests {
         // 作者行はあるが空のときも None
         let empty = r#"<dt class="informationList__ttl">作者</dt><dd class="informationList__txt"><a href="/x"></a></dd>"#;
         assert_eq!(parse_product_page(empty).author, None);
+    }
+
+    /// 作品ページの骨格（作品情報テーブル / ジャンル一覧）を含むか。
+    ///
+    /// age 確認・bot チャレンジ・レイアウト変更などで**別の HTML** が 200 で返ると、
+    /// タグも作者も空のまま「取得済み」になり、その作品のタグが二度と取れなくなる。
+    /// 骨格が無いページは取得失敗として扱う。
+    #[test]
+    fn product_page_skeleton_detection() {
+        assert!(
+            !looks_like_product_page("<html><body>年齢確認が必要です</body></html>"),
+            "作品ページでない HTML を通している"
+        );
+        assert!(looks_like_product_page(
+            r#"<dl class="informationList"><dt class="informationList__ttl">作者</dt></dl>"#
+        ));
+        assert!(looks_like_product_page(r#"<ul class="genreTagList"></ul>"#));
+    }
+
+    /// 作品ページでない HTML は `product_page` がエラーを返す
+    /// （＝呼び出し側は「取得失敗」として扱い、取得済みの印を立てない）。
+    #[test]
+    fn product_page_returns_an_error_for_a_non_product_page() {
+        let transport = MockTransport {
+            handler: Box::new(move |_| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: "<html><body>年齢確認</body></html>".as_bytes().to_vec(),
+                })
+            }),
+        };
+        let mut client = FanzaClient::with_transport(Box::new(transport), session());
+        assert!(
+            client.product_page("d_1").is_err(),
+            "作品ページでない HTML を成功として返している"
+        );
     }
 
     /// 実機プローブ: **本番の経路**（`FanzaClient::download_with_progress`）で proxy → 302 →

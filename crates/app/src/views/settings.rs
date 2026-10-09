@@ -1476,6 +1476,10 @@ impl SettingsView {
                     id
                 }
             };
+            // 利用者が手動で同期した＝Drive 同期は有効。トグルを行を持たない状態
+            // （「同期情報をクリア」後の再同期など）で終了時のアップロード確認が
+            // 抑止されないよう、ここで確実に立てる。
+            let _ = db::settings::set(&db, "drive.sync.enabled", "true");
             // pack の鍵（v3 の PRK）を先に用意する（必要なら解錠ダイアログが出る）。
             // 鍵が無いまま暗号化 pack を同期すると `PackKeyRequired` で失敗する。
             let pack_root_key = keys
@@ -1741,6 +1745,13 @@ impl SettingsView {
             return;
         };
         self.confirm_data_dir = false;
+        // 一時フォルダ（OS がクリーンアップで消す場所）は保存先にしない。選べてしまうと
+        // 再起動やディスククリーンアップで本ごと消える（実測で発生）。
+        if let Some(reason) = crate::app_state::data_dir_change_rejection(&new_dir) {
+            crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Error, reason);
+            cx.notify();
+            return;
+        }
         cx.notify();
         let handle = cx.entity();
         let state = AppState::global(cx);
@@ -4828,6 +4839,42 @@ mod tests {
         });
     }
 
+    /// データ保存先に一時フォルダ（OS が消す場所）は選べない。
+    ///
+    /// `%TEMP%` を保存先にすると、ディスククリーンアップや再起動で本ごと消える
+    /// （実測で発生）。選択を拒否し、理由を通知する。
+    #[gpui_kit::test]
+    async fn data_dir_under_temp_is_rejected(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(SettingsView::new);
+        let temp_target = std::env::temp_dir().join("thundoku-shelf-guard-test");
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.pending_data_dir = Some(temp_target.clone());
+                this.confirm_data_dir = true;
+                this.confirm_data_dir_change(cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let state = AppState::global(cx);
+            assert_eq!(
+                *state.toast_kind.lock(),
+                crate::app_state::ToastKind::Error,
+                "一時フォルダをデータ保存先に選べてしまっている"
+            );
+            assert!(
+                state.toast_message.lock().is_some(),
+                "拒否した理由が表示されていない"
+            );
+            assert!(
+                view.read(cx).pending_data_dir.is_none(),
+                "拒否したのに選択が残っている"
+            );
+        });
+    }
+
     /// サンプルモードではデータ保存先を変更しない（本物の設定ファイルを書き換えない）。
     ///
     /// 変更すると、次回の通常起動が空のフォルダを指して本物の本棚が消えたように見える。
@@ -4836,7 +4883,12 @@ mod tests {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_demo);
         let view = cx.new(SettingsView::new);
-        let new_dir = std::env::temp_dir().join("thundoku-shelf-demo-move-test");
+        // 固定名の %TEMP% パスを消してはいけない: 保存先が（デモの不具合の残骸などで）
+        // 同じパスを指していると、テスト実行が**本物のデータ**を消してしまう（実測で発生）。
+        // テストごとに一意な名前を使い、実データディレクトリと衝突させない。
+        let new_dir = std::env::temp_dir()
+            .join("thundoku-shelf-test")
+            .join(format!("demo-move-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&new_dir);
         cx.update(|cx| {
             view.update(cx, |this, cx| {

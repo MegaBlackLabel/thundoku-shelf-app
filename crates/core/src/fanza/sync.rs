@@ -249,7 +249,7 @@ pub fn fetch_pending_tags(
         match client.product_page(database_id) {
             Ok(page) => {
                 // タグが 0 件でも「取得済み」にする（毎回同じ作品を叩かない）
-                bookshelf::update_tags(pool, SITE_ID_FANZA, database_id, &page.genre_tags)?;
+                bookshelf::store_fetched_tags(pool, SITE_ID_FANZA, database_id, &page.genre_tags)?;
                 outcome.fetched += 1;
             }
             Err(error @ (FanzaError::Unauthorized(_) | FanzaError::SessionExpired)) => {
@@ -288,7 +288,7 @@ pub fn fetch_tags_for(
         match client.product_page(database_id) {
             Ok(page) => {
                 // タグが 0 件でも「取得済み」にする（毎回同じ作品を叩かない）
-                bookshelf::update_tags(pool, SITE_ID_FANZA, database_id, &page.genre_tags)?;
+                bookshelf::store_fetched_tags(pool, SITE_ID_FANZA, database_id, &page.genre_tags)?;
                 outcome.fetched += 1;
             }
             Err(error @ (FanzaError::Unauthorized(_) | FanzaError::SessionExpired)) => {
@@ -654,6 +654,70 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "タグ無しの作品を再取得しようとしている"
+        );
+    }
+
+    /// 空の取得結果でも既存の非空タグを消さない（取得済みの印だけ立てる）。
+    /// 「タグ有り + 未取得」はフラグ後付け DB や Drive 復元で生じる。
+    #[test]
+    fn fetch_pending_tags_keeps_existing_tags_when_the_page_has_no_genres() {
+        let pool = crate::db::test_pool();
+        seed_pending_items(&pool, 1);
+        crate::db::block_on(async {
+            sqlx::query(
+                "UPDATE bookshelf_items SET tags_json = '[\"既存\"]', tags_fetched = 0 \
+                 WHERE database_id = 'd_1'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut client = FanzaClient::with_transport(
+            Box::new(tag_transport(calls.clone(), vec![], 200)),
+            session(),
+        );
+
+        let outcome = fetch_pending_tags(&pool, &mut client, 1, Duration::ZERO).unwrap();
+
+        assert_eq!(outcome.fetched, 1);
+        let (tags, fetched) = tags_of(&pool, "d_1");
+        assert_eq!(
+            tags.as_deref(),
+            Some(r#"["既存"]"#),
+            "空の取得結果で既存タグを消している"
+        );
+        assert_eq!(fetched, 1, "取得済みの印が立っていない");
+    }
+
+    /// 作品ページでない HTML（age 確認 / bot ページ等）は取得失敗扱いにする。
+    /// 印を立てず、次回に再試行する（空タグで「取得済み」にしない）。
+    #[test]
+    fn fetch_pending_tags_skips_a_non_product_page_without_marking_fetched() {
+        let pool = crate::db::test_pool();
+        seed_pending_items(&pool, 1);
+        let transport = MockTransport {
+            handler: Box::new(move |_| {
+                Ok(ResponseSpec {
+                    status: 200,
+                    headers: vec![],
+                    body: "<html><body>年齢確認</body></html>".as_bytes().to_vec(),
+                })
+            }),
+        };
+        let mut client = FanzaClient::with_transport(Box::new(transport), session());
+
+        let outcome = fetch_pending_tags(&pool, &mut client, 1, Duration::ZERO).unwrap();
+
+        assert_eq!(outcome.fetched, 0);
+        assert_eq!(outcome.skipped, 1);
+        let (tags, fetched) = tags_of(&pool, "d_1");
+        assert_eq!(tags, None, "作品ページでない HTML のタグを保存している");
+        assert_eq!(fetched, 0, "作品ページでない HTML で取得済みの印を立てている");
+        assert_eq!(
+            bookshelf::pending_tag_fetch(&pool, SITE_ID_FANZA, 10).unwrap(),
+            vec!["d_1".to_string()],
+            "次回の対象から外している"
         );
     }
 

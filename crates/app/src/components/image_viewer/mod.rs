@@ -588,6 +588,11 @@ fn resolve_page_turn(
 }
 
 impl ImageViewer {
+    /// ワークスペースからキーボードフォーカスを戻す（サイドバーから表示中のビューアーへ）。
+    pub fn focus_view(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+    }
+
     /// サイト別設定キー（viewer.mode.{site}）。サイトが分からなければ従来キー。
     fn setting_key(&self, base: &str) -> String {
         match self.book.as_ref().and_then(|book| book.site_id.as_deref()) {

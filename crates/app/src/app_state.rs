@@ -270,12 +270,78 @@ pub fn save_data_path(path: &std::path::Path) {
 ///
 /// **`main.rs` は AppState の初期化より先にこれを使う**（ログの出力先を決めるため。
 /// `AppState::init` も同じ値を使うので、保存先の解決はここ 1 箇所）。
+///
+/// 設定された保存先が**一時ディレクトリ**（`%TEMP%` 等）を指しているときは使わない:
+/// OS のクリーンアップや再起動で消えて、本ごと失われる（実測で発生）。既定の保存先へ
+/// 落として起動する。
 pub fn resolve_data_dir() -> PathBuf {
-    loaded_data_path().unwrap_or_else(|| {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("thundoku-shelf")
+    let default = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("thundoku-shelf");
+    match loaded_data_path() {
+        Some(path) if path_is_under_temp(&path, &std::env::temp_dir()) => {
+            log::warn!(
+                "保存先 {} は一時フォルダのため使わない（OS が消す）。既定の {} を使う",
+                path.display(),
+                default.display()
+            );
+            default
+        }
+        Some(path) => path,
+        None => default,
+    }
+}
+
+/// 変更後の保存先として受け付けられない理由（受け付けるときは `None`）。
+///
+/// OS の一時ディレクトリは再起動やディスククリーンアップで消えるため、保存先に選ばせない
+/// （`%TEMP%` を保存先にして本ごと消える事故が実測で起きた）。
+pub(crate) fn data_dir_change_rejection(new_dir: &std::path::Path) -> Option<String> {
+    path_is_under_temp(new_dir, &std::env::temp_dir()).then(|| {
+        "一時フォルダ（OS が削除する場所）はデータ保存先にできません。別のフォルダを選んでください"
+            .to_string()
     })
+}
+
+/// 比較用に絶対パスへ寄せる（保存先はまだ無いことがあるので `canonicalize` はしない）。
+///
+/// `canonicalize` は Windows で `\\?\` 接頭辞を付けた形を返すため、正規化していない
+/// パスと成分が食い違って誤判定する（実測: 一時フォルダの判定がすり抜けた）。
+/// 比較は「絶対化 + 成分ごと（Windows は大小無視）」で行う。
+fn normalize_path(path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|dir| dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// Windows は同じフォルダを大小文字違いで指せるため、成分比較もそれに合わせる。
+fn same_path_component(a: &std::path::Component<'_>, b: &std::path::Component<'_>) -> bool {
+    let (a, b) = (a.as_os_str(), b.as_os_str());
+    if cfg!(windows) {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
+    }
+}
+
+/// `path` が `temp_root`（一時ディレクトリ）自身か、その下にあるか。
+///
+/// 成分単位で見る（`Temp` と `Temp2` のような**前方一致するだけの兄弟**を弾く）。
+pub(crate) fn path_is_under_temp(path: &std::path::Path, temp_root: &std::path::Path) -> bool {
+    let path = normalize_path(path);
+    let temp = normalize_path(temp_root);
+    let mut path_components = path.components();
+    for temp_component in temp.components() {
+        match path_components.next() {
+            Some(component) if same_path_component(&component, &temp_component) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// 保存済みの Google プロフィール（`sub` 等）を keyring から復元する（起動時に呼ぶ）。
@@ -1149,6 +1215,45 @@ fn clear_pending_logout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 保存先が一時ディレクトリ配下かを判定できる（OS が消す場所を保存先にしない）。
+    #[test]
+    fn temp_paths_are_detected_as_under_temp() {
+        let root = if cfg!(windows) {
+            PathBuf::from("C:/Users/x/AppData/Local/Temp")
+        } else {
+            PathBuf::from("/tmp")
+        };
+        // 一時ディレクトリそのもの / その下は一時と判定する
+        assert!(path_is_under_temp(&root, &root), "temp 直下を一時と判定していない");
+        assert!(
+            path_is_under_temp(&root.join("thundoku-shelf-demo-move-test"), &root),
+            "temp の子を一時と判定していない"
+        );
+        // 名前が前方一致するだけの兄弟は一時ではない（区切りまで見る）
+        assert!(
+            !path_is_under_temp(&root.with_file_name("Temp2").join("thundoku-shelf"), &root),
+            "前方一致するだけの別ディレクトリを一時と誤判定している"
+        );
+        // 通常のデータディレクトリは一時ではない
+        let normal = if cfg!(windows) {
+            PathBuf::from("C:/Users/x/AppData/Roaming/thundoku-shelf")
+        } else {
+            PathBuf::from("/home/x/.local/share/thundoku-shelf")
+        };
+        assert!(!path_is_under_temp(&normal, &root));
+    }
+
+    /// Windows では大小文字を無視して判定する（同じフォルダを指す別表記を弾く）。
+    #[cfg(windows)]
+    #[test]
+    fn temp_path_detection_ignores_case_on_windows() {
+        let root = PathBuf::from("C:/Users/x/AppData/Local/Temp");
+        assert!(path_is_under_temp(
+            &PathBuf::from("c:/users/x/appdata/local/temp/abc"),
+            &root
+        ));
+    }
 
     /// メモリバックエンド（`SecretStore`）はプロセス内で共有されるため、
     /// `USER_GOOGLE_PROFILE` スロットを使うテストはこの Mutex で直列化する

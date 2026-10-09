@@ -137,6 +137,11 @@ impl NotesView {
         view
     }
 
+    /// ワークスペースからキーボードフォーカスを戻す（サイドバーから表示中の付箋へ）。
+    pub(crate) fn focus_view(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+    }
+
     /// 付箋を読み直す（追加が新しい順。外した付箋は出さない）。
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         let state = AppState::global(cx);
