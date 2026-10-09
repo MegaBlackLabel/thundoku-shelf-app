@@ -532,6 +532,11 @@ impl HistoryView {
         self.period != HistoryPeriod::All || self.site.is_some() || !self.selected_tags.is_empty()
     }
 
+    /// ワークスペースからキーボードフォーカスを戻す（サイドバーから表示中の履歴へ）。
+    pub(crate) fn focus_view(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+    }
+
     /// キーボード操作: Enter で開く、矢印 / hjkl で選択移動、ESC で絞り込み解除。
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {

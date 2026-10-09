@@ -76,6 +76,12 @@ impl ReaderView {
         (self.content_id.clone(), self.format_id.clone())
     }
 
+    /// ワークスペースからキーボードフォーカスを戻す（サイドバーから表示中のビューアーへ）。
+    pub(crate) fn focus_view(&self, window: &mut gpui_kit::Window, cx: &mut Context<Self>) {
+        self.viewer
+            .update(cx, |viewer, cx| viewer.focus_view(window, cx));
+    }
+
     /// 表示するコンテンツ／レンディションを切り替える（フェーズ4の UI から呼ぶ）。
     ///
     /// 先頭ページに戻し、ページ毎記録の起点も切り替える。進捗（`reading_progress`）は
