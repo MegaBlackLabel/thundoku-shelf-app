@@ -2109,7 +2109,12 @@ impl BookshelfView {
                     cx.stop_propagation();
                     return;
                 }
-                _ => {}
+                // これ以外のキーも背後の本棚へ漏らさない（左/右や h/l が背後の選択を
+                // 動かし、Escape が背後の絞り込みを消していた）。モーダルが入力を独占する。
+                _ => {
+                    cx.stop_propagation();
+                    return;
+                }
             }
         }
         // ファイル選択ダイアログが出ている間は、矢印 / j k / Enter を
@@ -2136,7 +2141,12 @@ impl BookshelfView {
                     cx.stop_propagation();
                     return;
                 }
-                _ => {}
+                // これ以外のキーも背後の本棚へ漏らさない（左/右や h/l が背後の選択を
+                // 動かし、Escape が背後の絞り込みを消していた）。モーダルが入力を独占する。
+                _ => {
+                    cx.stop_propagation();
+                    return;
+                }
             }
         }
         match event.keystroke.key.as_str() {
@@ -13753,6 +13763,26 @@ mod tests {
             view.read_with(cx, |this, _| this.selected_index),
             shelf_selected_before,
             "ファイル選択中の ↓ / j が背後の本棚へ漏れている"
+        );
+
+        // 左/右・h/l・Escape など他のキーも背後の本棚へ漏らさない
+        // （モーダルが入力を独占する）。
+        for key in ["left", "right", "h", "l", "escape"] {
+            press_key(&mut *visual, key);
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |this, _| this.selected_index),
+            shelf_selected_before,
+            "ファイル選択中の左/右・h/l が背後の本棚へ漏れている"
+        );
+        assert_eq!(
+            view.read_with(cx, |this, _| this
+                .pending_file_choice
+                .as_ref()
+                .map(|pending| pending.selected)),
+            Some(1),
+            "他のキーでファイル選択の選択が変わっている"
         );
 
         // Enter は選択中のファイルで確定する（ダイアログが閉じてダウンロードが始まる）
