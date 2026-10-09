@@ -274,6 +274,39 @@ pub fn update_tags(
     })
 }
 
+/// タグ取得（作品ページ）の結果を保存する。**[`update_tags`] の取得経路版。**
+///
+/// タグが 0 件でも「取得済み」の印は立てる（毎回同じ作品を叩かない）が、
+/// **既存の非空タグは空の取得結果で上書きしない**。作品ページが 200 で想定外の
+/// HTML を返したとき（age 確認・bot ページ・レイアウト変更）に、既に入っている
+/// タグを `[]` で潰すのを防ぐための保険。
+///
+/// 手動編集（`save_tag_edit`）は意図的な全消しを許すため [`update_tags`] を使う。
+pub fn store_fetched_tags(
+    pool: &SqlitePool,
+    site_id: &str,
+    database_id: &str,
+    tags: &[String],
+) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+    crate::db::block_on(async {
+        sqlx::query(
+            "UPDATE bookshelf_items SET \
+             tags_json = CASE \
+               WHEN ?1 = '[]' AND tags_json IS NOT NULL AND tags_json NOT IN ('[]', '') \
+               THEN tags_json ELSE ?1 END, \
+             tags_fetched = 1, updated_at = CURRENT_TIMESTAMP \
+             WHERE site_id = ?2 AND database_id = ?3",
+        )
+        .bind(json)
+        .bind(site_id)
+        .bind(database_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    })
+}
+
 /// タグ未取得の**未ダウンロード**作品の件数（通知に残り件数を出すため）。
 pub fn pending_tag_fetch_count(pool: &SqlitePool, site_id: &str) -> Result<i64, sqlx::Error> {
     crate::db::block_on(async {
@@ -720,5 +753,81 @@ mod tests {
             unfetched_among(&pool, "dlsite", &["RJ1".to_string()]).unwrap(),
             vec!["RJ1".to_string()]
         );
+    }
+
+    /// 保存済みの `(tags_json, tags_fetched)`。
+    fn tags_and_flag(pool: &SqlitePool, site_id: &str, database_id: &str) -> (Option<String>, i64) {
+        crate::db::block_on(async {
+            sqlx::query_as::<_, (Option<String>, i64)>(
+                "SELECT tags_json, tags_fetched FROM bookshelf_items \
+                 WHERE site_id = ?1 AND database_id = ?2",
+            )
+            .bind(site_id)
+            .bind(database_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        })
+    }
+
+    /// 既存のタグを後から作る（フラグ後付け DB / Drive 復元で生じる「タグ有り + 未取得」）。
+    fn seed_unfetched_tags(pool: &SqlitePool, site_id: &str, database_id: &str, tags_json: &str) {
+        crate::db::block_on(async {
+            sqlx::query(
+                "UPDATE bookshelf_items SET tags_json = ?1, tags_fetched = 0 \
+                 WHERE site_id = ?2 AND database_id = ?3",
+            )
+            .bind(tags_json)
+            .bind(site_id)
+            .bind(database_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        })
+    }
+
+    /// 取得結果が**空**なら既存の非空タグを消さない（取得済みの印だけ立てる）。
+    #[test]
+    fn store_fetched_tags_keeps_existing_tags_when_the_result_is_empty() {
+        let pool = crate::db::test_pool();
+        seed_item(&pool, "fanza", "d_1");
+        seed_unfetched_tags(&pool, "fanza", "d_1", r#"["既存","タグ"]"#);
+
+        store_fetched_tags(&pool, "fanza", "d_1", &[]).unwrap();
+
+        let (tags, fetched) = tags_and_flag(&pool, "fanza", "d_1");
+        assert_eq!(
+            tags.as_deref(),
+            Some(r#"["既存","タグ"]"#),
+            "空の取得結果で既存タグを消している"
+        );
+        assert_eq!(fetched, 1, "取得済みの印が立っていない");
+    }
+
+    /// 取得結果が**空で、既存も空/無し**なら `[]` を書いて取得済みにする（現行動作）。
+    #[test]
+    fn store_fetched_tags_marks_a_genuinely_empty_result_as_fetched() {
+        let pool = crate::db::test_pool();
+        seed_item(&pool, "fanza", "d_2");
+
+        store_fetched_tags(&pool, "fanza", "d_2", &[]).unwrap();
+
+        let (tags, fetched) = tags_and_flag(&pool, "fanza", "d_2");
+        assert_eq!(tags.as_deref(), Some("[]"));
+        assert_eq!(fetched, 1);
+    }
+
+    /// 取得結果が**非空**なら既存を上書きする（通常の取得）。
+    #[test]
+    fn store_fetched_tags_overwrites_with_a_nonempty_result() {
+        let pool = crate::db::test_pool();
+        seed_item(&pool, "fanza", "d_3");
+        seed_unfetched_tags(&pool, "fanza", "d_3", r#"["古い"]"#);
+
+        store_fetched_tags(&pool, "fanza", "d_3", &["新しい".to_string()]).unwrap();
+
+        let (tags, fetched) = tags_and_flag(&pool, "fanza", "d_3");
+        assert_eq!(tags.as_deref(), Some(r#"["新しい"]"#));
+        assert_eq!(fetched, 1);
     }
 }
