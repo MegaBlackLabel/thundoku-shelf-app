@@ -4402,13 +4402,15 @@ mod tests {
             visual.debug_bounds("account-row-fantia").is_some(),
             "アカウントに Fantia 行があること"
         );
-        // 各サイトの設定カードに「表紙更新」がある（Fantia は同期で表紙を持たないため
-        // 表紙更新の対象外 = カードも無い）
-        let sites: [(&str, &'static str); 4] = [
+        // 各サイトの設定カードに「表紙更新」がある。Fantia も同期で `thumbnail_url`
+        // （商品ページの 1 枚目）を持つので、他サイトと同じく取得し直せる
+        //（`refresh_site_covers` はサイト非依存で、そのサイトの行を対象にする）。
+        let sites: [(&str, &'static str); 5] = [
             ("技術書典", "site-refresh-covers-techbookfest"),
             ("BOOTH", "site-refresh-covers-booth"),
             ("FANZA", "site-refresh-covers-fanza"),
             ("DLsite", "site-refresh-covers-dlsite"),
+            ("Fantia", "site-refresh-covers-fantia"),
         ];
         for (site, selector) in sites {
             assert!(
