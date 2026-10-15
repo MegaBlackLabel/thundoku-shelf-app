@@ -71,6 +71,8 @@ pub enum StoreSession {
     Booth,
     Fanza,
     Dlsite,
+    /// Fantia（fantia.jp）。セッションを保存する（同期は [`crate::fantia::sync`]）。
+    Fantia,
     /// 技術書典（techbookfest.org）。旧版は keyring に期限なしで置いていたため、
     /// [`SessionVault::adopt_legacy`] で vault へ移行する。
     Techbookfest,
@@ -83,6 +85,7 @@ impl StoreSession {
             Self::Booth => "booth.session",
             Self::Fanza => "fanza.session",
             Self::Dlsite => "dlsite.session",
+            Self::Fantia => "fantia.session",
             Self::Techbookfest => "tbf.session",
         }
     }
@@ -93,6 +96,7 @@ impl StoreSession {
             Self::Booth => "booth",
             Self::Fanza => "fanza",
             Self::Dlsite => "dlsite",
+            Self::Fantia => "fantia",
             Self::Techbookfest => "tbf",
         }
     }
@@ -461,6 +465,36 @@ mod tests {
         settings::get(pool, store.settings_key()).unwrap()
     }
 
+    /// `settings_key` / `label` はストアごとに別であること。
+    ///
+    /// キーが重複すると、片方のログアウトでもう片方のセッションまで消え、ログイン状態が
+    /// 混ざる。`label` はログだけでなく**削除できなかった印のファイル名**なので、重複すると
+    /// 別ストアの印として読まれる。ストアを足したときの取りこぼしもここで検知する。
+    #[test]
+    fn every_store_has_its_own_settings_key_and_label() {
+        let stores = [
+            StoreSession::Booth,
+            StoreSession::Fanza,
+            StoreSession::Dlsite,
+            StoreSession::Fantia,
+            StoreSession::Techbookfest,
+        ];
+        let keys: std::collections::BTreeSet<&str> =
+            stores.iter().map(|store| store.settings_key()).collect();
+        assert_eq!(keys.len(), stores.len(), "キーが重複している: {keys:?}");
+        let labels: std::collections::BTreeSet<&str> =
+            stores.iter().map(|store| store.label()).collect();
+        assert_eq!(
+            labels.len(),
+            stores.len(),
+            "ラベルが重複している: {labels:?}"
+        );
+
+        // Fantia の保存先は他ストアと同じ扱いにする（旧作は無いので新規でよい）。
+        assert_eq!(StoreSession::Fantia.settings_key(), "fantia.session");
+        assert_eq!(StoreSession::Fantia.label(), "fantia");
+    }
+
     /// 保存した値は復元でき、DB には暗号文しか残らない。
     #[test]
     fn session_round_trips_and_is_encrypted_at_rest() {
@@ -761,7 +795,10 @@ mod tests {
         let secrets = SecretStore::new();
         let legacy_key = "legacy-techbookfest-pending";
 
-        vault.marker.mark(StoreSession::Techbookfest.label()).unwrap();
+        vault
+            .marker
+            .mark(StoreSession::Techbookfest.label())
+            .unwrap();
         secrets
             .save(legacy_key, &serde_json::to_string(&fake_session()).unwrap())
             .unwrap();
@@ -769,7 +806,10 @@ mod tests {
         let adopted: Option<FakeSession> =
             vault.adopt_legacy(&secrets, &pool, StoreSession::Techbookfest, legacy_key);
 
-        assert!(adopted.is_none(), "印があるのに旧値を移行（再利用）している");
+        assert!(
+            adopted.is_none(),
+            "印があるのに旧値を移行（再利用）している"
+        );
         assert!(
             stored(&pool, StoreSession::Techbookfest).is_none(),
             "印があるのに vault へ書き込んでいる"

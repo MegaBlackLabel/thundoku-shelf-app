@@ -383,6 +383,24 @@ pub fn unfetched_among(
     })
 }
 
+/// 保存済みの表紙 URL（行が無ければ `None`）。同期で「既に表紙があるか」を見るのに使う。
+pub fn thumbnail_url(
+    pool: &SqlitePool,
+    site_id: &str,
+    database_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    crate::db::block_on(async {
+        let row: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT thumbnail_url FROM bookshelf_items WHERE site_id = ?1 AND database_id = ?2",
+        )
+        .bind(site_id)
+        .bind(database_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.flatten())
+    })
+}
+
 /// Set the author name of a bookshelf item（取得元 = サイトの作品ページ）。
 pub fn update_author(
     pool: &SqlitePool,

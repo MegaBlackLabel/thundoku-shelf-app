@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use thundoku_core::booth::BoothSession;
 use thundoku_core::db;
 use thundoku_core::dlsite::client::DlsiteSession;
+use thundoku_core::fantia::client::FantiaSession;
 use thundoku_core::fanza::client::FanzaSession;
 use thundoku_core::google::{GoogleClient, GoogleProfile};
 use thundoku_core::secrets::SecretStore;
@@ -52,6 +53,7 @@ pub fn purge_marker(state: &AppState) -> PurgeMarker {
 pub struct SyncCursors {
     pub fanza: Option<thundoku_core::fanza::sync::PurchaseCursor>,
     pub dlsite: Option<thundoku_core::dlsite::sync::PurchaseCursor>,
+    pub fantia: Option<thundoku_core::fantia::sync::PurchaseCursor>,
 }
 
 pub struct AppState {
@@ -97,6 +99,9 @@ pub struct AppState {
     /// DLsite（www.dlsite.com）のセッション Cookie
     pub dlsite_session: Arc<Mutex<Option<DlsiteSession>>>,
     pub dlsite_logged_in: Arc<Mutex<bool>>,
+    /// Fantia（fantia.jp）のセッション Cookie
+    pub fantia_session: Arc<Mutex<Option<FantiaSession>>>,
+    pub fantia_logged_in: Arc<Mutex<bool>>,
     /// ストアのセッション Cookie の暗号化保存（keyring の鍵が使えない環境では `None`）。
     pub session_vault: Option<SessionVault>,
     /// 購入一覧の分割同期の続き位置（ストアごと。`SyncCursors` の説明を参照）。
@@ -117,7 +122,7 @@ pub struct AppState {
     /// トーストを自動で消すか（終了時のアップロード中など、完了まで出したいときは false）
     pub toast_autohide: Arc<Mutex<bool>>,
     /// 進行中のトーストか（通知に Spinner を添えて「動いている」ことを示す）
-        pub toast_progress: Arc<Mutex<bool>>,
+    pub toast_progress: Arc<Mutex<bool>>,
     /// 保護つき通知（タグ取得の完了など）の保護期限。この時刻まではバックグラウンドの
     /// 通知（進行中・定期同期の完了）で上書きしない（`set_protected_notice` が立てる）
     pub toast_protected_until: Arc<Mutex<Option<std::time::Instant>>>,
@@ -216,14 +221,18 @@ pub fn set_modal(cx: &App, kind: ModalKind, showing: bool) {
 
 /// いま描くべきモーダル（優先度が最も強い 1 つ）。無ければ `None`。
 pub fn active_modal(cx: &App) -> Option<ModalKind> {
-    AppState::global(cx).modals.lock().iter().next_back().copied()
+    AppState::global(cx)
+        .modals
+        .lock()
+        .iter()
+        .next_back()
+        .copied()
 }
 
 /// 何かのモーダルが表示中か（ウィンドウを閉じてよいかの判定に使う）。
 pub fn any_modal_active(cx: &App) -> bool {
     !AppState::global(cx).modals.lock().is_empty()
 }
-
 
 // WebView2（wry）の呼び出しのうち、Windows のメッセージループを回して gpui の窓更新と
 // 衝突し得るのは**生成**と **`cookies_for_url`** だけで、どちらも App の借用の外から
@@ -322,7 +331,8 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
 fn same_path_component(a: &std::path::Component<'_>, b: &std::path::Component<'_>) -> bool {
     let (a, b) = (a.as_os_str(), b.as_os_str());
     if cfg!(windows) {
-        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
     } else {
         a == b
     }
@@ -476,7 +486,12 @@ impl AppState {
             );
             let token_delete = secrets.delete(thundoku_core::secrets::USER_GOOGLE);
             let profile_deleted = thundoku_core::google::delete_saved_profile(&secrets);
-            clear_pending_logout(&purge_marker, GOOGLE_LOGOUT_SLOT, token_delete, profile_deleted)
+            clear_pending_logout(
+                &purge_marker,
+                GOOGLE_LOGOUT_SLOT,
+                token_delete,
+                profile_deleted,
+            )
         } else {
             true
         };
@@ -546,6 +561,12 @@ impl AppState {
             .filter(DlsiteSession::logged_in);
         let dlsite_logged_in = dlsite_session.is_some();
 
+        let fantia_session = session_vault
+            .as_ref()
+            .and_then(|vault| vault.load::<FantiaSession>(&db_pool, StoreSession::Fantia))
+            .filter(FantiaSession::logged_in);
+        let fantia_logged_in = fantia_session.is_some();
+
         // 起動時に keyring の PRK（pack のルート鍵）を読む。ネットワークは触らず、
         // Drive の bundle からの復元（必要ならパスフレーズ入力）はログイン後 /
         // 必要になった時点で背景タスクが行う（[`crate::pack_keys`]）。
@@ -576,6 +597,8 @@ impl AppState {
             fanza_logged_in: Arc::new(Mutex::new(fanza_logged_in)),
             dlsite_session: Arc::new(Mutex::new(dlsite_session)),
             dlsite_logged_in: Arc::new(Mutex::new(dlsite_logged_in)),
+            fantia_session: Arc::new(Mutex::new(fantia_session)),
+            fantia_logged_in: Arc::new(Mutex::new(fantia_logged_in)),
             session_vault,
             sync_cursors: Arc::new(Mutex::new(SyncCursors::default())),
             login_sync_requested: Arc::new(Mutex::new(None)),
@@ -702,6 +725,8 @@ impl AppState {
             fanza_logged_in: Arc::new(Mutex::new(false)),
             dlsite_session: Arc::new(Mutex::new(None)),
             dlsite_logged_in: Arc::new(Mutex::new(false)),
+            fantia_session: Arc::new(Mutex::new(None)),
+            fantia_logged_in: Arc::new(Mutex::new(false)),
             sync_cursors: Arc::new(Mutex::new(SyncCursors::default())),
             login_sync_requested: Arc::new(Mutex::new(None)),
             toast_message: Arc::new(Mutex::new(None)),
@@ -998,7 +1023,6 @@ pub fn clear_toast(cx: &App) {
     *state.toast_message.lock() = None;
 }
 
-
 /// 技術書典のセッションを共通 Vault（暗号化 + 7 日の期限）へ永続化し、クライアントと
 /// 状態を更新する。WebView ログイン（Cookie 取得）の完了時に呼ぶ。
 pub fn save_tbf_session(cx: &App, session: &TbfSession) {
@@ -1134,6 +1158,26 @@ pub fn clear_dlsite_session(cx: &App) -> Result<(), String> {
     clear_store_session(state, StoreSession::Dlsite)
 }
 
+/// Fantia のセッションを DB（app_settings）に暗号化して永続化し、グローバル状態を更新する。
+pub fn save_fantia_session(cx: &App, session: &FantiaSession) {
+    let state = AppState::global(cx);
+    let logged_in = session.logged_in();
+    save_store_session(state, StoreSession::Fantia, session);
+    *state.fantia_session.lock() = Some(session.clone());
+    *state.fantia_logged_in.lock() = logged_in;
+    // アカウントが変わると続き位置は無意味（別アカウントの一覧を途中から取らない）
+    state.sync_cursors.lock().fantia = None;
+}
+
+/// Fantia のセッションを破棄する（ログアウト）。削除に失敗したら `Err`。
+pub fn clear_fantia_session(cx: &App) -> Result<(), String> {
+    let state = AppState::global(cx);
+    *state.fantia_session.lock() = None;
+    *state.fantia_logged_in.lock() = false;
+    state.sync_cursors.lock().fantia = None;
+    clear_store_session(state, StoreSession::Fantia)
+}
+
 /// 保存済みのウィンドウ状態（最大化/通常/フルスクリーン + 復元 size）の DB キー。
 const WINDOW_BOUNDS_KEY: &str = "window.bounds";
 
@@ -1206,9 +1250,7 @@ fn clear_pending_logout(
         log::info!("google: 前回のログアウトで残っていた資格情報を削除しました");
         return true;
     }
-    log::warn!(
-        "google: 資格情報を削除できないため、この起動では復元しません（再ログインが必要）"
-    );
+    log::warn!("google: 資格情報を削除できないため、この起動では復元しません（再ログインが必要）");
     false
 }
 
@@ -1225,7 +1267,10 @@ mod tests {
             PathBuf::from("/tmp")
         };
         // 一時ディレクトリそのもの / その下は一時と判定する
-        assert!(path_is_under_temp(&root, &root), "temp 直下を一時と判定していない");
+        assert!(
+            path_is_under_temp(&root, &root),
+            "temp 直下を一時と判定していない"
+        );
         assert!(
             path_is_under_temp(&root.join("thundoku-shelf-demo-move-test"), &root),
             "temp の子を一時と判定していない"
@@ -1340,7 +1385,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("テンポラリを作れる");
         let marker = PurgeMarker::new(&dir);
         marker.mark(GOOGLE_LOGOUT_SLOT).expect("印を付けられる");
-        let failed = || Err(thundoku_core::secrets::SecretError::Keyring("locked".into()));
+        let failed = || {
+            Err(thundoku_core::secrets::SecretError::Keyring(
+                "locked".into(),
+            ))
+        };
 
         // トークンの削除に失敗 → 復元させない・印は残す（次の起動でも再試行）
         assert!(
@@ -1377,17 +1426,19 @@ mod tests {
         );
 
         // 印が無い通常起動 → 復元を許す（削除は呼ばない）
-        assert!(clear_pending_logout(&marker, GOOGLE_LOGOUT_SLOT, failed(), true));
+        assert!(clear_pending_logout(
+            &marker,
+            GOOGLE_LOGOUT_SLOT,
+            failed(),
+            true
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// テスト用のデータディレクトリ（テストごとに作り直す）。
     fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "thundoku-shelf-{tag}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("thundoku-shelf-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
