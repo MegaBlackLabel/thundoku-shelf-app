@@ -155,7 +155,10 @@ fn migrate_is_idempotent() {
             .await
     })
     .unwrap();
-    assert_eq!(count, 4);
+    assert_eq!(
+        count, 5,
+        "サイトの行数（技術書典 / BOOTH / FANZA / DLsite / Fantia）"
+    );
 }
 
 // 本ごとの綴じ方向（books.page_turn）は後発の列。既存 DB（列が無い）でも
@@ -2043,7 +2046,11 @@ fn drm_status_migration_moves_legacy_zeros_to_unknown_once() {
         thundoku_core::db::migrate_drm_status_once(&pool).unwrap(),
         "初回は移行する"
     );
-    assert_eq!(shelf_is_drm(&pool, "RJ1"), 2, "未検証の 0 は不明（2）へ移す");
+    assert_eq!(
+        shelf_is_drm(&pool, "RJ1"),
+        2,
+        "未検証の 0 は不明（2）へ移す"
+    );
     assert_eq!(shelf_is_drm(&pool, "RJ2"), 1, "確認済みの 1 は触らない");
     assert_eq!(book_is_drm(&pool, "book-1"), 2, "books 側も移行する");
 
@@ -2079,8 +2086,13 @@ fn set_drm_status_records_the_verified_result() {
     )
     .unwrap();
     assert_eq!(shelf_is_drm(&pool, "RJ4"), 1);
-    bookshelf::set_drm_status(&pool, "fanza", "missing", thundoku_core::drm::DrmStatus::NoDrm)
-        .unwrap();
+    bookshelf::set_drm_status(
+        &pool,
+        "fanza",
+        "missing",
+        thundoku_core::drm::DrmStatus::NoDrm,
+    )
+    .unwrap();
 }
 
 /// 同期（`is_drm` = 不明）は、判定済みの値を**上書きしない**。
@@ -2120,7 +2132,11 @@ fn sync_does_not_clobber_a_verified_drm_status() {
     // 判定できた値を送ってきたときは上書きする
     no_drm.is_drm = DrmStatus::Protected.as_db();
     bookshelf::upsert(&pool, &no_drm).unwrap();
-    assert_eq!(shelf_is_drm(&pool, "RJ5"), 1, "新しい判定結果を反映していない");
+    assert_eq!(
+        shelf_is_drm(&pool, "RJ5"),
+        1,
+        "新しい判定結果を反映していない"
+    );
 }
 
 // ---- 機密列の暗号化（セキュリティ評価 F02） ------------------------------------
@@ -2227,7 +2243,10 @@ fn document_text_is_encrypted_at_rest() {
         stored.starts_with(column_crypto::PREFIX),
         "本文が平文で保存されている: {stored}"
     );
-    assert!(!stored.contains("ページの本文"), "平文が残っている: {stored}");
+    assert!(
+        !stored.contains("ページの本文"),
+        "平文が残っている: {stored}"
+    );
 
     // 読み出しは復号される
     assert_eq!(
@@ -2366,7 +2385,10 @@ fn page_notes_memo_is_encrypted_at_rest() {
     )
     .unwrap();
     assert_eq!(
-        notes::get_for_page(&pool, "b1", "", 3).unwrap().unwrap().memo,
+        notes::get_for_page(&pool, "b1", "", 3)
+            .unwrap()
+            .unwrap()
+            .memo,
         "書き直したメモ",
         "id が違っても復号できること（自然キーを AAD にしている）"
     );
@@ -2446,10 +2468,8 @@ fn migrate_column_crypto_is_a_noop_without_plaintext() {
 /// 確かめる（移行後に `PRAGMA wal_checkpoint(TRUNCATE)` で切り詰める）。
 #[test]
 fn migrate_column_crypto_truncates_the_wal() {
-    let root = std::env::temp_dir().join(format!(
-        "thundoku-column-crypto-wal-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("thundoku-column-crypto-wal-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("thundoku-shelf.db");
@@ -2474,8 +2494,11 @@ fn migrate_column_crypto_truncates_the_wal() {
     );
     // DB 本体も暗号文になっている
     assert!(
-        raw_column(&pool, "SELECT text_content FROM document_text WHERE id = 'dt-1'")
-            .starts_with(thundoku_core::db::column_crypto::PREFIX)
+        raw_column(
+            &pool,
+            "SELECT text_content FROM document_text WHERE id = 'dt-1'"
+        )
+        .starts_with(thundoku_core::db::column_crypto::PREFIX)
     );
 
     drop(pool);
@@ -2518,7 +2541,10 @@ fn migrate_column_crypto_encrypts_plaintext_rows() {
             "SELECT text_content FROM document_text WHERE id = 'dt-1'",
             "本文",
         ),
-        ("SELECT token FROM token_analysis WHERE id = 'tk-1'", "トークン"),
+        (
+            "SELECT token FROM token_analysis WHERE id = 'tk-1'",
+            "トークン",
+        ),
         ("SELECT memo FROM page_notes WHERE id = 'note-1'", "メモ"),
     ] {
         let stored = raw_column(&pool, sql);
@@ -2534,13 +2560,19 @@ fn migrate_column_crypto_encrypts_plaintext_rows() {
         vec!["平文の本文".to_string()]
     );
     assert_eq!(
-        notes::get_for_page(&pool, "b1", "", 3).unwrap().unwrap().memo,
+        notes::get_for_page(&pool, "b1", "", 3)
+            .unwrap()
+            .unwrap()
+            .memo,
         "平文のメモ"
     );
 
     // 2 回目は何もしない（フラグ。暗号文も置き換えない = 毎回 IV が変わらない）
     let before = raw_column(&pool, "SELECT memo FROM page_notes WHERE id = 'note-1'");
-    assert_eq!(thundoku_core::db::migrate_column_crypto_once(&pool).unwrap(), 0);
+    assert_eq!(
+        thundoku_core::db::migrate_column_crypto_once(&pool).unwrap(),
+        0
+    );
     assert_eq!(
         raw_column(&pool, "SELECT memo FROM page_notes WHERE id = 'note-1'"),
         before

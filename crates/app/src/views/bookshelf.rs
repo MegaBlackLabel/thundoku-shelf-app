@@ -31,14 +31,14 @@ use thundoku_core::booth::BoothClient;
 use thundoku_core::db;
 use thundoku_core::db::{books, bookshelf, documents, progress};
 use thundoku_core::dlsite::client::DlsiteClient;
+use thundoku_core::fantia::client::FantiaClient;
 use thundoku_core::fanza::client::FanzaClient;
 use thundoku_core::import::ImportSource;
 use thundoku_core::tbf::{self, TBF_DOWNLOAD_BASE, UreqTransport};
 
 use crate::actions::{
     CancelDownload, DeleteBackupFromDrive, DeleteBook, EditBookTags, HideBook, OpenAuth,
-    OpenAuthProvider, OpenReader, ToggleBackupExcluded,
-    SyncDrive,
+    OpenAuthProvider, OpenReader, SyncDrive, ToggleBackupExcluded,
 };
 use crate::app_state::{AppState, ToastKind};
 use crate::components::dialog::dialog_button;
@@ -1404,12 +1404,11 @@ const LOGIN_REQUIRED_FOR_IMPORT: &str =
 /// （起動時と、各サイトの同期が終わったときに未ダウンロードのお気に入りを落とす）。
 /// 取り込みには Google ログインが要る（鍵はアカウントごと。セキュリティ評価 F03）ので、
 /// その条件も書く。
-const FAVORITES_NOTE: &str =
-    "お気に入りにした本は、Google にログイン中のとき、同期時に未ダウンロードだと自動でダウンロードされます";
+const FAVORITES_NOTE: &str = "お気に入りにした本は、Google にログイン中のとき、同期時に未ダウンロードだと自動でダウンロードされます";
 
 /// 同期できるサイトの id（本棚の絞り込み・サイドバーのサイト行と同じ表記）。
 /// 「すべての本」での同期（`sync_all`）と、ログイン直後の自動同期が同じ一覧を使う。
-const SYNC_SITE_IDS: [&str; 4] = ["techbookfest", "booth", "fanza", "dlsite"];
+const SYNC_SITE_IDS: [&str; 5] = ["techbookfest", "booth", "fanza", "dlsite", "fantia"];
 
 /// 「すべての本」で同期するサイト（**ログイン済みだけ**）。
 ///
@@ -1425,6 +1424,7 @@ fn logged_in_sync_sites(cx: &App) -> Vec<&'static str> {
             "booth" => *state.booth_logged_in.lock(),
             "fanza" => *state.fanza_logged_in.lock(),
             "dlsite" => *state.dlsite_logged_in.lock(),
+            "fantia" => *state.fantia_logged_in.lock(),
             _ => false,
         })
         .collect()
@@ -1621,6 +1621,14 @@ fn import_failure(error: thundoku_core::import::ImportError) -> ImportFailure {
     }
 }
 
+/// 取り込めなかった作品を**自動で非表示**にするか。
+///
+/// 「中身が読めないと分かった」ときだけ。中止・2 GiB 超（確認待ち）・通信失敗など
+/// やり直せる失敗で棚から消すと、ユーザーの操作を勝手に無かったことにしてしまう。
+fn hides_after_failure(result: &Result<ImportOutcome, ImportFailure>) -> bool {
+    matches!(result, Err(ImportFailure::NotAReadable))
+}
+
 /// 取り込み結果を (トースト, 赤いエラー行) に変換する。
 /// I/O と切り離した純粋関数にして文言を試せるようにしている。
 fn download_messages(
@@ -1682,9 +1690,7 @@ fn split_tag_targets(targets: &[(String, String)]) -> (Vec<String>, Vec<String>,
     for (site_id, database_id) in targets {
         match site_id.as_str() {
             "fanza" if fanza.len() < FANZA_TAG_FETCH_PER_RUN => fanza.push(database_id.clone()),
-            "dlsite" if dlsite.len() < DLSITE_TAG_FETCH_PER_RUN => {
-                dlsite.push(database_id.clone())
-            }
+            "dlsite" if dlsite.len() < DLSITE_TAG_FETCH_PER_RUN => dlsite.push(database_id.clone()),
             // 上限を超えたぶんは次回に回す
             "fanza" | "dlsite" => remaining += 1,
             _ => {}
@@ -2700,6 +2706,35 @@ impl BookshelfView {
         CoverSlot::Remote
     }
 
+    /// ディスクからの表紙読み込みが終わったカードへ結果を反映する。
+    ///
+    /// 戻り値は「リモート取得を始めるべきか」（`Remote` に落ちたときだけ `true`）。
+    /// **呼び出し側は返り値が `true` なら取得を始めること**: ここで始めないと、
+    /// 直前の `reload` が組んだ取得対象の一覧に入らず（ディスクの読み込みは reload より
+    /// 後に終わるため）、NoImage のまま固まる（実測: ダウンロード済みの本で pack に
+    /// 表紙が無い取り込み）。
+    fn apply_cover_from_disk(
+        &mut self,
+        card_index: usize,
+        decoded: Option<Arc<RenderImage>>,
+    ) -> bool {
+        let key = cover_key(
+            &self.shelf_cards[card_index].shelf.site_id,
+            &self.shelf_cards[card_index].shelf.database_id,
+        );
+        let slot = match decoded {
+            Some(image) => {
+                self.cover_cache.insert(key, image.clone());
+                CoverSlot::Ready(image)
+            }
+            // ローカルの表紙が無い/壊れている: リモートで取り直せるなら対象に戻す
+            None if self.shelf_cards[card_index].shelf.thumbnail_url.is_some() => CoverSlot::Remote,
+            None => CoverSlot::Failed,
+        };
+        self.shelf_cards[card_index].cover = slot;
+        self.shelf_cards[card_index].cover.is_remote()
+    }
+
     /// 可視になったカードの表紙を読み込む（同じ表紙は二重に読まない）。
     ///
     /// 読み込みは背景スレッド（キャッシュファイル → pack の順に試す）で行い、完了したら
@@ -2737,19 +2772,13 @@ impl BookshelfView {
                     // reload でカードごと入れ替わっている（次に可視になったら読み直す）
                     return;
                 };
-                let slot = match decoded {
-                    Some(image) => {
-                        this.cover_cache.insert(key.clone(), image.clone());
-                        CoverSlot::Ready(image)
-                    }
-                    // ローカルの表紙が壊れていた: リモートで取り直せるなら対象に戻す
-                    None if this.shelf_cards[card_index].shelf.thumbnail_url.is_some() => {
-                        CoverSlot::Remote
-                    }
-                    None => CoverSlot::Failed,
-                };
-                this.shelf_cards[card_index].cover = slot;
+                let start_fetch = this.apply_cover_from_disk(card_index, decoded);
                 cx.notify();
+                // `Remote` に落ちたら**その場で取得を始める**（理由は
+                // `apply_cover_from_disk` のドキュメント参照）。
+                if start_fetch {
+                    this.fetch_remote_covers(cx);
+                }
             });
         })
         .detach();
@@ -3024,7 +3053,10 @@ impl BookshelfView {
                 // （例: BOOTH 完了 → reload → fetch 後に技術書典 307 件が reload される）、
                 // 残っているカードの表紙を取得するため 1 回だけ再実行する
                 let still_pending = this.shelf_cards.iter().any(|c| {
-                    c.local.is_none() && c.cover.is_remote() && c.shelf.thumbnail_url.is_some()
+                    // ローカル本（ダウンロード済み）も対象にする: pack に表紙が無い
+                    // 取り込みがあり、ディスクの読み込みに失敗すると `Remote` に落ちる。
+                    // ここで除外すると、その本の表紙が取得されないまま残る。
+                    c.cover.is_remote() && c.shelf.thumbnail_url.is_some()
                 });
                 if still_pending && ok > 0 && !this.cover_fetch_retried {
                     this.cover_fetch_retried = true;
@@ -3551,7 +3583,7 @@ impl BookshelfView {
         // （`self` を可変借用して同期するため、先に絞り込みを複製する）
         let site_filter = self.site_filter.clone();
         match site_filter.as_deref() {
-            Some(site @ ("techbookfest" | "booth" | "fanza" | "dlsite")) => {
+            Some(site @ ("techbookfest" | "booth" | "fanza" | "dlsite" | "fantia")) => {
                 self.sync_site(site, cx)
             }
             _ => {
@@ -3616,6 +3648,7 @@ impl BookshelfView {
             "booth" => self.sync_booth(cx),
             "fanza" => self.sync_fanza(cx),
             "dlsite" => self.sync_dlsite(cx),
+            "fantia" => self.sync_fantia(cx),
             _ => {}
         }
     }
@@ -4315,6 +4348,117 @@ impl BookshelfView {
         .detach();
     }
 
+    /// Fantia から本棚を同期する（ショップの購入履歴 → 画像系のみ bookshelf_items へ保存）。
+    ///
+    /// Fantia は公式 API が無く、一覧の HTML を 1 ページずつ辿り、**注文ごとに 1 リクエスト**
+    /// 増える（`fantia::sync` が間隔を空けて進める）。ページ数は HTML から分からないため、
+    /// 続きの通知は「あと何回か」の下限を出す。
+    pub fn sync_fantia(&mut self, cx: &mut Context<Self>) {
+        let logged_in = *AppState::global(cx).fantia_logged_in.lock();
+        if !logged_in {
+            crate::app_state::set_toast_kind(
+                cx,
+                ToastKind::Info,
+                "Fantia にログインしてから同期してください",
+            );
+            cx.defer(move |cx| {
+                cx.dispatch_action(&OpenAuthProvider {
+                    provider: crate::views::auth::AuthProvider::Fantia,
+                })
+            });
+            cx.notify();
+            return;
+        }
+        log::info!("sync_fantia: 開始");
+        self.sync_busy += 1;
+        // 前回の続き通知は新しい同期で置き換える
+        self.pending_sync_notice = None;
+        crate::app_state::set_toast_kind(cx, ToastKind::Info, "Fantia サイトのデータを取得中です");
+        let handle = cx.entity();
+        let state = Self::app_state(cx);
+        let session = state.fantia_session.lock().clone();
+        // 続きの位置（前回の続きがあればそこから取る）
+        let cursor = state.sync_cursors.lock().fantia.unwrap_or_default();
+        let db = state.db_pool.clone();
+        let owner = crate::app_state::owner_token(state);
+        let (tx, rx) = std::sync::mpsc::channel::<
+            Result<thundoku_core::fantia::sync::PurchaseBatch, String>,
+        >();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<thundoku_core::fantia::sync::PurchaseBatch, String> {
+                let session = session.ok_or_else(|| "Fantia セッションがありません".to_string())?;
+                let mut client =
+                    FantiaClient::with_transport(Box::new(UreqTransport::new()), session);
+                thundoku_core::fantia::sync::save_purchases_batch(
+                    &db,
+                    &mut client,
+                    owner.as_deref(),
+                    cursor,
+                    thundoku_core::fantia::sync::PURCHASE_PAGES_PER_RUN,
+                )
+                .map_err(|e| e.to_string())
+            })();
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_window, cx| {
+            let result = loop {
+                match rx.try_recv() {
+                    Ok(result) => break result,
+                    Err(_) => {
+                        handle.update(cx, |_, cx| cx.notify());
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(120))
+                            .await;
+                    }
+                }
+            };
+            handle.update(cx, |this, cx| {
+                this.sync_busy = this.sync_busy.saturating_sub(1);
+                match result {
+                    Ok(batch) => {
+                        let more = batch.next.is_some();
+                        log::info!(
+                            "sync_fantia: 完了（{} 件 / {} ページ、続きあり = {more}）",
+                            batch.saved,
+                            batch.fetched_pages
+                        );
+                        Self::app_state(cx).sync_cursors.lock().fantia = batch.next;
+                        this.reload(cx);
+                        this.show_sync_notice(
+                            cx,
+                            SyncNotice {
+                                site_id: "fantia",
+                                label: "Fantia",
+                                saved: batch.saved,
+                                // 一覧の HTML に総数の表記が無いため「全体 N 件」は出さない
+                                // （`batch.total_items` はこの実行で読んだ商品数で、全体ではない）
+                                total_items: 0,
+                                remaining_runs: batch.remaining_runs,
+                            },
+                            more,
+                        );
+                        // 同期で入ってきた未ダウンロードのお気に入りを自動で落とす
+                        this.auto_download_favorites(cx);
+                    }
+                    Err(message) => {
+                        log::error!("sync_fantia failed: {message}");
+                        crate::app_state::set_toast_kind(cx, ToastKind::Error, message.clone());
+                        if message.contains("not logged in") || message.contains("セッション")
+                        {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&OpenAuthProvider {
+                                    provider: crate::views::auth::AuthProvider::Fantia,
+                                })
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 技術書典から本棚を同期する（bookshelf_items upsert）。
     pub fn sync_tbf(&mut self, cx: &mut Context<Self>) {
         let logged_in = *AppState::global(cx).tbf_logged_in.lock();
@@ -4489,6 +4633,7 @@ impl BookshelfView {
         let booth_session = state.booth_session.lock().clone();
         let fanza_session = state.fanza_session.lock().clone();
         let dlsite_session = state.dlsite_session.lock().clone();
+        let fantia_session = state.fantia_session.lock().clone();
         let db = state.db_pool.clone();
         let packs_dir = state.packs_dir.clone();
         let downloads_dir = state.downloads_dir.clone();
@@ -4595,9 +4740,12 @@ impl BookshelfView {
                     } else {
                         thundoku_core::drm::DrmStatus::NoDrm
                     };
-                    if let Err(error) =
-                        thundoku_core::db::bookshelf::set_drm_status(&db, "fanza", &product_id, status)
-                    {
+                    if let Err(error) = thundoku_core::db::bookshelf::set_drm_status(
+                        &db,
+                        "fanza",
+                        &product_id,
+                        status,
+                    ) {
                         log::warn!("fanza: DRM 判定（{}）の記録に失敗: {error}", status.label());
                     }
                     if detail.is_drm {
@@ -4613,7 +4761,9 @@ impl BookshelfView {
                     // 上限を超える本は**転送の前に**断る（落としても取り込めない）
                     reject_declared_too_large(declared_size)?;
                     if !large_confirmed
-                        && thundoku_core::store_size::needs_large_download_confirmation(declared_size)
+                        && thundoku_core::store_size::needs_large_download_confirmation(
+                            declared_size,
+                        )
                     {
                         return Err(ImportFailure::TooLarge {
                             size: declared_size.unwrap_or_default(),
@@ -4706,6 +4856,38 @@ impl BookshelfView {
                     client
                         .download_to_file_with_progress(&url, temp.path(), &mut on_download)
                         .map_err(|error| download_failure(error, &cancel))?;
+                } else if site_id == "fantia" {
+                    // Fantia: 同期で保存した商品 id から `/products/<id>/download` を
+                    // 1 回だけ 302 追跡して CDN のファイルを取得する。
+                    //
+                    // 作品メタ（作者 / 容量）の API は無いので、DLsite のような
+                    // 詳細取得はしない（`item` のファイル名と購入日をそのまま使う）。
+                    let session = fantia_session
+                        .ok_or_else(|| "Fantia セッションがありません".to_string())?;
+                    let mut client =
+                        FantiaClient::with_transport(Box::new(UreqTransport::new()), session);
+                    let download_tx = progress_tx.clone();
+                    let download_progress_id = product_id.clone();
+                    // 中止要求（UI スレッド）が立っていたら転送を中断する。
+                    let download_cancel = cancel.clone();
+                    let mut on_download = move |downloaded: u64, total: u64| {
+                        if download_cancel.load(Ordering::SeqCst) {
+                            return false;
+                        }
+                        let fraction = if total > 0 {
+                            downloaded as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let _ = download_tx.send((
+                            download_progress_id.clone(),
+                            DownloadState::Downloading(fraction),
+                        ));
+                        true
+                    };
+                    client
+                        .download_to_file(&product_id, temp.path(), &mut on_download)
+                        .map_err(|error| download_failure(error, &cancel))?;
                 } else {
                     let mut client = tbf_client.lock();
                     // The bookshelf item's `downloadURL` (GraphQL
@@ -4765,10 +4947,11 @@ impl BookshelfView {
                     ));
                 }
                 let mut file_name = item_file_name(&title, &item);
-                // FANZA は ZIP（画像セット）または PDF。ファイル名由来の拡張子
-                // （既定 .pdf）で誤判定して PDF レンダリングするのを防ぐため、
-                // 実バイトのマジックナンバーから拡張子を判定する。
-                if (site_id == "fanza" || site_id == "dlsite")
+                // FANZA は ZIP（画像セット）または PDF。Fantia も同じくショップの
+                // ファイル名だけで種類が決まる。ファイル名由来の拡張子（既定 .pdf）で
+                // 誤判定して PDF レンダリングするのを防ぐため、実バイトの
+                // マジックナンバーから拡張子を判定する。
+                if (site_id == "fanza" || site_id == "dlsite" || site_id == "fantia")
                     && let Some(ext) = sniff_extension(&temp.head(64))
                 {
                     let stem = file_name
@@ -4892,8 +5075,7 @@ impl BookshelfView {
                         "zip" => {
                             // §6.3: 曖昧な構造（コンテンツが複数 / 形式が複数）は
                             // サマリー付きモーダルで既定表示を選んでもらってから取り込む
-                            let mut plan =
-                                thundoku_core::import::analyze_zip_path(temp.path())
+                            let mut plan = thundoku_core::import::analyze_zip_path(temp.path())
                                 .map_err(import_failure)?;
                             if import_needs_confirmation(&plan) {
                                 match ask_import_confirmation(
@@ -5076,6 +5258,11 @@ impl BookshelfView {
                 this.notify_download_progress(cx);
                 let (toast, error) = download_messages(&result);
                 let succeeded = result.is_ok();
+                // 取り込めないと分かった作品（動画のみ等）は自動で非表示にする
+                // （棚に「押すたびに失敗するカード」を残さない）
+                if hides_after_failure(&result) {
+                    this.hide_unreadable_book(cx, &database_id);
+                }
                 // 2 GiB 超: 手動なら確認ダイアログ、自動ダウンロードなら見送り通知
                 if let Err(ImportFailure::TooLarge { size }) = &result {
                     if auto {
@@ -5305,12 +5492,11 @@ impl BookshelfView {
         let state = Self::app_state(cx);
         let db = state.db_pool.clone();
         let google = state.google.clone();
-        let Some(folder_id) = db::settings::get(&db, "drive.sync.folder_id").ok().flatten() else {
-            crate::app_state::set_toast_kind(
-                cx,
-                ToastKind::Info,
-                "Drive の同期が未設定です",
-            );
+        let Some(folder_id) = db::settings::get(&db, "drive.sync.folder_id")
+            .ok()
+            .flatten()
+        else {
+            crate::app_state::set_toast_kind(cx, ToastKind::Info, "Drive の同期が未設定です");
             cx.notify();
             return;
         };
@@ -5325,15 +5511,19 @@ impl BookshelfView {
         let task = cx.background_executor().spawn(async move {
             let token = {
                 let mut guard = google.lock();
-                let client = guard.as_mut().ok_or_else(|| "Google にログインしてください".to_string())?;
+                let client = guard
+                    .as_mut()
+                    .ok_or_else(|| "Google にログインしてください".to_string())?;
                 client.access_token().map_err(|e| e.to_string())?
             };
             let mut drive = thundoku_core::drive::DriveClient::new(
                 Box::new(thundoku_core::tbf::UreqTransport::new()),
                 token,
             );
-            thundoku_core::drive::sync::delete_pack_from_drive(&db, &mut drive, &folder_id, &pack_id)
-                .map_err(|error| error.to_string())
+            thundoku_core::drive::sync::delete_pack_from_drive(
+                &db, &mut drive, &folder_id, &pack_id,
+            )
+            .map_err(|error| error.to_string())
         });
         cx.spawn(async move |_window, cx| {
             let result = task.await;
@@ -5983,6 +6173,29 @@ impl BookshelfView {
         !self.download_states.is_empty()
     }
 
+    /// 取り込めないと分かった作品（動画のみ等）を**自動で非表示**にする。
+    ///
+    /// 棚に「押すたびに失敗するカード」を残さない（動画作品は大きく、押すたびに
+    /// 全部ダウンロードして失敗する）。同期の upsert は `is_hidden` を保持するので
+    /// 次の同期で戻ってこない。設定画面の非表示から解除できる。
+    fn hide_unreadable_book(&mut self, cx: &mut Context<Self>, database_id: &str) {
+        let Some(site_id) = self
+            .shelf_cards
+            .iter()
+            .find(|card| card.shelf.database_id == database_id)
+            .map(|card| card.shelf.site_id.clone())
+        else {
+            return;
+        };
+        let db = &Self::app_state(cx).db_pool;
+        if let Err(error) = bookshelf::set_hidden(db, &site_id, database_id, true) {
+            log::warn!("取り込めない作品を非表示にできません: {site_id}/{database_id}: {error}");
+            return;
+        }
+        log::info!("取り込めない作品を非表示にしました: {site_id}/{database_id}");
+        self.reload(cx);
+    }
+
     /// その本のダウンロードが進行中か（中止できるか）。
     fn is_downloading(&self, database_id: &str) -> bool {
         self.download_states.contains_key(database_id)
@@ -6615,7 +6828,8 @@ impl BookshelfView {
                             .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
                                 ("booth", Some(date))
                                 | ("fanza", Some(date))
-                                | ("dlsite", Some(date)) => format!("購入日: {date}"),
+                                | ("dlsite", Some(date))
+                                | ("fantia", Some(date)) => format!("購入日: {date}"),
                                 _ => event_text.clone(),
                             }),
                     )
@@ -7857,7 +8071,10 @@ impl BookshelfView {
                     // Web の formatEventLabel と同じ: イベント不明のときは
                     // 「イベント不明」を表示
                     .child(match (shelf.site_id.as_str(), purchase_date.as_deref()) {
-                        ("booth", Some(date)) | ("fanza", Some(date)) | ("dlsite", Some(date)) => {
+                        ("booth", Some(date))
+                        | ("fanza", Some(date))
+                        | ("dlsite", Some(date))
+                        | ("fantia", Some(date)) => {
                             format!("購入日: {date}")
                         }
                         _ => event_text.clone(),
@@ -8271,7 +8488,8 @@ impl Render for BookshelfView {
         let pending_large_download = (modal == Some(crate::app_state::ModalKind::DownloadConfirm))
             .then(|| self.pending_large_download.clone())
             .flatten();
-        let pending_download_confirm = (modal == Some(crate::app_state::ModalKind::DownloadConfirm)
+        let pending_download_confirm = (modal
+            == Some(crate::app_state::ModalKind::DownloadConfirm)
             && pending_large_download.is_none())
         .then(|| self.pending_download_confirm.clone())
         .flatten();
@@ -8333,6 +8551,7 @@ impl Render for BookshelfView {
                     Some("techbookfest") => ("技術書典", "TechBookFest の本棚"),
                     Some("fanza") => ("FANZA同人", "FANZA同人の本棚"),
                     Some("dlsite") => ("DLsite", "DLsite の本棚"),
+                    Some("fantia") => ("Fantia", "Fantia の本棚"),
                     _ => ("すべての本", "すべてのサイトの本棚"),
                 };
                 let mut row = div()
@@ -9824,7 +10043,7 @@ fn apply_site_metadata(
     item: &bookshelf::BookshelfItem,
     site_author: Option<&str>,
 ) {
-    if !matches!(site_id, "booth" | "fanza" | "dlsite") {
+    if !matches!(site_id, "booth" | "fanza" | "dlsite" | "fantia") {
         return;
     }
     // 作者名が取れなかったときは既存の author を残す（空文字で消さない）
@@ -9959,7 +10178,8 @@ pub(crate) fn fetch_cover_bytes(
             }
             None => fetch_bytes(agent, &resolved),
         }
-    } else if site_id == "dlsite" {
+    } else if site_id == "dlsite" || site_id == "fantia" {
+        // 公開 CDN をそのまま取る（Fantia の商品画像は `c.fantia.jp`）。
         // TBF クライアントにはフォールバックしない（誤った経路で失敗するため）
         fetch_bytes(agent, &resolved)
     } else if site_id == "fanza" {
@@ -11120,6 +11340,31 @@ mod tests {
                 "YORIMIYA"
             );
         });
+        // Fantia: 作者の API は無いが、タイトルと購入日は同期の値を反映する
+        // （`caused_at` は必須。取れない作者は既存を消さない）
+        seed_shelf_item_for_site(cx, "fantia", "111111", "Fantia の本", "");
+        cx.update(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            thundoku_core::db::block_on(async {
+                sqlx::query("UPDATE bookshelf_items SET causedAt = '2026/07/30' WHERE database_id = '111111'")
+                    .execute(db)
+                    .await
+            })
+            .unwrap();
+            let fantia_item = bookshelf::list(db, "fantia").unwrap().remove(0);
+            apply_site_metadata(db, "fantia", "111111", "book-1", &fantia_item, None);
+            let book = books::get(db, "book-1").unwrap().unwrap();
+            assert_eq!(book.title, "Fantia の本", "Fantia のタイトルが入ること");
+            assert_eq!(
+                book.purchase_date.as_deref(),
+                Some("2026/07/30"),
+                "Fantia の購入日が入ること"
+            );
+            assert_eq!(
+                book.author, "YORIMIYA",
+                "Fantia では作者を取らないが、既存の作者を消してはいけない"
+            );
+        });
     }
 
     /// サイト側タグの反映は PDF / それ以外の両経路で同じ関数を通る。
@@ -11250,6 +11495,49 @@ mod tests {
                 !this.matches_filter(cx, card),
                 "未取得のリモート本は取得完了まで非表示"
             );
+        });
+    }
+
+    /// ディスク（pack / キャッシュ）に表紙が無い本は、**その場でリモート表紙を取りに行く**こと。
+    ///
+    /// pack に `thumbnail.webp` が無い取り込み（画像セットで表紙を作れない場合など）があり、
+    /// `Remote` に落ちたあと取得が始まらないと NoImage のまま固まる
+    /// （実測: ダウンロード済みの本。ディスクの読み込みは reload より後に終わるため、
+    /// reload が組んだ取得対象の一覧に入らない）。
+    #[gpui_kit::test]
+    async fn a_missing_local_cover_starts_a_remote_fetch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item(
+            cx,
+            "cover-fix-local-1",
+            "ローカル本",
+            "サークルA",
+            Some("https://example.invalid/local.png"),
+        );
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, _cx| {
+                // ディスクから読めなかった場合（pack に表紙が無い / キャッシュが無い）
+                let start = this.apply_cover_from_disk(0, None);
+                assert!(
+                    this.shelf_cards[0].cover.is_remote(),
+                    "リモート表紙の URL があるのに取得対象へ戻していない"
+                );
+                assert!(
+                    start,
+                    "リモート表紙を取りに行くべきなのに取得を始めていない（NoImage のまま固まる）"
+                );
+
+                // URL が無ければ NoImage（取得対象にはしない）
+                this.shelf_cards[0].shelf.thumbnail_url = None;
+                let start = this.apply_cover_from_disk(0, None);
+                assert!(
+                    matches!(this.shelf_cards[0].cover, CoverSlot::Failed),
+                    "URL が無いのに取得対象（Remote）にしている"
+                );
+                assert!(!start, "URL が無いのに取得を始めている");
+            });
         });
     }
 
@@ -13702,9 +13990,7 @@ mod tests {
     /// ファイル選択ダイアログはキーボードでも操作できる（↓ で次の候補、Enter で確定）。
     /// 背後の本棚にはキーを漏らさない（本棚の選択が勝手に動かない）。
     #[gpui_kit::test]
-    async fn file_choice_keyboard_moves_selection_and_confirms_with_enter(
-        cx: &mut TestAppContext,
-    ) {
+    async fn file_choice_keyboard_moves_selection_and_confirms_with_enter(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         login_google_for_import(cx);
@@ -14992,7 +15278,10 @@ mod tests {
         let (toast, error) = download_messages(&Err(ImportFailure::TooLarge {
             size: 3 * 1024 * 1024 * 1024,
         }));
-        assert!(toast.is_none() && error.is_none(), "確認前に通知を出している: {toast:?} / {error:?}");
+        assert!(
+            toast.is_none() && error.is_none(),
+            "確認前に通知を出している: {toast:?} / {error:?}"
+        );
     }
 
     /// 2 GiB 超の確認: 「取得する」で確認済みとして記録し、再開する。
@@ -15057,9 +15346,7 @@ mod tests {
             "やめたのに状態が残っている"
         );
         assert!(
-            view.read_with(cx, |this, _| this
-                .confirmed_large_downloads
-                .is_empty()),
+            view.read_with(cx, |this, _| this.confirmed_large_downloads.is_empty()),
             "やめたのに確認済みとして記録している"
         );
         assert!(
@@ -15101,6 +15388,56 @@ mod tests {
         // それ以外の失敗はそのまま出す
         let (_, error) = download_messages(&Err(ImportFailure::Message("通信に失敗".into())));
         assert_eq!(error.as_deref(), Some("通信に失敗"));
+
+        // 棚から外すのは「中身が読めないと分かった」ときだけ。やり直せる失敗
+        //（中止・2 GiB 超の確認待ち・通信失敗）では消さない。
+        assert!(hides_after_failure(&Err(ImportFailure::NotAReadable)));
+        assert!(!hides_after_failure(&Err(ImportFailure::Cancelled)));
+        assert!(!hides_after_failure(&Err(ImportFailure::DownloadCancelled)));
+        assert!(!hides_after_failure(&Err(ImportFailure::TooLarge {
+            size: 3_000_000_000
+        })));
+        assert!(!hides_after_failure(&Err(ImportFailure::Message(
+            "通信に失敗".into()
+        ))));
+        assert!(!hides_after_failure(&Ok(ImportOutcome {
+            title: "本".into(),
+            warnings: Vec::new(),
+        })));
+    }
+
+    /// 取り込めないと分かった作品（動画のみ等）は**自動で非表示**にすること。
+    ///
+    /// 棚に「押すたびに失敗するカード」を残さない。非表示は同期の upsert が保持するので
+    /// 次の同期で戻ってこない（設定画面の非表示から解除できる）。
+    #[gpui_kit::test]
+    async fn unreadable_work_is_hidden_after_the_failure(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item_for_site(cx, "fantia", "db-unreadable", "動画だけの作品", "サークルA");
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.hide_unreadable_book(cx, "db-unreadable")
+            });
+        });
+        cx.update(|cx| {
+            let this = view.read(cx);
+            assert!(
+                this.visible_shelf_cards(cx)
+                    .iter()
+                    .all(|card| card.shelf.database_id != "db-unreadable"),
+                "取り込めない作品が棚に残っている"
+            );
+            let db = &AppState::global(cx).db_pool;
+            assert!(
+                bookshelf::list_hidden(db)
+                    .unwrap()
+                    .iter()
+                    .any(|item| item.database_id == "db-unreadable"),
+                "非表示になっていない（DB に is_hidden が入っていない）"
+            );
+        });
     }
 
     /// 未ダウンロード本のタグ取得は、取得できた件数を通知する（0 件なら出さない）。
@@ -17299,6 +17636,30 @@ mod tests {
         assert_eq!(tbf, 2, "techbookfest filter must show only tbf items");
     }
 
+    /// Fantia のサイト絞り込みが効くこと（同期で入る `site_id="fantia"` の行が出る）。
+    ///
+    /// `bookshelf_items.site_id` は `sites` への FK なので、`sites` の行が無いと
+    /// そもそも保存できない（同期が FK で落ちる）。ここは保存できることも見る。
+    #[gpui_kit::test]
+    async fn fantia_site_filter_shows_only_fantia_items(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        seed_shelf_item_for_site(cx, "fantia", "111111", "Fantia の本", "");
+        seed_shelf_item_for_site(cx, "dlsite", "RJ1", "DLsite の本", "サークル");
+        let view = cx.new(BookshelfView::new);
+
+        let all = view.read_with(cx, |v, cx| v.visible_shelf_cards(cx).len());
+        assert_eq!(all, 2, "すべての本は両方出す");
+        cx.update(|cx| view.update(cx, |v, cx| v.set_site_filter(cx, Some("fantia"))));
+        let items = view.read_with(cx, |v, cx| {
+            v.visible_shelf_cards(cx)
+                .iter()
+                .map(|card| card.shelf.database_id.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(items, vec!["111111".to_string()], "Fantia の本だけが出る");
+    }
+
     #[gpui_kit::test]
     async fn event_filter_filters_by_selected_event(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
@@ -17886,9 +18247,7 @@ mod tests {
     /// 取り込みの書き込みとビューアーの読み込みは競合しない（DB は WAL、ページ画像は
     /// 別ファイル）。待たせると読書ができないため、開けるようにしてある。
     #[gpui_kit::test]
-    async fn another_download_does_not_block_opening_a_downloaded_book(
-        cx: &mut TestAppContext,
-    ) {
+    async fn another_download_does_not_block_opening_a_downloaded_book(cx: &mut TestAppContext) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         seed_book(cx, "local-1", "ローカル本", "サークル");
@@ -18428,7 +18787,8 @@ mod tests {
         let view = cx.new(BookshelfView::new);
 
         // 取得元があるサイトだけを、表示順で返す
-        let targets = cx.update(|cx| view.update(cx, |this, cx| this.tag_fetch_targets(cx, (0, 3))));
+        let targets =
+            cx.update(|cx| view.update(cx, |this, cx| this.tag_fetch_targets(cx, (0, 3))));
         assert_eq!(
             targets,
             vec![
@@ -18541,6 +18901,17 @@ mod tests {
             vec!["fanza"],
             "未ログインのサイトまで同期対象になっている"
         );
+
+        // Fantia もログイン済みなら対象に入る（`SYNC_SITE_IDS` の並び順）
+        cx.update(|cx| {
+            *AppState::global(cx).fantia_logged_in.lock() = true;
+        });
+        let sites = cx.update(|cx| logged_in_sync_sites(cx));
+        assert_eq!(
+            sites,
+            vec!["fanza", "fantia"],
+            "Fantia が同期対象に入っていない"
+        );
     }
 
     /// どのサイトにもログインしていなければ、同期対象は空（ログイン導線も出さない）。
@@ -18550,6 +18921,22 @@ mod tests {
         cx.update(AppState::init_test);
         let sites = cx.update(|cx| logged_in_sync_sites(cx));
         assert!(sites.is_empty(), "未ログインなのに同期対象がある");
+    }
+
+    /// Fantia を選んで同期したとき、未ログインならログインを促す（同期は始めない）。
+    #[gpui_kit::test]
+    async fn sync_site_without_fantia_login_asks_for_login(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(BookshelfView::new);
+        cx.update(|cx| view.update(cx, |this, cx| this.sync_site("fantia", cx)));
+        let busy = view.read_with(cx, |this, _| this.sync_busy);
+        assert_eq!(busy, 0, "未ログインなのに Fantia の同期が始まっている");
+        assert_eq!(
+            cx.update(|cx| AppState::global(cx).toast_message.lock().clone()),
+            Some("Fantia にログインしてから同期してください".to_string()),
+            "Fantia のログイン導線が出ていない"
+        );
     }
 
     /// サンプルモードの本棚は技術書典に固定される（保存値に他サイトが残っていても）。

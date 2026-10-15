@@ -439,6 +439,13 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         )
         .execute(&mut *conn)
         .await?;
+        // Fantia（`bookshelf_items.site_id` は `sites` への FK。行が無いと同期が落ちる）
+        sqlx::query(
+            "INSERT OR IGNORE INTO sites (id, name, url, display_order, is_visible) \
+             VALUES ('fantia', 'Fantia', 'https://fantia.jp/', 4, 1)",
+        )
+        .execute(&mut *conn)
+        .await?;
         // 複数アカウント対応: `books.owner_sub` と同じ所有者列を、アカウントに
         // 紐づく他テーブルにも持たせる。DB バックアップを現在 sub の行だけに
         // 絞るために使う（値は `books.owner_sub` と同じ keyring 鍵による暗号文）。

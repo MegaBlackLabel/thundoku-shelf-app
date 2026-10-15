@@ -1740,7 +1740,10 @@ pub(crate) fn shelf_event_text(shelf: Option<&db::bookshelf::BookshelfItem>) -> 
         .as_deref()
         .map(crate::views::bookshelf::format_purchase_date);
     match (shelf.site_id.as_str(), purchase_date.as_deref()) {
-        ("booth", Some(date)) | ("fanza", Some(date)) | ("dlsite", Some(date)) => {
+        ("booth", Some(date))
+        | ("fanza", Some(date))
+        | ("dlsite", Some(date))
+        | ("fantia", Some(date)) => {
             format!("購入日: {date}")
         }
         _ => shelf
@@ -1758,6 +1761,7 @@ fn site_label(site: &str) -> String {
         "booth" => "BOOTH".to_string(),
         "fanza" => "FANZA同人".to_string(),
         "dlsite" => "DLsite".to_string(),
+        "fantia" => "Fantia".to_string(),
         other => other.to_string(),
     }
 }
@@ -1807,14 +1811,7 @@ impl Render for HistoryView {
             view.built_rows
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             view.render_list_row(
-                window,
-                &row_theme,
-                &handle,
-                row_ix,
-                &tag_order,
-                selected,
-                view_mode,
-                card_width,
+                window, &row_theme, &handle, row_ix, &tag_order, selected, view_mode, card_width,
             )
         });
 
@@ -3090,13 +3087,14 @@ mod tests {
             bar.size.width.as_f32()
         );
         // 仮想化しても並びは同じ: 今日の日付バー → 今日のカード → 昨日の日付バー
-        let yesterday_bar = visual.debug_bounds("history-day-1").expect("昨日の日付バー");
+        let yesterday_bar = visual
+            .debug_bounds("history-day-1")
+            .expect("昨日の日付バー");
         let today_card = visual
             .debug_bounds(interned(format!("history-card-{today_key}-b1")))
             .expect("今日のカード");
         assert!(
-            bar.origin.y < today_card.origin.y
-                && today_card.origin.y < yesterday_bar.origin.y,
+            bar.origin.y < today_card.origin.y && today_card.origin.y < yesterday_bar.origin.y,
             "日付バーとカードの並びが崩れている（今日 {} / カード {} / 昨日 {}）",
             bar.origin.y.as_f32(),
             today_card.origin.y.as_f32(),

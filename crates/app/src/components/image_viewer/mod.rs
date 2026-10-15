@@ -579,7 +579,7 @@ fn resolve_page_turn(
     site_setting: Option<PageTurn>,
     site_id: Option<&str>,
 ) -> PageTurn {
-    let site_default = if matches!(site_id, Some("fanza") | Some("dlsite")) {
+    let site_default = if matches!(site_id, Some("fanza") | Some("dlsite") | Some("fantia")) {
         PageTurn::RightToLeft
     } else {
         PageTurn::LeftToRight
@@ -629,10 +629,8 @@ impl ImageViewer {
                 Some("spread") => ViewMode::Spread,
                 Some("scroll") => ViewMode::Scroll,
                 Some(_) => ViewMode::Single,
-                // 未設定のときのデフォルト: FANZA / DLsite は見開き。
-                None if site_id.as_deref() == Some("fanza")
-                    || site_id.as_deref() == Some("dlsite") =>
-                {
+                // 未設定のときのデフォルト: FANZA / DLsite / Fantia は見開き。
+                None if matches!(site_id.as_deref(), Some("fanza" | "dlsite" | "fantia")) => {
                     ViewMode::Spread
                 }
                 None => ViewMode::Single,
@@ -640,7 +638,7 @@ impl ImageViewer {
         };
         // ページめくり方向（本ごとの指定 → サイト別設定 → グローバル設定 → サイト既定）。
         // 本ごとの指定（books.page_turn）はビューアの綴じ切替で保存される。
-        // サイト既定は左綴じ（技術書典の本は左綴じ想定）、FANZA / DLsite は右綴じ。
+        // サイト既定は左綴じ（技術書典の本は左綴じ想定）、FANZA / DLsite / Fantia は右綴じ。
         let page_turn_right_to_left = {
             let state = crate::app_state::AppState::global(cx);
             let db = &state.db_pool;
@@ -2499,12 +2497,9 @@ impl Render for ImageViewer {
         // 上端 12px + ヘッダー 60px なので、残りを上限にして**中身をスクロール**させる。
         // コンテンツ（フォルダ）が多い本で下の方が見切れて選べなくなるのを防ぐ
         // （2026-09-26 の実機報告）。
-        let panel_content_max_h = (window.bounds().size.height.as_f32()
-            - WIN_TITLE_BAR_HEIGHT
-            - 12.0
-            - 60.0
-            - 16.0)
-            .max(200.0);
+        let panel_content_max_h =
+            (window.bounds().size.height.as_f32() - WIN_TITLE_BAR_HEIGHT - 12.0 - 60.0 - 16.0)
+                .max(200.0);
         if !input_focused && !self.note_dialog_open && !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
@@ -3874,7 +3869,11 @@ mod tests {
 
         // 帯のクリックは今までどおりページ送りに効く（伝播を止めても壊れていない）
         cx.update(|cx| view.update(cx, |this, cx| this.next_page(cx)));
-        assert_eq!(view.read_with(cx, |v, _| v.current_page), 2, "見開きは 2 ページ送り");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            2,
+            "見開きは 2 ページ送り"
+        );
         send_mouse_down(visual, 8.0, 300.0);
         assert_eq!(
             view.read_with(cx, |v, _| v.current_page),
@@ -4582,8 +4581,9 @@ mod tests {
             PageTurn::RightToLeft,
             "サイト設定が既定に負けている"
         );
-        // どちらも無ければサイト既定（同人漫画の FANZA / DLsite は右綴じ、それ以外は左綴じ）
-        for site in ["fanza", "dlsite"] {
+        // どちらも無ければサイト既定（同人漫画の FANZA / DLsite / Fantia は右綴じ、
+        // それ以外は左綴じ）
+        for site in ["fanza", "dlsite", "fantia"] {
             assert_eq!(
                 resolve_page_turn(None, None, Some(site)),
                 PageTurn::RightToLeft,

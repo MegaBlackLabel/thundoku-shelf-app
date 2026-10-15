@@ -14,6 +14,7 @@ use thundoku_core::google::GoogleProfile;
 use crate::app_state::AppState;
 use crate::views::booth_login::{BoothLoginCancelled, BoothLoginDone, BoothLoginView};
 use crate::views::dlsite_login::{DlsiteLoginCancelled, DlsiteLoginDone, DlsiteLoginView};
+use crate::views::fantia_login::{FantiaLoginCancelled, FantiaLoginDone, FantiaLoginView};
 use crate::views::fanza_login::{FanzaLoginCancelled, FanzaLoginDone, FanzaLoginView};
 use crate::views::google_login::{
     GoogleLoginCancelled, GoogleLoginDone, GoogleLoginFailed, GoogleLoginView,
@@ -28,6 +29,7 @@ pub enum AuthProvider {
     Booth,
     Fanza,
     Dlsite,
+    Fantia,
 }
 
 impl AuthProvider {
@@ -41,6 +43,7 @@ impl AuthProvider {
             AuthProvider::Booth => Some("booth"),
             AuthProvider::Fanza => Some("fanza"),
             AuthProvider::Dlsite => Some("dlsite"),
+            AuthProvider::Fantia => Some("fantia"),
             AuthProvider::Google => None,
         }
     }
@@ -67,6 +70,11 @@ pub struct AuthDialog {
     dlsite_login: Option<Entity<DlsiteLoginView>>,
     /// DlsiteLoginView のイベント購読（Done / Cancelled の 2 本）。束縛せずに捨てるとイベントが届かなくなる（✕ や完了でモーダルが閉じなくなる）
     dlsite_subscriptions: Vec<gpui_kit::Subscription>,
+    /// Fantia の WebView ログインモーダルを表示中か
+    show_fantia_login: bool,
+    fantia_login: Option<Entity<FantiaLoginView>>,
+    /// FantiaLoginView のイベント購読（Done / Cancelled の 2 本）。束縛せずに捨てるとイベントが届かなくなる（✕ や完了でモーダルが閉じなくなる）
+    fantia_subscriptions: Vec<gpui_kit::Subscription>,
     /// Google の WebView ログインモーダルを表示中か
     show_google_login: bool,
     google_login: Option<Entity<GoogleLoginView>>,
@@ -110,6 +118,9 @@ impl AuthDialog {
             show_dlsite_login: false,
             dlsite_login: None,
             dlsite_subscriptions: Vec::new(),
+            show_fantia_login: false,
+            fantia_login: None,
+            fantia_subscriptions: Vec::new(),
             show_google_login: false,
             google_login: None,
             google_subscriptions: Vec::new(),
@@ -135,6 +146,7 @@ impl AuthDialog {
             AuthProvider::Booth => self.show_booth_login = true,
             AuthProvider::Fanza => self.show_fanza_login = true,
             AuthProvider::Dlsite => self.show_dlsite_login = true,
+            AuthProvider::Fantia => self.show_fantia_login = true,
         }
     }
 
@@ -166,6 +178,12 @@ impl AuthDialog {
     #[cfg(test)]
     pub(crate) fn show_dlsite_login(&self) -> bool {
         self.show_dlsite_login
+    }
+
+    /// Fantia の WebView ログインモーダルを表示中か（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn show_fantia_login(&self) -> bool {
+        self.show_fantia_login
     }
 
     /// WebView（wry）は実ウィンドウが必要なため、ログインモーダルを
@@ -256,6 +274,35 @@ impl AuthDialog {
                 );
                 this.dlsite_subscriptions = vec![_done, _cancelled];
                 this.dlsite_login = Some(dlsite_login);
+                cx.notify();
+            });
+        }
+        // Fantia: WebView ログイン（テスト環境では WebView を作らない）
+        if self.show_fantia_login && self.fantia_login.is_none() {
+            cx.defer_in(window, |this, window, cx| {
+                let fantia_login = cx.new(|cx| FantiaLoginView::new(window, cx));
+                // 成功: WebView を閉じてモーダル全体も閉じる
+                let _done = cx.subscribe(
+                    &fantia_login,
+                    |this: &mut Self, _: Entity<FantiaLoginView>, _: &FantiaLoginDone, cx| {
+                        this.show_fantia_login = false;
+                        this.fantia_login = None;
+                        this.fantia_subscriptions.clear();
+                        this.request_site_sync_after_login(AuthProvider::Fantia, cx);
+                        cx.defer(|cx| cx.dispatch_action(&crate::actions::CloseAuth));
+                    },
+                );
+                // キャンセル: WebView を破棄してログイン画面に戻る（次回は新規フロー）
+                let _cancelled = cx.subscribe(
+                    &fantia_login,
+                    |this: &mut Self, _: Entity<FantiaLoginView>, _: &FantiaLoginCancelled, _| {
+                        this.show_fantia_login = false;
+                        this.fantia_login = None;
+                        this.fantia_subscriptions.clear();
+                    },
+                );
+                this.fantia_subscriptions = vec![_done, _cancelled];
+                this.fantia_login = Some(fantia_login);
                 cx.notify();
             });
         }
@@ -384,6 +431,11 @@ impl Render for AuthDialog {
         {
             dlsite.update(cx, |view, cx| view.show(cx));
         }
+        if self.show_fantia_login
+            && let Some(fantia) = &self.fantia_login
+        {
+            fantia.update(cx, |view, cx| view.show(cx));
+        }
         let error = self.error.clone();
         let tbf_logged_in = self.tbf_logged_in;
         let google_profile = self.google_profile.clone();
@@ -427,10 +479,15 @@ impl Render for AuthDialog {
                     Some(dlsite) => deferred(dlsite.clone()).into_any_element(),
                     None => div().into_any_element(),
                 }
+            } else if self.show_fantia_login {
+                match &self.fantia_login {
+                    Some(fantia) => deferred(fantia.clone()).into_any_element(),
+                    None => div().into_any_element(),
+                }
             } else {
                 div().into_any_element()
             })
-            .child(if self.show_booth_login || self.show_google_login || self.show_tbf_login || self.show_fanza_login || self.show_dlsite_login {
+            .child(if self.show_booth_login || self.show_google_login || self.show_tbf_login || self.show_fanza_login || self.show_dlsite_login || self.show_fantia_login {
                 // WebView のログインモーダル表示中は auth-modal（中央モーダル）を
                 // 重ねない。前面に出るログインビューがあるため不要な見た目になる。
                 div().into_any_element()
@@ -466,6 +523,7 @@ impl Render for AuthDialog {
                                     Some(AuthProvider::Booth) => "BOOTHでログイン",
                                     Some(AuthProvider::Fanza) => "FANZAでログイン",
                                     Some(AuthProvider::Dlsite) => "DLsiteでログイン",
+                                    Some(AuthProvider::Fantia) => "Fantiaでログイン",
                                     None => "ログイン",
                                 },
                             ))
@@ -617,6 +675,35 @@ impl Render for AuthDialog {
                                     }),
                             )
                             .into_any_element(),
+                        // Fantia: WebView でログイン（モーダル内で完結）
+                        Some(AuthProvider::Fantia) => div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "Fantia のログインはアプリ内ブラウザ（WebView）で行います。\nメールアドレスとパスワードに加えて認証（reCAPTCHA・2 段階認証）があるため、ログイン画面で続けて完了してください。セッションは自動で保存されます。",
+                                    ),
+                            )
+                            .child(
+                                Button::new("auth-fantia-open")
+                                    .cursor_pointer()
+                                    .primary()
+                                    .label("Fantiaログイン画面を開く")
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.show_fantia_login = true;
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            )
+                            .into_any_element(),
                         // BOOTH: WebView で pixiv ログイン（モーダル内で完結）
                         Some(AuthProvider::Booth) => div()
                             .flex()
@@ -726,6 +813,7 @@ mod dialog_render_tests {
             (AuthProvider::Booth, Some("booth")),
             (AuthProvider::Fanza, Some("fanza")),
             (AuthProvider::Dlsite, Some("dlsite")),
+            (AuthProvider::Fantia, Some("fantia")),
             (AuthProvider::Google, None),
         ] {
             cx.update(|cx| {
@@ -817,6 +905,20 @@ mod dialog_render_tests {
         assert!(
             dialog.read_with(cx, |d, _| d.show_dlsite_login()),
             "DLsite provider should open webview login directly"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn fantia_provider_opens_webview_login_flag(cx: &mut TestAppContext) {
+        cx.update(AppState::init_test);
+        let dialog = cx.new(AuthDialog::new);
+        dialog.update(cx, |dialog, _| {
+            dialog.open_with_provider(Some(AuthProvider::Fantia));
+        });
+        // プロバイダ指定で WebView ログインモーダルを直接開く（遅延なし）。
+        assert!(
+            dialog.read_with(cx, |d, _| d.show_fantia_login()),
+            "Fantia provider should open webview login directly"
         );
     }
 

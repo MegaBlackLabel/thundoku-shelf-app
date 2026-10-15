@@ -6,6 +6,33 @@
 
 ### Added
 
+- **Fantia（fantia.jp）のログイン**: FANZA / DLsite と同じくアプリ内 WebView でログインし、
+  セッション Cookie（`_session_id`）を端末の vault に保存する。`/sessions/signin` は
+  reCAPTCHA と 2 段階認証があるため、アプリから資格情報を送る自動ログインはしない
+  （ユーザーが WebView で完了する）。**ログイン完了は `/api/v1/me` が 200 を返すことで
+  確認する**（`_session_id` は未ログインでも発行されるため、Cookie の有無だけでは判定
+  できない。実測 2026-10-15）。アカウントメニュー / 設定から「Fantiaでログイン」を
+  開ける。購入の取り込み（同期）と本棚のサイト行は下の項目を参照。
+  `crates/core/src/fantia/`、`crates/app/src/views/fantia_login.rs`、`crates/app/src/views/auth.rs`、
+  `crates/app/src/views/settings.rs`、`crates/app/src/workspace.rs`、`crates/app/src/app_state.rs`、
+  `crates/core/src/session_store.rs`
+- **Fantia のサイト設定（設定画面）**: 表示モード（単一 / 見開き / スクロール）と
+  ページめくり方向を `viewer.mode.fantia` / `viewer.page_turn.fantia` として設定できる。
+  **既定は FANZA と同じ**（見開き + 右綴じ。既存のグローバルキーがあればそれに従う）。
+  ビューア側の未設定時の既定も FANZA と同じに揃えた。
+  `crates/app/src/views/settings.rs`、`crates/app/src/components/image_viewer/mod.rs`
+- **Fantia の購入の取り込み（同期）と本棚のサイト行**: ショップの購入履歴
+  （`/mypage/users/purchases`）を 1 ページずつ読み、注文ページの `ファイル名:` から
+  **ビューアーで開けるもの（zip / pdf / 画像）だけ**を `site_id="fantia"` で
+  `bookshelf_items` へ取り込む。動画 / 音声や、取り込みが対応していない `rar` / `7z` は
+  保存しない（開けない行を本棚に残さない）。リクエストは 300 ms 間隔で、
+  1 回の同期は 3 ページまで（続きは通知から）。ダウンロードは
+  `/products/<id>/download` の 302 を 1 回だけ辿って CDN のファイルを一時ファイルへ取り、
+  通常の取り込み経路に渡す。**表紙は商品ページの 1 枚目**（`ld+json` の `Product.image[0]`。
+  実測 2026-10-15）を使い、既に表紙がある行は商品ページを叩き直さない。サイドバーの
+  サイト行・「すべての本」の同期対象・履歴のサイト名にも Fantia が並ぶ。
+  `crates/core/src/fantia/{sync,shop,client}.rs`、`crates/core/src/db/{mod,bookshelf}.rs`、
+  `crates/app/src/views/{bookshelf,history}.rs`、`crates/app/src/{workspace,app_state}.rs`
 - **サイドバーのキーボード入口（`F6` / `Ctrl+0` / `Ctrl+B`）**: Tab はタイトルバーなどの
   タブストップに先に入って狙った枠へ行きにくいので、サイドバー専用の入口を用意した。
   <kbd>F6</kbd> または <kbd>Ctrl</kbd>+<kbd>0</kbd> でフォーカスが入り、上下キー /
@@ -38,6 +65,19 @@
 
 ### Fixed
 
+- **動画・音声のコンテンツを取り込まないようにした**: 一部の商品は ZIP に画像と動画が
+  混在し、`book_contents` に「動画」が残って切り替え先に出ていた（ビューアで開けない）。
+  取り込み時に**ビューアで読めない種別（音声・動画）をコンテンツ一覧から外す**ようにした。
+  動画しか無い商品は「読めるものが無い」として取り込まず、**自動で非表示**にする（棚に
+  「押すたびに大きいファイルを落として失敗するカード」を残さない。解除は設定画面の非表示から）。
+  既に取り込んだ本は**再ダウンロード**すると消える（再取り込みはコンテンツを入れ直す）。
+  `crates/core/src/import/mod.rs` / `crates/app/src/views/bookshelf.rs`
+- **ダウンロード済みの本で表紙が出ないことがある問題を修正**: pack に表紙
+  （`thumbnail.webp`）が無い取り込み（画像セットで表紙を作れない場合）があり、
+  ディスクから読めないと分かった時点でリモート表紙の取得が始まらず、NoImage のまま
+  固まっていた（ディスクの読み込みが reload より後に終わるため、reload が組んだ取得対象に
+  入らない）。読み込み失敗で取得対象へ戻ったら**その場で取得を始める**ようにし、取得完了後の
+  再試行からローカル本の除外も外した。`crates/app/src/views/bookshelf.rs`
 - **ダウンロード中でも、ダウンロード済みの本をビューアーで開けるようにした**: 他の本を
   取り込み中は（すでにダウンロード済みでも）「ダウンロード中です」で開けなかった。取り込みの
   書き込みとビューアーの読み込みは競合しない（DB は WAL、ページ画像は別ファイル）ため、

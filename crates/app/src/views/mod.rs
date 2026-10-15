@@ -4,6 +4,7 @@ pub mod bookshelf;
 pub mod booth_login;
 pub mod checklist;
 pub mod dlsite_login;
+pub mod fantia_login;
 pub mod fanza_login;
 pub mod google_login;
 pub mod history;
@@ -79,13 +80,12 @@ impl raw_window_handle::HasWindowHandle for OwnedHwnd {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        let hwnd = std::num::NonZero::new(self.0).ok_or(raw_window_handle::HandleError::Unavailable)?;
+        let hwnd =
+            std::num::NonZero::new(self.0).ok_or(raw_window_handle::HandleError::Unavailable)?;
         Ok(unsafe {
-            raw_window_handle::WindowHandle::borrow_raw(
-                raw_window_handle::RawWindowHandle::Win32(
-                    raw_window_handle::Win32WindowHandle::new(hwnd),
-                ),
-            )
+            raw_window_handle::WindowHandle::borrow_raw(raw_window_handle::RawWindowHandle::Win32(
+                raw_window_handle::Win32WindowHandle::new(hwnd),
+            ))
         })
     }
 }
@@ -114,11 +114,18 @@ pub(crate) fn create_login_webview<T: 'static>(
     initial_url: &'static str,
     on_ready: impl FnOnce(&mut T, Entity<WebView>, &mut Window, &mut Context<T>) + 'static,
 ) {
-    create_login_webview_reported(this, window, cx, incognito, initial_url, move |this, webview, window, cx| {
-        if let Some(webview) = webview {
-            on_ready(this, webview, window, cx);
-        }
-    });
+    create_login_webview_reported(
+        this,
+        window,
+        cx,
+        incognito,
+        initial_url,
+        move |this, webview, window, cx| {
+            if let Some(webview) = webview {
+                on_ready(this, webview, window, cx);
+            }
+        },
+    );
 }
 
 /// [`create_login_webview`] の「生成できなかった」も呼び出し側へ知らせる版。
@@ -156,8 +163,8 @@ fn create_login_webview_reported<T: 'static>(
                 Ok(webview) => webview,
                 Err(error) => {
                     log::error!("webview: build failed: {error:?} | {error}");
-                    let _ = weak
-                        .update_in(cx, |this, window, cx| on_result(this, None, window, cx));
+                    let _ =
+                        weak.update_in(cx, |this, window, cx| on_result(this, None, window, cx));
                     return;
                 }
             };
@@ -295,8 +302,10 @@ unsafe fn ns_view_has_window(view: *mut std::ffi::c_void) -> bool {
     #[link(name = "objc")]
     unsafe extern "C" {
         fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
-        fn objc_msgSend(obj: *mut std::ffi::c_void, sel: *mut std::ffi::c_void)
-            -> *mut std::ffi::c_void;
+        fn objc_msgSend(
+            obj: *mut std::ffi::c_void,
+            sel: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
     }
     if view.is_null() {
         return false;
@@ -546,10 +555,7 @@ pub(crate) fn collect_session_cookies(
 /// （完全一致の照会）が引けず、`DlsiteSession` などのログイン判定が「未認証」のままになって
 /// モーダルが閉じない（実測）。`Domain` 属性が起点に一致する**最初の起点**へ寄せる。
 /// どの起点にも一致しない Cookie（無関係なサイト）は `None`（後段の `retain` で落ちる）。
-fn cookie_home_origin<'a>(
-    cookie: &CookieEntry,
-    origin_hosts: &'a [String],
-) -> Option<&'a String> {
+fn cookie_home_origin<'a>(cookie: &CookieEntry, origin_hosts: &'a [String]) -> Option<&'a String> {
     origin_hosts.iter().find(|origin| {
         cookie.domain.as_deref().is_some_and(|domain| {
             let domain = domain.trim_start_matches('.').to_ascii_lowercase();
@@ -619,10 +625,19 @@ mod tests {
         };
 
         // host-only / 親ドメイン のどちらも最初の起点へ寄る
-        assert_eq!(cookie_home_origin(&cookie("www.dlsite.com"), &origins), Some(&origins[0]));
-        assert_eq!(cookie_home_origin(&cookie(".dlsite.com"), &origins), Some(&origins[0]));
+        assert_eq!(
+            cookie_home_origin(&cookie("www.dlsite.com"), &origins),
+            Some(&origins[0])
+        );
+        assert_eq!(
+            cookie_home_origin(&cookie(".dlsite.com"), &origins),
+            Some(&origins[0])
+        );
         // 起点でないサイトの Cookie は寄せない（後段の retain で落ちる）
-        assert_eq!(cookie_home_origin(&cookie("techbookfest.org"), &origins), None);
+        assert_eq!(
+            cookie_home_origin(&cookie("techbookfest.org"), &origins),
+            None
+        );
     }
 
     /// `cookies()` はデータストア全体を返すため、起点サイトと親子関係にあるドメインだけ残す。
@@ -640,7 +655,10 @@ mod tests {
         // 無関係なサイト・ラベル境界を偽装したものは落とす
         assert!(!host_is_related_to_any("techbookfest.org", &origins));
         assert!(!host_is_related_to_any("evilbooth.pm", &origins));
-        assert!(!host_is_related_to_any("booth.pm.evil.example.com", &origins));
+        assert!(!host_is_related_to_any(
+            "booth.pm.evil.example.com",
+            &origins
+        ));
     }
 
     /// 閉じるボタンは**モーダルの右上・すぐ外側**（技術書典のログインモーダルと同じ位置）。

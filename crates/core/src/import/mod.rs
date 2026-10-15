@@ -1116,7 +1116,10 @@ impl PackEntryStore {
 
     /// すでにメモリ上にあるエントリ群から作る（小さい本・画像 1 枚などの経路）。
     fn from_entries(entries: Vec<(String, Vec<u8>, String, bool)>) -> Self {
-        let total_bytes: u64 = entries.iter().map(|(_, data, _, _)| data.len() as u64).sum();
+        let total_bytes: u64 = entries
+            .iter()
+            .map(|(_, data, _, _)| data.len() as u64)
+            .sum();
         Self {
             entries: entries
                 .into_iter()
@@ -1223,9 +1226,9 @@ impl PackEntryStore {
                 let _ = std::fs::remove_file(&path);
                 Ok(data)
             }
-            StoredData::Memory(None) | StoredData::Taken => Err(ImportError::Zip(
-                "pack entry already taken".into(),
-            )),
+            StoredData::Memory(None) | StoredData::Taken => {
+                Err(ImportError::Zip("pack entry already taken".into()))
+            }
         }
     }
 }
@@ -1303,8 +1306,12 @@ fn finish_import(
 
     // Build the pack first (metadata + pages), so document.file_hash can
     // reference the real pack bytes.
-    let (metadata, metadata_path) =
-        metadata_entry(&title, Some(spec.total_pages), &spec.contents, spec.source.as_ref());
+    let (metadata, metadata_path) = metadata_entry(
+        &title,
+        Some(spec.total_pages),
+        &spec.contents,
+        spec.source.as_ref(),
+    );
     // **エントリを 1 件ずつ供給して組み立てる**: ページデータは `PackEntryStore` から
     // 必要なときに取り出す（メモリか一時ファイル）。全ページを同時に持たない。
     let mut entries = vec![opfspack::EntrySpec {
@@ -1350,34 +1357,29 @@ fn finish_import(
     })?;
     // **ファイルへ直接組み立てる**（pack 全体を RAM に持たない）。書き込み途中の
     // クラッシュで壊れた pack が残らないよう、一時ファイル → rename（原子的）で置換する。
-    let temp_file = pack_file.with_file_name(format!("{book_id}.{}.tmp", crate::pack_path::PACK_EXTENSION));
+    let temp_file = pack_file.with_file_name(format!(
+        "{book_id}.{}.tmp",
+        crate::pack_path::PACK_EXTENSION
+    ));
     let mut remainder = by_path;
     let built = PackBuilder::new(chrono::Utc::now().timestamp_millis() as u64)
-        .build_to_file_streaming(
-            &temp_file,
-            entries,
-            pack_key.as_ref(),
-            true,
-            |path| {
-                if path == metadata_path {
-                    return Ok(metadata_for_build.clone());
-                }
-                if path == TEXT_ENTRY {
-                    return texts_entry
-                        .clone()
-                        .ok_or_else(|| opfspack::PackError::Io("text entry missing".to_string()));
-                }
-                let index = remainder
-                    .get_mut(path)
-                    .and_then(std::collections::VecDeque::pop_front)
-                    .ok_or_else(|| {
-                        opfspack::PackError::Io(format!("import entry missing: {path}"))
-                    })?;
-                store
-                    .take(index)
-                    .map_err(|error| opfspack::PackError::Io(error.to_string()))
-            },
-        );
+        .build_to_file_streaming(&temp_file, entries, pack_key.as_ref(), true, |path| {
+            if path == metadata_path {
+                return Ok(metadata_for_build.clone());
+            }
+            if path == TEXT_ENTRY {
+                return texts_entry
+                    .clone()
+                    .ok_or_else(|| opfspack::PackError::Io("text entry missing".to_string()));
+            }
+            let index = remainder
+                .get_mut(path)
+                .and_then(std::collections::VecDeque::pop_front)
+                .ok_or_else(|| opfspack::PackError::Io(format!("import entry missing: {path}")))?;
+            store
+                .take(index)
+                .map_err(|error| opfspack::PackError::Io(error.to_string()))
+        });
     drop(store);
     let pack_bytes = built?;
     if let Err(error) = std::fs::rename(&temp_file, &pack_file) {
@@ -1654,7 +1656,14 @@ pub fn import_file(
     match extension.as_str() {
         // PDF は**ファイルから**読む（4 GiB 級をメモリに載せない）
         "pdf" => import_pdf_path(
-            pool, &file_name, source_path, packs_dir, root_key, progress, None, source,
+            pool,
+            &file_name,
+            source_path,
+            packs_dir,
+            root_key,
+            progress,
+            None,
+            source,
         ),
         // EPUB は pack に 1 エントリとして入れるだけ（ビューアー非対応）なので全体を読む
         "epub" => {
@@ -1663,7 +1672,14 @@ pub fn import_file(
         }
         // ZIP はファイルから読む（同じく大きい本があるため）
         "zip" => import_zip_path(
-            pool, &file_name, source_path, packs_dir, root_key, progress, None, source,
+            pool,
+            &file_name,
+            source_path,
+            packs_dir,
+            root_key,
+            progress,
+            None,
+            source,
         ),
         _ => Err(ImportError::UnsupportedType(extension)),
     }
@@ -1782,19 +1798,26 @@ fn import_pdf_rendered(
     let format_id = content.formats[0].format_id.clone();
     let page_rows: Vec<PageRow> = rows
         .into_iter()
-        .map(|(page_number, width, height, entry_path, file_size)| PageRow {
-            content_id: Some(content_id.clone()),
-            format_id: Some(format_id.clone()),
-            page_number,
-            width,
-            height,
-            entry_path,
-            file_size,
-        })
+        .map(
+            |(page_number, width, height, entry_path, file_size)| PageRow {
+                content_id: Some(content_id.clone()),
+                format_id: Some(format_id.clone()),
+                page_number,
+                width,
+                height,
+                entry_path,
+                file_size,
+            },
+        )
         .collect();
     // cover = page 1; thumbnail = page 1 scaled to 200px width（レンダリング中に作ってある）。
     if let Some(cover) = cover {
-        store.push("cover.webp".to_string(), cover, "image/webp".to_string(), false)?;
+        store.push(
+            "cover.webp".to_string(),
+            cover,
+            "image/webp".to_string(),
+            false,
+        )?;
     }
     if let Some(thumbnail) = thumbnail {
         store.push(
@@ -1901,30 +1924,25 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     ka.len().cmp(&kb.len())
 }
 
-/// 既定の優先コンテンツを選ぶ（表紙・junk は `build_contents` で除外済み）。
+/// 既定の優先コンテンツを選ぶ（表紙・junk は `build_contents` で、ビューアで開けない
+/// 種別は `analyze_zip_with` で除外済み）。
 ///
 /// 1. 名前に「本文」系の語を含むもの
 /// 2. ページ数の目安が最大のもの
 /// 3. 同数なら PDF / EPUB を優先、最後は索引順
 fn choose_primary(contents: &[PlannedContent]) -> usize {
-    // ビューアで読める種別だけを候補にする（音声・動画は取り込めない）
-    let candidates: Vec<usize> = contents
-        .iter()
-        .enumerate()
-        .filter(|(_, content)| is_viewable_media(content.media_kind))
-        .map(|(index, _)| index)
-        .collect();
-    let Some(&fallback) = candidates.first() else {
+    if contents.is_empty() {
+        // 呼び出し側が「読めるものが無い」として扱う（`commit` が NotAReadableWork を返す）
         return 0;
-    };
-    if let Some(&body) = candidates
+    }
+    if let Some(body) = contents
         .iter()
-        .find(|&&index| is_body_name(&contents[index].display_name))
+        .position(|content| is_body_name(&content.display_name))
     {
         return body;
     }
-    let mut best = fallback;
-    for &index in &candidates {
+    let mut best = 0;
+    for index in 0..contents.len() {
         let pages = contents[index].page_hint();
         let best_pages = contents[best].page_hint();
         let prefer_media = matches!(contents[index].media_kind, MediaKind::Pdf | MediaKind::Epub)
@@ -2000,7 +2018,14 @@ pub fn analyze_zip_with<R: std::io::Read + std::io::Seek>(
             ),
         });
     }
-    let contents = build_contents(&metas);
+    // 音声・動画はビューアで開けないので**コンテンツ一覧からも外す**
+    // （`book_contents` に残すと、切り替え先に「開けないエントリ」が出る。実データで
+    // Fantia の ZIP に `movie`（video）が混在していた）。全部外れたらコンテンツが空になり、
+    // `commit` が `NotAReadableWork` を返して取り込まない（＝対象外）。
+    let contents: Vec<PlannedContent> = build_contents(&metas)
+        .into_iter()
+        .filter(|content| is_viewable_media(content.media_kind))
+        .collect();
     let primary = choose_primary(&contents);
 
     // `_export.txt` は本文テキストなので解析時に読む（小さく、画像の伸長は伴わない）。
@@ -2971,10 +2996,9 @@ mod pack_root_key_tests {
     #[test]
     fn logged_in_without_key_fails_instead_of_plaintext() {
         let owner = profile("sub-1");
-        let error = pack_root_key_for_import(Some(&owner), |_| {
-            Err(ImportError::IdentityKeyUnavailable)
-        })
-        .expect_err("鍵が無いなら平文にしない");
+        let error =
+            pack_root_key_for_import(Some(&owner), |_| Err(ImportError::IdentityKeyUnavailable))
+                .expect_err("鍵が無いなら平文にしない");
 
         // 利用者に伝わる文言（内部型名や空文字を出さない）。
         // 「旧形式のため再取り込みが必要」（v2 pack の案内）とは別の、復元を促す文言。
@@ -3011,15 +3035,16 @@ mod pack_root_key_tests {
     fn empty_sub_is_rejected() {
         for sub in ["", "   "] {
             let broken = profile(sub);
-            let error = pack_root_key_for_import(Some(&broken), |_| {
-                panic!("空の sub では鍵を解決しない")
-            })
-            .expect_err("空の sub で暗号化しない");
-            assert!(matches!(error, ImportError::IdentitySubMissing), "{error:?}");
+            let error =
+                pack_root_key_for_import(Some(&broken), |_| panic!("空の sub では鍵を解決しない"))
+                    .expect_err("空の sub で暗号化しない");
+            assert!(
+                matches!(error, ImportError::IdentitySubMissing),
+                "{error:?}"
+            );
         }
     }
 }
-
 
 #[cfg(test)]
 mod pack_entry_store_tests {
@@ -3051,7 +3076,10 @@ mod pack_entry_store_tests {
             .push("a".into(), vec![2u8; 10], "image/webp".into(), true)
             .unwrap();
         let index = store.index_by_path();
-        assert_eq!(index["a"].clone().into_iter().collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(
+            index["a"].clone().into_iter().collect::<Vec<_>>(),
+            vec![0, 1]
+        );
         assert_eq!(store.specs().len(), 2);
     }
 
@@ -3100,8 +3128,7 @@ mod pack_entry_store_tests {
 #[cfg(test)]
 mod zip_entry_limit_tests {
     use super::{
-        ImportError, MAX_ZIP_ENTRY_BYTES, read_zip_entry_capped_detail,
-        zip_entry_too_large_error,
+        ImportError, MAX_ZIP_ENTRY_BYTES, read_zip_entry_capped_detail, zip_entry_too_large_error,
     };
     use std::io::Write as _;
 
@@ -3147,7 +3174,10 @@ mod zip_entry_limit_tests {
             "上限値が入る: {message}"
         );
         assert!(message.contains("宣言 1000 バイト"), "{message}");
-        assert!(message.contains("実際に読めた 700000000 バイト"), "{message}");
+        assert!(
+            message.contains("実際に読めた 700000000 バイト"),
+            "{message}"
+        );
     }
 }
 
@@ -3211,7 +3241,11 @@ mod page_render_bench {
         // 幅 1600 に収めた場合（表示は最大でも 1000px 幅相当。縮小するとどうなるか）
         if decoded.width() > 1600 {
             let t = std::time::Instant::now();
-            let small = decoded.resize_exact(1600, 1600 * decoded.height() / decoded.width(), image::imageops::FilterType::Triangle);
+            let small = decoded.resize_exact(
+                1600,
+                1600 * decoded.height() / decoded.width(),
+                image::imageops::FilterType::Triangle,
+            );
             let resize = t.elapsed();
             let rgba = small.to_rgba8();
             let t = std::time::Instant::now();
@@ -3237,8 +3271,84 @@ mod backup_exclude_tests {
             !should_auto_exclude_backup(AUTO_EXCLUDE_BACKUP_PACK_BYTES),
             "上限ちょうどは対象内（境界）"
         );
-        assert!(should_auto_exclude_backup(AUTO_EXCLUDE_BACKUP_PACK_BYTES + 1));
+        assert!(should_auto_exclude_backup(
+            AUTO_EXCLUDE_BACKUP_PACK_BYTES + 1
+        ));
         // 実データの想定: 1.03GB の pack は対象外になる
         assert!(should_auto_exclude_backup(1_080_044_140));
+    }
+}
+
+#[cfg(test)]
+mod content_filter_tests {
+    use super::{MediaKind, analyze_zip};
+
+    /// 画像 + 動画の ZIP を作る（中身は検証しないので、画像だけ本物の PNG にする）。
+    fn zip_with(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            for (name, data) in entries {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    fn png() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    /// 動画はコンテンツ一覧から外すこと。
+    ///
+    /// ビューアで開けないコンテンツは**切り替え先にも出さない**（実データで
+    /// `movie`（`media_kind=video`）が入っていた）。
+    #[test]
+    fn non_viewable_contents_are_dropped_from_the_plan() {
+        let bytes = zip_with(&[
+            ("photo/01.png", png()),
+            ("photo/02.png", png()),
+            ("movie/01.mp4", vec![0u8; 16]),
+        ]);
+        let plan = analyze_zip(&bytes).unwrap();
+        assert!(
+            plan.contents
+                .iter()
+                .all(|content| content.media_kind == MediaKind::Image),
+            "動画のコンテンツが残っている: {:?}",
+            plan.contents
+                .iter()
+                .map(|content| (content.display_name.as_str(), content.media_kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.contents[plan.primary].media_kind,
+            MediaKind::Image,
+            "既定表示が画像でない"
+        );
+    }
+
+    /// 動画しか無い ZIP は「読めるものが無い」ものとして扱う（本にしない）。
+    #[test]
+    fn a_video_only_zip_has_no_contents() {
+        let bytes = zip_with(&[("movie/01.mp4", vec![0u8; 16])]);
+        let plan = analyze_zip(&bytes).unwrap();
+        assert!(
+            plan.contents.is_empty(),
+            "動画だけの ZIP をコンテンツとして扱っている: {:?}",
+            plan.contents
+                .iter()
+                .map(|content| content.display_name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }

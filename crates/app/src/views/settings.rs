@@ -7,13 +7,13 @@ use gpui_kit::StyledImage as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, Focusable as _, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement as _,
     Subscription, Window, div, img, px, relative,
 };
 use gpui_kit::{ReadGlobal as _, Styled as _};
-use gpui_kit::prelude::FluentBuilder as _;
 
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
@@ -71,6 +71,10 @@ pub struct SettingsView {
     dlsite_viewer_mode: String,
     /// DLsite サイトのページめくり方向
     dlsite_page_turn: String,
+    /// Fantia サイトのビューアー表示モード（viewer.mode.fantia と同期）
+    fantia_viewer_mode: String,
+    /// Fantia サイトのページめくり方向
+    fantia_page_turn: String,
     /// ビューアのホイール方向（`down-to-next` = 下スクロールで次へ / `up-to-next`）。
     /// サイトに依らない設定なので共通カードに出す。
     viewer_wheel_direction: String,
@@ -299,6 +303,13 @@ impl SettingsView {
             dlsite_page_turn: Self::read_setting(cx, "viewer.page_turn.dlsite")
                 .or_else(|| Self::read_setting(cx, "viewer.page_turn"))
                 .unwrap_or_else(|| "right-to-left".into()),
+            // Fantia も同人漫画なので **FANZA と同じ**既定（見開き + 右綴じ）。
+            fantia_viewer_mode: Self::read_setting(cx, "viewer.mode.fantia")
+                .or_else(|| Self::read_setting(cx, "viewer.mode"))
+                .unwrap_or_else(|| "spread".into()),
+            fantia_page_turn: Self::read_setting(cx, "viewer.page_turn.fantia")
+                .or_else(|| Self::read_setting(cx, "viewer.page_turn"))
+                .unwrap_or_else(|| "right-to-left".into()),
             // ホイール方向は画面に入ったとき（`reload`）に読む。ここは既定値。
             // Windows / macOS とも「ユーザーにとっての下（文書の先へ進む）」が次へ
             // （macOS は AppKit がナチュラルスクロール設定を反映した値を渡す）。
@@ -432,6 +443,20 @@ impl SettingsView {
     pub fn set_dlsite_page_turn(&mut self, cx: &mut Context<Self>, direction: &str) {
         self.dlsite_page_turn = direction.to_string();
         Self::write_setting(cx, "viewer.page_turn.dlsite", direction);
+        cx.notify();
+    }
+
+    /// Fantia サイトの表示モードを保存。
+    pub fn set_fantia_viewer_mode(&mut self, cx: &mut Context<Self>, mode: &str) {
+        self.fantia_viewer_mode = mode.to_string();
+        Self::write_setting(cx, "viewer.mode.fantia", mode);
+        cx.notify();
+    }
+
+    /// Fantia サイトのページめくり方向を保存。
+    pub fn set_fantia_page_turn(&mut self, cx: &mut Context<Self>, direction: &str) {
+        self.fantia_page_turn = direction.to_string();
+        Self::write_setting(cx, "viewer.page_turn.fantia", direction);
         cx.notify();
     }
 
@@ -882,7 +907,13 @@ impl SettingsView {
                             );
                             match bytes {
                                 Some(bytes) => {
-                                    write_cover_cache(db, thumbnails_dir, site_id, database_id, &bytes);
+                                    write_cover_cache(
+                                        db,
+                                        thumbnails_dir,
+                                        site_id,
+                                        database_id,
+                                        &bytes,
+                                    );
                                     ok.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 }
                                 None => {
@@ -1330,6 +1361,14 @@ impl SettingsView {
         cx.notify();
     }
 
+    pub fn logout_fantia(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let t = std::time::Instant::now();
+        let purge = crate::app_state::clear_fantia_session(cx);
+        log::info!("logout_fantia: cleared ({:?})", t.elapsed());
+        self.report_logout("Fantia", purge, cx);
+        cx.notify();
+    }
+
     /// ログアウトの結果を知らせる。永続値の削除に失敗したら**成功として見せない**
     /// （共有端末で「消えた」と誤解させないため）。
     fn report_logout(&mut self, service: &str, purge: Result<(), String>, cx: &mut Context<Self>) {
@@ -1471,7 +1510,8 @@ impl SettingsView {
                 None => {
                     log::info!("sync_drive_now: looking for an existing folder");
                     // 既存の同名フォルダを先に探す（毎回作ると My Drive 直下に孤児が増える）
-                    let id = ensure_folder(&mut drive, SYNC_FOLDER_NAME).map_err(|e| e.to_string())?;
+                    let id =
+                        ensure_folder(&mut drive, SYNC_FOLDER_NAME).map_err(|e| e.to_string())?;
                     let _ = db::settings::set(&db, "drive.sync.folder_id", &id);
                     id
                 }
@@ -1505,8 +1545,7 @@ impl SettingsView {
                     key,
                     sub: Some(sub),
                 };
-                let baseline =
-                    db::settings::get(&db, "drive.backup.md5").ok().flatten();
+                let baseline = db::settings::get(&db, "drive.backup.md5").ok().flatten();
                 match sync::inspect_drive_backup(
                     &db,
                     &mut drive,
@@ -2062,6 +2101,8 @@ impl SettingsView {
                                                         this.set_fanza_viewer_mode(cx, &value);
                                                     } else if site_id == "dlsite" {
                                                         this.set_dlsite_viewer_mode(cx, &value);
+                                                    } else if site_id == "fantia" {
+                                                        this.set_fantia_viewer_mode(cx, &value);
                                                     } else {
                                                         this.set_viewer_mode(cx, &value);
                                                     }
@@ -2133,6 +2174,8 @@ impl SettingsView {
                                                             this.set_fanza_page_turn(cx, &value);
                                                         } else if site_id == "dlsite" {
                                                             this.set_dlsite_page_turn(cx, &value);
+                                                        } else if site_id == "fantia" {
+                                                            this.set_fantia_page_turn(cx, &value);
                                                         } else {
                                                             this.set_page_turn(cx, &value);
                                                         }
@@ -2215,7 +2258,7 @@ impl SettingsView {
                 ),
         )
     }
-    /// アカウント欄（Google / 技術書典 / BOOTH / FANZA / DLsite のログイン状態）。
+    /// アカウント欄（Google / 技術書典 / BOOTH / FANZA / DLsite / Fantia のログイン状態）。
     ///
     /// `render` のスタックフレームを抑えるため別メソッドに切り出している。
     #[allow(clippy::too_many_arguments)]
@@ -2228,6 +2271,7 @@ impl SettingsView {
         booth_logged_in: bool,
         fanza_logged_in: bool,
         dlsite_logged_in: bool,
+        fantia_logged_in: bool,
         demo: bool,
     ) -> gpui_kit::AnyElement {
         let handle = cx.weak_entity();
@@ -2235,7 +2279,7 @@ impl SettingsView {
         self.settings_card(
             cx,
             "アカウント",
-            Some("技術書典・Google・BOOTH・FANZA・DLsite のログイン状態"),
+            Some("技術書典・Google・BOOTH・FANZA・DLsite・Fantia のログイン状態"),
             Icon::new(IconName::CircleUser)
                 .size(px(16.0))
                 .text_color(muted_fg),
@@ -2525,6 +2569,62 @@ impl SettingsView {
                                 })
                                 .into_any_element()
                         }),
+                )
+                // Fantia 行
+                .child(
+                    div()
+                        .debug_selector(|| "account-row-fantia".into())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("Fantia"))
+                                .child(div().text_xs().text_color(muted_fg).child(
+                                    if fantia_logged_in {
+                                        "ログイン済み"
+                                    } else {
+                                        "未ログイン"
+                                    },
+                                )),
+                        )
+                        .child(if fantia_logged_in {
+                            Button::new("logout-fantia")
+                                .cursor_pointer()
+                                .label("ログアウト")
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, window, cx| {
+                                        handle
+                                            .update(cx, |this, cx| this.logout_fantia(window, cx))
+                                            .ok();
+                                    }
+                                })
+                                .into_any_element()
+                        } else {
+                            Button::new("login-fantia")
+                                .cursor_pointer()
+                                .label("ログイン")
+                                .disabled(demo)
+                                .cursor_pointer()
+                                .on_click(|_, _window, cx| {
+                                    // アプリ内 WebView で Fantia のログインへ直接進む
+                                    cx.defer(move |cx| {
+                                        cx.dispatch_action(&OpenAuthProvider {
+                                            provider: AuthProvider::Fantia,
+                                        })
+                                    });
+                                })
+                                .into_any_element()
+                        }),
                 ),
         )
         .into_any_element()
@@ -2613,6 +2713,7 @@ impl Render for SettingsView {
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
         let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
+        let fantia_logged_in = *AppState::global(cx).fantia_logged_in.lock();
         let data_dir = AppState::global(cx).data_dir.clone();
         let confirm_data_dir = settings_confirm && self.confirm_data_dir;
         let confirm_clear_sync = settings_confirm && self.confirm_clear_sync;
@@ -2647,6 +2748,8 @@ impl Render for SettingsView {
         let fanza_page_turn = self.fanza_page_turn.clone();
         let dlsite_viewer_mode = self.dlsite_viewer_mode.clone();
         let dlsite_page_turn = self.dlsite_page_turn.clone();
+        let fantia_viewer_mode = self.fantia_viewer_mode.clone();
+        let fantia_page_turn = self.fantia_page_turn.clone();
         let status_counts = self.status_counts;
         let last_synced_at = self.api_last_sync_at.clone();
         let handle = cx.entity();
@@ -2687,6 +2790,14 @@ impl Render for SettingsView {
             "DLsite サイトの設定",
             dlsite_viewer_mode,
             dlsite_page_turn,
+        );
+        let fantia_viewer_settings = self.site_viewer_settings_card(
+            cx,
+            "fantia",
+            "Fantia サイト設定",
+            "Fantia サイトの設定",
+            fantia_viewer_mode,
+            fantia_page_turn,
         );
 
         let storage_settings = self.settings_card(
@@ -3182,12 +3293,7 @@ impl Render for SettingsView {
                             .child(
                                 div()
                                     .debug_selector(|| "passphrase-input".into())
-                                    .child(
-                                        Input::new(&input)
-                                            .cursor_text()
-                                            .w_full()
-                                            .mask_toggle(),
-                                    ),
+                                    .child(Input::new(&input).cursor_text().w_full().mask_toggle()),
                             )
                             .child(
                                 div()
@@ -3255,37 +3361,35 @@ impl Render for SettingsView {
                                  （Drive の鍵ファイルと sub を奪われても本は復号できません）。\
                                  パスフレーズを忘れると復元できません。"
                             }))
-                            .child(
-                                div().flex().flex_row().gap_2().child(if mode {
-                                    dialog_button("passphrase-only-disable", "必須を解除する")
-                                        .disabled(key_busy)
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                handle.update(cx, |this, cx| {
-                                                    this.disable_passphrase_only(cx)
-                                                });
-                                            }
-                                        })
-                                } else {
-                                    Button::new("passphrase-only-enable")
-                                        .cursor_pointer()
-                                        .label(if key_has_passphrase {
-                                            "必須にする（設定済みのパスフレーズを使う）"
-                                        } else {
-                                            "必須にする（上のパスフレーズを設定）"
-                                        })
-                                        .disabled(key_busy)
-                                        .on_click({
-                                            let handle = handle.clone();
-                                            move |_, _window, cx| {
-                                                handle.update(cx, |this, cx| {
-                                                    this.enable_passphrase_only(cx)
-                                                });
-                                            }
-                                        })
-                                }),
-                            ),
+                            .child(div().flex().flex_row().gap_2().child(if mode {
+                                dialog_button("passphrase-only-disable", "必須を解除する")
+                                    .disabled(key_busy)
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.disable_passphrase_only(cx)
+                                            });
+                                        }
+                                    })
+                            } else {
+                                Button::new("passphrase-only-enable")
+                                    .cursor_pointer()
+                                    .label(if key_has_passphrase {
+                                        "必須にする（設定済みのパスフレーズを使う）"
+                                    } else {
+                                        "必須にする（上のパスフレーズを設定）"
+                                    })
+                                    .disabled(key_busy)
+                                    .on_click({
+                                        let handle = handle.clone();
+                                        move |_, _window, cx| {
+                                            handle.update(cx, |this, cx| {
+                                                this.enable_passphrase_only(cx)
+                                            });
+                                        }
+                                    })
+                            })),
                     );
                 }
             } else {
@@ -3459,6 +3563,7 @@ impl Render for SettingsView {
             booth_logged_in,
             fanza_logged_in,
             dlsite_logged_in,
+            fantia_logged_in,
             demo,
         );
         div()
@@ -3513,6 +3618,7 @@ impl Render for SettingsView {
                     .child(booth_viewer_settings)
                     .child(fanza_viewer_settings)
                     .child(dlsite_viewer_settings)
+                    .child(fantia_viewer_settings)
                     // データ設定（Web のセクション見出し）
                     .child(
                         div()
@@ -4087,7 +4193,9 @@ mod tests {
 
         assert!(purge.is_err(), "削除失敗を成功として返している");
         assert!(
-            pending.iter().any(|slot| slot == StoreSession::Techbookfest.label()),
+            pending
+                .iter()
+                .any(|slot| slot == StoreSession::Techbookfest.label()),
             "次回起動用の印が残っていない: {pending:?}"
         );
         cx.update(|cx| {
@@ -4280,7 +4388,7 @@ mod tests {
             let arena_clear = window.draw(cx);
             arena_clear.clear(cx);
         });
-        // アカウント欄に FANZA / DLsite が並ぶ
+        // アカウント欄に FANZA / DLsite / Fantia が並ぶ
         assert!(
             visual.debug_bounds("account-row-fanza").is_some(),
             "アカウントに FANZA 行があること"
@@ -4289,12 +4397,20 @@ mod tests {
             visual.debug_bounds("account-row-dlsite").is_some(),
             "アカウントに DLsite 行があること"
         );
-        // 各サイトの設定カードに「表紙更新」がある
-        let sites: [(&str, &'static str); 4] = [
+        // Fantia もログインの導線（本棚のサイト行と同期にも並ぶ）を出す
+        assert!(
+            visual.debug_bounds("account-row-fantia").is_some(),
+            "アカウントに Fantia 行があること"
+        );
+        // 各サイトの設定カードに「表紙更新」がある。Fantia も同期で `thumbnail_url`
+        // （商品ページの 1 枚目）を持つので、他サイトと同じく取得し直せる
+        //（`refresh_site_covers` はサイト非依存で、そのサイトの行を対象にする）。
+        let sites: [(&str, &'static str); 5] = [
             ("技術書典", "site-refresh-covers-techbookfest"),
             ("BOOTH", "site-refresh-covers-booth"),
             ("FANZA", "site-refresh-covers-fanza"),
             ("DLsite", "site-refresh-covers-dlsite"),
+            ("Fantia", "site-refresh-covers-fantia"),
         ];
         for (site, selector) in sites {
             assert!(
@@ -4303,7 +4419,6 @@ mod tests {
             );
         }
     }
-
 
     #[gpui_kit::test]
     async fn drive_sync_toggle_persists(cx: &mut TestAppContext) {
@@ -4355,7 +4470,7 @@ mod tests {
     #[gpui_kit::test]
     async fn drive_books_toggle_is_rendered_and_persists_on_click(cx: &mut TestAppContext) {
         // Drive カードは設定画面の下の方にあるので、縦に長いウィンドウで描く
-        const WINDOW_H: f32 = 3400.0;
+        const WINDOW_H: f32 = 3800.0;
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         cx.update(|cx| *AppState::global(cx).google_logged_in.lock() = true);
@@ -4485,7 +4600,10 @@ mod tests {
     /// ときだけ出す）。
     fn open_settings(
         cx: &mut TestAppContext,
-    ) -> (&'static mut gpui_kit::VisualTestContext, Entity<SettingsView>) {
+    ) -> (
+        &'static mut gpui_kit::VisualTestContext,
+        Entity<SettingsView>,
+    ) {
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         cx.update(|cx| *AppState::global(cx).google_logged_in.lock() = true);
@@ -4572,9 +4690,7 @@ mod tests {
             "切り替えで入力内容を失っている"
         );
         assert!(
-            visual.update(|window, cx| input.read(cx)
-                .focus_handle(cx)
-                .is_focused(window)),
+            visual.update(|window, cx| input.read(cx).focus_handle(cx).is_focused(window)),
             "切り替えでフォーカスを失っている"
         );
 
@@ -4614,10 +4730,7 @@ mod tests {
             assert!(!view.busy, "busy が解除されない");
             assert!(view.sync_progress.is_none(), "進捗が残っている");
             assert!(view.sync_cancel.is_none(), "中止フラグが残っている");
-            assert!(
-                view.error.is_some(),
-                "ログイン不足がエラーとして出ていない"
-            );
+            assert!(view.error.is_some(), "ログイン不足がエラーとして出ていない");
         });
     }
 
@@ -4708,7 +4821,7 @@ mod tests {
     async fn drive_sync_shows_progress_with_a_cancel_button(cx: &mut TestAppContext) {
         // Drive カードは設定画面の下の方（実測 y≈3000px）にあるので、縦に長いウィンドウで描く
         // （ウィンドウ外に描かれた要素はクリックできない）
-        const WINDOW_H: f32 = 3400.0;
+        const WINDOW_H: f32 = 3800.0;
         cx.update(gpui_kit::component::init);
         cx.update(AppState::init_test);
         cx.update(|cx| *AppState::global(cx).google_logged_in.lock() = true);
@@ -4903,5 +5016,50 @@ mod tests {
             "サンプルモードでデータ保存先が移動されている: {}",
             new_dir.display()
         );
+    }
+
+    /// Fantia のサイト設定は **FANZA と同じ既定**（見開き + 右綴じ）で、変更すると
+    /// `viewer.mode.fantia` / `viewer.page_turn.fantia` に保存されること。
+    #[gpui_kit::test]
+    async fn fantia_site_settings_default_to_fanza_and_persist(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        cx.update(AppState::init_test);
+        let view = cx.new(SettingsView::new);
+        let (mode, turn) = cx.read(|cx| {
+            let this = view.read(cx);
+            (
+                this.fantia_viewer_mode.clone(),
+                this.fantia_page_turn.clone(),
+            )
+        });
+        assert_eq!(mode, "spread", "既定が FANZA と同じ見開きになっていない");
+        assert_eq!(
+            turn, "right-to-left",
+            "既定が FANZA と同じ右綴じになっていない"
+        );
+
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.set_fantia_viewer_mode(cx, "single");
+                this.set_fantia_page_turn(cx, "left-to-right");
+            });
+        });
+        cx.read(|cx| {
+            let db = &AppState::global(cx).db_pool;
+            assert_eq!(
+                db::settings::get(db, "viewer.mode.fantia")
+                    .unwrap()
+                    .as_deref(),
+                Some("single"),
+                "表示モードが保存されていない"
+            );
+            assert_eq!(
+                db::settings::get(db, "viewer.page_turn.fantia")
+                    .unwrap()
+                    .as_deref(),
+                Some("left-to-right"),
+                "ページめくり方向が保存されていない"
+            );
+        });
     }
 }

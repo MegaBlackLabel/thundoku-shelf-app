@@ -278,16 +278,17 @@ pub struct Workspace {
     passphrase_notice_dismissed: bool,
 }
 
-/// いずれかのサイト（技術書典 / BOOTH / FANZA同人 / DLsite）にログイン済みか。
+/// いずれかのサイト（技術書典 / BOOTH / FANZA同人 / DLsite / Fantia）にログイン済みか。
 ///
 /// Google はアカウント連携用で本の供給元（サイト）ではないため含めない。
-/// 本棚のサイト行を出す判定と同じ 4 サイトを見る。
+/// 本棚のサイト行を出す判定と同じ 5 サイトを見る。
 fn any_site_logged_in(cx: &App) -> bool {
     let state = AppState::global(cx);
     *state.tbf_logged_in.lock()
         || *state.booth_logged_in.lock()
         || *state.fanza_logged_in.lock()
         || *state.dlsite_logged_in.lock()
+        || *state.fantia_logged_in.lock()
 }
 
 /// サイドバーの行（アイコン + ラベル）の見た目。
@@ -688,7 +689,8 @@ impl Workspace {
                     });
                 }
                 if any_changed {
-                    let _ = settings_entity.update(cx, |settings, cx| settings.sync_drive_now(false, cx));
+                    let _ = settings_entity
+                        .update(cx, |settings, cx| settings.sync_drive_now(false, cx));
                 }
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(interval_min as u64 * 60))
@@ -1634,7 +1636,8 @@ impl Workspace {
         let keys = crate::pack_keys::KeyContext::from_state(state);
         // アップロードの進捗を UI（スティッキー通知）へ流す口。
         // `send` は無限バッファなのでブロックしない（終了処理を止めない）。
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<thundoku_core::drive::sync::SyncProgress>();
+        let (progress_tx, progress_rx) =
+            std::sync::mpsc::channel::<thundoku_core::drive::sync::SyncProgress>();
         let task: gpui_kit::Task<Result<(), String>> = cx.background_executor().spawn(async move {
             log::info!("exit upload: start");
             let folder_id = db::settings::get(&db, "drive.sync.folder_id")
@@ -1654,7 +1657,11 @@ impl Workspace {
             });
             log::info!(
                 "exit upload: 鍵 {}",
-                if pack_root_key.is_some() { "ok" } else { "なし（平文 pack のみ同期）" }
+                if pack_root_key.is_some() {
+                    "ok"
+                } else {
+                    "なし（平文 pack のみ同期）"
+                }
             );
             // トークンだけ取り、**ロックはすぐ手放す**（この後の `sync` は `drive` を使う）。
             let token = {
@@ -1722,7 +1729,8 @@ impl Workspace {
                     // **値が変わったときだけ**更新する。加えて 250ms の間隔を空けて、
                     // 文字列が細かく変わっても描き直しが連続しないようにする。
                     // 通知は作り直さず、子ビュー（`exit_progress`）だけを `notify` する。
-                    let due = last_at.map(|at: std::time::Instant| at.elapsed().as_millis() >= 250)
+                    let due = last_at
+                        .map(|at: std::time::Instant| at.elapsed().as_millis() >= 250)
                         .unwrap_or(true);
                     if last.as_ref() != Some(&text) && due {
                         last = Some(text.clone());
@@ -1779,11 +1787,7 @@ impl Workspace {
                 let expired = crate::app_state::handle_google_auth_expiry(&error, cx);
                 let message = exit_upload_failure_message(&error, expired);
                 // 進行中（消えない）通知を、失敗の通知で置き換える。
-                crate::app_state::set_toast_kind(
-                    cx,
-                    crate::app_state::ToastKind::Error,
-                    message,
-                );
+                crate::app_state::set_toast_kind(cx, crate::app_state::ToastKind::Error, message);
                 cx.notify();
             });
         })
@@ -1825,6 +1829,8 @@ impl Workspace {
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
         let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
+        // Fantia もログイン状態とログアウトの導線を出す（本棚のサイト行にも並ぶ）
+        let fantia_logged_in = *AppState::global(cx).fantia_logged_in.lock();
         // サンプル（デモ）モードはログイン導線を無効にする（`open_auth` / `OpenAuthProvider`
         // でも止めるが、押せない見た目にしておく）。
         let demo = AppState::global(cx).demo;
@@ -1940,9 +1946,9 @@ impl Workspace {
                                 move |_, _window, cx| {
                                     if let Some(provider) = provider {
                                         cx.defer(move |cx| {
-                                            cx.dispatch_action(
-                                                &crate::actions::OpenAuthProvider { provider },
-                                            );
+                                            cx.dispatch_action(&crate::actions::OpenAuthProvider {
+                                                provider,
+                                            });
                                         });
                                         handle.update(cx, |this, cx| {
                                             this.auth_panel_open = false;
@@ -2006,6 +2012,12 @@ impl Workspace {
                 dlsite_logged_in,
                 Some(AuthProvider::Dlsite),
                 Some(crate::views::settings::SettingsView::logout_dlsite),
+            ))
+            .child(site_row(
+                "Fantia",
+                fantia_logged_in,
+                Some(AuthProvider::Fantia),
+                Some(crate::views::settings::SettingsView::logout_fantia),
             ))
     }
 
@@ -2223,21 +2235,23 @@ impl Render for Workspace {
                     // 作り直すと出入りのアニメーションが走って点滅するので、文言だけを
                     // 差し替えたいときはこの子ビューを `notify` する（通知は据え置き）。
                     let progress = self.exit_progress.clone();
-                    notification = notification.id::<ProgressNotice>().content(move |_, _, cx| {
-                        gpui_kit::div()
-                            .flex()
-                            .flex_row()
-                            .debug_selector(|| "notice-progress".into())
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                gpui_kit::component::spinner::Spinner::new()
-                                    .small()
-                                    .color(cx.theme().muted_foreground),
-                            )
-                            .child(progress.clone())
-                            .into_any_element()
-                    });
+                    notification = notification
+                        .id::<ProgressNotice>()
+                        .content(move |_, _, cx| {
+                            gpui_kit::div()
+                                .flex()
+                                .flex_row()
+                                .debug_selector(|| "notice-progress".into())
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    gpui_kit::component::spinner::Spinner::new()
+                                        .small()
+                                        .color(cx.theme().muted_foreground),
+                                )
+                                .child(progress.clone())
+                                .into_any_element()
+                        });
                 }
                 window.push_notification(notification, cx);
             }
@@ -3317,6 +3331,9 @@ impl Workspace {
             if *state.dlsite_logged_in.lock() {
                 targets.push(SidebarCursor::Site("dlsite"));
             }
+            if *state.fantia_logged_in.lock() {
+                targets.push(SidebarCursor::Site("fantia"));
+            }
         }
         targets.push(SidebarCursor::Nav(NavTarget::Favorites));
         targets.push(SidebarCursor::Nav(NavTarget::History));
@@ -3848,12 +3865,14 @@ impl Workspace {
         let booth_logged_in = *AppState::global(cx).booth_logged_in.lock();
         let fanza_logged_in = *AppState::global(cx).fanza_logged_in.lock();
         let dlsite_logged_in = *AppState::global(cx).dlsite_logged_in.lock();
+        let fantia_logged_in = *AppState::global(cx).fantia_logged_in.lock();
         // 「すべての本」+ ログイン中のサイトの行数ぶんの高さを確保する
         let submenu_height = Self::bookshelf_submenu_height(
             1 + usize::from(tbf_logged_in)
                 + usize::from(booth_logged_in)
                 + usize::from(fanza_logged_in)
-                + usize::from(dlsite_logged_in),
+                + usize::from(dlsite_logged_in)
+                + usize::from(fantia_logged_in),
         );
 
         div()
@@ -4074,6 +4093,47 @@ impl Workspace {
                                 .child("DLsite"),
                         )
                     })
+                    .when(fantia_logged_in, |this| {
+                        this.child(
+                            div()
+                                .id("bookshelf-site-fantia")
+                                .debug_selector(|| "bookshelf-site-fantia".into())
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded_lg()
+                                .px_2()
+                                .py_1p5()
+                                .text_xs()
+                                .border_1()
+                                .border_color(if keyboard_site("fantia") {
+                                    sidebar_row_cursor_border(&theme)
+                                } else {
+                                    gpui_kit::transparent_black()
+                                })
+                                .when(site_filter.as_deref() == Some("fantia"), |this| {
+                                    this.bg(theme.secondary)
+                                        .text_color(theme.primary)
+                                        .font_weight(FontWeight::MEDIUM)
+                                })
+                                .hover(|style| style.bg(theme.muted))
+                                .cursor_pointer()
+                                .on_click({
+                                    let handle = handle.clone();
+                                    move |_, _window, cx| {
+                                        cx.stop_propagation();
+                                        handle.update(cx, |this, cx| {
+                                            this.bookshelf.update(cx, |b, cx| {
+                                                b.set_site_filter(cx, Some("fantia"));
+                                            });
+                                            this.switch_to(NavTarget::Bookshelf, cx);
+                                            this.refresh_unread_count(cx);
+                                        });
+                                    }
+                                })
+                                .child("Fantia"),
+                        )
+                    })
                     .with_animation(
                         SharedString::from(format!(
                             "bookshelf-submenu-anim-{}",
@@ -4224,7 +4284,10 @@ mod tests {
             expired.contains("アップロードして終了できませんでした"),
             "{expired}"
         );
-        assert!(expired.contains("もう一度ログインしてください"), "{expired}");
+        assert!(
+            expired.contains("もう一度ログインしてください"),
+            "{expired}"
+        );
 
         let other = super::exit_upload_failure_message("Drive 同期が未設定です", false);
         assert!(other.contains("Drive 同期が未設定です"), "{other}");
@@ -4328,6 +4391,7 @@ mod tests {
                     "booth" => *state.booth_logged_in.lock() = true,
                     "fanza" => *state.fanza_logged_in.lock() = true,
                     "dlsite" => *state.dlsite_logged_in.lock() = true,
+                    "fantia" => *state.fantia_logged_in.lock() = true,
                     other => panic!("未知のサイト: {other}"),
                 }
             }
@@ -4669,9 +4733,7 @@ mod tests {
 
     /// 未アップロードの変更があるときは、これまでどおり終了確認を出す（閉じる要求は拒否）。
     #[gpui_kit::test]
-    async fn close_request_opens_the_exit_prompt_when_a_backup_is_pending(
-        cx: &mut TestAppContext,
-    ) {
+    async fn close_request_opens_the_exit_prompt_when_a_backup_is_pending(cx: &mut TestAppContext) {
         let ws = setup(cx);
         let sub = "sub-exit-pending";
         set_drive_ready(cx, sub);
@@ -5704,9 +5766,7 @@ mod tests {
     /// `clear_toast` で状態を消してしまう（通知そのものへの変換は
     /// `toast_is_delivered_as_a_notification` が固定する）。
     #[gpui_kit::test]
-    async fn exit_upload_failure_keeps_the_app_open_and_shows_the_error(
-        cx: &mut TestAppContext,
-    ) {
+    async fn exit_upload_failure_keeps_the_app_open_and_shows_the_error(cx: &mut TestAppContext) {
         let ws = setup(cx);
         // テスト環境は `drive.sync.folder_id` が無いので、終了時アップロードは必ず失敗する
         cx.update(|cx| {
@@ -6666,6 +6726,7 @@ mod tests {
             *state.booth_logged_in.lock() = true;
             *state.fanza_logged_in.lock() = true;
             *state.dlsite_logged_in.lock() = true;
+            *state.fantia_logged_in.lock() = true;
             ws.update(cx, |w, cx| {
                 w.sidebar_open = true;
                 w.bookshelf_submenu_open = true;
@@ -6681,7 +6742,7 @@ mod tests {
         );
         let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
         // 開閉アニメーション（200ms）が完了するまで描画する。
-        // 「高さが変わらなくなったら完了」とみなす（回数固定だと進み具合がぶれて不安定になる）。
+        // 「高さが変わらなくなったら完了」とみなす（回数固定だと進み具合でぶれて不安定になる）。
         let mut prev_height = gpui_kit::px(-1.0);
         for _ in 0..20 {
             cx.executor()
@@ -6704,12 +6765,60 @@ mod tests {
             .debug_bounds("bookshelf-submenu")
             .expect("サブメニューが描画されている");
         let last = visual
-            .debug_bounds("bookshelf-site-dlsite")
-            .expect("最終行 (DLsite) が描画されている");
+            .debug_bounds("bookshelf-site-fantia")
+            .expect("最終行 (Fantia) が描画されている");
         assert!(
             last.origin.y + last.size.height
                 <= wrap.origin.y + wrap.size.height + gpui_kit::px(1.0),
             "サブメニューの高さが足りず最終行が切れている: wrap={wrap:?} last={last:?}"
+        );
+    }
+
+    /// ログイン中のサイトだけがサイドバーのサイト行に出ること（Fantia の行も含む）。
+    #[gpui_kit::test]
+    async fn sidebar_site_rows_follow_the_logged_in_fantia_site(cx: &mut TestAppContext) {
+        let ws = setup_with_logins(cx, &["fantia"], false);
+        cx.update(|cx| {
+            ws.update(cx, |w, cx| {
+                w.sidebar_open = true;
+                w.bookshelf_submenu_open = true;
+                cx.notify();
+            });
+        });
+        let window = cx.open_window(
+            gpui_kit::Size {
+                width: gpui_kit::px(1200.0),
+                height: gpui_kit::px(800.0),
+            },
+            |window, cx| gpui_kit::component::Root::new(ws.clone(), window, cx),
+        );
+        let visual = gpui_kit::VisualTestContext::from_window(*window, cx).into_mut();
+        let mut prev_height = gpui_kit::px(-1.0);
+        for _ in 0..20 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(50));
+            visual.update(|window, cx| {
+                let arena_clear = window.draw(cx);
+                arena_clear.clear(cx);
+            });
+            let height = visual
+                .debug_bounds("bookshelf-submenu")
+                .map(|b| b.size.height);
+            if height == Some(prev_height) {
+                break;
+            }
+            if let Some(height) = height {
+                prev_height = height;
+            }
+        }
+        assert!(
+            visual.debug_bounds("bookshelf-site-fantia").is_some(),
+            "Fantia にログイン済みなのにサイト行が出ていない"
+        );
+        // 未ログインのサイトの行は出ない
+        assert!(
+            visual.debug_bounds("bookshelf-site-dlsite").is_none(),
+            "未ログインの DLsite の行が出ている"
         );
     }
 
@@ -6798,11 +6907,7 @@ mod tests {
             )
             .unwrap();
             std::fs::create_dir_all(&state.packs_dir).unwrap();
-            std::fs::write(
-                state.packs_dir.join(format!("{pack_id}.opfspack")),
-                b"PACK",
-            )
-            .unwrap();
+            std::fs::write(state.packs_dir.join(format!("{pack_id}.opfspack")), b"PACK").unwrap();
         });
     }
 
@@ -7202,7 +7307,11 @@ mod tests {
             ws.update(cx, |w, cx| w.confirm_exit_upload(cx));
         });
         draw_frames(visual);
-        assert_eq!(notification_count(visual), 1, "アップロード中の通知が出ていない");
+        assert_eq!(
+            notification_count(visual),
+            1,
+            "アップロード中の通知が出ていない"
+        );
 
         // 進捗を何度更新しても通知は 1 件のまま（作り直していない）。
         for percent in [1u32, 17, 42, 73, 100] {
@@ -7549,7 +7658,9 @@ mod tests {
         });
         draw_frames(visual);
 
-        let input = ws.read_with(cx, |w, _| w.pack_key_input.clone()).expect("入力欄");
+        let input = ws
+            .read_with(cx, |w, _| w.pack_key_input.clone())
+            .expect("入力欄");
         assert!(
             cx.read(|cx| input.read(cx).presentation().is_masked()),
             "既定はマスク"
@@ -7558,10 +7669,7 @@ mod tests {
         let bounds = visual
             .debug_bounds("pack-key-input")
             .expect("解錠ダイアログの入力欄が出ていない");
-        let eye = gpui_kit::point(
-            bounds.right() - gpui_kit::px(22.0),
-            bounds.center().y,
-        );
+        let eye = gpui_kit::point(bounds.right() - gpui_kit::px(22.0), bounds.center().y);
         visual.update(|window, cx| {
             input.update(cx, |state, cx| state.set_value("passphrase-1", window, cx));
         });
@@ -7583,6 +7691,9 @@ mod tests {
                 .pack_key_prompt
                 .answer(crate::pack_keys::PassphraseAnswer::Skipped);
         });
-        assert_eq!(asked.join().ok(), Some(crate::pack_keys::PassphraseAnswer::Skipped));
+        assert_eq!(
+            asked.join().ok(),
+            Some(crate::pack_keys::PassphraseAnswer::Skipped)
+        );
     }
 }
