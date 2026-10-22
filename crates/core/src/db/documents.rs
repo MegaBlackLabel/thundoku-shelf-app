@@ -250,6 +250,55 @@ pub fn delete_for_book(pool: &SqlitePool, book_id: &str) -> Result<(), sqlx::Err
     })
 }
 
+/// 同じ本に取り込みドキュメントが複数残っている場合、**最新の 1 つだけ**を残して
+/// 古いもの（とその子行）を消す。戻り値は消したドキュメント数。
+///
+/// 再取り込みで古いページ行が残ると [`images_for_selection`] が同じページを複数返し、
+/// 見開きで左右に同じページが出る（実データで 1 ページが 3 行になっていた）。
+/// [`crate::db::migrate`] が起動のたびに呼ぶ（正常な DB では何もしない）。
+pub fn prune_stale_documents(pool: &SqlitePool) -> Result<usize, sqlx::Error> {
+    crate::db::block_on(async {
+        let mut conn = pool.acquire().await?;
+        prune_stale_documents_conn(&mut conn).await
+    })
+}
+
+/// [`prune_stale_documents`] の本体（マイグレーションの接続上で動かす版）。
+pub(crate) async fn prune_stale_documents_conn(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<usize, sqlx::Error> {
+    // 各本で最新（created_at が最大。同着は rowid が大きい方）以外は stale。
+    let stale: Vec<String> = sqlx::query_scalar(
+        "SELECT d.id FROM imported_documents d \
+         WHERE d.id <> (SELECT n.id FROM imported_documents n \
+                        WHERE n.book_id = d.book_id \
+                        ORDER BY n.created_at DESC, n.rowid DESC LIMIT 1)",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for document_id in &stale {
+        // 子（テキスト・解析・画像）→ 親（ドキュメント）の順で消す
+        for sql in [
+            "DELETE FROM token_analysis WHERE document_id = ?1",
+            "DELETE FROM document_text WHERE document_id = ?1",
+            "DELETE FROM document_images WHERE document_id = ?1",
+            "DELETE FROM imported_documents WHERE id = ?1",
+        ] {
+            sqlx::query(sql)
+                .bind(document_id)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    if !stale.is_empty() {
+        log::info!(
+            "documents: 同じ本の古い取り込み {} 件を削除（ページ行の重複を解消）",
+            stale.len()
+        );
+    }
+    Ok(stale.len())
+}
+
 pub fn insert_text(pool: &SqlitePool, text: &DocumentText) -> Result<(), sqlx::Error> {
     // 抽出したページ本文は平文で残さない（セキュリティ評価 F02）。鍵が取れないときは
     // **平文で書かず**にエラーにする（fail-closed）。

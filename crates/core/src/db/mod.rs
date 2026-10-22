@@ -491,6 +491,10 @@ pub fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         )
         .execute(&mut *conn)
         .await?;
+        // 古い取り込みドキュメントが残っている本を掃除する（冪等）。残すと
+        // `images_for_selection` が同じページを複数返し、見開きに同じページが
+        // 左右へ出る（実データで 1 ページが 3 行になっていた）。
+        documents::prune_stale_documents_conn(&mut conn).await?;
         Ok(())
     })
 }

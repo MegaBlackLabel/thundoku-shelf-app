@@ -485,6 +485,65 @@ fn image_zip_imports_sorted_pages() {
     assert_eq!(&first[8..12], b"WEBP");
 }
 
+/// 同じ本を再取り込みしたら、前回のページ行を**置き換える**（追記しない）。
+///
+/// 追記されると `images_for_selection` が同じページを複数返し、見開きで
+/// 左右に同じページが出る（実データで 1 ページが 3 行になっていた）。
+#[test]
+fn reimport_replaces_pages_instead_of_appending_them() {
+    let env = TestEnv::new("reimport-pages");
+    let zip_path = env.root.join("pages.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, color) in [
+        ("001.png", [255, 0, 0]),
+        ("002.png", [0, 255, 0]),
+        ("003.png", [0, 0, 255]),
+    ] {
+        zip.start_file(name, options).unwrap();
+        use std::io::Write;
+        zip.write_all(&make_png(64, 96, color)).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let first = import_file(
+        &env.pool,
+        &zip_path,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        None,
+    )
+    .unwrap();
+
+    // 再取得相当（同じ book_id を再利用して取り込み直す）
+    let bytes = std::fs::read(&zip_path).unwrap();
+    let again = thundoku_core::import::import_zip_bytes(
+        &env.pool,
+        "pages.zip",
+        &bytes,
+        &env.packs(),
+        None,
+        &mut no_progress,
+        Some(&first.book.id),
+        None,
+    )
+    .unwrap();
+    assert_eq!(again.book.id, first.book.id);
+
+    let pages: Vec<i64> =
+        db::documents::images_for_selection(&env.pool, &first.book.id, None, None)
+            .unwrap()
+            .into_iter()
+            .filter(|image| image.image_type == "page")
+            .map(|image| image.page_number)
+            .collect();
+    assert_eq!(
+        pages, vec![1, 2, 3],
+        "再取り込みでページ行が重複している（見開きに同じページが出る）"
+    );
+}
+
 #[test]
 fn zip_with_pdf_reuses_book_id_without_duplicate() {
     let env = TestEnv::new("zip-pdf-reuse");
