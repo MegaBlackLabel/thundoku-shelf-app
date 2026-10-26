@@ -1860,7 +1860,7 @@ fn analyze_zip_rejects_more_entries_than_the_limit() {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options = zip::write::SimpleFileOptions::default();
         for index in 0..=opfspack::MAX_ENTRY_COUNT {
             writer
                 .start_file(format!("pages/{index:05}.txt"), options)
@@ -1886,7 +1886,7 @@ fn analyze_zip_rejects_a_declared_total_over_the_limit() {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options = zip::write::SimpleFileOptions::default();
         // 1 エントリの宣言サイズは u32 までなので、合計で上限（10 GiB）を超えるには
         // 複数エントリが要る（u32::MAX を 3 件で約 12 GiB）。
         for index in 0..3 {

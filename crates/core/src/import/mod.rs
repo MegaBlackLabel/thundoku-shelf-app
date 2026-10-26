@@ -3141,7 +3141,7 @@ mod zip_entry_limit_tests {
         let mut buffer = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut buffer);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let options = zip::write::SimpleFileOptions::default();
             writer.start_file("pages/page_0001.webp", options).unwrap();
             writer.write_all(&vec![7u8; 2000]).unwrap();
             writer.finish().unwrap();
@@ -3289,7 +3289,7 @@ mod content_filter_tests {
         let mut buffer = std::io::Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut buffer);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let options = zip::write::SimpleFileOptions::default();
             for (name, data) in entries {
                 writer.start_file(*name, options).unwrap();
                 writer.write_all(data).unwrap();

@@ -36,7 +36,7 @@ opfspack = { path = "../opfspack" }
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg", "bmp", "tiff"] }
 webp = "0.3"
 lindera = { version = "0.44", features = ["ipadic"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 yaml-rust2 = "0.13"
 # PDF レンダリングは PDFium（BSD-3-Clause / Apache-2.0）に統一した。mupdf は
 # AGPL-3.0 で、MIT で配布するこのアプリと両立しないため依存から外している。
