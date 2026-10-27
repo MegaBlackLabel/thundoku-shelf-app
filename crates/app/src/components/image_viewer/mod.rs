@@ -2996,7 +2996,7 @@ impl Render for ImageViewer {
                             });
                         }
                     })
-                    .on_scroll({
+                    .on_scroll_wheel({
                         let handle = handle.clone();
                         move |event, _window, cx| {
                             // Ctrl スクロール（ピンチ）のみズーム。
@@ -3198,7 +3198,7 @@ impl Render for ImageViewer {
                         // ページ送りをしない（2026-09-26 の実機報告）。パネル自身のスクロールは
                         // 内側のスクロール領域（`overflow_y_scroll`）が受け取るので、
                         // ここで伝播を止めても中身はスクロールできる。
-                        .on_scroll(|_, _, cx| {
+                        .on_scroll_wheel(|_, _, cx| {
                             cx.stop_propagation();
                         }),
 
@@ -4340,7 +4340,7 @@ mod tests {
     /// 符号は gpui の規約で **負 = 下（文書の先へ進む）**（`scroll_offset.y += delta` を
     /// `[-max, 0]` にクランプするため）。Windows の 1 ノッチは既定で 3 行。
     fn wheel(visual: &mut gpui_kit::VisualTestContext, lines: f32) {
-        visual.simulate_event(gpui_kit::ScrollEvent {
+        visual.simulate_event(gpui_kit::ScrollWheelEvent {
             position: gpui_kit::point(gpui_kit::px(400.0), gpui_kit::px(300.0)),
             delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0.0, lines)),
             ..Default::default()

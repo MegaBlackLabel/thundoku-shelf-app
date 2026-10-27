@@ -14,11 +14,13 @@ path = "src/main.rs"
 # `test-support`（gpui のテストハーネス）は **dev-dependencies 側だけ**で有効にする:
 # 本番ビルドで有効にすると gpui の `leak-detection` が入り、終了時に残っている
 # ハンドル（常駐タスクが持つ `WeakEntity` など）で `Exited with leaked handles` パニックする。
-gpui-kit = "0.8.1"
+# 0.8.1 は gpui-pre-macos 0.3.10 が stable Rust 1.97 で未安定の
+# `Result::map_or_default` を使っており macOS がビルドできない。上流修正まで 0.8.0 固定。
+gpui-kit = "=0.8.0"
 # WebView は gpui-kit と同じ gpui-pre を指す必要がある（別クレート名にすると
 # gpui が二重に入り、`Window` / `Entity` の型が食い違う）。0.8 系から
 # `gpui-wry` は `gpui-webview` に改名された。
-gpui-webview = "0.8.1"
+gpui-webview = "=0.8.0"
 thundoku-core = { path = "../core" }
 url = "2"
 sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio"] }
@@ -64,4 +66,4 @@ winres = "0.1"
 toml = "1"
 # テストは gpui のテストハーネス（`#[gpui_kit::test]` / `TestAppContext`）を使う。
 # 本番ビルドには入れない（`leak-detection` が終了時にパニックするため）。
-gpui-kit = { version = "0.8.1", features = ["test-support"] }
+gpui-kit = { version = "=0.8.0", features = ["test-support"] }

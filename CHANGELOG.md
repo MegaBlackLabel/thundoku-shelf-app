@@ -67,8 +67,10 @@
 
 ### Changed
 
-- **UI フレームワークを gpui-kit 0.8.1 へ更新**: 上流 main の git rev 固定をやめ、
+- **UI フレームワークを gpui-kit 0.8.0 へ更新**: 上流 main の git rev 固定をやめ、
   crates.io のリリース版を使うようにした（関連書籍カルーセルは 0.6.2 でリリース済み）。
+  0.8.1 は `gpui-pre-macos 0.3.10` が stable Rust 1.97 で未安定 API を使うため macOS を
+  ビルドできず、上流修正まで 0.8.0 に固定している。
   WebView は 0.8 で `gpui-wry` から `gpui-webview` に改名されたため依存と import を移行。
   0.7 で削除された手動の通知レイヤーを撤去し、`Root` の自動ホスティングに追従した。
   `crates/app/Cargo.toml`、`crates/app/src/views/`、`crates/app/src/workspace.rs`
