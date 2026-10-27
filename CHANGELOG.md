@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-10-27
+
 ### Added
 
 - **Fantia（fantia.jp）のログイン**: FANZA / DLsite と同じくアプリ内 WebView でログインし、
@@ -63,8 +65,33 @@
   お気に入り / 閲覧履歴 / 付箋 / チェックリスト / レポート / 設定）。テーマ・アカウントは
   マウスのみ。`crates/app/src/workspace.rs`
 
+### Changed
+
+- **UI フレームワークを gpui-kit 0.8.1 へ更新**: 上流 main の git rev 固定をやめ、
+  crates.io のリリース版を使うようにした（関連書籍カルーセルは 0.6.2 でリリース済み）。
+  WebView は 0.8 で `gpui-wry` から `gpui-webview` に改名されたため依存と import を移行。
+  0.7 で削除された手動の通知レイヤーを撤去し、`Root` の自動ホスティングに追従した。
+  `crates/app/Cargo.toml`、`crates/app/src/views/`、`crates/app/src/workspace.rs`
+- **主要な依存を更新**: `sqlx` 0.9 / `rand` 0.10 / `aes-gcm` 0.11 / `sha2` 0.11 /
+  `hkdf`・`hmac`・`pbkdf2` 0.13 / `keyring` 4 / `resvg`・`usvg` 0.49 / `tiny-skia` 0.12 /
+  `dirs` 7 / `parking_lot` 0.13 / `libsqlite3-sys` 0.37 / `lindera` 6.2 / `ureq` 3.5。
+  `lindera` は `embedded://ipadic` + `lindera-analysis` の Tokenizer に、
+  `ureq` は Agent 設定と Request/Response/body API に移行した。`sqlx` 0.9 の動的 SQL は
+  `AssertSqlSafe` を明示（補間はテーブル名・列名だけ、値は `.bind()` のまま）。
+  `crates/core/Cargo.toml`、`crates/app/Cargo.toml`、`crates/core/src/`
+- **ライセンス一覧を再生成**（依存グラフの変更に追随）。
+  `crates/app/assets/third-party/licenses.json`
+
 ### Fixed
 
+- **見開きの最終見開きから次へ進めないようにした**: ページ数が偶数で最終見開きが
+  ちょうど終わるとき、次ページ送りが最終ページだけの片側見開きになっていた。
+  範囲外へ進む前進を止め、奇数ページの最終ページ単独表示は従来どおり進める。
+  `crates/app/src/components/image_viewer/mod.rs`
+- **Google 未ログイン時に終了時のアップロード確認を出さないようにした**: 保存済みの
+  プロフィール（sub）だけが残っている状態でも確認を出していたため、アップロードが失敗し
+  終了できないように見えていた。実際にログインしている場合だけ確認する。
+  `crates/app/src/workspace.rs`
 - **動画・音声のコンテンツを取り込まないようにした**: 一部の商品は ZIP に画像と動画が
   混在し、`book_contents` に「動画」が残って切り替え先に出ていた（ビューアで開けない）。
   取り込み時に**ビューアで読めない種別（音声・動画）をコンテンツ一覧から外す**ようにした。
