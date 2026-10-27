@@ -251,7 +251,7 @@
 - **[BOOTH]** `library()` の「1 ページ 10 件」はコメント由来でコード定数が無い。実際のページ件数が 10 件である保証は HTML 依存（`crates/core/src/booth.rs:199`）。
 - **[BOOTH]** `orders()` の終了閾値 12 の根拠（1 ページ 12 件という前提）はコードコメントにも書かれておらず**不明**。定数名も無い（`crates/core/src/booth.rs:287`）。
 - **[BOOTH]** BOOTH 側の API レート制限値（429 の閾値、推奨間隔）はコード・ドキュメントに記述が無く**不明**。実装は無待機・無リトライ。
-- **[BOOTH]** `with_incognito(true)` が Windows WebView2 で具体的にどのプロファイル（`InPrivate` 等）にマップされるかは `lb-wry` / `gpui-wry` の内部実装依存で、このリポジトリからは**不明**。
+- **[BOOTH]** `with_incognito(true)` が Windows WebView2 で具体的にどのプロファイル（`InPrivate` 等）にマップされるかは `lb-wry` / `gpui-webview` の内部実装依存で、このリポジトリからは**不明**。
 - **[BOOTH]** `cookies_for_url` が HttpOnly Cookie を返すかは wry 実装依存で**不明**（`crates/app/src/views/booth_login.rs:128-138` は戻り値をそのまま使う）。
 - **[BOOTH]** `item_detail`（`Accept: application/json`）が Cloudflare 等で失敗する頻度、およびその場合の実挙動（表紙が `None` のまま残る）については運用ログ依存で、コードからは**不明**。
 - **[BOOTH]** 「同期中にアプリを終了した場合」の状態（スレッド中断の有無）は `JoinHandle` を保持していないため挙動が読めず、**不明**（`crates/app/src/views/bookshelf.rs:2278`）。

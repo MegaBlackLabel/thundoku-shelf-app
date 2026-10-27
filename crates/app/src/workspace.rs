@@ -1445,6 +1445,12 @@ impl Workspace {
             return false;
         }
         let state = AppState::global(cx);
+        // プロフィール（sub）は keyring から復元されるが、トークンが無い＝未ログインの
+        // ことがある。「アップロードして終了」は必ず失敗し、確認を閉じるまで終了できない
+        // ように見えるため、実際にログインしているときだけ確認する。
+        if !*state.google_logged_in.lock() {
+            return false;
+        }
         let Some(sub) = state
             .google_profile
             .lock()
@@ -2392,10 +2398,7 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
-            // gpui-kit の Notification レイヤー（右上に出る。既定 5 秒で自動的に消える）
-            .children(gpui_kit::component::Root::render_notification_layer(
-                window, cx,
-            ))
+            // Notification は gpui-kit の Root が自動で描く（0.7 で手動レイヤー API は削除された）
             .child(if self.auth_panel_open {
                 let panel = self.account_panel(cx);
                 gpui_kit::deferred(
@@ -4361,17 +4364,7 @@ mod tests {
 
     /// いま表示されている Notification の件数。
     fn notification_count(visual: &mut gpui_kit::VisualTestContext) -> usize {
-        visual.update(|window, cx| {
-            window
-                .root::<gpui_kit::component::Root>()
-                .expect("root")
-                .expect("root view")
-                .read(cx)
-                .notification
-                .read(cx)
-                .notifications()
-                .len()
-        })
+        visual.update(|window, cx| window.notifications(cx).len())
     }
 
     /// 起動時の初期表示を決めるテスト用の土台（指定したサイトだけログイン済みにする）。
@@ -4797,6 +4790,31 @@ mod tests {
         );
     }
 
+    /// Google にログインしていないのに、保存済みプロフィール（sub）だけが残っていても
+    /// 終了時のアップロード確認を出さない。未ログインではアップロードが必ず失敗し、
+    /// 確認を閉じるまで終了できないように見えるため。
+    #[gpui_kit::test]
+    async fn close_request_closes_without_the_upload_prompt_when_google_is_logged_out(
+        cx: &mut TestAppContext,
+    ) {
+        let ws = setup(cx);
+        let sub = "sub-exit-logged-out";
+        // Drive の設定（folder_id / enabled）と所有者プロフィールは残っているが、
+        // 資格情報は無い（前回のログアウト後にプロフィールだけ復元された状態）。
+        set_drive_ready(cx, sub);
+        seed_pending_pack(cx, sub, "exit-logged-out-pack");
+        cx.update(|cx| {
+            *AppState::global(cx).google_logged_in.lock() = false;
+        });
+
+        let allowed = ws.update(cx, |ws, cx| ws.handle_window_close_request(cx));
+        assert!(allowed, "Google 未ログインなら確認を出さずに閉じる");
+        assert!(
+            !ws.read_with(cx, |ws, _| ws.exit_upload_prompt),
+            "Google 未ログインなのに終了確認を出す（アップロードできず終了できない）"
+        );
+    }
+
     #[gpui_kit::test]
     async fn sidebar_toggle_flips_open_state(cx: &mut TestAppContext) {
         let ws = setup(cx);
@@ -4903,7 +4921,7 @@ mod tests {
     }
 
     /// キーを 1 つ押す（`"down"` / `"j"` のように名前で指定する）。
-    fn press_key(visual: &mut gpui_kit::VisualTestContext, key: &str) {
+    fn press_key(visual: &mut gpui_kit::VisualTestContext, key: &'static str) {
         visual.simulate_event(gpui_kit::KeyDownEvent {
             keystroke: gpui_kit::Keystroke::parse(key).expect("キー名が不正"),
             is_held: false,
@@ -6889,6 +6907,7 @@ mod tests {
         cx.update(|cx| {
             let state = AppState::global(cx);
             *state.google_profile.lock() = Some(google_profile(sub));
+            *state.google_logged_in.lock() = true;
             let _ = db::settings::set(&state.db_pool, "drive.sync.enabled", "true");
             let _ = db::settings::set(&state.db_pool, "drive.sync.folder_id", "folder-1");
         });

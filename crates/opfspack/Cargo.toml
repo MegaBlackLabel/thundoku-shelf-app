@@ -8,18 +8,18 @@ license.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-pbkdf2 = "0.12"
-hkdf = "0.12"
+pbkdf2 = "0.13"
+hkdf = "0.13"
 # バックアップ封筒（§11）の平文 HMAC。HKDF の内部依存として既にグラフにあり、
 # 直接依存にしてもライセンス一覧（licenses.json）は変わらない。
-hmac = "0.12"
+hmac = "0.13"
 sha2.workspace = true
-aes-gcm = "0.10"
-base64 = "0.22"
+aes-gcm = "0.11"
+base64 = "0.23"
 unicode-normalization = "0.1"
 flate2 = "1"
 crc32fast = "1"
-rand = "0.8"
+rand = "0.10"
 [dev-dependencies]
 crc32fast = "1"
 hex = "0.4"

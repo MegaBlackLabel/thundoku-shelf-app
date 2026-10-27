@@ -337,10 +337,12 @@ impl ChecklistView {
         let state = AppState::global(cx);
         let db = state.db_pool.clone();
         let task = cx.background_executor().spawn(async move {
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(15))
-                .timeout_read(std::time::Duration::from_secs(30))
-                .build();
+            let agent = ureq::Agent::new_with_config(
+                ureq::Agent::config_builder()
+                    .timeout_connect(Some(std::time::Duration::from_secs(15)))
+                    .timeout_per_read(Some(std::time::Duration::from_secs(30)))
+                    .build(),
+            );
             // ダウンロード → 縮小 JPEG にして DB へ保存する。
             // 表示用のデコードは描画中のページだけ `decode_cached_thumbnails` が行う
             // （全件分の RenderImage をメモリに作らない）
@@ -350,7 +352,8 @@ impl ChecklistView {
                 let ok = (|| {
                     let resp = agent.get(&url).call().map_err(|e| e.to_string())?;
                     let mut body = Vec::new();
-                    resp.into_reader()
+                    resp.into_body()
+                        .into_reader()
                         .read_to_end(&mut body)
                         .map_err(|e| e.to_string())?;
                     // 永続化は縮小 JPEG のみ（元画像は保存しない）

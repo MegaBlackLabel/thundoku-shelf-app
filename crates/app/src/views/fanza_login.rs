@@ -1,4 +1,4 @@
-//! FANZA同人（www.dmm.co.jp/dc/doujin）のログインをアプリ内 WebView（gpui-wry）で行うビュー。
+//! FANZA同人（www.dmm.co.jp/dc/doujin）のログインをアプリ内 WebView（gpui-webview）で行うビュー。
 //!
 //! FANZA の購入済み作品ページ（mylibrary）を WebView で開く。ユーザーが年齢確認（はい）→
 //! accounts.dmm.co.jp のパスワードログインを WebView 内で完了して www.dmm.co.jp に戻ったら、
@@ -9,7 +9,7 @@ use gpui_kit::{
     App, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement,
     Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_wry::WebView;
+use gpui_webview::WebView;
 
 /// ログイン完了イベント（Cookie を取得して永続化した後に発行）。
 pub struct FanzaLoginDone;

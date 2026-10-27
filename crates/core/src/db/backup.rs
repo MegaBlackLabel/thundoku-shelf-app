@@ -11,7 +11,7 @@ use sqlx::{Row, TypeInfo, ValueRef};
 
 use opfspack::{BACKUP_LABEL, PackRootKey, SealedEnvelope};
 
-use crate::db::SqlitePool;
+use crate::db::{SqlitePool, dynamic_sql};
 
 /// エクスポート対象のテーブル（テキストデータのみ）。
 const TABLES: &[&str] = &[
@@ -336,7 +336,7 @@ pub fn user_data_row_count(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
             ("books", " WHERE owner_sub IS NOT NULL"),
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table}{where_sql}");
-            let count: i64 = sqlx::query_scalar(&sql).fetch_one(pool).await?;
+            let count: i64 = sqlx::query_scalar(dynamic_sql(sql.as_str())).fetch_one(pool).await?;
             total += count;
         }
         Ok(total)
@@ -699,7 +699,7 @@ async fn table_rows(
 ) -> Result<Vec<Value>, sqlx::Error> {
     // 画像（blob）カラムは SELECT から除外して読み込みコストを削る
     let cols: Vec<String> = {
-        let info = sqlx::query(&format!("PRAGMA table_info({table})"))
+        let info = sqlx::query(dynamic_sql(format!("PRAGMA table_info({table})")))
             .fetch_all(&mut *conn)
             .await?;
         let mut names = Vec::new();
@@ -761,7 +761,7 @@ async fn table_rows(
         None => String::new(),
     };
     let sql = format!("SELECT {col_list} FROM {table}{where_sql}{order_sql}");
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(dynamic_sql(sql.as_str()));
     if let Some(json) = &bind_json {
         query = query.bind(json);
     }
@@ -820,7 +820,7 @@ async fn upsert_rows(
 ) -> Result<(), sqlx::Error> {
     // 画像（blob）カラムは対象外（エクスポート時と同じ除外リスト）
     let table_cols: Vec<String> = {
-        let info = sqlx::query(&format!("PRAGMA table_info({table})"))
+        let info = sqlx::query(dynamic_sql(format!("PRAGMA table_info({table})")))
             .fetch_all(&mut *conn)
             .await?;
         let mut names = Vec::new();
@@ -926,7 +926,7 @@ async fn upsert_rows(
                  ON CONFLICT ({conflict}) DO UPDATE SET {update_set}"
             )
         };
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(dynamic_sql(sql.as_str()));
         for col in &cols {
             let v = obj.get(*col).cloned().unwrap_or(Value::Null);
             match v {

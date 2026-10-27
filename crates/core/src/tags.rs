@@ -3,10 +3,11 @@
 //! frequency when the Zenn API is unavailable.
 
 use std::collections::HashMap;
-use std::io::Read;
 
-use lindera::dictionary::DictionaryKind;
-use lindera::tokenizer::TokenizerBuilder;
+use lindera::dictionary::load_dictionary;
+use lindera::mode::Mode;
+use lindera::segmenter::Segmenter;
+use lindera_analysis::tokenizer::Tokenizer;
 
 const MAX_TAGS: usize = 10;
 const MAX_WORD_CHARS: usize = 20;
@@ -20,10 +21,10 @@ pub struct NounToken {
     pub reading: String,
 }
 
-fn build_tokenizer() -> Result<lindera::tokenizer::Tokenizer, String> {
-    let mut builder = TokenizerBuilder::new().map_err(|e| e.to_string())?;
-    builder.set_segmenter_dictionary_kind(&DictionaryKind::IPADIC);
-    builder.build().map_err(|e| e.to_string())
+fn build_tokenizer() -> Result<Tokenizer, String> {
+    let dictionary = load_dictionary("embedded://ipadic").map_err(|e| e.to_string())?;
+    let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
+    Ok(Tokenizer::new(segmenter))
 }
 
 /// Tokenize one page and return noun tokens (POS starts with 名詞).
@@ -32,7 +33,7 @@ pub fn analyze_page(text: &str) -> Result<Vec<NounToken>, String> {
     let tokens = tokenizer.tokenize(text).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for mut token in tokens {
-        let surface = token.text.to_string();
+        let surface = token.surface.to_string();
         let details: Vec<&str> = token.details();
         if details.first().is_none_or(|pos| !pos.starts_with("名詞")) {
             continue;
@@ -98,23 +99,21 @@ pub fn fetch_zenn_tags() -> Result<Vec<String>, ZennError> {
         return Ok(tags);
     }
     // タイムアウト付きで取得（ハングすると取り込みが止まるため）
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout_read(std::time::Duration::from_secs(10))
-        .build();
-    let response = agent
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(5)))
+            .timeout_per_read(Some(std::time::Duration::from_secs(10)))
+            .build(),
+    );
+    let mut response = agent
         .get(ZENN_TAGS_URL)
-        .set("User-Agent", "thundoku-shelf/0.1")
+        .header("User-Agent", "thundoku-shelf/0.1")
         .call()
         .map_err(|_| ZennError)?;
-    if response.status() != 200 {
+    if response.status().as_u16() != 200 {
         return Err(ZennError);
     }
-    let mut body = String::new();
-    response
-        .into_reader()
-        .read_to_string(&mut body)
-        .map_err(|_| ZennError)?;
+    let body = response.body_mut().read_to_string().map_err(|_| ZennError)?;
     let payload: serde_json::Value = serde_json::from_str(&body).map_err(|_| ZennError)?;
 
     let tags: Vec<String> = payload

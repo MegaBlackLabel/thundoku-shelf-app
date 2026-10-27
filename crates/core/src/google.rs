@@ -140,14 +140,16 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
 /// RFC 7636 code verifier: 32 random bytes, base64url without padding.
 pub fn generate_verifier() -> String {
     let mut bytes = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)
+        .expect("OS RNG is available");
     base64_url_no_pad(&bytes)
 }
 
 /// OAuth `state` nonce.
 pub fn generate_state() -> String {
     let mut bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)
+        .expect("OS RNG is available");
     base64_url_no_pad(&bytes)
 }
 

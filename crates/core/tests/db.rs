@@ -18,9 +18,9 @@ fn is_drm_defaults_to_unknown() {
     let pool = memory_db();
     for table in ["bookshelf_items", "books"] {
         let default: Option<String> = thundoku_core::db::block_on(async {
-            sqlx::query_scalar(&format!(
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT dflt_value FROM pragma_table_info('{table}') WHERE name = 'is_drm'",
-            ))
+            )))
             .fetch_one(&pool)
             .await
         })
@@ -2204,14 +2204,14 @@ fn seed_crypto_document(pool: &thundoku_core::db::SqlitePool, book_id: &str, doc
 }
 
 /// 生 SQL で 1 つの文字列列を読む（保存値そのものを見る）。
-fn raw_column(pool: &thundoku_core::db::SqlitePool, sql: &str) -> String {
+fn raw_column(pool: &thundoku_core::db::SqlitePool, sql: &'static str) -> String {
     thundoku_core::db::block_on(async {
         sqlx::query_scalar::<_, String>(sql).fetch_one(pool).await
     })
     .unwrap()
 }
 
-fn raw_exec(pool: &thundoku_core::db::SqlitePool, sql: &str) {
+fn raw_exec(pool: &thundoku_core::db::SqlitePool, sql: &'static str) {
     thundoku_core::db::block_on(async { sqlx::query(sql).execute(pool).await }).unwrap();
 }
 

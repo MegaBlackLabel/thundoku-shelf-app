@@ -873,10 +873,12 @@ impl SettingsView {
         let workspace = AppState::global(cx).workspace.lock().clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, usize)>();
         std::thread::spawn(move || {
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(5))
-                .timeout_read(std::time::Duration::from_secs(15))
-                .build();
+            let agent = ureq::Agent::new_with_config(
+                ureq::Agent::config_builder()
+                    .timeout_connect(Some(std::time::Duration::from_secs(5)))
+                    .timeout_per_read(Some(std::time::Duration::from_secs(15)))
+                    .build(),
+            );
             let next = std::sync::atomic::AtomicUsize::new(0);
             let ok = std::sync::atomic::AtomicUsize::new(0);
             let failed = std::sync::atomic::AtomicUsize::new(0);
@@ -1007,7 +1009,7 @@ impl SettingsView {
         let tbf_client = state.tbf.clone();
         let handle = cx.weak_entity();
         cx.spawn(async move |_window, cx| {
-            let agent = ureq::Agent::new();
+            let agent = ureq::Agent::new_with_defaults();
             let thumbnails_dir = data_dir.join("thumbnails");
             let _ = std::fs::create_dir_all(&thumbnails_dir);
             for (site_id, database_id, url) in &targets {
@@ -1920,7 +1922,7 @@ impl SettingsView {
             ] {
                 let pool = db.clone();
                 let _ = thundoku_core::db::block_on(async {
-                    sqlx::query(&format!("DELETE FROM {table}"))
+                    sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
                         .execute(&pool)
                         .await
                 });

@@ -47,6 +47,15 @@ pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     runtime().block_on(fut)
 }
 
+/// 内部で組み立てた SQL を sqlx の [`sqlx::AssertSqlSafe`] で包む。
+///
+/// 補間してよいのはテーブル名・列名・プレースホルダだけで、いずれも内部の定数か
+/// 既存スキーマ（`PRAGMA table_info`）から得た識別子に限る。**値は必ず `.bind()`**。
+/// sqlx 0.9 は動的 SQL を型で拒否するため、この関数が唯一の通過点になる。
+pub(crate) fn dynamic_sql(sql: impl Into<String>) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(sql.into())
+}
+
 /// Open a pooled connection with foreign keys enabled and apply pending
 /// migrations (`migrations/` directory, managed via `_sqlx_migrations`).
 pub fn connect(path: &Path) -> Result<SqlitePool, sqlx::Error> {
@@ -77,7 +86,7 @@ async fn ensure_column(
             .fetch_one(&mut *conn)
             .await?;
     if exists == 0 {
-        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
+        sqlx::query(dynamic_sql(format!("ALTER TABLE {table} ADD COLUMN {definition}")))
             .execute(&mut *conn)
             .await?;
     }
@@ -527,7 +536,7 @@ pub fn clear_owner_model_if_first_run(
         "thumbnail_share",
     ] {
         let _ = block_on(async {
-            sqlx::query(&format!("DELETE FROM {table}"))
+            sqlx::query(dynamic_sql(format!("DELETE FROM {table}")))
                 .execute(pool)
                 .await
         });
@@ -573,7 +582,7 @@ pub fn migrate_drm_status_once(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
     }
     block_on(async {
         for table in ["bookshelf_items", "books"] {
-            sqlx::query(&format!("UPDATE {table} SET is_drm = 2 WHERE is_drm = 0"))
+            sqlx::query(dynamic_sql(format!("UPDATE {table} SET is_drm = 2 WHERE is_drm = 0")))
                 .execute(pool)
                 .await?;
         }

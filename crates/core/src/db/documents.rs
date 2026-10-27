@@ -6,7 +6,7 @@
 
 use sqlx::Row;
 
-use crate::db::{SqlitePool, column_crypto};
+use crate::db::{SqlitePool, column_crypto, dynamic_sql};
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct ImportedDocument {
@@ -295,7 +295,7 @@ pub fn insert_images_batch(pool: &SqlitePool, images: &[DocumentImage]) -> Resul
                 values.push("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string());
             }
             sql.push_str(&values.join(", "));
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(dynamic_sql(sql.as_str()));
             for img in chunk {
                 q = q
                     .bind(&img.id)
@@ -338,7 +338,7 @@ pub fn insert_texts_batch(pool: &SqlitePool, texts: &[DocumentText]) -> Result<(
                 values.push("(?, ?, ?, ?, ?)".to_string());
             }
             sql.push_str(&values.join(", "));
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(dynamic_sql(sql.as_str()));
             for t in chunk {
                 let text_content = column_crypto::encrypt_str(
                     &key,
@@ -380,7 +380,7 @@ pub fn insert_tokens_batch(pool: &SqlitePool, tokens: &[TokenRow]) -> Result<(),
                 values.push("(?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string());
             }
             sql.push_str(&values.join(", "));
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(dynamic_sql(sql.as_str()));
             for t in chunk {
                 q = q
                     .bind(&t.id)

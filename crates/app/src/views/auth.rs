@@ -1,4 +1,4 @@
-//! 認証ダイアログ: 技術書典・Google・BOOTH をアプリ内 WebView（gpui-wry）でログインする。
+//! 認証ダイアログ: 技術書典・Google・BOOTH をアプリ内 WebView（gpui-webview）でログインする。
 //! 各プロバイダは WebView でログイン画面を開き、Cookie / 認可フローを自動処理する。
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};

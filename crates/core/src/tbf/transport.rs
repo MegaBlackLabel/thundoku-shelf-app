@@ -182,32 +182,76 @@ impl Default for UreqTransport {
 
 impl UreqTransport {
     pub fn new() -> Self {
-        let build_agent = || {
-            ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(5))
-                .timeout_read(std::time::Duration::from_secs(15))
-                .build()
-        };
         Self {
-            agent: build_agent(),
+            agent: build_agent(5),
             // リダイレクト手動追跡用もタイムアウト必須（無いとハングする）
-            manual_redirect_agent: ureq::AgentBuilder::new()
-                .redirects(0)
-                .timeout_connect(std::time::Duration::from_secs(5))
-                .timeout_read(std::time::Duration::from_secs(15))
-                .build(),
+            manual_redirect_agent: build_agent(0),
         }
     }
 }
 
-fn collect_headers(resp: &ureq::Response) -> Vec<(String, String)> {
-    let mut headers = Vec::new();
-    for name in resp.headers_names() {
-        for value in resp.all(&name) {
-            headers.push((name.clone(), value.to_string()));
-        }
+/// リダイレクト回数を固定したエージェントを作る。
+///
+/// `http_status_as_error(false)` にして 4xx/5xx も `Ok(Response)` で受ける。
+/// 現行の呼び出し側はエラー本文（小さな JSON）を読んで画面に出すため、
+/// `Error::StatusCode` に落とすと本文が失われる。
+fn build_agent(redirects: u32) -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .max_redirects(redirects)
+            .http_status_as_error(false)
+            .timeout_connect(Some(std::time::Duration::from_secs(5)))
+            // ureq 2 の `timeout_read` はソケット 1 回の読み取りタイムアウト。
+            // `timeout_recv_body`（本文全体）に読み替えると大容量の DL が切れる。
+            .timeout_per_read(Some(std::time::Duration::from_secs(15)))
+            .build(),
+    )
+}
+
+fn collect_headers(resp: &ureq::http::Response<ureq::Body>) -> Vec<(String, String)> {
+    resp.headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
+}
+
+/// メソッド・URL・ヘッダーを組んだリクエストビルダー（本文は呼び出し側で付ける）。
+fn request_builder(spec: &RequestSpec) -> Result<ureq::http::request::Builder, TbfError> {
+    let mut builder = ureq::http::Request::builder()
+        .method(spec.method.as_str())
+        .uri(spec.url.as_str());
+    for (name, value) in &spec.headers {
+        builder = builder.header(name.as_str(), value.as_str());
     }
-    headers
+    Ok(builder)
+}
+
+/// ビルダーに本文を付けて送る（ureq 3 は `Agent::request` の代わりに `run`）。
+fn run_request(
+    agent: &ureq::Agent,
+    builder: ureq::http::request::Builder,
+    body: impl ureq::AsSendBody,
+) -> Result<ureq::http::Response<ureq::Body>, TbfError> {
+    let request = builder
+        .body(body)
+        .map_err(|error| TbfError::Network(error.to_string()))?;
+    agent
+        .run(request)
+        .map_err(|error| TbfError::Network(error.to_string()))
+}
+
+/// ステータス・ヘッダー・本文リーダーを取り出す。
+fn response_parts(
+    resp: ureq::http::Response<ureq::Body>,
+) -> (u16, Vec<(String, String)>, ureq::BodyReader<'static>) {
+    let status = resp.status().as_u16();
+    let headers = collect_headers(&resp);
+    (status, headers, resp.into_body().into_reader())
 }
 
 /// API 応答（JSON / HTML）本文の上限。同期の応答がこれを超えることはない。
@@ -403,30 +447,15 @@ impl Transport for UreqTransport {
         } else {
             &self.agent
         };
-        let mut request = agent.request(&spec.method, &spec.url);
-        for (name, value) in &spec.headers {
-            request = request.set(name, value);
-        }
+        let builder = request_builder(&spec)?;
         let body = spec.body.unwrap_or_default();
-        match request.send_bytes(&body) {
-            Ok(resp) => Ok(ResponseSpec {
-                status: resp.status(),
-                headers: collect_headers(&resp),
-                body: with_limit(read_body_capped(
-                    &mut resp.into_reader(),
-                    MAX_API_BODY_BYTES,
-                ))?,
-            }),
-            Err(ureq::Error::Status(status, resp)) => Ok(ResponseSpec {
-                status,
-                headers: collect_headers(&resp),
-                body: with_limit(read_body_capped(
-                    &mut resp.into_reader(),
-                    MAX_API_BODY_BYTES,
-                ))?,
-            }),
-            Err(other) => Err(TbfError::Network(other.to_string())),
-        }
+        let resp = run_request(agent, builder, body)?;
+        let (status, headers, mut reader) = response_parts(resp);
+        Ok(ResponseSpec {
+            status,
+            headers,
+            body: with_limit(read_body_capped(&mut reader, MAX_API_BODY_BYTES))?,
+        })
     }
 
     /// 本文を `Read` から送る（`Content-Length` を明示する）。
@@ -441,32 +470,21 @@ impl Transport for UreqTransport {
         } else {
             &self.agent
         };
-        let mut request = agent.request(&spec.method, &spec.url);
-        for (name, value) in &spec.headers {
-            request = request.set(name, value);
-        }
+        let mut builder = request_builder(&spec)?;
         // ureq は `Content-Length` を自動で付けない（`Read` の長さが分からないため）。
-        request = request.set("Content-Length", &content_length.to_string());
-        match request.send(body) {
-            Ok(resp) => Ok(ResponseSpec {
-                status: resp.status(),
-                headers: collect_headers(&resp),
-                // 応答（作成されたファイルの JSON）は小さい。通常 API と同じ上限で読む。
-                body: with_limit(read_body_capped(
-                    &mut resp.into_reader(),
-                    MAX_API_BODY_BYTES,
-                ))?,
-            }),
-            Err(ureq::Error::Status(status, resp)) => Ok(ResponseSpec {
-                status,
-                headers: collect_headers(&resp),
-                body: with_limit(read_body_capped(
-                    &mut resp.into_reader(),
-                    MAX_API_BODY_BYTES,
-                ))?,
-            }),
-            Err(other) => Err(TbfError::Network(other.to_string())),
-        }
+        builder = builder.header("Content-Length", content_length.to_string());
+        let resp = run_request(
+            agent,
+            builder,
+            ureq::SendBody::from_reader(body),
+        )?;
+        let (status, headers, mut reader) = response_parts(resp);
+        Ok(ResponseSpec {
+            status,
+            headers,
+            // 応答（作成されたファイルの JSON）は小さい。通常 API と同じ上限で読む。
+            body: with_limit(read_body_capped(&mut reader, MAX_API_BODY_BYTES))?,
+        })
     }
 
     fn send_download(
@@ -479,55 +497,45 @@ impl Transport for UreqTransport {
         } else {
             &self.agent
         };
-        let mut request = agent.request(&spec.method, &spec.url);
-        for (name, value) in &spec.headers {
-            request = request.set(name, value);
-        }
+        let builder = request_builder(&spec)?;
         let body = spec.body.unwrap_or_default();
-        match request.send_bytes(&body) {
-            Ok(resp) => {
-                let status = resp.status();
-                let headers = collect_headers(&resp);
-                let total = resp
-                    .header("content-length")
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let mut reader = resp.into_reader();
-                let body = match read_body_with_progress(
-                    &mut reader,
-                    total,
-                    MAX_DOWNLOAD_BODY_BYTES,
-                    on_progress,
-                ) {
-                    BodyOutcome::Read(body) => body,
-                    BodyOutcome::Cancelled => return Err(TbfError::Cancelled),
-                    BodyOutcome::TooLarge(limit) => {
-                        return Err(TbfError::Upstream(format!(
-                            "ダウンロードが上限（{limit} バイト）を超えました"
-                        )));
-                    }
-                    BodyOutcome::Io(message) => {
-                        return Err(TbfError::Network(format!(
-                            "ダウンロードの読み出しに失敗しました: {message}"
-                        )));
-                    }
-                };
-                Ok(ResponseSpec {
-                    status,
-                    headers,
-                    body,
-                })
+        let resp = run_request(agent, builder, body)?;
+        let (status, headers, mut reader) = response_parts(resp);
+        let total = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let limit = if status >= 400 {
+            // 4xx/5xx はエラー本文（小さな JSON / HTML）。
+            MAX_API_BODY_BYTES
+        } else {
+            MAX_DOWNLOAD_BODY_BYTES
+        };
+        let body = match read_body_with_progress(
+            &mut reader,
+            total,
+            limit,
+            on_progress,
+        ) {
+            BodyOutcome::Read(body) => body,
+            BodyOutcome::Cancelled => return Err(TbfError::Cancelled),
+            BodyOutcome::TooLarge(limit) => {
+                return Err(TbfError::Upstream(format!(
+                    "ダウンロードが上限（{limit} バイト）を超えました"
+                )));
             }
-            Err(ureq::Error::Status(status, resp)) => Ok(ResponseSpec {
-                status,
-                headers: collect_headers(&resp),
-                body: with_limit(read_body_capped(
-                    &mut resp.into_reader(),
-                    MAX_API_BODY_BYTES,
-                ))?,
-            }),
-            Err(other) => Err(TbfError::Network(other.to_string())),
-        }
+            BodyOutcome::Io(message) => {
+                return Err(TbfError::Network(format!(
+                    "ダウンロードの読み出しに失敗しました: {message}"
+                )));
+            }
+        };
+        Ok(ResponseSpec {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// 本文を `sink` へ書く。2xx 以外は `sink` に書かず、エラー本文だけを返す。
@@ -542,80 +550,53 @@ impl Transport for UreqTransport {
         } else {
             &self.agent
         };
-        let mut request = agent.request(&spec.method, &spec.url);
-        for (name, value) in &spec.headers {
-            request = request.set(name, value);
-        }
+        let builder = request_builder(&spec)?;
         let body = spec.body.unwrap_or_default();
-        match request.send_bytes(&body) {
-            Ok(resp) => {
-                let status = resp.status();
-                let headers = collect_headers(&resp);
-                let total = resp
-                    .header("content-length")
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let mut reader = resp.into_reader();
-                if !(200..300).contains(&status) {
-                    // エラー本文（小さな JSON）だけ読んで返す。`sink` には触らない。
-                    let error_body = match read_body_with_progress(
-                        &mut reader,
-                        total,
-                        ERROR_BODY_LIMIT,
-                        &mut |_, _| true,
-                    ) {
-                        BodyOutcome::Read(body) => body,
-                        _ => Vec::new(),
-                    };
-                    return Ok(DownloadResult {
-                        status,
-                        headers,
-                        bytes: 0,
-                        error_body,
-                    });
-                }
-                match read_body_to(
-                    &mut reader,
-                    sink,
-                    total,
-                    MAX_DOWNLOAD_BODY_BYTES,
-                    on_progress,
-                ) {
-                    SinkOutcome::Written(bytes) => Ok(DownloadResult {
-                        status,
-                        headers,
-                        bytes,
-                        error_body: Vec::new(),
-                    }),
-                    SinkOutcome::Cancelled => Err(TbfError::Cancelled),
-                    SinkOutcome::TooLarge(limit) => Err(TbfError::Upstream(format!(
-                        "ダウンロードが上限（{limit} バイト）を超えました"
-                    ))),
-                    SinkOutcome::Io(message) => Err(TbfError::Network(format!(
-                        "ダウンロードの読み書きに失敗しました: {message}"
-                    ))),
-                }
-            }
-            Err(ureq::Error::Status(status, resp)) => {
-                // ヘッダは `into_reader()` の前に取り出す（resp を move するため）。
-                let headers = collect_headers(&resp);
-                let error_body = match read_body_with_progress(
-                    &mut resp.into_reader(),
-                    0,
-                    ERROR_BODY_LIMIT,
-                    &mut |_, _| true,
-                ) {
-                    BodyOutcome::Read(body) => body,
-                    _ => Vec::new(),
-                };
-                Ok(DownloadResult {
-                    status,
-                    headers,
-                    bytes: 0,
-                    error_body,
-                })
-            }
-            Err(other) => Err(TbfError::Network(other.to_string())),
+        let resp = run_request(agent, builder, body)?;
+        let (status, headers, mut reader) = response_parts(resp);
+        let total = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if !(200..300).contains(&status) {
+            // エラー本文（小さな JSON）だけ読んで返す。`sink` には触らない。
+            let error_body = match read_body_with_progress(
+                &mut reader,
+                total,
+                ERROR_BODY_LIMIT,
+                &mut |_, _| true,
+            ) {
+                BodyOutcome::Read(body) => body,
+                _ => Vec::new(),
+            };
+            return Ok(DownloadResult {
+                status,
+                headers,
+                bytes: 0,
+                error_body,
+            });
+        }
+        match read_body_to(
+            &mut reader,
+            sink,
+            total,
+            MAX_DOWNLOAD_BODY_BYTES,
+            on_progress,
+        ) {
+            SinkOutcome::Written(bytes) => Ok(DownloadResult {
+                status,
+                headers,
+                bytes,
+                error_body: Vec::new(),
+            }),
+            SinkOutcome::Cancelled => Err(TbfError::Cancelled),
+            SinkOutcome::TooLarge(limit) => Err(TbfError::Upstream(format!(
+                "ダウンロードが上限（{limit} バイト）を超えました"
+            ))),
+            SinkOutcome::Io(message) => Err(TbfError::Network(format!(
+                "ダウンロードの読み書きに失敗しました: {message}"
+            ))),
         }
     }
 }
@@ -846,5 +827,126 @@ mod tests {
             )
             .expect_err("中止される");
         assert!(matches!(error, TbfError::Cancelled), "{error:?}");
+    }
+
+    /// 1 リクエストだけ受けて固定レスポンスを返すローカルサーバー。
+    /// 受け取ったリクエスト全体をチャネルで返す（ヘッダー・本文の検証用）。
+    fn serve_once(
+        response: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut buf).unwrap_or(0);
+                if read == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(pos + 4);
+                }
+            };
+            if let Some(header_end) = header_end {
+                // `Content-Length` があれば本文全体まで読む。
+                let head = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    let read = stream.read(&mut buf).unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+            }
+            let _ = tx.send(request);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (format!("http://{addr}/"), rx)
+    }
+
+    /// 4xx の本文を捨てない（`http_status_as_error(false)` の効果）。
+    #[test]
+    fn ureq_transport_keeps_the_body_of_a_404() {
+        let (url, _request) = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing",
+        );
+        let mut transport = UreqTransport::new();
+        let response = transport
+            .send(RequestSpec {
+                method: "GET".into(),
+                url,
+                headers: Vec::new(),
+                body: None,
+                redirects: 3,
+            })
+            .expect("404 もレスポンスとして返す");
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, b"missing");
+    }
+
+    /// ストリーム送信で `Content-Length` と本文が実際に送られる。
+    #[test]
+    fn ureq_transport_streams_body_with_content_length() {
+        let (url, request) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let mut transport = UreqTransport::new();
+        let mut body = std::io::Cursor::new(b"hello".to_vec());
+        let response = transport
+            .send_stream(
+                RequestSpec {
+                    method: "PUT".into(),
+                    url,
+                    headers: vec![("X-Test".into(), "1".into())],
+                    body: None,
+                    redirects: 0,
+                },
+                &mut body,
+                5,
+            )
+            .expect("送信できる");
+        assert_eq!(response.status, 200);
+
+        let request = request.recv().expect("request not captured");
+        let parsed = String::from_utf8_lossy(&request);
+        assert!(
+            parsed.to_ascii_lowercase().contains("content-length: 5"),
+            "Content-Length が送られていない: {parsed}"
+        );
+        assert!(parsed.ends_with("hello"), "本文が送られていない: {parsed}");
+    }
+
+    /// `redirects = 0` では 3xx を追わず、そのまま返す。
+    #[test]
+    fn ureq_transport_returns_3xx_when_redirects_are_manual() {
+        let (url, _request) = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut transport = UreqTransport::new();
+        let response = transport
+            .send(RequestSpec {
+                method: "GET".into(),
+                url,
+                headers: Vec::new(),
+                body: None,
+                redirects: 0,
+            })
+            .expect("3xx もレスポンスとして返す");
+        assert_eq!(response.status, 302);
+        assert_eq!(response.header("location"), Some("/next"));
     }
 }

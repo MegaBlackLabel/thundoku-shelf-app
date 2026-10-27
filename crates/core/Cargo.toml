@@ -9,34 +9,35 @@ serde.workspace = true
 serde_json.workspace = true
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate"] }
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # xwin クロスビルドで SSE4.1 ソースがフラグなしでコンパイルされて失敗するため、
 # sse41 feature を有効にする（-msse4.1 が付与される）
 libwebp-sys = { version = "0.9", features = ["sse41"] }
 thiserror.workspace = true
 log.workspace = true
-ureq = { version = "2", features = ["tls", "json"] }
+ureq = { version = "3", features = ["json"] }
 # 送信時（ureq 内部）と同じ WHATWG の URL 解釈で検証するため、直接依存にする。
 # 手動の文字列分割で検証すると実送信先と食い違う（バックスラッシュ・符号化ドット）。
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-keyring = { version = "3", features = ["apple-native", "windows-native"] }
-base64 = "0.22"
+keyring = "4"
+base64 = "0.23"
 # ZIP（FANZA / BOOTH / DLsite）のエントリ名は Shift-JIS（CP932）が主流。
 # `zip` crate は UTF-8 フラグの無い名前を CP437 として復号するため、自前でデコードする。
 encoding_rs = "0.8"
 percent-encoding = "2"
-md5 = "0.7"
-rand = "0.8"
+md5 = "0.8"
+rand = "0.10"
 sha2.workspace = true
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 socket2 = "0.6"
 opfspack = { path = "../opfspack" }
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg", "bmp", "tiff"] }
 webp = "0.3"
-lindera = { version = "0.44", features = ["ipadic"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+lindera = { version = "6.2", features = ["embed-ipadic"] }
+lindera-analysis = "6.2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 yaml-rust2 = "0.13"
 # PDF レンダリングは PDFium（BSD-3-Clause / Apache-2.0）に統一した。mupdf は
 # AGPL-3.0 で、MIT で配布するこのアプリと両立しないため依存から外している。

@@ -25,7 +25,6 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
@@ -130,7 +129,7 @@ fn envelope_hash_key(label: &EnvelopeLabel, root: &PackRootKey) -> [u8; 32] {
 
 /// HMAC-SHA256（RFC 2104。`backup_envelope.rs` のベクタで固定している）。
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit as _, Mac};
     use sha2::Sha256;
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
@@ -193,7 +192,8 @@ impl PackRootKey {
     /// 新しい PRK を `OsRng` で生成する（仕様 §5.1）。
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)
+            .expect("OS RNG is available");
         Self(bytes)
     }
 
@@ -345,7 +345,8 @@ impl PackRootKeyWrap {
     /// `created_at` / `updated_at` が持つ（仕様 §3.2）ためここでは使わない。
     pub fn wrap_with_sub(root: &PackRootKey, sub: &str, owner_id: &str, _now_ms: i64) -> Self {
         let mut nonce = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut nonce)
+            .expect("OS RNG is available");
         Self::wrap_with_kek(
             root,
             &sub_wrap_kek(sub),
@@ -369,9 +370,11 @@ impl PackRootKeyWrap {
         _now_ms: i64,
     ) -> Self {
         let mut salt = vec![0u8; PASSPHRASE_SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut salt)
+            .expect("OS RNG is available");
         let mut nonce = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut nonce)
+            .expect("OS RNG is available");
         let kek = passphrase_kek(passphrase, &salt, iterations);
         Self::wrap_with_kek(
             root,
@@ -678,7 +681,8 @@ impl SealedEnvelope {
         owner_id: &str,
     ) -> Self {
         let mut nonce = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut nonce)
+            .expect("OS RNG is available");
         Self::seal_with_nonce(label, plaintext, root, owner_id, nonce)
     }
 
