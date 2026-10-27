@@ -1442,7 +1442,13 @@ impl ImageViewer {
             1
         };
         let max = self.loader.page_count().saturating_sub(1);
-        let target = (self.current_page as i64 + direction * step).clamp(0, max as i64) as usize;
+        let target = self.current_page as i64 + direction * step;
+        // 見開きの最終見開きより先は存在しない。clamp すると最終ページだけの
+        // 「片側見開き」に落ちるため、前進はそこで止める（Shift の 1 ページ送りは除く）。
+        if self.mode == ViewMode::Spread && !shift && direction > 0 && target > max as i64 {
+            return;
+        }
+        let target = target.clamp(0, max as i64) as usize;
         if target != self.current_page {
             self.current_page = target;
             // ページ送りが連続 2 回以上されたらトップ/ボトムメニューを非表示に
@@ -4254,6 +4260,29 @@ mod tests {
         assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![2, 3]);
         cx.update(|cx| view.update(cx, |this, cx| this.next_page(cx)));
         assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![4]);
+    }
+
+    #[gpui_kit::test]
+    async fn spread_mode_does_not_advance_past_a_full_last_spread(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+        let view = viewer(cx, 4);
+        cx.update(|cx| view.update(cx, |this, cx| this.set_mode(cx, ViewMode::Spread)));
+        // [0, 1] → [2, 3]（2, 3 が最終見開きで、4 ページ目まででちょうど終わる）
+        cx.update(|cx| view.update(cx, |this, cx| this.next_page(cx)));
+        assert_eq!(view.read_with(cx, |v, _| v.spread_pages()), vec![2, 3]);
+
+        // 次の見開きは存在しないので、最終ページ 3 を片側だけにしない
+        cx.update(|cx| view.update(cx, |this, cx| this.next_page(cx)));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.current_page),
+            2,
+            "見開きが終わっているのに 1 ページ進んでいる"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| v.spread_pages()),
+            vec![2, 3],
+            "最終ページが片側だけの見開きになっている"
+        );
     }
 
     #[gpui_kit::test]
