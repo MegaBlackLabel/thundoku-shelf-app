@@ -2871,10 +2871,12 @@ impl BookshelfView {
         let db = state.db_pool.clone();
         let handle = cx.entity();
         // タイムアウト付きのエージェント（ハングすると 5 分以上待つ原因になるため）
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(5))
-            .timeout_read(std::time::Duration::from_secs(15))
-            .build();
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_connect(Some(std::time::Duration::from_secs(5)))
+                .timeout_per_read(Some(std::time::Duration::from_secs(15)))
+                .build(),
+        );
         // 取得完了した表紙を 1 枚ずつ UI に通知するチャネル
         // （デコード済みの縮小サムネイルを送る — UI 側でデコードしない）
         let (tx, rx) = std::sync::mpsc::channel::<(String, String, Arc<RenderImage>)>();
@@ -10244,7 +10246,7 @@ fn fetch_bytes(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
     use std::io::Read;
     match agent
         .get(url)
-        .set(
+        .header(
             "User-Agent",
             &thundoku_core::ua::for_store(COVER_USER_AGENT, thundoku_core::ua::ENV_COVER),
         )
@@ -10252,7 +10254,7 @@ fn fetch_bytes(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
     {
         Ok(response) => {
             let mut buf = Vec::new();
-            match response.into_reader().read_to_end(&mut buf) {
+            match response.into_body().into_reader().read_to_end(&mut buf) {
                 Ok(_) => Some(buf),
                 Err(e) => {
                     log::warn!("fetch_bytes 読み込み失敗: {url}: {e}");

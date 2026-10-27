@@ -348,12 +348,16 @@ mod tests {
         let owned = owned_keys(&pool, &KEY, Some("A")).unwrap();
         assert_eq!(
             owned.shelf,
-            ["dlsite:RJ-a".to_string()].into_iter().collect(),
+            ["dlsite:RJ-a".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
             "他アカウントの本棚が混ざっている"
         );
         assert_eq!(
             owned.checklist,
-            ["check-a".to_string()].into_iter().collect(),
+            ["check-a".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
             "他アカウントのチェックリストが混ざっている"
         );
 
@@ -380,7 +384,9 @@ mod tests {
         let owned = owned_keys(&pool, &KEY, None).unwrap();
         assert_eq!(
             owned.shelf,
-            ["dlsite:RJ-none".to_string()].into_iter().collect(),
+            ["dlsite:RJ-none".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
             "未ログインでは未所属の行だけ（復号できない行は含めない）"
         );
         assert_eq!(entries_for_owner(&pool, &owned).unwrap().len(), 1);

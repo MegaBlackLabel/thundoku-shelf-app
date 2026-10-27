@@ -222,15 +222,21 @@ fn remove_html_dumps() {
     }
 }
 
+/// タイムアウト付きエージェント。4xx/5xx も本文を読めるよう `Ok` で返す。
+fn build_agent(redirects: u32) -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .max_redirects(redirects)
+            .http_status_as_error(false)
+            .timeout_connect(Some(std::time::Duration::from_secs(5)))
+            // ureq 2 の `timeout_read` は 1 回のソケット読み取り。
+            .timeout_per_read(Some(std::time::Duration::from_secs(15)))
+            .build(),
+    )
+}
+
 impl BoothClient {
     pub fn new(session: &BoothSession) -> Self {
-        let build_agent = |redirects: u32| {
-            ureq::AgentBuilder::new()
-                .redirects(redirects)
-                .timeout_connect(std::time::Duration::from_secs(5))
-                .timeout_read(std::time::Duration::from_secs(15))
-                .build()
-        };
         Self {
             session: session.clone(),
             agent: build_agent(5),
@@ -268,20 +274,24 @@ impl BoothClient {
             let mut request = self
                 .agent
                 .post("https://accounts.booth.pm/users/sign_out")
-                .set("User-Agent", &user_agent())
-                .set("Accept", "*/*")
-                .set("X-CSRF-Token", &csrf)
-                .set("Referer", "https://accounts.booth.pm")
-                .set("Origin", "https://accounts.booth.pm");
+                .header("User-Agent", &user_agent())
+                .header("Accept", "*/*")
+                .header("X-CSRF-Token", &csrf)
+                .header("Referer", "https://accounts.booth.pm")
+                .header("Origin", "https://accounts.booth.pm");
             if !plaza_cookie.is_empty() {
-                request = request.set("Cookie", &plaza_cookie);
+                request = request.header("Cookie", &plaza_cookie);
             }
-            match request.send_form(&[("_method", "delete")]) {
+            match request.send_form([("_method", "delete")]) {
                 Ok(response) => {
                     log::info!(
                         "booth logout(plaza): status={} location={:?}",
-                        response.status(),
-                        response.header("location").unwrap_or_default()
+                        response.status().as_u16(),
+                        response
+                            .headers()
+                            .get("location")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
                     );
                 }
                 Err(e) => {
@@ -294,27 +304,30 @@ impl BoothClient {
         let mut request = self
             .agent
             .post("https://booth.pm/users/sign_out")
-            .set("User-Agent", &user_agent())
-            .set("Accept", "*/*")
-            .set("X-CSRF-Token", &csrf)
-            .set("Referer", "https://booth.pm/ja")
-            .set("Origin", "https://booth.pm");
+            .header("User-Agent", &user_agent())
+            .header("Accept", "*/*")
+            .header("X-CSRF-Token", &csrf)
+            .header("Referer", "https://booth.pm/ja")
+            .header("Origin", "https://booth.pm");
         if !booth_cookie.is_empty() {
-            request = request.set("Cookie", &booth_cookie);
+            request = request.header("Cookie", &booth_cookie);
         }
         let response = request
-            .send_form(&[("_method", "delete")])
-            .map_err(|e| match e {
-                ureq::Error::Status(code, _) if code == 401 || code == 403 => {
-                    BoothError::NotLoggedIn
-                }
-                _ => BoothError::Network(e.to_string()),
-            })?;
-        let status = response.status();
+            .send_form([("_method", "delete")])
+            .map_err(|e| BoothError::Network(e.to_string()))?;
+        let status = response.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(BoothError::NotLoggedIn);
+        }
+        if status >= 400 {
+            return Err(BoothError::Network(format!("HTTP {status} が返りました")));
+        }
         let location = response
-            .header("location")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         log::info!("booth logout(booth): status={status} location={location:?}");
         // 診断用ダンプ（旧バージョンが無条件に書いた分を含む）を残さない。
         remove_html_dumps();
@@ -325,26 +338,33 @@ impl BoothClient {
         let mut request = self
             .agent
             .get(url)
-            .set("User-Agent", &user_agent())
-            .set("Accept", accept)
-            .set("Accept-Language", "ja,en-US;q=0.9,en;q=0.8");
+            .header("User-Agent", &user_agent())
+            .header("Accept", accept)
+            .header("Accept-Language", "ja,en-US;q=0.9,en;q=0.8");
         let cookie = self.cookie_for(url);
         if !cookie.is_empty() {
-            request = request.set("Cookie", &cookie);
+            request = request.header("Cookie", &cookie);
         }
-        let response = request.call().map_err(|e| match e {
+        let mut response = request
+            .call()
+            .map_err(|e| BoothError::Network(e.to_string()))?;
+        match response.status().as_u16() {
             // Cloudflare のクリアランス（cf_clearance）失効やセッション切れは
             // 403/401 になる。再ログインを促すため NotLoggedIn に分類する
-            ureq::Error::Status(code, _) if code == 401 || code == 403 => BoothError::NotLoggedIn,
+            401 | 403 => return Err(BoothError::NotLoggedIn),
             // 商品ページが消えている（「お探しの本は見つかりませんでした」）
-            ureq::Error::Status(404, _) => BoothError::NotFound,
-            _ => BoothError::Network(e.to_string()),
-        })?;
-        if response.status() == 302 && url.contains("sign_in") {
+            404 => return Err(BoothError::NotFound),
+            status @ 400..=599 => {
+                return Err(BoothError::Network(format!("HTTP {status} が返りました")));
+            }
+            _ => {}
+        }
+        if response.status().as_u16() == 302 && url.contains("sign_in") {
             return Err(BoothError::NotLoggedIn);
         }
         response
-            .into_string()
+            .body_mut()
+            .read_to_string()
             .map_err(|e| BoothError::Network(e.to_string()))
     }
 
@@ -465,12 +485,14 @@ impl BoothClient {
     ) -> Result<u64, BoothError> {
         let response = self.fetch(download_url)?;
         let total = response
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
         let file = std::fs::File::create(path).map_err(|e| BoothError::Io(e.to_string()))?;
         let mut sink = std::io::BufWriter::new(file);
-        let mut reader = response.into_reader();
+        let mut reader = response.into_body().into_reader();
         let mut written = 0u64;
         let mut buf = vec![0u8; 1024 * 1024];
         loop {
@@ -506,10 +528,12 @@ impl BoothClient {
     ) -> Result<Vec<u8>, BoothError> {
         let response = self.fetch(download_url)?;
         let total = response
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        let mut reader = response.into_reader();
+        let mut reader = response.into_body().into_reader();
         use crate::tbf::transport::BodyOutcome;
         match crate::tbf::transport::read_body_with_progress(
             &mut reader,
@@ -529,7 +553,7 @@ impl BoothClient {
     }
 
     /// 検証（宛先）→ リダイレクト追跡 → content-type 検査までを行い、最終応答を返す。
-    fn fetch(&self, download_url: &str) -> Result<ureq::Response, BoothError> {
+    fn fetch(&self, download_url: &str) -> Result<ureq::http::Response<ureq::Body>, BoothError> {
         // 認証（Cookie）を付ける前に送信先を検証する。保存 URL はバックアップ由来も
         // あり得るため、外部ホストへセッションを渡さない。
         let parsed = crate::download_url::check(download_url, BOOTH_DOWNLOAD_RULES)
@@ -543,24 +567,29 @@ impl BoothClient {
             let mut request = self
                 .download_agent
                 .get(current.as_str())
-                .set("User-Agent", &user_agent())
-                .set("Accept", "application/octet-stream, */*");
+                .header("User-Agent", &user_agent())
+                .header("Accept", "application/octet-stream, */*");
             // Cookie は許可リスト内のホスト向けだけを載せる
             // （署名付き S3 は配布先であって、こちらのセッションの宛先ではない）。
             if crate::download_url::check_url(&current, BOOTH_DOWNLOAD_RULES).is_ok() {
                 let cookie = self.cookie_for(current.as_str());
                 if !cookie.is_empty() {
-                    request = request.set("Cookie", &cookie);
+                    request = request.header("Cookie", &cookie);
                 }
             }
             let response = request
                 .call()
                 .map_err(|e| BoothError::Network(e.to_string()))?;
-            let status = response.status();
+            let status = response.status().as_u16();
             if !(300..400).contains(&status) {
                 break response;
             }
-            let Some(location) = response.header("Location").map(str::to_string) else {
+            let Some(location) = response
+                .headers()
+                .get("Location")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+            else {
                 // `Location` の無い 3xx はそのまま返す（下の content-type 検査に任せる）。
                 break response;
             };
@@ -581,10 +610,18 @@ impl BoothClient {
             }
             current = next;
         };
+        let status = response.status().as_u16();
+        if status >= 400 {
+            return Err(BoothError::Network(format!(
+                "ダウンロードが HTTP {status} を返しました: {download_url}"
+            )));
+        }
         let content_type = response
-            .header("content-type")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         // ファイルではなく HTML（エラーページ・ダウンロード画面）が返った場合は
         // 明示的に失敗させる（見かけ上の成功で HTML を取り込んでしまうのを防ぐ）。
         if content_type.contains("text/html") {

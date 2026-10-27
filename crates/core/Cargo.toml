@@ -16,7 +16,7 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 libwebp-sys = { version = "0.9", features = ["sse41"] }
 thiserror.workspace = true
 log.workspace = true
-ureq = { version = "2", features = ["tls", "json"] }
+ureq = { version = "3", features = ["json"] }
 # 送信時（ureq 内部）と同じ WHATWG の URL 解釈で検証するため、直接依存にする。
 # 手動の文字列分割で検証すると実送信先と食い違う（バックスラッシュ・符号化ドット）。
 url = "2"
@@ -35,7 +35,8 @@ socket2 = "0.6"
 opfspack = { path = "../opfspack" }
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg", "bmp", "tiff"] }
 webp = "0.3"
-lindera = { version = "0.44", features = ["ipadic"] }
+lindera = { version = "6.2", features = ["embed-ipadic"] }
+lindera-analysis = "6.2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 yaml-rust2 = "0.13"
 # PDF レンダリングは PDFium（BSD-3-Clause / Apache-2.0）に統一した。mupdf は
