@@ -9,15 +9,15 @@
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use rand::RngCore;
 
 /// Encrypt a `sub` into a BASE64 `IV(12) || ciphertext || tag` blob.
 pub fn encrypt(key: &[u8; 32], sub: &str) -> String {
     let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte AES-256 key is valid");
     let mut iv = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut iv);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut iv)
+        .expect("OS RNG is available");
     let ct = cipher
-        .encrypt(Nonce::from_slice(&iv), sub.as_bytes())
+        .encrypt((&iv).into(), sub.as_bytes())
         .expect("in-memory AES-256-GCM encryption cannot fail");
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&iv);
@@ -34,7 +34,9 @@ pub fn decrypt(key: &[u8; 32], blob: &str) -> Option<String> {
     }
     let (iv, ct) = data.split_at(12);
     let cipher = Aes256Gcm::new_from_slice(key).ok()?;
-    let pt = cipher.decrypt(Nonce::from_slice(iv), ct).ok()?;
+    let pt = cipher
+        .decrypt(&Nonce::try_from(iv).expect("12-byte IV"), ct)
+        .ok()?;
     String::from_utf8(pt).ok()
 }
 
@@ -74,9 +76,10 @@ mod tests {
         // Build a valid blob with non-UTF-8 plaintext.
         let cipher = Aes256Gcm::new_from_slice(&KEY).unwrap();
         let mut iv = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut iv);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut iv)
+            .expect("OS RNG is available");
         let ct = cipher
-            .encrypt(Nonce::from_slice(&iv), &[0xffu8, 0xfeu8, 0x00u8][..])
+            .encrypt((&iv).into(), &[0xffu8, 0xfeu8, 0x00u8][..])
             .unwrap();
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&iv);

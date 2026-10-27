@@ -3816,7 +3816,7 @@ impl BookshelfView {
                                 let sql = format!(
                                     "DELETE FROM bookshelf_items WHERE site_id = 'booth'                              AND database_id NOT IN ({placeholders})                              AND database_id NOT IN                              (SELECT tbf_product_id FROM books WHERE site_id = 'booth')"
                                 );
-                                let mut query = sqlx::query(&sql);
+                                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                                 for id in ids {
                                     query = query.bind(id);
                                 }
@@ -3832,7 +3832,7 @@ impl BookshelfView {
                     let sql = format!(
                         "DELETE FROM bookshelf_items WHERE site_id = 'booth'                      AND database_id IN ({placeholders})                      AND database_id NOT IN                      (SELECT tbf_product_id FROM books WHERE site_id = 'booth')"
                     );
-                    let mut query = sqlx::query(&sql);
+                    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                     for id in &vanished {
                         query = query.bind(id.to_string());
                     }
@@ -18417,7 +18417,7 @@ mod tests {
     }
 
     /// キーを 1 回押す（フォーカスは本棚にある前提）。
-    fn press_key(visual: &mut gpui_kit::VisualTestContext, key: &str) {
+    fn press_key(visual: &mut gpui_kit::VisualTestContext, key: &'static str) {
         visual.simulate_event(gpui_kit::KeyDownEvent {
             keystroke: gpui_kit::Keystroke::parse(key).unwrap(),
             is_held: false,

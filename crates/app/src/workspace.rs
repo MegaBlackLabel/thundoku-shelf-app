@@ -2392,10 +2392,7 @@ impl Render for Workspace {
             } else {
                 div().into_any_element()
             })
-            // gpui-kit の Notification レイヤー（右上に出る。既定 5 秒で自動的に消える）
-            .children(gpui_kit::component::Root::render_notification_layer(
-                window, cx,
-            ))
+            // Notification は gpui-kit の Root が自動で描く（0.7 で手動レイヤー API は削除された）
             .child(if self.auth_panel_open {
                 let panel = self.account_panel(cx);
                 gpui_kit::deferred(
@@ -4361,17 +4358,7 @@ mod tests {
 
     /// いま表示されている Notification の件数。
     fn notification_count(visual: &mut gpui_kit::VisualTestContext) -> usize {
-        visual.update(|window, cx| {
-            window
-                .root::<gpui_kit::component::Root>()
-                .expect("root")
-                .expect("root view")
-                .read(cx)
-                .notification
-                .read(cx)
-                .notifications()
-                .len()
-        })
+        visual.update(|window, cx| window.notifications(cx).len())
     }
 
     /// 起動時の初期表示を決めるテスト用の土台（指定したサイトだけログイン済みにする）。
@@ -4903,7 +4890,7 @@ mod tests {
     }
 
     /// キーを 1 つ押す（`"down"` / `"j"` のように名前で指定する）。
-    fn press_key(visual: &mut gpui_kit::VisualTestContext, key: &str) {
+    fn press_key(visual: &mut gpui_kit::VisualTestContext, key: &'static str) {
         visual.simulate_event(gpui_kit::KeyDownEvent {
             keystroke: gpui_kit::Keystroke::parse(key).expect("キー名が不正"),
             is_held: false,

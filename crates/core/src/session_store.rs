@@ -19,7 +19,6 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use rand::RngCore;
 
 use crate::db::{SqlitePool, settings};
 use crate::secrets::{SecretError, SecretStore};
@@ -315,11 +314,12 @@ impl SessionVault {
         let cipher = Aes256Gcm::new_from_slice(&self.key)
             .map_err(|e| SessionError::Crypto(e.to_string()))?;
         let mut iv = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut iv);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut iv)
+            .expect("OS RNG is available");
         let aad = store.purpose();
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&iv),
+                (&iv).into(),
                 Payload {
                     msg: plaintext,
                     aad: aad.as_bytes(),
@@ -346,7 +346,7 @@ impl SessionVault {
         let aad = store.purpose();
         cipher
             .decrypt(
-                Nonce::from_slice(iv),
+                &Nonce::try_from(iv).expect("12-byte IV"),
                 Payload {
                     msg: ciphertext,
                     aad: aad.as_bytes(),

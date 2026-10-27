@@ -1,4 +1,4 @@
-//! DLsite（www.dlsite.com）のログインをアプリ内 WebView（gpui-wry）で行うビュー。
+//! DLsite（www.dlsite.com）のログインをアプリ内 WebView（gpui-webview）で行うビュー。
 //!
 //! viviON ID のログイン（`login.dlsite.com/login?user=self`）を WebView で開く。ユーザーが
 //! ログインを完了して `www.dlsite.com`（ストア）に到達すると、`www.dlsite.com` の
@@ -11,7 +11,7 @@ use gpui_kit::{
     App, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement,
     Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_wry::WebView;
+use gpui_webview::WebView;
 use thundoku_core::dlsite::client::{DlsiteSession, LOGIN_HOST, SITE_HOST};
 
 /// セッション Cookie を集める起点（ストアとログイン）。

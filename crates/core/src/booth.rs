@@ -1,6 +1,6 @@
 //! BOOTH（booth.pm）のセッション管理と購入品取得。
 //!
-//! ログインはアプリ内 WebView（gpui-wry）で pixiv OAuth を実施し、
+//! ログインはアプリ内 WebView（gpui-webview）で pixiv OAuth を実施し、
 //! 取得した booth.pm のセッション Cookie を保持・永続化する。
 //! 購入品一覧はライブラリページ、購入日は購入履歴ページから取得する。
 

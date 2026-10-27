@@ -12,7 +12,7 @@ use thundoku_shelf::icons::AppAssets;
 use thundoku_shelf::workspace::Workspace;
 
 fn main() {
-    // Windows で WebView（gpui-wry）を描画させるには DirectComposition を
+    // Windows で WebView（gpui-webview）を描画させるには DirectComposition を
     // 無効化する必要がある（gpui-component examples/webview に準拠）。
     // 無効化しないと WebView2 子ウィンドウが GPUI ウィンドウに正しく表示されず、
     // 技術書典・BOOTH・Google のログイン画面が「空」になる。

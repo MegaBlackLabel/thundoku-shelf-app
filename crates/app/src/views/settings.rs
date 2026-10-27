@@ -1920,7 +1920,7 @@ impl SettingsView {
             ] {
                 let pool = db.clone();
                 let _ = thundoku_core::db::block_on(async {
-                    sqlx::query(&format!("DELETE FROM {table}"))
+                    sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
                         .execute(&pool)
                         .await
                 });

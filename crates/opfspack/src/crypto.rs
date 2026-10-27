@@ -4,12 +4,11 @@
 //! `docs/spec/10-pack-keys.md` §2 equivalents).
 
 use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
+    Aes256Gcm, KeyInit,
     aead::{Aead, Payload},
 };
 use hkdf::Hkdf;
 use pbkdf2::pbkdf2_hmac;
-use rand::RngCore;
 use sha2::Sha256;
 
 /// HKDF info string for the per-pack entry key (v2 と同一）。
@@ -39,7 +38,8 @@ pub(crate) fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
 /// AES-256-GCM encrypt with a random 12-byte IV; returns (IV, ciphertext || tag).
 pub(crate) fn encrypt(data: &[u8], key: &[u8; 32]) -> ([u8; 12], Vec<u8>) {
     let mut iv = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut iv);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut iv)
+        .expect("OS RNG is available");
     (iv, encrypt_with(data, key, &iv, &[]))
 }
 
@@ -47,7 +47,7 @@ pub(crate) fn encrypt(data: &[u8], key: &[u8; 32]) -> ([u8; 12], Vec<u8>) {
 pub(crate) fn encrypt_with(data: &[u8], key: &[u8; 32], iv: &[u8; 12], aad: &[u8]) -> Vec<u8> {
     let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key is valid for AES-256");
     cipher
-        .encrypt(Nonce::from_slice(iv), Payload { msg: data, aad })
+        .encrypt(iv.into(), Payload { msg: data, aad })
         .expect("in-memory AES-GCM encryption cannot fail")
 }
 
@@ -65,6 +65,6 @@ pub(crate) fn decrypt_with(
 ) -> Result<Vec<u8>, ()> {
     let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key is valid for AES-256");
     cipher
-        .decrypt(Nonce::from_slice(iv), Payload { msg: data, aad })
+        .decrypt(iv.into(), Payload { msg: data, aad })
         .map_err(|_| ())
 }

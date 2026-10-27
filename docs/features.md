@@ -7,7 +7,7 @@ Thundoku Shelf Desktop は、技術書典・BOOTH・FANZA同人・DLsite で購�
 （https://thundoku-shelf-staging.megablacklabel.workers.dev/）の機能をローカルで
 再現し、追加でデスクトップ固有の機能を備えています。
 
-- 技術: Rust + GPUI（zed の GUI フレームワーク）+ gpui-component
+- 技術: Rust + GPUI（zed の GUI フレームワーク）+ gpui-kit
 - ストレージ: SQLite（ローカルファイル）+ .opfspack（画像アーカイブ）
 - 依存: `mise` でツールチェーン管理（`mise run <task>`）
 
@@ -18,8 +18,8 @@ Thundoku Shelf Desktop は、技術書典・BOOTH・FANZA同人・DLsite で購�
 | ライブラリ | 用途 |
 |---|---|
 | `gpui`（zed-industries/zed） | ウィンドウ・レイアウト・描画・イベントなど GUI の土台 |
-| `gpui-component`（longbridge） | ボタン・入力・ポップオーバー・スライダー・スピナー・メニュー等の部品 |
-| `gpui-component-assets` / `gpui-base` / `gpui-wry` | gpui-component のアセット・基盤・WebView バックエンド |
+| `gpui-kit`（longbridge） | GPUI 本体・`gpui-base`・`gpui-component`・アイコンをまとめた単一の依存。ボタン・入力・ポップオーバー・スライダー・スピナー・メニュー等の部品 |
+| `gpui-webview` | ログイン用 WebView（wry バックエンド） |
 | `gpui_platform` | macOS / Windows のプラットフォーム実装（font-kit, runtime_shaders） |
 | `resvg` / `usvg` | SVG のレンダリング（アイコン等） |
 

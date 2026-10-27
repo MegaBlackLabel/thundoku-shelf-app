@@ -294,7 +294,7 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 
 | 項目 | 事実 | アンカー |
 |---|---|---|
-| 取得方法 | **アプリ内 WebView（gpui-wry / lb_wry）**。HTTP ログイン（フォーム POST）は行わない | `crates/app/src/views/dlsite_login.rs:1-2`, `:39-74` |
+| 取得方法 | **アプリ内 WebView（gpui-webview / lb_wry）**。HTTP ログイン（フォーム POST）は行わない | `crates/app/src/views/dlsite_login.rs:1-2`, `:39-74` |
 | セッション Cookie 名（必須） | `__DLsite_SID` | `crates/app/src/views/dlsite_login.rs:155` |
 | 認証 ID Cookie（どちらか必須） | `uhashjp` または `uid_jp` | `crates/app/src/views/dlsite_login.rs:155-161` |
 | ダウンロード用 Cookie | `jwt`（DL の 302 `Set-Cookie` から捕捉。セッションには保存せず、CDN 以降のホップのヘッダにだけ載せる）。**CDN へはこの `jwt` と「CDN 向けに収集した Cookie」だけを送り、www のセッション Cookie は送らない** | `crates/core/src/dlsite/client.rs:364-368`, `:370-386` |
@@ -557,7 +557,7 @@ Cookie の `Domain` / `Path` / `Secure` / 期限は `CookieEntry` に保存し�
 
 #### 2.1 方式の要約
 
-- **アプリ内 WebView（`gpui-wry` / `lb_wry`）による手動ログイン**。HTTP ログイン実装・パスワード送信コードは存在しない（`crates/app/src/views/fanza_login.rs` が唯一のログイン実装）。
+- **アプリ内 WebView（`gpui-webview` / `lb_wry`）による手動ログイン**。HTTP ログイン実装・パスワード送信コードは存在しない（`crates/app/src/views/fanza_login.rs` が唯一のログイン実装）。
 - WebView は **incognito（non-persistent）ストア**で生成（永続ストアだと SSO で自動再ログインされ、ログアウトが効かないように見えるため）: `crates/app/src/views/fanza_login.rs:38-40`。
 - デバッグビルドでは devtools 有効: `crates/app/src/views/fanza_login.rs:41-42`。
 - 起点 URL: `https://www.dmm.co.jp/dc/-/mylibrary/`: `crates/app/src/views/fanza_login.rs:61`。

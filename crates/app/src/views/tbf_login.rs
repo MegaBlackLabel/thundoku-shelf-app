@@ -1,4 +1,4 @@
-//! 技術書典（techbookfest.org）のログインをアプリ内 WebView（gpui-wry）で行うビュー。
+//! 技術書典（techbookfest.org）のログインをアプリ内 WebView（gpui-webview）で行うビュー。
 //!
 //! 技術書典のログインページを WebView で開き、ユーザーが WebView 内で
 //! メールアドレス・パスワードでログインしてログイン後のページに遷移したら、
@@ -9,7 +9,7 @@ use gpui_kit::{
     App, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement,
     Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_wry::WebView;
+use gpui_webview::WebView;
 use thundoku_core::tbf::TbfSession;
 
 /// セッション Cookie を集める起点（技術書典は単一ホスト）。

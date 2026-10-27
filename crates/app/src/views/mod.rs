@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use gpui_kit::AppContext as _;
 use gpui_kit::gpui::{App, Context, Entity, Window};
-use gpui_wry::{WebView, WebViewHandle};
+use gpui_webview::{WebView, WebViewHandle};
 use thundoku_core::download_url::host_within;
 use thundoku_core::session_cookies::CookieEntry;
 
@@ -465,7 +465,7 @@ pub(crate) enum CheckStep {
 
 /// 借用の外で Cookie を集めるための材料。
 pub(crate) struct CheckTick {
-    /// cloneable な wry ハンドル（`gpui_wry::WebViewHandle`）。借用を取らずに wry を触れる。
+    /// cloneable な wry ハンドル（`gpui_webview::WebViewHandle`）。借用を取らずに wry を触れる。
     pub(crate) webview: WebViewHandle,
 }
 

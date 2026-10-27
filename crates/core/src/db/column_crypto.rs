@@ -20,9 +20,8 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use rand::RngCore;
 
-use crate::db::SqlitePool;
+use crate::db::{SqlitePool, dynamic_sql};
 use crate::secrets::{SecretError, SecretStore};
 
 /// 暗号化された値の接頭辞。**これが無い値は移行前の平文**として扱う。
@@ -80,10 +79,11 @@ pub fn encrypt(key: &[u8; 32], aad: &str, plain: &str) -> Result<String, ColumnC
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| ColumnCryptoError::Encrypt(e.to_string()))?;
     let mut iv = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut iv);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut iv)
+        .expect("OS RNG is available");
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&iv),
+            (&iv).into(),
             Payload {
                 msg: plain.as_bytes(),
                 aad: aad.as_bytes(),
@@ -115,7 +115,7 @@ pub fn decrypt(key: &[u8; 32], aad: &str, stored: &str) -> Option<String> {
     let cipher = Aes256Gcm::new_from_slice(key).ok()?;
     let plain = cipher
         .decrypt(
-            Nonce::from_slice(iv),
+            &Nonce::try_from(iv).expect("12-byte IV"),
             Payload {
                 msg: ciphertext,
                 aad: aad.as_bytes(),
@@ -170,9 +170,9 @@ pub(crate) async fn has_plaintext_rows(pool: &SqlitePool) -> Result<bool, sqlx::
         ("token_analysis", "token"),
         ("page_notes", "memo"),
     ] {
-        let found: Option<i64> = sqlx::query_scalar(&format!(
+        let found: Option<i64> = sqlx::query_scalar(dynamic_sql(format!(
             "SELECT 1 FROM {table} WHERE substr({column}, 1, ?1) <> ?2 LIMIT 1"
-        ))
+        )))
         .bind(PREFIX.len() as i64)
         .bind(PREFIX)
         .fetch_optional(pool)

@@ -11,17 +11,17 @@ path = "src/main.rs"
 [dependencies]
 # windows-manifest は xwin クロスビルドで llvm-rc の相対パス解決に失敗するため外す
 # （macOS / Windows のアプリ実行には不要。default の wayland/x11 も不要）
-# Carousel（Multiple Item）は未リリース。crates.io の最新 0.6.1 の gpui-component には
-# carousel モジュールが無いため、上流 main を rev 固定で使う（本棚リストの関連書籍カルーセル）。
-# Carousel を含む版が crates.io に出たら `version = "0.6"` に戻す。
 # `test-support`（gpui のテストハーネス）は **dev-dependencies 側だけ**で有効にする:
 # 本番ビルドで有効にすると gpui の `leak-detection` が入り、終了時に残っている
 # ハンドル（常駐タスクが持つ `WeakEntity` など）で `Exited with leaked handles` パニックする。
-gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "84f57fdfcb4910623fb0bb7f795b077e249f9271" }
-gpui-wry = { version = "0.6" }
+gpui-kit = "0.8.1"
+# WebView は gpui-kit と同じ gpui-pre を指す必要がある（別クレート名にすると
+# gpui が二重に入り、`Window` / `Entity` の型が食い違う）。0.8 系から
+# `gpui-wry` は `gpui-webview` に改名された。
+gpui-webview = "0.8.1"
 thundoku-core = { path = "../core" }
 url = "2"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio"] }
 lb-wry = { version = "0.53.3", package = "lb-wry" }
 raw-window-handle = "0.6"
 anyhow = "1"
@@ -29,31 +29,31 @@ log.workspace = true
 env_logger = "0.11"
 serde_json.workspace = true
 serde.workspace = true
- dirs = "6"
+ dirs = "7"
 rfd = "0.17"
- parking_lot = "0.12"
+ parking_lot = "0.13"
 ureq = { version = "2", features = ["tls", "json"] }
 opfspack = { path = "../opfspack" }
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
 webp = "0.3"
 libwebp-sys = { version = "0.9", features = ["sse41"] }
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
-resvg = "0.44"
+resvg = "0.49"
 # `text` / `system-fonts` を明示する: SVG の `<text>`（表紙プレースホルダ）を描くには
 # フォントDBへのシステムフォント読込が要る（`usvg::Options::default()` のフォントDBは空）。
 # `resvg` の既定 feature でも有効になるが、ここに書いておかないと resvg 側の変更で静かに壊れる。
 # `memmap-fonts` はフォント本体をメモリへ読み込まず mmap で参照する（常駐メモリを抑える）。
-usvg = { version = "0.44", default-features = false, features = [
+usvg = { version = "0.49", default-features = false, features = [
     "text",
     "system-fonts",
     "memmap-fonts",
 ] }
- tiny-skia = "0.11"
+ tiny-skia = "0.12"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
  [build-dependencies]
 # Windows exe のアイコン埋め込み（リリースビルド時のみ、build.rs から使用）
@@ -64,4 +64,4 @@ winres = "0.1"
 toml = "1"
 # テストは gpui のテストハーネス（`#[gpui_kit::test]` / `TestAppContext`）を使う。
 # 本番ビルドには入れない（`leak-detection` が終了時にパニックするため）。
-gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "84f57fdfcb4910623fb0bb7f795b077e249f9271", features = ["test-support"] }
+gpui-kit = { version = "0.8.1", features = ["test-support"] }

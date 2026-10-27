@@ -1,6 +1,6 @@
 //! `books` repository.
 
-use crate::db::SqlitePool;
+use crate::db::{SqlitePool, dynamic_sql};
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct Book {
@@ -75,10 +75,10 @@ impl PageTurn {
 
 pub fn insert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query(&format!(
+        sqlx::query(dynamic_sql(format!(
             "INSERT INTO books ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
              ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"
-        ))
+        )))
         .bind(&book.id)
         .bind(&book.title)
         .bind(&book.author)
@@ -115,7 +115,7 @@ pub fn insert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
 /// Insert or replace an existing row by id (drive sync import uses this).
 pub fn upsert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query(&format!(
+        sqlx::query(dynamic_sql(format!(
             "INSERT INTO books ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
              ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
              ON CONFLICT(id) DO UPDATE SET
@@ -142,7 +142,7 @@ pub fn upsert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
                page_count = excluded.page_count,
                age_rating = excluded.age_rating,
                series_name = excluded.series_name"
-        ))
+        )))
         .bind(&book.id)
         .bind(&book.title)
         .bind(&book.author)
@@ -178,7 +178,7 @@ pub fn upsert(pool: &SqlitePool, book: &Book) -> Result<(), sqlx::Error> {
 
 pub fn get(pool: &SqlitePool, id: &str) -> Result<Option<Book>, sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query_as::<_, Book>(&format!("SELECT {COLUMNS} FROM books WHERE id = ?1"))
+        sqlx::query_as::<_, Book>(dynamic_sql(format!("SELECT {COLUMNS} FROM books WHERE id = ?1")))
             .bind(id)
             .fetch_optional(pool)
             .await
@@ -187,9 +187,9 @@ pub fn get(pool: &SqlitePool, id: &str) -> Result<Option<Book>, sqlx::Error> {
 
 pub fn list(pool: &SqlitePool) -> Result<Vec<Book>, sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query_as::<_, Book>(&format!(
+        sqlx::query_as::<_, Book>(dynamic_sql(format!(
             "SELECT {COLUMNS} FROM books ORDER BY created_at DESC"
-        ))
+        )))
         .fetch_all(pool)
         .await
     })
@@ -568,9 +568,9 @@ pub fn set_page_turn(
 /// List favorite books (for the auto-download on startup).
 pub fn list_favorites(pool: &SqlitePool) -> Result<Vec<Book>, sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query_as::<_, Book>(&format!(
+        sqlx::query_as::<_, Book>(dynamic_sql(format!(
             "SELECT {COLUMNS} FROM books WHERE is_favorite = 1 ORDER BY created_at DESC"
-        ))
+        )))
         .fetch_all(pool)
         .await
     })

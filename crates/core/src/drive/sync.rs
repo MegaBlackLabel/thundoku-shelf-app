@@ -99,7 +99,7 @@ fn md5_file(path: &std::path::Path) -> Result<String, SyncError> {
         }
         context.consume(&buf[..read]);
     }
-    Ok(format!("{:x}", context.compute()))
+    Ok(format!("{:x}", context.finalize()))
 }
 
 /// 1 冊の pack を **Drive から削除**する（ローカルの pack は残す）。

@@ -1,7 +1,7 @@
 //! `bookshelf_items` repository (技術書典本棚).
 //! Note: the verbatim Web schema uses camelCase `causedAt`.
 
-use crate::db::SqlitePool;
+use crate::db::{SqlitePool, dynamic_sql};
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct BookshelfItem {
@@ -85,7 +85,7 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
     crate::db::block_on(async {
         // 「不明」は同期の既定値なので、それを送ってきたときは既存の判定結果を残す。
         let unknown = crate::drm::DrmStatus::Unknown.as_db();
-        sqlx::query(&format!(
+        sqlx::query(dynamic_sql(format!(
             "INSERT INTO bookshelf_items ({COLUMNS}) VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
              ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, \
@@ -134,7 +134,7 @@ pub fn upsert(pool: &SqlitePool, item: &BookshelfItem) -> Result<(), sqlx::Error
                page_count = excluded.page_count,
                age_rating = excluded.age_rating,
                series_name = excluded.series_name"
-        ))
+        )))
         .bind(&item.site_id)
         .bind(&item.database_id)
         .bind(&item.title)
@@ -229,9 +229,9 @@ pub fn set_event_name(
 /// 全サイトの本棚アイテムを取得する（BOOTH と技術書典をまとめて扱う）。
 pub fn list_all(pool: &SqlitePool) -> Result<Vec<BookshelfItem>, sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query_as::<_, BookshelfItem>(&format!(
+        sqlx::query_as::<_, BookshelfItem>(dynamic_sql(format!(
             "SELECT {COLUMNS} FROM bookshelf_items              ORDER BY causedAt IS NULL, causedAt DESC, title ASC"
-        ))
+        )))
         .fetch_all(pool)
         .await
     })
@@ -240,10 +240,10 @@ pub fn list_all(pool: &SqlitePool) -> Result<Vec<BookshelfItem>, sqlx::Error> {
 pub fn list(pool: &SqlitePool, site_id: &str) -> Result<Vec<BookshelfItem>, sqlx::Error> {
     // Web 版と同一: 購入日（causedAt）が新しい順、null は末尾、同列はタイトル順。
     crate::db::block_on(async {
-        sqlx::query_as::<_, BookshelfItem>(&format!(
+        sqlx::query_as::<_, BookshelfItem>(dynamic_sql(format!(
             "SELECT {COLUMNS} FROM bookshelf_items WHERE site_id = ?1 \
              ORDER BY causedAt IS NULL, causedAt DESC, title ASC"
-        ))
+        )))
         .bind(site_id)
         .fetch_all(pool)
         .await
@@ -373,7 +373,7 @@ pub fn unfetched_among(
                 "SELECT database_id FROM bookshelf_items \
                  WHERE site_id = ?1 AND tags_fetched = 0 AND database_id IN ({placeholders})"
             );
-            let mut query = sqlx::query_scalar::<_, String>(&sql).bind(site_id);
+            let mut query = sqlx::query_scalar::<_, String>(dynamic_sql(sql.as_str())).bind(site_id);
             for database_id in chunk {
                 query = query.bind(database_id);
             }
@@ -489,11 +489,11 @@ pub fn set_hidden(
         } else {
             "NULL".to_string()
         };
-        sqlx::query(&format!(
+        sqlx::query(dynamic_sql(format!(
             "UPDATE bookshelf_items SET is_hidden = ?1, hidden_at = {hidden_at}, \
              updated_at = CURRENT_TIMESTAMP \
              WHERE site_id = ?2 AND database_id = ?3"
-        ))
+        )))
         .bind(hidden as i64)
         .bind(site_id)
         .bind(database_id)
@@ -513,10 +513,10 @@ pub fn list_hidden(pool: &SqlitePool) -> Result<Vec<BookshelfItem>, sqlx::Error>
         )
         .execute(pool)
         .await?;
-        sqlx::query_as::<_, BookshelfItem>(&format!(
+        sqlx::query_as::<_, BookshelfItem>(dynamic_sql(format!(
             "SELECT {COLUMNS} FROM bookshelf_items WHERE is_hidden = 1 \
              ORDER BY hidden_at DESC, title ASC"
-        ))
+        )))
         .fetch_all(pool)
         .await
     })
@@ -525,10 +525,10 @@ pub fn list_hidden(pool: &SqlitePool) -> Result<Vec<BookshelfItem>, sqlx::Error>
 /// Favorite shelf items (for the auto-download on startup).
 pub fn list_favorites(pool: &SqlitePool) -> Result<Vec<BookshelfItem>, sqlx::Error> {
     crate::db::block_on(async {
-        sqlx::query_as::<_, BookshelfItem>(&format!(
+        sqlx::query_as::<_, BookshelfItem>(dynamic_sql(format!(
             "SELECT {COLUMNS} FROM bookshelf_items WHERE is_favorite = 1 \
              ORDER BY causedAt IS NULL, causedAt DESC, title ASC"
-        ))
+        )))
         .fetch_all(pool)
         .await
     })

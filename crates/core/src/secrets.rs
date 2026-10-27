@@ -3,7 +3,6 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -182,7 +181,8 @@ impl SecretStore {
             return Ok(key);
         }
         let mut key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut key)
+            .expect("OS RNG is available");
         self.save(slot, &B64.encode(key))?;
         Ok(key)
     }

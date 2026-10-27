@@ -10,7 +10,7 @@
 |---|---|---|
 | `crates/opfspack` | 書籍ファイル形式 `.opfspack` の読み書き（自前形式） | Rust / aes-gcm, sha2 |
 | `crates/core` | DB・取り込み・各ストア同期・Google/Drive・タグ・暗号（UI 非依存） | Rust / sqlx, tokio, reqwest 相当は ureq, lindera, pdfium-render |
-| `crates/app` | GPUI デスクトップ UI（画面・ビューアー・通知・アイコン） | Rust / gpui-kit, gpui-wry, image, resvg, usvg |
+| `crates/app` | GPUI デスクトップ UI（画面・ビューアー・通知・アイコン） | Rust / gpui-kit, gpui-webview, image, resvg, usvg |
 
 - ワークスペース: `resolver = "3"`, `edition = "2024"`, version 0.2.4, license MIT（`Cargo.toml:1-9`）
 - リリースプロファイルは `debug = false`（`Cargo.toml:19-23`）
@@ -92,8 +92,8 @@
 
 | 依存 | 用途 | コメントに残っている意図 |
 |---|---|---|
-| `gpui-kit`（git rev 固定 `84f57fdf...`） | UI コンポーネント（Button/Dialog/Popover/Notification/Radio/Icon 等） | crates.io 0.6.1 に Carousel が無く、上流 main を rev 固定で使用（`crates/app/Cargo.toml`） |
-| `gpui-wry` / `lb-wry` | ログイン用 WebView | |
+| `gpui-kit`（crates.io 0.8.1） | UI コンポーネント（Button/Dialog/Popover/Notification/Radio/Icon/Carousel 等） | Carousel は 0.6.2 でリリース済みのため git rev 固定をやめた（`crates/app/Cargo.toml`） |
+| `gpui-webview` / `lb-wry` | ログイン用 WebView | |
 | `sqlx`（sqlite, runtime-tokio, migrate） | DB | |
 | `image` / `webp` / `libwebp-sys`（sse41） | WebP エンコード/デコード | `sse41` は xwin クロスビルド対策 |
 | `resvg` / `usvg` / `tiny-skia` | SVG（プレースホルダ表紙）のラスタライズ | `image` クレートは SVG を復号できないため |

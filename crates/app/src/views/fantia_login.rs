@@ -1,4 +1,4 @@
-//! Fantia（fantia.jp）のログインをアプリ内 WebView（gpui-wry）で行うビュー。
+//! Fantia（fantia.jp）のログインをアプリ内 WebView（gpui-webview）で行うビュー。
 //!
 //! Fantia のログイン（`https://fantia.jp/sessions/signin`）はパスワードに加えて
 //! **reCAPTCHA** があり、続けて **2 段階認証**のステップがある（実測 2026-10-15）。
@@ -19,7 +19,7 @@ use gpui_kit::{
     App, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement,
     Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_wry::WebView;
+use gpui_webview::WebView;
 use thundoku_core::fantia::client::{FantiaSession, SITE_HOST};
 
 /// セッション Cookie を集める起点（Fantia は 1 ホストに集約されている）。

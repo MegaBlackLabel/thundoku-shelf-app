@@ -1,4 +1,4 @@
-//! BOOTH（booth.pm）のログインをアプリ内 WebView（gpui-wry）で行うビュー。
+//! BOOTH（booth.pm）のログインをアプリ内 WebView（gpui-webview）で行うビュー。
 //!
 //! booth.pm のログインページ（pixiv OAuth）を WebView で開き、ユーザーが
 //! WebView 内でログインを完了して booth.pm に戻ったら、booth.pm のセッション
@@ -9,7 +9,7 @@ use gpui_kit::{
     App, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement, ParentElement,
     Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use gpui_wry::WebView;
+use gpui_webview::WebView;
 
 /// セッション Cookie を集める URL（`accounts.booth.pm` の `_plaza_session_*` は
 /// ログアウトにも必要なので、booth / プラザ / pixiv の 3 つを集める）。
