@@ -1416,6 +1416,94 @@ fn books_delete_removes_dependent_rows() {
     );
 }
 
+/// 同じ本に取り込みドキュメントが複数残っている（過去の不具合）場合、起動時の
+/// `migrate` が**最新の 1 つだけ**を残すこと。
+///
+/// 残ると `images_for_selection` が同じページを複数返し、見開きで左右に同じ
+/// ページが出る（実データで 1 ページが 3 行になっていた）。
+#[test]
+fn migrate_prunes_stale_documents_for_the_same_book() {
+    use thundoku_core::db::documents;
+    let pool = memory_db();
+    let stamp = "2026-09-12 00:00:00";
+    books::insert(
+        &pool,
+        &books::Book {
+            id: "book-dup".into(),
+            title: "複数回取り込まれた本".into(),
+            author: String::new(),
+            circle_name: String::new(),
+            purchase_date: None,
+            file_name: "b.zip".into(),
+            file_size: 100,
+            opfs_path: "book-dup.opfspack".into(),
+            cover_thumbnail: None,
+            tbf_product_id: None,
+            site_id: Some("fanza".into()),
+            tags_fetched: 1,
+            pack_id: Some("book-dup".into()),
+            is_favorite: 0,
+            is_hidden: 0,
+            created_at: stamp.into(),
+            updated_at: stamp.into(),
+            media_category: None,
+            ai_type: None,
+            is_drm: 0,
+            release_date: None,
+            description: None,
+            theme: None,
+            maker_id: None,
+            page_count: None,
+            age_rating: None,
+            series_name: None,
+        },
+    )
+    .unwrap();
+    let document = |id: &str, created_at: &str| documents::ImportedDocument {
+        id: id.into(),
+        book_id: "book-dup".into(),
+        source_type: "image".into(),
+        file_hash: "hash".into(),
+        total_pages: 1,
+        metadata: None,
+        status: "completed".into(),
+        created_at: created_at.into(),
+        updated_at: created_at.into(),
+    };
+    let image = |id: &str, document_id: &str| documents::DocumentImage {
+        id: id.into(),
+        document_id: document_id.into(),
+        content_id: None,
+        format_id: None,
+        page_number: 1,
+        image_type: "page".into(),
+        opfs_path: "book-dup.opfspack".into(),
+        width: 10,
+        height: 10,
+        mime_type: "image/webp".into(),
+        file_size: 1,
+        pack_entry_path: Some("pages/page_0001.webp".into()),
+        created_at: stamp.into(),
+    };
+    // 09-26 と 09-29 に取り込まれた 2 つのドキュメント（同じページ）
+    documents::insert_document(&pool, &document("doc-old", "2026-09-26 06:29:46")).unwrap();
+    documents::insert_images_batch(&pool, &[image("img-old", "doc-old")]).unwrap();
+    documents::insert_document(&pool, &document("doc-new", "2026-09-29 12:37:06")).unwrap();
+    documents::insert_images_batch(&pool, &[image("img-new", "doc-new")]).unwrap();
+
+    // 起動時と同じ手順（マイグレーションは適用済みなので掃除だけが効く）
+    thundoku_core::db::migrate(&pool).unwrap();
+
+    let images = documents::images_for_selection(&pool, "book-dup", None, None).unwrap();
+    assert_eq!(
+        images.len(),
+        1,
+        "同じページが複数返っている（見開きで左右に同じページが出る）: {:?}",
+        images.iter().map(|image| &image.id).collect::<Vec<_>>()
+    );
+    assert_eq!(images[0].document_id, "doc-new", "最新のドキュメントを残すこと");
+}
+
 // FANZA同人 / DLsite の共有ソースメタ列が BookshelfItem に入出力（upsert/list）で
 // roundtrip することを検証する。
 #[test]

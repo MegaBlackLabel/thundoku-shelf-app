@@ -1444,9 +1444,11 @@ fn finish_import(
         }
         None => book,
     };
+    // 同じ book_id の前回の取り込みは**必ず**消す（`books` 行が読めなかった場合でも
+    // 消す。消し漏らすとページ行が二重になり、見開きに同じページが左右へ出る）。
+    documents::delete_for_book(pool, &book_id)?;
+    contents::delete_for_book(pool, &book_id)?;
     if previous.is_some() {
-        documents::delete_for_book(pool, &book_id)?;
-        contents::delete_for_book(pool, &book_id)?;
         books::upsert(pool, &book)?;
         log::info!("finish_import: books 更新（再取り込み）");
     } else {
